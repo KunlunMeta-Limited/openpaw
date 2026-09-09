@@ -1,0 +1,4 @@
+{"step":"mock","mode":"tool_use","tool":"echo_tool","input":{"text":"x"},"text":"calling echo"}
+{"step":"mock","mode":"fixed","text":"done"}
+{"step":"user","text":"call the echo tool with x"}
+{"step":"expect","stop":"end_turn","tool_calls":["echo_tool"],"final_reply":"done","min_parallel":1}

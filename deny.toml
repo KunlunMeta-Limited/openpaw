@@ -1,0 +1,32 @@
+# cargo-deny configuration — dependency whitelist enforcement (Q2).
+# Banned families (dev plan section 1.2):
+#   - Browser stack: deno_core / v8 / tokio-tungstenite
+#   - Cloud SDKs: aws-* (allowed only behind the `bedrock` feature, never default)
+#   - Any workspace path dep outside this repository (no upstream leakage)
+
+[graph]
+all-features = false
+no-default-features = false
+
+[licenses]
+version = 2
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    { name = "deno_core" },
+    { name = "v8" },
+    { name = "tokio-tungstenite" },
+    { name = "aws-config" },
+    { name = "aws-sdk-bedrockruntime" },
+    { name = "aws-credential-types" },
+    { name = "aws-sigv4" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

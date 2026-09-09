@@ -1,0 +1,27 @@
+[package]
+name = "openpaw-plugins"
+description = "Plugin discovery, manifest, and the 24 HookPoint event system (M3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+openpaw-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+toml.workspace = true
+dirs.workspace = true
+walkdir.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

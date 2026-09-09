@@ -1,0 +1,18 @@
+{
+  "final_reply": "done after compaction",
+  "max_tool_concurrency": 0,
+  "provider_calls": 2,
+  "scenario": "05-compaction-trigger",
+  "schema": "openpaw-parity-transcript/1",
+  "turns": [
+    {
+      "error_tools": [],
+      "event_kinds": [
+        "compaction_performed",
+        "turn_usage"
+      ],
+      "stop": "end_turn",
+      "tool_calls": []
+    }
+  ]
+}

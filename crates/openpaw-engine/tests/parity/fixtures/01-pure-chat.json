@@ -1,0 +1,17 @@
+{
+  "final_reply": "pong",
+  "max_tool_concurrency": 0,
+  "provider_calls": 1,
+  "scenario": "01-pure-chat",
+  "schema": "openpaw-parity-transcript/1",
+  "turns": [
+    {
+      "error_tools": [],
+      "event_kinds": [
+        "turn_usage"
+      ],
+      "stop": "end_turn",
+      "tool_calls": []
+    }
+  ]
+}

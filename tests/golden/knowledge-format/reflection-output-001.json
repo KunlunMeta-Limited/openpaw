@@ -1,0 +1,24 @@
+{
+  "summary": "Debugging session distilled into one reusable thinking path.",
+  "skill_candidates": [],
+  "memory_candidates": [
+    {
+      "fact": "Reproduce before theorizing: rerun the failing command and capture the exact panic.",
+      "tags": [
+        "debugging"
+      ],
+      "scope": "user",
+      "confidence": "medium",
+      "rationale": "Applied successfully twice in this session.",
+      "supersedes": [],
+      "zone": "thinking-paths",
+      "memory_type": "reasoning",
+      "thinking_path": "reproduce → isolate → hypothesize → test → conclude",
+      "concrete_instance": "Reproduced the panic, isolated the index math, patched the bound check.",
+      "problem_type": "debugging"
+    }
+  ],
+  "conflicts": [],
+  "task_candidates": [],
+  "reflection_process": "observed repeated manual debugging → hypothesized a reusable path → validated against two incidents → concluded it is worth persisting"
+}

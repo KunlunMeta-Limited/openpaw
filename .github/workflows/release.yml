@@ -1,0 +1,194 @@
+name: release
+
+# M6 release engineering: signed (Sigstore keyless), reproducible builds of
+# the openpaw CLI plus a crates.io publish dry-run of the placeholder crates.
+#
+# Triggers:
+# - push of a v* tag -> full pipeline: build + sign + attach to the Release
+# - workflow_dispatch -> build + sign + publish dry-run only (the release
+#   job is skipped because there is no tag ref to release against)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release and attach artifacts
+  id-token: write # Sigstore keyless signing (OIDC identity; no stored secrets)
+
+env:
+  CARGO_TERM_COLOR: always
+  # Reproducible-build hardening (timestamps are pinned per job below):
+  # no incremental state, LTO on, dependency versions frozen by Cargo.lock.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_LTO: "true"
+
+jobs:
+  build:
+    name: build & sign (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Compute release metadata (SOURCE_DATE_EPOCH, version, platform)
+        shell: bash
+        run: |
+          # Reproducible builds pin every timestamp to the last commit time:
+          # git records nothing newer than HEAD, so it is the upper bound.
+          epoch="$(git log -1 --format=%ct)"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dispatch-$(git rev-parse --short HEAD)"
+          fi
+          case "$RUNNER_OS" in
+            Windows) platform="windows-x86_64"; ext="zip"; bin="openpaw.exe" ;;
+            Linux)   platform="linux-x86_64";   ext="tar.gz"; bin="openpaw" ;;
+            macOS)   platform="macos-aarch64";  ext="tar.gz"; bin="openpaw" ;;
+          esac
+          echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
+          echo "RELEASE_VERSION=${version}" >> "$GITHUB_ENV"
+          echo "RELEASE_PLATFORM=${platform}" >> "$GITHUB_ENV"
+          echo "RELEASE_EXT=${ext}" >> "$GITHUB_ENV"
+          echo "RELEASE_BIN=${bin}" >> "$GITHUB_ENV"
+
+      - name: Reproducible release build (--locked, -p openpaw-cli)
+        run: cargo build --release --locked -p openpaw-cli
+
+      - name: Package archive (zip on Windows, tar.gz elsewhere)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $bin = "target/release/$env:RELEASE_BIN"
+          if (-not (Test-Path $bin)) { throw "$bin not found" }
+          $archive = "dist/openpaw-$env:RELEASE_VERSION-$env:RELEASE_PLATFORM.$env:RELEASE_EXT"
+          if ($IsWindows) {
+            Compress-Archive -Path $bin -DestinationPath $archive -Force
+          } else {
+            tar -czf $archive -C target/release $env:RELEASE_BIN
+          }
+          Write-Output "packaged: $archive"
+
+      - name: SHA-256 checksum manifest
+        shell: bash
+        run: |
+          archive="openpaw-${RELEASE_VERSION}-${RELEASE_PLATFORM}.${RELEASE_EXT}"
+          cd dist
+          sha256sum "$archive" > "SHA256SUMS-${RELEASE_PLATFORM}.txt"
+          cat "SHA256SUMS-${RELEASE_PLATFORM}.txt"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts (Sigstore keyless)
+        shell: bash
+        run: |
+          # Keyless signing uses the workflow's OIDC identity (id-token: write
+          # above) — no private key or secret is stored anywhere. The ephemeral
+          # signing certificate lands next to the signature and in the Rekor
+          # transparency log. Verify with:
+          #   cosign verify-blob \
+          #     --signature <file>.sig --certificate <file>.pem \
+          #     --certificate-identity-regexp '^https://github.com/<org>/<repo>/' \
+          #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+          #     <file>
+          for f in dist/*; do
+            cosign sign-blob --yes "$f" \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: dist/
+
+  publish:
+    name: crates.io publish dry-run (topological order)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Dry-run publish of the 12 placeholder crates in dependency order
+        run: |
+          # Real publishing (drop --dry-run) needs a crates.io token:
+          #   1. generate an API token at https://crates.io/settings/tokens
+          #   2. store it as the CARGO_REGISTRY_TOKEN repository secret
+          #   3. run cargo publish without --dry-run (this job keeps the
+          #      dry-run until the 1.0 hardening is done)
+          # Crates go out in dependency order. A dry-run resolves the package
+          # against the live crates.io index, so until the first real publish
+          # every crate with internal openpaw-* dependencies is deferred with
+          # "no matching package named openpaw-*": its predecessors must land
+          # first. Any other failure fails the job.
+          set -uo pipefail
+          failed=0
+          # openpaw-engine-host is excluded from the release manifest: it was
+          # archived onto the community-experiment track by ADR-001 (no public
+          # engine-replacement surface exists; restart conditions are recorded
+          # in the ADR).
+          for crate in \
+            openpaw-core \
+            openpaw-store \
+            openpaw-llm \
+            openpaw-plugins \
+            openpaw-memory \
+            openpaw-mcp \
+            openpaw-goal-ledger \
+            openpaw-tools \
+            openpaw-sandbox \
+            openpaw-engine \
+            openpaw-reflect-lite \
+            openpaw-cli; do
+            echo "::group::$crate"
+            if out="$(cargo publish -p "$crate" --dry-run --locked 2>&1)"; then
+              printf '%s\n' "$out"
+              echo "$crate: dry-run PASS"
+            else
+              printf '%s\n' "$out"
+              if printf '%s' "$out" | grep -q 'no matching package named .openpaw-'; then
+                echo "$crate: dry-run deferred (workspace deps not yet live on crates.io)"
+              else
+                echo "::error::cargo publish --dry-run failed for $crate"
+                failed=1
+              fi
+            fi
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+  release:
+    name: attach artifacts to the GitHub Release
+    needs: [build]
+    # workflow_dispatch runs have no tag to release against; build + sign +
+    # publish dry-run still validate the pipeline end to end.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: List release payload
+        run: ls -la dist/
+
+      - name: Create the GitHub Release
+        # Stable, widely used community action: attaches every platform's
+        # archives, SHA-256 manifests, and cosign signatures to the tag.
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          fail_on_unmatched_files: true
+          generate_release_notes: true

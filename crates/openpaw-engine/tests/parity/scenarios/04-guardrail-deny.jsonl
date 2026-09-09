@@ -1,0 +1,5 @@
+{"step":"guardrail","allow":["grep","glob"]}
+{"step":"mock","mode":"tool_use","tool":"bash","input":{"cmd":"ls"},"text":"running shell"}
+{"step":"mock","mode":"fixed","text":"cannot run shell commands"}
+{"step":"user","text":"run ls for me"}
+{"step":"expect","stop":"end_turn","tool_calls":["bash"],"error_tools":["bash"],"final_reply":"cannot run shell commands","min_parallel":0}

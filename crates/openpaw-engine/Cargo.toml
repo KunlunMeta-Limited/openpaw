@@ -1,0 +1,25 @@
+[package]
+name = "openpaw-engine"
+description = "Agent loop: run_turn, three-phase tool execution, compaction, fallback (M2, staged E1/E2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+openpaw-core.workspace = true
+openpaw-llm.workspace = true
+openpaw-plugins.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+openpaw-tools.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

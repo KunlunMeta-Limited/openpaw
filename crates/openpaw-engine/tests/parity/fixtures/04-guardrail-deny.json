@@ -1,0 +1,26 @@
+{
+  "final_reply": "cannot run shell commands",
+  "max_tool_concurrency": 0,
+  "provider_calls": 2,
+  "scenario": "04-guardrail-deny",
+  "schema": "openpaw-parity-transcript/1",
+  "turns": [
+    {
+      "error_tools": [
+        "bash"
+      ],
+      "event_kinds": [
+        "turn_usage",
+        "tool_use_start",
+        "classifier_status",
+        "classifier_status",
+        "tool_result",
+        "turn_usage"
+      ],
+      "stop": "end_turn",
+      "tool_calls": [
+        "bash"
+      ]
+    }
+  ]
+}

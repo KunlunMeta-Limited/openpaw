@@ -1,0 +1,24 @@
+{
+  "final_reply": "done",
+  "max_tool_concurrency": 1,
+  "provider_calls": 2,
+  "scenario": "02-single-tool-serial",
+  "schema": "openpaw-parity-transcript/1",
+  "turns": [
+    {
+      "error_tools": [],
+      "event_kinds": [
+        "turn_usage",
+        "tool_use_start",
+        "classifier_status",
+        "classifier_status",
+        "tool_result",
+        "turn_usage"
+      ],
+      "stop": "end_turn",
+      "tool_calls": [
+        "echo_tool"
+      ]
+    }
+  ]
+}

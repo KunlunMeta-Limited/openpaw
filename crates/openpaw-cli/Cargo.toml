@@ -1,0 +1,37 @@
+[package]
+name = "openpaw-cli"
+description = "The openpaw binary: chat entry points and management commands."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "openpaw"
+path = "src/main.rs"
+
+[features]
+default = []
+# MCP sidecar server (rmcp); single-line budget ≤2,000 (plan section 3.9)
+sidecar = ["dep:rmcp"]
+
+[dependencies]
+openpaw-core.workspace = true
+openpaw-engine.workspace = true
+openpaw-goal-ledger.workspace = true
+openpaw-llm.workspace = true
+openpaw-memory.workspace = true
+openpaw-reflect-lite.workspace = true
+openpaw-store.workspace = true
+openpaw-tools.workspace = true
+rmcp = { workspace = true, optional = true }
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

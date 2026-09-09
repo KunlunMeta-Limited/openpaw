@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target/
+**/target/
+# Local MSRV verification builds (e.g. target-msrv85 with CARGO_TARGET_DIR)
+/target-msrv*/
+**/*.rs.bk
+
+# Cargo
+Cargo.lock.orig
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local env / secrets
+.env
+*.pem
+*.key
+
+# Test / scratch output
+*.log
+/g_*.txt
+/verify_fmt.txt
+/scrub_result.txt

@@ -1,0 +1,3 @@
+{"step":"mock","mode":"fixed","text":"pong"}
+{"step":"user","text":"ping"}
+{"step":"expect","stop":"end_turn","tool_calls":[],"final_reply":"pong","min_parallel":0}

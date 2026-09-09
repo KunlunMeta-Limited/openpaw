@@ -1,0 +1,4 @@
+{"step":"mock","mode":"parallel_tool_use","tools":[["grep",{"pattern":"TODO"}],["glob",{"pattern":"*.rs"}]],"text":"searching"}
+{"step":"mock","mode":"fixed","text":"found 2 results"}
+{"step":"user","text":"search for TODO in rust files"}
+{"step":"expect","stop":"end_turn","tool_calls":["grep","glob"],"final_reply":"found 2 results","min_parallel":2}

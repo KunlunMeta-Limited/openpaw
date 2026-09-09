@@ -1,0 +1,149 @@
+{
+  "crate": "openpaw-core",
+  "traits": [
+    {
+      "methods": [
+        "async fn request (& self , req : ApprovalRequest) -> ApprovalResponse"
+      ],
+      "name": "ApprovalManager"
+    },
+    {
+      "methods": [
+        "async fn extract (& self , transcript : & Transcript) -> Vec < KnowledgeCandidate >",
+        "async fn resolve (& self , candidates : Vec < KnowledgeCandidate >) -> Vec < KnowledgeCandidate >",
+        "async fn should_reflect (& self , ctx : & TurnContext) -> bool",
+        "fn name (& self) -> & str",
+        "fn requires_human_alignment (& self) -> bool"
+      ],
+      "name": "EvolutionPolicy"
+    },
+    {
+      "methods": [
+        "async fn complete (& self , req : CompletionRequest) -> Result < CompletionResponse >",
+        "async fn stream (& self , req : CompletionRequest ,) -> Result < BoxStream < 'static , Result < StreamEvent > > >",
+        "fn capabilities (& self) -> Capabilities",
+        "fn default_model (& self) -> & str",
+        "fn name (& self) -> & str"
+      ],
+      "name": "LlmProvider"
+    },
+    {
+      "methods": [
+        "async fn next_action (& self , ledger : & GoalLedgerView) -> LongHorizonDecision",
+        "fn name (& self) -> & str"
+      ],
+      "name": "LongHorizonPolicy"
+    },
+    {
+      "methods": [
+        "async fn count (& self) -> usize",
+        "async fn get (& self , key : & str) -> Option < MemoryEntry >",
+        "async fn list_categories (& self) -> Vec < String >",
+        "async fn remove (& self , key : & str) -> bool",
+        "async fn search (& self , query : & MemorySearchQuery) -> MemorySearchResult",
+        "async fn set (& self , entry : MemoryEntry)"
+      ],
+      "name": "MemoryProvider"
+    },
+    {
+      "methods": [
+        "async fn start (& self , sink : InboundSink) -> Result < () >",
+        "async fn stop (& self) -> Result < () >",
+        "fn name (& self) -> & str"
+      ],
+      "name": "PlatformAdapter"
+    },
+    {
+      "methods": [
+        "async fn count_tokens (& self , system : & str , messages : & [Message] , tools : & [ToolSpec] ,) -> Option < usize >"
+      ],
+      "name": "TokenCounter"
+    },
+    {
+      "methods": [
+        "async fn call (& self , name : & str , args : serde_json :: Value) -> Result < ToolCallOutcome >",
+        "async fn list_tools (& self) -> Result < Vec < ToolSpec > >"
+      ],
+      "name": "ToolExecutor"
+    },
+    {
+      "methods": [
+        "async fn check (& self , _name : & str , _args : & serde_json :: Value) -> GuardrailDecision",
+        "async fn check_with_context (& self , name : & str , args : & serde_json :: Value , _context : & CheckContext ,) -> GuardrailDecision"
+      ],
+      "name": "ToolGuardrail"
+    },
+    {
+      "methods": [],
+      "name": "ToolHost"
+    },
+    {
+      "methods": [
+        "async fn validate_input (& self , _name : & str , _input : & serde_json :: Value ,) -> std :: result :: Result < () , String >",
+        "fn should_cascade_on_error (& self , _tool_name : & str , _outcome : & ToolCallOutcome) -> bool"
+      ],
+      "name": "ToolHostValidator"
+    }
+  ],
+  "types": [
+    "enum ApiErrorClass",
+    "enum ApprovalResponse",
+    "enum CandidateKind",
+    "enum CompactType",
+    "enum Confidence",
+    "enum ContentBlock",
+    "enum Error",
+    "enum GoalStatusView",
+    "enum GuardrailDecision",
+    "enum LongHorizonDecision",
+    "enum Role",
+    "enum SessionEvent",
+    "enum StopReason",
+    "enum StreamEvent",
+    "enum ToolCategory",
+    "enum ToolConcurrency",
+    "enum ToolInterruptBehavior",
+    "struct AllowlistGuardrail",
+    "struct ApprovalRequest",
+    "struct AutoApproveManager",
+    "struct AutoDenyManager",
+    "struct Capabilities",
+    "struct CheckContext",
+    "struct CompactMetadata",
+    "struct CompletionRequest",
+    "struct CompletionResponse",
+    "struct ConfirmBash",
+    "struct DenyBash",
+    "struct GoalLedgerView",
+    "struct GuardrailChain",
+    "struct InMemoryProvider",
+    "struct InboundSink",
+    "struct InjectionRecord",
+    "struct IterationBudget",
+    "struct KnowledgeCandidate",
+    "struct MemoryEntry",
+    "struct MemorySearchQuery",
+    "struct MemorySearchResult",
+    "struct Message",
+    "struct NullPolicy",
+    "struct NullProvider",
+    "struct NullToolHost",
+    "struct PermissiveGuardrail",
+    "struct RegistryToolHost",
+    "struct RetryPolicy",
+    "struct RunSummaryView",
+    "struct Session",
+    "struct SessionId",
+    "struct SessionMeta",
+    "struct SystemPromptBlocks",
+    "struct ToolAnnotations",
+    "struct ToolCallOutcome",
+    "struct ToolSpec",
+    "struct Transcript",
+    "struct TurnContext",
+    "struct Usage",
+    "type DescriptionFn",
+    "type Result"
+  ],
+  "version": 1
+}

@@ -1,0 +1,41 @@
+[package]
+name = "openpaw-mcp"
+description = "MCP client host: server lifecycle, circuit breaker, resources (M2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# Client transports only, with two floor-driven choices (MC-0 spike):
+# 1. No `transport-child-process`: originally forced by the 1.80/1.85 MSRV
+#    floor (process-wrap 9.x needs 1.87); under the final 1.88 floor it
+#    would be usable, but the hand-rolled stdio transport is kept
+#    deliberately — tokio `kill_on_drop` + `AsyncRwTransport` keeps
+#    process-wrap/nix out of the tree and Windows `.cmd/.bat` spawn
+#    semantics (cmd /c wrapping) in our own config layer.
+# 2. No TLS: rmcp declares reqwest default-features = false, so plain-http
+#    Streamable HTTP keeps the aws-lc-sys (cmake + C) chain out of the
+#    tree. HTTPS servers are a documented 1.0 limitation; re-enabling is
+#    additive (add rmcp's "reqwest" feature). The lock pins reqwest at
+#    0.13.3 (rust-version 1.64; 0.13.4 needs 1.85+ toolchain crate-side).
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-async-rw",
+    "transport-streamable-http-client-reqwest",
+] }
+# [mcp.servers] config parsing (toml + serde derive) and http:// URL
+# validation (url).
+serde.workspace = true
+# stdio transport: tokio::process (kill_on_drop) + io pipes
+tokio.workspace = true
+toml.workspace = true
+url.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

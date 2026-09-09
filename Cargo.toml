@@ -1,0 +1,128 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/openpaw-core",
+    "crates/openpaw-store",
+    "crates/openpaw-llm",
+    "crates/openpaw-mcp",
+    "crates/openpaw-plugins",
+    "crates/openpaw-memory",
+    "crates/openpaw-goal-ledger",
+    "crates/openpaw-tools",
+    "crates/openpaw-engine",
+    "crates/openpaw-reflect-lite",
+    "crates/openpaw-engine-host",
+    "crates/openpaw-cli",
+    "crates/openpaw-sandbox",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "Apache-2.0"
+authors = ["OpenPaw contributors"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time", "process"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yml = "0.0.12"
+toml = "0.8"
+
+# Time / IDs
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Filesystem helpers
+walkdir = "2"
+glob = "0.3"
+tempfile = "3"
+dirs = "5"
+
+# Database
+rusqlite = { version = "0.33", features = ["bundled", "column_decltype"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP (LLM providers + web tools; rustls to keep Windows builds self-contained;
+# gzip/brotli/deflate so advertised accept-encoding can actually be decoded)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli", "deflate"] }
+
+# MCP protocol SDK (openpaw-mcp client; openpaw-cli sidecar server — R9 single-point
+# dependency, transport wrapped behind a thin trait)
+rmcp = { version = "1.6", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+
+# Web tool stack (openpaw-tools web; url parsing, LRU fetch cache, query encoding, base64 data URIs)
+url = "2"
+urlencoding = "2"
+lru = "0.12"
+base64 = "0.22"
+
+# bash AST security analysis (openpaw-tools bashast; pwsh/batch grammars deferred to Phase 3)
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25"
+tree-sitter-language = "0.1"
+
+# Local sandbox (openpaw-sandbox; Windows Restricted Token via the windows
+# crate, cryptographic SID randomness, Unix flock via libc, policy hashing)
+# Virtual manifests must not carry [target] sections; platform-specific deps
+# are declared here and inherited by member crates via `dep.workspace = true`
+# inside their own [target.'cfg(...)'.dependencies] tables.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Console",
+    "Win32_System_IO",
+] }
+getrandom = "0.2"
+libc = "0.2"
+
+# xtask AST parsing (syn with span locations for line counting)
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+regex = "1"
+
+# Internal (layering per dev plan section 1.5 — upper layers only).
+# Each member carries the shared workspace version next to its path so the
+# crates are publishable: `cargo publish` strips the path and resolves the
+# dependency from crates.io, which requires an explicit version requirement.
+# Keep these in sync with [workspace.package].version until 1.0.
+openpaw-core = { path = "crates/openpaw-core", version = "0.1.0" }
+openpaw-store = { path = "crates/openpaw-store", version = "0.1.0" }
+openpaw-llm = { path = "crates/openpaw-llm", version = "0.1.0" }
+openpaw-mcp = { path = "crates/openpaw-mcp", version = "0.1.0" }
+openpaw-plugins = { path = "crates/openpaw-plugins", version = "0.1.0" }
+openpaw-memory = { path = "crates/openpaw-memory", version = "0.1.0" }
+openpaw-goal-ledger = { path = "crates/openpaw-goal-ledger", version = "0.1.0" }
+openpaw-tools = { path = "crates/openpaw-tools", version = "0.1.0" }
+openpaw-sandbox = { path = "crates/openpaw-sandbox", version = "0.1.0" }
+openpaw-engine = { path = "crates/openpaw-engine", version = "0.1.0" }
+openpaw-reflect-lite = { path = "crates/openpaw-reflect-lite", version = "0.1.0" }
+openpaw-engine-host = { path = "crates/openpaw-engine-host", version = "0.1.0" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

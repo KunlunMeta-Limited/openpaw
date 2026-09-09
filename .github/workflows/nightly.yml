@@ -1,0 +1,68 @@
+name: nightly
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cold-build-timing:
+    # Q8: cold build < 5 minutes per platform
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cold build (no cache)
+        run: |
+          cargo clean
+          cargo build --workspace --timings
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cargo-timings-${{ matrix.os }}
+          path: target/cargo-timings/
+
+  offline-smoke:
+    # Q4: hello → echo conversation fully offline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p openpaw-cli
+      - name: Network-blocked hello smoke
+        run: |
+          # unshare the network namespace and run the hello flow
+          sudo unshare -n bash -c 'printf "ping\nexit\n" | target/debug/openpaw hello | tee /tmp/out.txt'
+          grep -q "Echo: ping" /tmp/out.txt
+
+  three-fives:
+    # Q8: cold rebuild of the CLI crate on Windows in under five minutes
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cold rebuild openpaw-cli (< 5 min budget)
+        shell: pwsh
+        run: |
+          cargo clean -p openpaw-cli
+          $t = Measure-Command { cargo build -p openpaw-cli }
+          Write-Output ("cold build openpaw-cli: {0:N1}s" -f $t.TotalSeconds)
+          if ($t.TotalSeconds -ge 300) {
+            throw ("cold build took {0:N1}s - over the 300s budget" -f $t.TotalSeconds)
+          }
+
+  smoke-offline:
+    # Q4 offline-equivalent smoke: hello → doctor → evolve status
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p xtask -- smoke-offline

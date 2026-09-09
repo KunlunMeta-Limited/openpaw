@@ -1,0 +1,29 @@
+{
+  "final_reply": "found 2 results",
+  "max_tool_concurrency": 2,
+  "provider_calls": 2,
+  "scenario": "03-two-tools-parallel",
+  "schema": "openpaw-parity-transcript/1",
+  "turns": [
+    {
+      "error_tools": [],
+      "event_kinds": [
+        "turn_usage",
+        "tool_use_start",
+        "tool_use_start",
+        "classifier_status",
+        "classifier_status",
+        "classifier_status",
+        "classifier_status",
+        "tool_result",
+        "tool_result",
+        "turn_usage"
+      ],
+      "stop": "end_turn",
+      "tool_calls": [
+        "grep",
+        "glob"
+      ]
+    }
+  ]
+}

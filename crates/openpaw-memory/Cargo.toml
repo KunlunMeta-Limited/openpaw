@@ -1,0 +1,33 @@
+[package]
+name = "openpaw-memory"
+description = "Memory and skills: nine memory types, spaced repetition, skill lifecycle (M3)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+openpaw-core.workspace = true
+openpaw-store.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+walkdir.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde_yml.workspace = true
+
+[features]
+default = []
+# Name-only placeholder frozen at 1.0 (plan §3.7): the flag is kept so the
+# future fastembed integration lands as an additive opt-in feature.
+# Relevance is lexical (TF-IDF + CJK bigram); see docs/compatibility.md §6.
+embed = []
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
