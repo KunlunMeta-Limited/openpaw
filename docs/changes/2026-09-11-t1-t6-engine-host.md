@@ -9,7 +9,7 @@
 ## 修改前检查
 
 - `openpaw` 存在未提交用户改动：`crates/openpaw-cli/src/sidecar.rs`、`crates/openpaw-sandbox/src/platform/linux.rs`、`.cargo/`、`Dockerfile`。
-- `openpaw-engine-host` 当前只有占位 `lib.rs`，T1-T3 需要新增实现。
+- `openpaw-engine-host` 当前已有 T1/T2 基础实现；本轮继续补齐 AgentLoop、SSE 和 abort。
 - 当前工作区未执行通过验证；T1/T2 在个人工作计划中没有完成证据。
 
 ## 实施步骤
@@ -32,7 +32,7 @@
 
 - `Cargo.toml`：加入 axum 和 tokio `net`，仅由 Host feature 使用。
 - `openpaw-engine-host/Cargo.toml`：加入可选 `engine-host` 依赖。
-- `openpaw-engine-host/src/lib.rs`：加入 loopback 动态端口 Host、health/session/message/prompt/status/abort 路由。
+- `openpaw-engine-host/src/lib.rs`：加入 loopback 动态端口 Host、health/session/message/prompt/status/abort 路由、AgentLoop 后台执行和 per-session SSE broadcast。
 - `openpaw-engine-host/src/protocol.rs`：加入 status/event wire 类型和 serde 往返 fixture 测试。
 - `openpaw-cli`：加入 `engine-host` feature 及三个全局旗标。
 - `xtask/src/lines.rs`：Host 预算从 2000 调整为团队大纲要求的 5000 行。
@@ -52,10 +52,10 @@
 
 ## 当前状态
 
-T1、T2、T6 的实现和对应验证证据已具备；T3 目前是最小 HTTP 基础面，尚未包含团队大纲要求的完整 AgentLoop、SSE、审批和 abort 行为，因此不能把 M2/M3 或 T4/T5 记为完成。未提交前仍不宣称已有 Git 交付。
+T1、T2、T3 基础面、AgentLoop/SSE 接线和 T6 的实现与验证证据已具备；人工审批协议和完整 tool guardrail 仍未完成，因此 T5/M3 不能记为完成。当前变更尚未形成新的 Git commit。
 
 ## 未完成项
 
-- AgentLoop/SSE/审批的完整 T4/T5 行为尚未纳入本变更；若 T3 实现触及这些边界，必须扩展本记录后再修改。
+- manual permission pending/reply/reject 和完整 tool guardrail 尚未纳入本变更。
 - 提交前需保留并单独说明已有用户改动。
-- 下一步：补齐 AgentLoop/SSE/审批前，先与团队确认协议 fixture 和本轮 T3 范围。
+- 下一步：接入 manual permission pending/reply/reject 和 abort 清理，补齐 T5 验收。
