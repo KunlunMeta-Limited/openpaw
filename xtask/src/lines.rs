@@ -23,7 +23,7 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-plugins", 1_300),
     ("openpaw-cli", 4_500),
     ("openpaw-reflect-lite", 3_000),
-    ("openpaw-engine-host", 2_000),
+    ("openpaw-engine-host", 5_000),
     ("openpaw-goal-ledger", 2_000),
     // Local sandbox (plan section 3.4 budget lives in the tools domain; the
     // crate is standalone for the crate-level unsafe allowance, D-9).

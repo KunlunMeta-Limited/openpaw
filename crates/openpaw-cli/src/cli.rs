@@ -23,6 +23,15 @@ pub struct Cli {
     /// Subcommand to run; omit it to print help.
     #[command(subcommand)]
     pub command: Option<Command>,
+    #[cfg(feature = "engine-host")]
+    #[arg(long)]
+    pub engine_host: bool,
+    #[cfg(feature = "engine-host")]
+    #[arg(long, default_value = "127.0.0.1")]
+    pub engine_host_hostname: String,
+    #[cfg(feature = "engine-host")]
+    #[arg(long, default_value_t = 0)]
+    pub engine_host_port: u16,
     /// Serve the MCP sidecar tools in-process instead of running a
     /// subcommand (feature `sidecar`).
     #[cfg(feature = "sidecar")]

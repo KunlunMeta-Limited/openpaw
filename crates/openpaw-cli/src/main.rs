@@ -27,6 +27,20 @@ fn default_workspace() -> PathBuf {
 
 fn main() {
     let cli = Cli::parse();
+    #[cfg(feature = "engine-host")]
+    if cli.engine_host {
+        let code = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(openpaw_engine_host::run(
+                &cli.engine_host_hostname,
+                cli.engine_host_port,
+            ));
+        if let Err(error) = code {
+            eprintln!("engine host failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // `--sidecar` short-circuits subcommands: the MCP server runs in-process.
     #[cfg(feature = "sidecar")]
     if cli.sidecar {

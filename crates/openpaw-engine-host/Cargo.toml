@@ -9,7 +9,16 @@ authors.workspace = true
 
 [features]
 default = []
-engine-host = []
+engine-host = ["dep:anyhow", "dep:axum", "dep:serde", "dep:serde_json", "dep:tokio", "dep:uuid", "dep:chrono"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [lints]
 workspace = true
