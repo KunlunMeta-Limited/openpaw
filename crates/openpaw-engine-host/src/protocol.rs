@@ -3,10 +3,52 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Status { #[serde(rename = "type")] pub kind: String }
+pub struct Status {
+    #[serde(rename = "type")]
+    pub kind: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Event<T> { pub r#type: String, pub properties: T }
+pub struct Event<T> {
+    pub r#type: String,
+    pub properties: T,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Session {
+    pub id: String,
+    pub title: String,
+    pub slug: String,
+    pub directory: String,
+    pub time: Time,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Time {
+    pub created: i64,
+    pub updated: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PermissionRequest {
+    pub id: String,
+    pub tool: String,
+    pub input: serde_json::Value,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    Once,
+    Always,
+    Reject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionReply {
+    pub decision: PermissionDecision,
+}
 
 #[cfg(test)]
 mod tests {
@@ -14,7 +56,9 @@ mod tests {
 
     #[test]
     fn status_fixture_round_trips() {
-        let value = Status { kind: "busy".into() };
+        let value = Status {
+            kind: "busy".into(),
+        };
         let json = serde_json::to_string(&value).unwrap();
         assert_eq!(json, r#"{"type":"busy"}"#);
         assert_eq!(serde_json::from_str::<Status>(&json).unwrap(), value);
@@ -22,8 +66,26 @@ mod tests {
 
     #[test]
     fn event_fixture_round_trips() {
-        let value = Event { r#type: "session.status".into(), properties: Status { kind: "idle".into() } };
+        let value = Event {
+            r#type: "session.status".into(),
+            properties: Status {
+                kind: "idle".into(),
+            },
+        };
         let json = serde_json::to_string(&value).unwrap();
         assert_eq!(serde_json::from_str::<Event<Status>>(&json).unwrap(), value);
+    }
+
+    #[test]
+    fn permission_fixture_round_trips() {
+        let value = PermissionReply {
+            decision: PermissionDecision::Once,
+        };
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(json, r#"{"decision":"once"}"#);
+        assert_eq!(
+            serde_json::from_str::<PermissionReply>(&json).unwrap(),
+            value
+        );
     }
 }

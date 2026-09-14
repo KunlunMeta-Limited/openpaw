@@ -59,3 +59,22 @@ T1、T2、T3 基础面、AgentLoop/SSE 接线和 T6 的实现与验证证据已�
 - manual permission pending/reply/reject 和完整 tool guardrail 尚未纳入本变更。
 - 提交前需保留并单独说明已有用户改动。
 - 下一步：接入 manual permission pending/reply/reject 和 abort 清理，补齐 T5 验收。
+
+## 2026-09-14 T5 实施计划
+
+- 来源任务 ID：T5
+- 目标：将 OpenPaw `ApprovalManager` 接入 Engine Host，提供 pending 查询、人工回复和 SSE 审批事件。
+- 范围：`crates/openpaw-engine-host/src/lib.rs`、协议类型和 T5 测试；不修改用户已有未提交文件。
+- 开发环境：优先使用 Docker Desktop 的 `rust:1.88-bookworm` 镜像；容器不可用时停止代码开发。
+- 实施步骤：定义审批状态与回复模型；为 AgentLoop 注入审批管理器；增加 permission 路由和事件；补充 once/always/reject、abort 清理测试。
+- 验证方法：Docker 中执行 `cargo fmt --all -- --check`、Host 测试、CLI feature 测试和 `cargo run -p xtask -- lines`。
+
+## 实际交付结果（2026-09-14）
+
+- 正式模块已拆分为 `lib.rs`、`protocol.rs`、`runtime.rs`、`http.rs`、`events.rs`、`approval.rs`。
+- T3/T4：HTTP 路由、session 运行态、AgentLoop 后台执行、SSE 事件转换和 abort 已接入模块边界。
+- T5：Host `ApprovalManager` 支持 pending 查询、`once`、`always`、`reject`、`permission.asked`、`permission.replied` 和 abort 清理。
+- T6：补充 Session/Permission 协议类型及 serde fixture；完整 JSONL 历史持久化和全部 OpenCode 字段仍属于后续扩展。
+- Docker 验证：Host 6 项测试通过；CLI engine-host 测试 11 项通过；`xtask lines` 全预算通过；代码已执行 `cargo fmt`。
+- 变更提交：待本轮提交后补充 commit ID。
+- 未完成项：真实工具 mock 驱动的端到端审批 HTTP 测试、session JSONL 持久化、完整 OpenCode tool/usage/todo 字段。
