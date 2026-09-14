@@ -78,3 +78,22 @@ T1、T2、T3 基础面、AgentLoop/SSE 接线和 T6 的实现与验证证据已�
 - Docker 验证：Host 6 项测试通过；CLI engine-host 测试 11 项通过；`xtask lines` 全预算通过；代码已执行 `cargo fmt`。
 - 变更提交：`1bd42c6` (`feat(openpaw): modularize engine host and approvals`)、`e8a3748` (`fix(openpaw): separate classifier and approval events`)。
 - 未完成项：真实工具 mock 驱动的端到端审批 HTTP 测试、session JSONL 持久化、完整 OpenCode tool/usage/todo 字段。
+
+## 2026-09-14 T6 收尾及 T7/T9 执行计划
+
+- 来源任务 ID：T6、T7、T9
+- 目标：补齐 T6 可交付协议与历史边界，形成 OpenWork attached 联调所需的稳定 Host 契约。
+- 本轮范围：`protocol.rs` 完整请求/响应类型、`runtime.rs` session 历史与 JSONL、`http.rs` history/status/provider/todo 路由、`events.rs` 稳定事件字段及集成测试。
+- 不在本轮直接修改：OpenWork 仓库；T7/T9 在 T6 验收通过后单独建立变更记录。
+- 实施步骤：先扩充协议与 fixture，再补运行态持久化，随后补路由和事件序列测试，最后在 Docker 中执行 M1-M3 验收。
+- 开发环境：优先 JYZS Docker Compose；Rust 使用已有 `rust:1.88-bookworm` 镜像；若容器/镜像不可用才现场构建并记录原因。
+- 验证方法：`cargo fmt --all -- --check`、`cargo test -p openpaw-engine-host --features engine-host`、`cargo test -p openpaw-cli --features engine-host`、`cargo run -p xtask -- lines`、Host HTTP 冒烟。
+- T7/T9 入口条件：上述 T6 命令全部通过且协议/持久化缺口关闭后，进入 OpenWork attached 连接和 `pnpm evals:pr specs/openpaw-engine-attach.test.ts`。
+
+## T6 收尾结果（2026-09-14）
+
+- 实际文件：`protocol.rs`、`runtime.rs`、`http.rs`、`events.rs`、`approval.rs`、`lib.rs`。
+- 实际实现：Session/Message/Part/Permission/Todo/Provider 类型；历史查询；配置 `OPENPAW_HOME` 时 JSONL 追加；todo/provider 路由；审批和 SSE 保持可用。
+- Docker 验证：`cargo check`、Host 6 tests、CLI engine-host 11 tests、`xtask lines`（Host 500/5000）均通过；`cargo fmt` 已执行。
+- 当前结论：T6 基础交付可进入 T7；跨进程 JSONL 恢复、完整 OpenCode 字段和真实 OpenWork attached eval 仍是后续联调项。
+- 关联提交：待本轮提交后补充。

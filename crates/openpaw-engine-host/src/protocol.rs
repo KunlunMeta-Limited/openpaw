@@ -50,6 +50,28 @@ pub struct PermissionReply {
     pub decision: PermissionDecision,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Message {
+    pub id: String,
+    pub session_id: String,
+    pub role: String,
+    pub parts: Vec<Part>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Part {
+    Text { text: String },
+    Reasoning { text: String },
+    Tool { call_id: String, name: Option<String>, status: String, output: Option<String> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TodoItem { pub id: String, pub content: String, pub status: String }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Provider { pub id: String, pub name: String }
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -69,7 +69,7 @@ pub async fn messages(
     State(state): State<RuntimeState>,
 ) -> impl IntoResponse {
     if state.session_exists(&id) {
-        Json(Vec::<serde_json::Value>::new()).into_response()
+        Json(state.history(&id)).into_response()
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
@@ -89,6 +89,9 @@ pub async fn prompt(
         .filter_map(|p| p.text)
         .collect();
     state.touch_title(&id, &text);
+    if !text.is_empty() {
+        state.append_history(&id, serde_json::json!({"role":"user","parts":[{"type":"text","text":text}]}));
+    }
     let Some(tx) = state.event_sender(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -109,8 +112,11 @@ pub async fn prompt(
         let mut session = EngineSession::new("mock-1", "mock");
         let _ = tx.send(serde_json::json!({"type":"session.status","properties":{"sessionID":session_id,"status":{"type":"busy"}}}).to_string());
         let tx_events = tx.clone();
+        let history_state = state.clone();
+        let history_id = session_id.clone();
         let mut sink = move |event: AgentEvent| {
             if let Some(value) = events::to_wire(event) {
+                history_state.append_history(&history_id, value.clone());
                 let _ = tx_events.send(value.to_string());
             }
         };
@@ -131,6 +137,14 @@ pub async fn abort(Path(id): Path<String>, State(state): State<RuntimeState>) ->
 }
 pub async fn status() -> Json<serde_json::Value> {
     Json(serde_json::json!({}))
+}
+
+pub async fn todo(Path(id): Path<String>, State(state): State<RuntimeState>) -> impl IntoResponse {
+    if state.session_exists(&id) { Json(Vec::<serde_json::Value>::new()).into_response() } else { StatusCode::NOT_FOUND.into_response() }
+}
+
+pub async fn providers() -> Json<Vec<crate::protocol::Provider>> {
+    Json(vec![crate::protocol::Provider { id: "mock".into(), name: "Mock provider".into() }])
 }
 pub async fn permissions(State(state): State<RuntimeState>) -> Json<Vec<serde_json::Value>> {
     Json(state.approvals.list())
