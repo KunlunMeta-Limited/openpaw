@@ -24,11 +24,13 @@ pub async fn run(hostname: &str, port: u16) -> anyhow::Result<()> {
         .route("/session/status", get(http::status))
         .route("/session/{id}", get(http::get_session))
         .route("/session/{id}/message", get(http::messages))
+        .route("/session/{id}/todo", get(http::todo))
         .route("/session/{id}/prompt_async", post(http::prompt))
         .route("/session/{id}/abort", post(http::abort))
         .route("/session/{id}/event", get(http::events))
         .route("/permission", get(http::permissions))
         .route("/permission/{id}/reply", post(http::permission_reply))
+        .route("/provider", get(http::providers))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((hostname, port)).await?;
     let addr: SocketAddr = listener.local_addr()?;
