@@ -18,3 +18,4 @@
 - 运行期日志未出现 Cargo、pnpm/npm 或 registry 下载；数据卷 `openpaw-engine-data` 保留可迁移运行数据。
 - 未完成项：桌面 UI 人工审批、工具和 abort 手测不属于本镜像变更，仍待单独验收。
 - 关联提交：代码和本记录将在本轮 OpenPaw 提交中关联，提交完成后补入具体 hash。
+ - 关联提交更正：`9e9e861e836d78cdf53733530f786ca808c8eb9c`（`chore(openpaw): package portable engine host`）。
