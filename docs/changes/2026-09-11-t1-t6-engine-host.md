@@ -76,5 +76,5 @@ T1、T2、T3 基础面、AgentLoop/SSE 接线和 T6 的实现与验证证据已�
 - T5：Host `ApprovalManager` 支持 pending 查询、`once`、`always`、`reject`、`permission.asked`、`permission.replied` 和 abort 清理。
 - T6：补充 Session/Permission 协议类型及 serde fixture；完整 JSONL 历史持久化和全部 OpenCode 字段仍属于后续扩展。
 - Docker 验证：Host 6 项测试通过；CLI engine-host 测试 11 项通过；`xtask lines` 全预算通过；代码已执行 `cargo fmt`。
-- 变更提交：待本轮提交后补充 commit ID。
+- 变更提交：`1bd42c6` (`feat(openpaw): modularize engine host and approvals`)。
 - 未完成项：真实工具 mock 驱动的端到端审批 HTTP 测试、session JSONL 持久化、完整 OpenCode tool/usage/todo 字段。
