@@ -96,4 +96,4 @@ T1、T2、T3 基础面、AgentLoop/SSE 接线和 T6 的实现与验证证据已�
 - 实际实现：Session/Message/Part/Permission/Todo/Provider 类型；历史查询；配置 `OPENPAW_HOME` 时 JSONL 追加；todo/provider 路由；审批和 SSE 保持可用。
 - Docker 验证：`cargo check`、Host 6 tests、CLI engine-host 11 tests、`xtask lines`（Host 500/5000）均通过；`cargo fmt` 已执行。
 - 当前结论：T6 基础交付可进入 T7；跨进程 JSONL 恢复、完整 OpenCode 字段和真实 OpenWork attached eval 仍是后续联调项。
-- 关联提交：待本轮提交后补充。
+- 关联提交：`94b8a2b` (`feat(openpaw): complete engine host protocol and history`)。
