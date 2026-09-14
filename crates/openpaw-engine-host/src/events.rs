@@ -28,7 +28,7 @@ pub fn to_wire(event: AgentEvent) -> Option<serde_json::Value> {
             tool_use_id,
             status,
         } => (
-            "permission.asked",
+            "message.part.updated",
             serde_json::json!({"callID":tool_use_id,"status":format!("{status:?}")}),
         ),
         AgentEvent::TurnUsage { .. } => ("turn.usage", serde_json::json!({})),
