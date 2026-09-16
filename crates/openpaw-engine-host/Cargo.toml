@@ -9,7 +9,7 @@ authors.workspace = true
 
 [features]
 default = []
-engine-host = ["dep:anyhow", "dep:axum", "dep:serde", "dep:serde_json", "dep:tokio", "dep:uuid", "dep:chrono", "dep:openpaw-core", "dep:openpaw-engine", "dep:openpaw-llm", "dep:openpaw-tools", "dep:futures", "dep:async-trait"]
+engine-host = ["dep:anyhow", "dep:axum", "dep:serde", "dep:serde_json", "dep:tokio", "dep:uuid", "dep:chrono", "dep:openpaw-core", "dep:openpaw-engine", "dep:openpaw-llm", "dep:openpaw-store", "dep:openpaw-tools", "dep:futures", "dep:async-trait"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
@@ -22,6 +22,7 @@ uuid = { workspace = true, optional = true }
 openpaw-core = { workspace = true, optional = true }
 openpaw-engine = { workspace = true, optional = true }
 openpaw-llm = { workspace = true, optional = true }
+openpaw-store = { workspace = true, optional = true }
 openpaw-tools = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
