@@ -145,6 +145,12 @@
 - 同一命令指向未配置凭据的 host（匿名分支）：1 file / **6 passed** / 0 skipped。
 - 正式命令 `pnpm evals:pr specs/openpaw-engine-attach.test.ts`（带凭据）：1 file / **6 passed** / 0 skipped。
 
+## 关联提交
+
+- `5f34107` — `feat(engine-host): T3 HTTP baseline (HostConfig, Basic auth, degraded routes, global flags)`（openpaw `dev` 分支）
+- `874573a` — 同批提交前先落地的既有 09-16/09-17 待提交工作（engine / llm / sandbox / host 协议与夹具），本变更在其之上
+- 以上提交均在 openpaw `dev` 分支本地，未推送远端。
+
 ## 未完成项与下一步
 
 - `cargo test -p openpaw-cli --features sidecar` 仍未通过（09-16 已记录的既有缺陷）；M3 因此不能记为通过，需另立 Sidecar 修复任务（先定协议顺序语义，再让测试缓存乱序响应）。

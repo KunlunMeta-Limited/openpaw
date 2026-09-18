@@ -110,6 +110,11 @@
 
 即到达顺序契约恢复，且 `M3` 的 sidecar 命令首次可以记为通过。
 
+## 关联提交
+
+- `def5257` — `fix(sidecar): configurable listen address + tool calls run in arrival order`（openpaw `dev` 分支）
+- 本地提交，未推送远端。
+
 ## 未完成项与下一步
 
 - HTTP 传输未打票据（`http_accept_loop` 按连接串行处理，语义已成立）；若将来 HTTP 需要同序保证，需另开变更。
