@@ -13,18 +13,18 @@ use openpaw_engine::{AgentEvent, AgentLoop};
 
 const EXIT_WORDS: [&str; 4] = ["exit", "quit", "/exit", "/quit"];
 
-#[derive(Debug, clap::Args)]
+/// Resolved values for one `openpaw chat` run. The values come from the
+/// global `--provider` / `--workspace` / `--home` flags (`main.rs` applies
+/// the defaults), so this struct keeps no clap attributes.
+#[derive(Debug)]
 pub struct ChatArgs {
     /// Offline provider: `mock` (counter replies) or `echo`. Real network
     /// providers plug into this seam as they land.
-    #[arg(long, default_value = "mock")]
     pub provider: String,
     /// Workspace the tool host operates in (default: current directory).
-    #[arg(long)]
     pub workspace: Option<PathBuf>,
     /// OpenPaw home for session storage (default: OPENPAW_HOME or
     /// ~/.openpaw).
-    #[arg(long)]
     pub home: Option<PathBuf>,
 }
 

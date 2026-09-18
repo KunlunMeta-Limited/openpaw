@@ -13,9 +13,6 @@ use openpaw_memory::{FsMemoryStore, MemoryStore, Scope};
 pub enum Command {
     /// List active memories (id / type / zone / first line).
     List {
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
         /// Project directory whose `.openpaw/memories` is searched too.
         #[arg(long)]
         project: Option<std::path::PathBuf>,
@@ -27,9 +24,6 @@ pub enum Command {
         /// Maximum number of hits to print.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
         /// Project directory whose `.openpaw/memories` is searched too.
         #[arg(long)]
         project: Option<std::path::PathBuf>,
@@ -38,9 +32,6 @@ pub enum Command {
     Show {
         /// Memory id as shown by `openpaw memory list`.
         id: String,
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
         /// Project directory whose `.openpaw/memories` is searched too.
         #[arg(long)]
         project: Option<std::path::PathBuf>,
@@ -49,9 +40,6 @@ pub enum Command {
     Delete {
         /// Memory id as shown by `openpaw memory list`.
         id: String,
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
         /// Project directory whose `.openpaw/memories` is searched too.
         #[arg(long)]
         project: Option<std::path::PathBuf>,

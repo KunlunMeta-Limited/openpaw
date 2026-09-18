@@ -1160,6 +1160,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "futures",
  "openpaw-core",
@@ -1170,6 +1171,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "uuid",
 ]
 

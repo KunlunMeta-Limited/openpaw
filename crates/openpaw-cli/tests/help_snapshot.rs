@@ -10,6 +10,9 @@ use openpaw_cli::Cli;
 /// Render the help text of one top-level subcommand.
 fn sub_help(name: &str) -> String {
     let mut cmd = Cli::command();
+    // `build()` propagates the global `--provider` / `--workspace` / `--home`
+    // args down to the subcommands, so the rendered sub-help carries them.
+    cmd.build();
     let sub = cmd
         .find_subcommand_mut(name)
         .unwrap_or_else(|| panic!("subcommand `{name}` must exist"));

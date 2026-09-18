@@ -1,11 +1,13 @@
 use crate::approval::HostApprovalManager;
 use crate::protocol::{Message, ModelRef, Provider, ProviderList, ProviderModel, Session, Time};
+use crate::HostConfig;
 use openpaw_core::{LlmProvider, Session as EngineSession, SessionEvent};
 use openpaw_engine::AgentLoop;
 use openpaw_llm::{AnthropicProvider, EchoProvider, MockMode, MockProvider, OpenAiProvider};
 use openpaw_store::SessionWriter;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -22,9 +24,11 @@ struct ProviderConfig {
 }
 
 impl ProviderConfig {
-    fn from_env() -> Self {
+    /// `default_provider` comes from the CLI/env (`--provider` >
+    /// `OPENPAW_ENGINE_PROVIDER` > `mock`); the rest stays environment-driven.
+    fn new(default_provider: String) -> Self {
         Self {
-            default_provider: env_value("OPENPAW_ENGINE_PROVIDER").unwrap_or_else(|| "mock".into()),
+            default_provider,
             mock_mode: env_value("OPENPAW_ENGINE_MOCK").unwrap_or_else(|| "text".into()),
             openai_api_key: env_value("OPENAI_API_KEY"),
             openai_base_url: env_value("OPENAI_BASE_URL")
@@ -205,14 +209,20 @@ pub struct RuntimeState {
     writers: Arc<Mutex<HashMap<String, SessionWriter>>>,
     pub approvals: Arc<HostApprovalManager>,
     providers: Arc<ProviderConfig>,
+    default_workspace: String,
+    home: PathBuf,
     manual_permissions: bool,
 }
 impl RuntimeState {
-    pub fn new() -> Self {
-        Self::with_provider_config(ProviderConfig::from_env())
+    pub fn new(config: &HostConfig) -> Self {
+        Self::with_provider_config(
+            ProviderConfig::new(config.provider.clone()),
+            config.workspace.clone(),
+            config.home.clone(),
+        )
     }
 
-    fn with_provider_config(providers: ProviderConfig) -> Self {
+    fn with_provider_config(providers: ProviderConfig, workspace: PathBuf, home: PathBuf) -> Self {
         let events = Arc::new(Mutex::new(HashMap::new()));
         let (global_events, _) = broadcast::channel(1024);
         Self {
@@ -225,9 +235,17 @@ impl RuntimeState {
             writers: Arc::new(Mutex::new(HashMap::new())),
             approvals: Arc::new(HostApprovalManager::new(events, global_events)),
             providers: Arc::new(providers),
+            default_workspace: workspace.to_string_lossy().into_owned(),
+            home,
             manual_permissions: env_value("OPENPAW_ENGINE_PERMISSIONS").as_deref()
                 == Some("manual"),
         }
+    }
+
+    /// Workspace used when a request carries neither `x-opencode-directory`
+    /// nor `?directory=` (§3.2 third tier).
+    pub fn default_workspace(&self) -> String {
+        self.default_workspace.clone()
     }
 
     pub fn provider_list(&self) -> ProviderList {
@@ -284,30 +302,27 @@ impl RuntimeState {
                 updated: now,
             },
         };
-        let writer = if let Some(home) = std::env::var_os("OPENPAW_HOME") {
-            let path = std::path::PathBuf::from(home)
-                .join("sessions")
-                .join(format!("{id}.jsonl"));
-            let mut writer = SessionWriter::create(path)
-                .map_err(|error| format!("cannot create session transcript: {error}"))?;
-            writer
-                .append(&SessionEvent::Meta(engine_session.meta.clone()))
-                .map_err(|error| format!("cannot write session metadata: {error}"))?;
-            writer
-                .append(&SessionEvent::Metadata {
-                    title: Some(session.title.clone()),
-                    mode: Some("engine-host".into()),
-                    model_override: None,
-                    cwd: Some(session.directory.clone()),
-                    workspace_id: None,
-                    workspace_name: None,
-                    task_id: None,
-                })
-                .map_err(|error| format!("cannot write session workspace metadata: {error}"))?;
-            Some(writer)
-        } else {
-            None
-        };
+        // Transcript: <home>/sessions/<id>.jsonl. `home` comes from
+        // `--home` / `OPENPAW_HOME` / `~/.openpaw`, so every session is
+        // persisted regardless of how the host was started.
+        let path = self.home.join("sessions").join(format!("{id}.jsonl"));
+        let mut writer = SessionWriter::create(path)
+            .map_err(|error| format!("cannot create session transcript: {error}"))?;
+        writer
+            .append(&SessionEvent::Meta(engine_session.meta.clone()))
+            .map_err(|error| format!("cannot write session metadata: {error}"))?;
+        writer
+            .append(&SessionEvent::Metadata {
+                title: Some(session.title.clone()),
+                mode: Some("engine-host".into()),
+                model_override: None,
+                cwd: Some(session.directory.clone()),
+                workspace_id: None,
+                workspace_name: None,
+                task_id: None,
+            })
+            .map_err(|error| format!("cannot write session workspace metadata: {error}"))?;
+        let writer = Some(writer);
         let (tx, _) = broadcast::channel(256);
         self.sessions.lock().unwrap().push(session.clone());
         self.events.lock().unwrap().insert(id.clone(), tx);

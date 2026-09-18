@@ -14,15 +14,7 @@ pub enum Command {
     /// Print the resolved OpenPaw home and provider key presence (masked).
     Show,
     /// Alias of `openpaw doctor` (same checks, same report).
-    Doctor {
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
-        /// Workspace scanned by the network audit (default: current
-        /// directory).
-        #[arg(long)]
-        workspace: Option<std::path::PathBuf>,
-    },
+    Doctor,
 }
 
 /// `openpaw config show` — resolved home + provider key presence.

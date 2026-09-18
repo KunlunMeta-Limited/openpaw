@@ -28,19 +28,12 @@ pub enum Command {
         project: Option<std::path::PathBuf>,
     },
     /// List goal profiles (id / status / progress).
-    Status {
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
-    },
+    Status,
     /// Print the resume decision for one goal from its ledger (no agent
     /// loop is driven).
     Resume {
         /// Goal id as shown by `openpaw goal status`.
         id: String,
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
     },
 }
 

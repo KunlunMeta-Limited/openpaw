@@ -6,12 +6,7 @@ use std::path::Path;
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
     /// Print the registered tool names (static registry, one per line).
-    List {
-        /// Workspace the tool host operates in (default: current
-        /// directory).
-        #[arg(long)]
-        workspace: Option<std::path::PathBuf>,
-    },
+    List,
 }
 
 /// `openpaw tool list` — registered tool names from the static registry.

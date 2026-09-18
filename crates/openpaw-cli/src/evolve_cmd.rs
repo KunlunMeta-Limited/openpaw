@@ -26,9 +26,6 @@ pub enum Command {
     /// Unverified-artifact ratios (memories/skills, user + project scopes)
     /// and a goal-profile overview. Exit code 0 even when nothing exists.
     Status {
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
         /// Project directory whose `.openpaw` knowledge is scanned too.
         #[arg(long)]
         project: Option<std::path::PathBuf>,
@@ -36,9 +33,6 @@ pub enum Command {
     /// Clear the `unverified` flag on reflection artifacts (atomic
     /// frontmatter rewrite; files are kept). Requires `--yes`.
     Reset {
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
         /// Project directory whose `.openpaw` knowledge is reset too.
         #[arg(long)]
         project: Option<std::path::PathBuf>,

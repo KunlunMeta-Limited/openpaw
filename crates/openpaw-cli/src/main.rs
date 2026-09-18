@@ -27,14 +27,21 @@ fn default_workspace() -> PathBuf {
 
 fn main() {
     let cli = Cli::parse();
+    // Global flags: one resolution order for `--engine-host`, `chat` and the
+    // inspection subcommands.
+    let provider = cli.provider.clone();
+    let workspace = cli.workspace.clone();
+    let home = cli.home.clone();
     #[cfg(feature = "engine-host")]
     if cli.engine_host {
+        let config = openpaw_engine_host::HostConfig::from_env()
+            .with_listener(cli.engine_host_hostname.clone(), cli.engine_host_port)
+            .with_provider(provider.clone())
+            .with_workspace(workspace.clone())
+            .with_home(home.clone());
         let code = tokio::runtime::Runtime::new()
             .expect("tokio runtime")
-            .block_on(openpaw_engine_host::run(
-                &cli.engine_host_hostname,
-                cli.engine_host_port,
-            ));
+            .block_on(openpaw_engine_host::run(config));
         if let Err(error) = code {
             eprintln!("engine host failed: {error}");
             std::process::exit(1);
@@ -49,52 +56,45 @@ fn main() {
     }
     let code = match cli.command {
         Some(Command::Hello) => hello::run(),
-        Some(Command::Chat {
-            provider,
-            workspace,
-            home,
-        }) => chat::run(chat::ChatArgs {
-            provider,
+        Some(Command::Chat) => chat::run(chat::ChatArgs {
+            provider: provider.unwrap_or_else(|| "mock".to_string()),
             workspace,
             home,
         }),
         Some(Command::Session { cmd }) => match cmd {
-            session_cmd::Command::List { limit, home } => {
+            session_cmd::Command::List { limit } => {
                 session_cmd::run_list(&resolve_home(home), limit)
             }
-            session_cmd::Command::Show { id, home } => {
-                session_cmd::run_show(&resolve_home(home), &id)
-            }
-            session_cmd::Command::Search { query, limit, home } => {
+            session_cmd::Command::Show { id } => session_cmd::run_show(&resolve_home(home), &id),
+            session_cmd::Command::Search { query, limit } => {
                 session_cmd::run_search(&resolve_home(home), &query, limit)
             }
         },
         Some(Command::Memory { cmd }) => match cmd {
-            memory_cmd::Command::List { home, project } => {
+            memory_cmd::Command::List { project } => {
                 memory_cmd::run_list(&resolve_home(home), project.as_deref())
             }
             memory_cmd::Command::Search {
                 query,
                 limit,
-                home,
                 project,
             } => memory_cmd::run_search(&resolve_home(home), project.as_deref(), &query, limit),
-            memory_cmd::Command::Show { id, home, project } => {
+            memory_cmd::Command::Show { id, project } => {
                 memory_cmd::run_show(&resolve_home(home), project.as_deref(), &id)
             }
-            memory_cmd::Command::Delete { id, home, project } => {
+            memory_cmd::Command::Delete { id, project } => {
                 memory_cmd::run_delete(&resolve_home(home), project.as_deref(), &id)
             }
         },
         Some(Command::Evolve { cmd }) => match cmd {
-            evolve_cmd::Command::Status { home, project } => {
+            evolve_cmd::Command::Status { project } => {
                 evolve_cmd::run_status(&resolve_home(home), project.as_deref())
             }
-            evolve_cmd::Command::Reset { home, project, yes } => {
+            evolve_cmd::Command::Reset { project, yes } => {
                 evolve_cmd::run_reset(&resolve_home(home), project.as_deref(), yes)
             }
         },
-        Some(Command::Doctor { home, workspace }) => {
+        Some(Command::Doctor) => {
             let workspace = workspace.unwrap_or_else(default_workspace);
             doctor::run(&resolve_home(home), &workspace)
         }
@@ -102,18 +102,16 @@ fn main() {
             goal_cmd::Command::New { objective, project } => {
                 let goals_dir = match project {
                     Some(dir) => dir.join(".openpaw").join("goals"),
-                    None => resolve_home(None).join("goals"),
+                    None => resolve_home(home).join("goals"),
                 };
                 goal_cmd::run_new(&goals_dir, &objective)
             }
-            goal_cmd::Command::Status { home } => goal_cmd::run_status(&resolve_home(home)),
-            goal_cmd::Command::Resume { id, home } => {
-                goal_cmd::run_resume(&resolve_home(home), &id)
-            }
+            goal_cmd::Command::Status => goal_cmd::run_status(&resolve_home(home)),
+            goal_cmd::Command::Resume { id } => goal_cmd::run_resume(&resolve_home(home), &id),
         },
         Some(Command::Config { cmd }) => match cmd {
-            config_cmd::Command::Show => config_cmd::run_show(&resolve_home(None)),
-            config_cmd::Command::Doctor { home, workspace } => {
+            config_cmd::Command::Show => config_cmd::run_show(&resolve_home(home)),
+            config_cmd::Command::Doctor => {
                 let workspace = workspace.unwrap_or_else(default_workspace);
                 config_cmd::run_doctor(&resolve_home(home), &workspace)
             }
@@ -123,13 +121,13 @@ fn main() {
             model_cmd::Command::Default { name } => model_cmd::run_default(&name),
         },
         Some(Command::Tool { cmd }) => match cmd {
-            tool_cmd::Command::List { workspace } => {
+            tool_cmd::Command::List => {
                 let workspace = workspace.unwrap_or_else(default_workspace);
                 tool_cmd::run_list(&workspace)
             }
         },
         Some(Command::Completions { shell }) => completions_cmd::run(&shell),
-        Some(Command::Init { home }) => init_cmd::run(&resolve_home(home)),
+        Some(Command::Init) => init_cmd::run(&resolve_home(home)),
         #[cfg(feature = "sidecar")]
         Some(Command::Sidecar { cmd }) => match cmd {
             SidecarCommand::Status => sidecar::run_status_note(),

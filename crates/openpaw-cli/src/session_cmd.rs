@@ -19,17 +19,11 @@ pub enum Command {
         /// Maximum number of sessions to print.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
     },
     /// Print an ordered message digest for one session id.
     Show {
         /// Session id as shown by `openpaw session list`.
         id: String,
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
     },
     /// Full-text search across indexed session messages.
     Search {
@@ -38,9 +32,6 @@ pub enum Command {
         /// Maximum number of hits to print.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<std::path::PathBuf>,
     },
 }
 

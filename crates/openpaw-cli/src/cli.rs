@@ -23,6 +23,17 @@ pub struct Cli {
     /// Subcommand to run; omit it to print help.
     #[command(subcommand)]
     pub command: Option<Command>,
+    /// Offline provider: `mock`, `echo`, `anthropic`, or `openai`. Global so
+    /// `chat` and `--engine-host` share one resolution order.
+    #[arg(long, global = true)]
+    pub provider: Option<String>,
+    /// Workspace the tool host operates in (default: current directory).
+    #[arg(long, global = true)]
+    pub workspace: Option<PathBuf>,
+    /// OpenPaw home for session storage (default: OPENPAW_HOME or
+    /// ~/.openpaw).
+    #[arg(long, global = true)]
+    pub home: Option<PathBuf>,
     #[cfg(feature = "engine-host")]
     #[arg(long)]
     pub engine_host: bool,
@@ -53,19 +64,8 @@ pub enum Command {
     Hello,
     /// Start the agent loop conversation with tools and session
     /// persistence (offline providers; real providers plug into the same
-    /// seam).
-    Chat {
-        /// Offline provider: `mock` (counter replies) or `echo`.
-        #[arg(long, default_value = "mock")]
-        provider: String,
-        /// Workspace the tool host operates in (default: current directory).
-        #[arg(long)]
-        workspace: Option<PathBuf>,
-        /// OpenPaw home for session storage (default: OPENPAW_HOME or
-        /// ~/.openpaw).
-        #[arg(long)]
-        home: Option<PathBuf>,
-    },
+    /// seam). Provider, workspace and home come from the global flags.
+    Chat,
     /// List, show, and search persisted chat sessions.
     Session {
         #[command(subcommand)]
@@ -83,15 +83,7 @@ pub enum Command {
         cmd: evolve_cmd::Command,
     },
     /// Run local environment checks and the network-audit report.
-    Doctor {
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<PathBuf>,
-        /// Workspace scanned by the network audit (default: current
-        /// directory).
-        #[arg(long)]
-        workspace: Option<PathBuf>,
-    },
+    Doctor,
     /// Create and inspect goal profiles; `goal resume` prints the
     /// single-step resume decision without driving an agent loop.
     Goal {
@@ -120,11 +112,7 @@ pub enum Command {
         shell: String,
     },
     /// Create the OpenPaw home directory skeleton and self-check index.db.
-    Init {
-        /// OpenPaw home (default: OPENPAW_HOME or ~/.openpaw).
-        #[arg(long)]
-        home: Option<PathBuf>,
-    },
+    Init,
     /// Explain the in-process MCP sidecar model (no daemon; informational).
     #[cfg(feature = "sidecar")]
     Sidecar {
