@@ -362,6 +362,14 @@ impl AgentLoop {
 
             futures::pin_mut!(stream);
             let mut final_resp: Option<openpaw_core::CompletionResponse> = None;
+            // Whether this attempt already forwarded a `MessageStart` and any
+            // text/thinking delta. Providers without native streaming — and
+            // streams whose content rides only in `Final`, which the
+            // `LlmProvider::stream` contract allows — emit a single `Final`
+            // carrying the assembled response. Without the replay below that
+            // content never reaches the sink and callers observe an empty turn.
+            let mut announced = false;
+            let mut streamed = false;
 
             loop {
                 let ev = tokio::select! {
@@ -373,12 +381,15 @@ impl AgentLoop {
                 let Some(ev) = ev else { break };
                 match ev? {
                     openpaw_core::StreamEvent::MessageStart => {
+                        announced = true;
                         event_sink(AgentEvent::MessageStart);
                     }
                     openpaw_core::StreamEvent::TextDelta { text, .. } => {
+                        streamed = true;
                         event_sink(AgentEvent::TextDelta { text });
                     }
                     openpaw_core::StreamEvent::ThinkingDelta { text, .. } => {
+                        streamed = true;
                         event_sink(AgentEvent::ThinkingDelta { text });
                     }
                     // E1: buffered tool assembly — blocks arrive complete in
@@ -388,7 +399,11 @@ impl AgentLoop {
                     | openpaw_core::StreamEvent::ToolUseInputDelta { .. }
                     | openpaw_core::StreamEvent::BlockStop { .. } => {}
                     openpaw_core::StreamEvent::Final(resp) => {
-                        final_resp = Some(*resp);
+                        let resp = *resp;
+                        if !streamed {
+                            replay_final_content(&resp, announced, event_sink);
+                        }
+                        final_resp = Some(resp);
                         break;
                     }
                 }
@@ -704,6 +719,50 @@ impl AgentLoop {
         }
 
         results
+    }
+}
+
+/// Replay a `Final` response's assembled content as the event sequence a
+/// streaming provider would have produced.
+///
+/// `LlmProvider::stream` promises that `Final` "carries the fully assembled
+/// `CompletionResponse`", so a provider without native streaming (or a stream
+/// that only delivers content in `Final`) is fully conformant while emitting
+/// no delta at all. This is called only when the attempt forwarded no
+/// text/thinking delta, which keeps streaming providers on their exact
+/// existing event order; `announced` avoids a duplicate `MessageStart` when
+/// one was already forwarded.
+fn replay_final_content(
+    resp: &openpaw_core::CompletionResponse,
+    announced: bool,
+    event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+) {
+    let has_content = resp.content.iter().any(|block| {
+        block.as_text().is_some_and(|text| !text.is_empty())
+            || block
+                .as_thinking()
+                .is_some_and(|thinking| !thinking.is_empty())
+    });
+    if !has_content {
+        return;
+    }
+    if !announced {
+        event_sink(AgentEvent::MessageStart);
+    }
+    for block in &resp.content {
+        if let Some(text) = block.as_text() {
+            if !text.is_empty() {
+                event_sink(AgentEvent::TextDelta {
+                    text: text.to_string(),
+                });
+            }
+        } else if let Some(thinking) = block.as_thinking() {
+            if !thinking.is_empty() {
+                event_sink(AgentEvent::ThinkingDelta {
+                    text: thinking.to_string(),
+                });
+            }
+        }
     }
 }
 

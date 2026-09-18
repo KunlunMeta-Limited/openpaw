@@ -327,6 +327,10 @@ impl LlmProvider for OpenAiProvider {
 #[derive(Default)]
 struct OpenAiStreamState {
     tool_calls: std::collections::BTreeMap<usize, (String, String, String)>, // id, name, args
+    /// Accumulated assistant text. `LlmProvider::stream` requires `Final` to
+    /// carry the fully assembled response, so the deltas are kept here and
+    /// echoed back in `finish`.
+    text: String,
     usage: Usage,
     stop_reason: Option<StopReason>,
 }
@@ -341,6 +345,21 @@ impl OpenAiStreamState {
         if data.as_str() == Some("[DONE]") {
             return;
         }
+        // Upstreams report mid-stream failures as an `error` frame inside an
+        // HTTP 200 stream (no `choices`, no `[DONE]`). Dropping it turns a real
+        // failure into an empty-but-successful turn, so surface it instead; the
+        // message text also lets `classify_server_error` pick the right class.
+        if let Some(error) = data.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown upstream error");
+            queue.push_back(Err(Error::server_error(
+                503,
+                format!("openai stream error: {message}"),
+            )));
+            return;
+        }
         if let Some(u) = data.get("usage") {
             self.usage = OpenAiProvider::parse_usage(Some(u));
         }
@@ -350,6 +369,7 @@ impl OpenAiStreamState {
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
+                self.text.push_str(text);
                 queue.push_back(Ok(StreamEvent::TextDelta {
                     index: 0,
                     text: text.to_string(),
@@ -401,6 +421,15 @@ impl OpenAiStreamState {
             .map(|(idx, (id, name, args))| (idx, id, name, args))
             .collect();
         let mut final_content: Vec<ContentBlock> = Vec::new();
+        // `Final` must carry the fully assembled response, so the text streamed
+        // above belongs here too. Consumers that read only `Final` — the
+        // non-streaming replay path and the persisted transcript — would
+        // otherwise lose the assistant reply.
+        if !self.text.is_empty() {
+            final_content.push(ContentBlock::Text {
+                text: std::mem::take(&mut self.text),
+            });
+        }
         for (idx, id, name, args) in &calls {
             let input: serde_json::Value = serde_json::from_str(args).unwrap_or(json!({}));
             final_content.push(ContentBlock::ToolUse {

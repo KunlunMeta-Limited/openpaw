@@ -290,6 +290,19 @@ pub fn session_idle(session_id: &str) -> Value {
     json!({"type":"session.idle","properties":{"sessionID":session_id}})
 }
 
+/// §2.5: `prompt_async` opens a turn with the user message events and a busy
+/// status. Keeping the frame here rather than inline in `http.rs` is what makes
+/// the whole-turn ordering assertable from a unit test.
+pub fn turn_start_events(session_id: &str) -> Vec<Value> {
+    vec![session_status(session_id, "busy")]
+}
+
+/// §2.5: a finished turn closes with an idle status and `session.idle`, in that
+/// order, at the tail of the session's stream.
+pub fn turn_finish_events(session_id: &str) -> Vec<Value> {
+    vec![session_status(session_id, "idle"), session_idle(session_id)]
+}
+
 pub fn todo_updated(session_id: &str) -> Value {
     json!({"type":"todo.updated","properties":{"sessionID":session_id,"todos":[]}})
 }
@@ -313,6 +326,34 @@ fn now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openpaw_core::Usage;
+    use openpaw_engine::ClassifierStatus;
+
+    /// Collect the SSE `type` of each frame, in order.
+    fn types_of(events: &[Value]) -> Vec<&str> {
+        events
+            .iter()
+            .map(|event| event["type"].as_str().expect("frame carries a type"))
+            .collect()
+    }
+
+    fn text_delta(text: &str) -> AgentEvent {
+        AgentEvent::TextDelta { text: text.into() }
+    }
+
+    fn thinking_delta(text: &str) -> AgentEvent {
+        AgentEvent::ThinkingDelta { text: text.into() }
+    }
+
+    fn tool_result(is_error: bool) -> AgentEvent {
+        AgentEvent::ToolResult {
+            tool_use_id: "call_1".into(),
+            content: "payload".into(),
+            is_error,
+            name: Some("read_file".into()),
+            duration_ms: Some(7),
+        }
+    }
 
     #[test]
     fn text_delta_declares_part_and_carries_all_ids() {
@@ -365,5 +406,232 @@ mod tests {
         assert_eq!(update.events[1]["type"], "todo.updated");
         assert_eq!(update.events[1]["properties"]["sessionID"], "ses_1");
         assert_eq!(update.events[1]["properties"]["todos"], json!([]));
+    }
+
+    /// §2.5 mapping table, one row per `AgentEvent::kind()`. `None` means the
+    /// kind is explicitly excluded from the OpenCode surface. A fresh mapper is
+    /// primed with `MessageStart` so each row observes only its own frames.
+    #[test]
+    fn every_agent_event_kind_maps_to_expected_sse() {
+        let cases: Vec<(AgentEvent, Option<Vec<&str>>)> = vec![
+            (AgentEvent::MessageStart, Some(vec!["message.updated"])),
+            (
+                text_delta("a"),
+                Some(vec!["message.part.updated", "message.part.delta"]),
+            ),
+            (
+                thinking_delta("a"),
+                Some(vec!["message.part.updated", "message.part.delta"]),
+            ),
+            (
+                AgentEvent::ToolUseStart {
+                    tool_use_id: "call_1".into(),
+                    name: "read_file".into(),
+                },
+                Some(vec!["message.part.updated"]),
+            ),
+            (tool_result(false), Some(vec!["message.part.updated"])),
+            (
+                AgentEvent::ClassifierStatus {
+                    tool_use_id: "call_1".into(),
+                    status: ClassifierStatus::AutoDenied {
+                        reason: "blocked".into(),
+                    },
+                },
+                None,
+            ),
+            (
+                AgentEvent::CompactionPerformed {
+                    before_tokens: 10,
+                    after_tokens: 5,
+                },
+                None,
+            ),
+            (
+                AgentEvent::TurnUsage {
+                    usage: Usage::default(),
+                },
+                None,
+            ),
+        ];
+
+        let mut kinds: Vec<&str> = cases.iter().map(|(event, _)| event.kind()).collect();
+        let covered = kinds.len();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(kinds.len(), covered, "each kind must appear exactly once");
+        assert_eq!(covered, 8, "AgentEvent exposes 8 kinds");
+
+        for (event, expected) in cases {
+            let mut mapper = TurnEventMapper::new("ses_1");
+            if !matches!(event, AgentEvent::MessageStart) {
+                mapper.apply(AgentEvent::MessageStart);
+            }
+            let update = mapper.apply(event);
+            let types = types_of(&update.events);
+            match expected {
+                Some(expected) => {
+                    assert_eq!(types, expected, "unexpected mapping for this kind")
+                }
+                None => assert!(types.is_empty(), "excluded kind emitted {types:?}"),
+            }
+        }
+    }
+
+    /// Completion evidence: the unmapped inventory holds exactly the kinds §2.5
+    /// excludes — no more.
+    #[test]
+    fn unmapped_kinds_are_exactly_the_planned_exclusions() {
+        let excluded = [
+            AgentEvent::ClassifierStatus {
+                tool_use_id: "call_1".into(),
+                status: ClassifierStatus::AutoDenied {
+                    reason: "blocked".into(),
+                },
+            },
+            AgentEvent::CompactionPerformed {
+                before_tokens: 9,
+                after_tokens: 4,
+            },
+            AgentEvent::TurnUsage {
+                usage: Usage::default(),
+            },
+        ];
+
+        let mut mapper = TurnEventMapper::new("ses_1");
+        mapper.apply(AgentEvent::MessageStart);
+        let mut names: Vec<&str> = Vec::new();
+        for event in excluded {
+            let kind = event.kind();
+            assert!(
+                mapper.apply(event).events.is_empty(),
+                "{kind} must not reach the OpenCode surface"
+            );
+            names.push(kind);
+        }
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["classifier_status", "compaction_performed", "turn_usage"]
+        );
+    }
+
+    /// `busy` opens the turn, the assistant stream follows, and the turn closes
+    /// with idle `session.status` + `session.idle` at the very tail.
+    #[test]
+    fn busy_precedes_assistant_stream_and_idle_closes_turn() {
+        let session_id = "ses_1";
+        let mut sequence: Vec<Value> = turn_start_events(session_id);
+        assert_eq!(sequence[0]["properties"]["status"]["type"], "busy");
+
+        let mut mapper = TurnEventMapper::new(session_id);
+        for event in [
+            AgentEvent::MessageStart,
+            thinking_delta("think"),
+            text_delta("hi"),
+            AgentEvent::ToolUseStart {
+                tool_use_id: "call_1".into(),
+                name: "read_file".into(),
+            },
+            tool_result(false),
+        ] {
+            sequence.extend(mapper.apply(event).events);
+        }
+        // §2.5: the turn end fills `time.completed` and closes the stream.
+        let finished = mapper.finish();
+        assert!(finished.messages[0].info.time.completed.is_some());
+        sequence.extend(finished.events);
+        sequence.extend(turn_finish_events(session_id));
+
+        let types = types_of(&sequence);
+        let busy = types
+            .iter()
+            .position(|kind| *kind == "session.status")
+            .expect("busy frame present");
+        let first_assistant = types
+            .iter()
+            .position(|kind| *kind == "message.updated")
+            .expect("assistant frame present");
+        assert!(
+            busy < first_assistant,
+            "busy must precede the assistant stream: {types:?}"
+        );
+
+        let tail = &types[types.len() - 2..];
+        assert_eq!(
+            tail,
+            ["session.status", "session.idle"],
+            "turn tail: {types:?}"
+        );
+        assert_eq!(
+            sequence[sequence.len() - 2]["properties"]["status"]["type"],
+            "idle"
+        );
+    }
+
+    /// The first text/reasoning delta declares the part and then sends the
+    /// delta; later deltas must not redeclare it (§2.5: "首次收到时").
+    #[test]
+    fn first_delta_declares_part_then_delta_and_later_deltas_do_not() {
+        for (event, field) in [
+            (text_delta("a"), "text"),
+            (thinking_delta("a"), "reasoning"),
+        ] {
+            let mut mapper = TurnEventMapper::new("ses_1");
+            mapper.apply(AgentEvent::MessageStart);
+
+            let first = mapper.apply(event.clone());
+            assert_eq!(
+                types_of(&first.events),
+                ["message.part.updated", "message.part.delta"],
+                "{field}: first delta order"
+            );
+            let declared = &first.events[0]["properties"]["part"];
+            assert_eq!(declared["type"], field);
+            assert_eq!(
+                declared["id"], first.events[1]["properties"]["partID"],
+                "{field}: delta must target the declared part"
+            );
+
+            let later = mapper.apply(event);
+            assert_eq!(
+                types_of(&later.events),
+                ["message.part.delta"],
+                "{field}: later deltas must not redeclare the part"
+            );
+        }
+    }
+
+    /// A tool part moves `running` → `completed` / `error` in place, and its
+    /// `callID` is the engine's `tool_use_id`.
+    #[test]
+    fn tool_part_transitions_from_running_to_completed_or_error() {
+        for (is_error, expected) in [(false, "completed"), (true, "error")] {
+            let mut mapper = TurnEventMapper::new("ses_1");
+            mapper.apply(AgentEvent::MessageStart);
+
+            let started = mapper.apply(AgentEvent::ToolUseStart {
+                tool_use_id: "call_1".into(),
+                name: "read_file".into(),
+            });
+            let running = &started.events[0]["properties"]["part"];
+            assert_eq!(running["type"], "tool");
+            assert_eq!(running["callID"], "call_1");
+            assert_eq!(running["state"]["status"], "running");
+            let part_id = running["id"].clone();
+
+            let finished = mapper.apply(tool_result(is_error));
+            let done = &finished.events[0]["properties"]["part"];
+            assert_eq!(done["id"], part_id, "the same part must be updated");
+            assert_eq!(done["state"]["status"], expected);
+            assert_eq!(done["state"]["durationMs"], 7);
+            if is_error {
+                assert_eq!(done["state"]["error"], "payload");
+                assert!(done["state"].get("output").is_none());
+            } else {
+                assert_eq!(done["state"]["output"], "payload");
+                assert!(done["state"].get("error").is_none());
+            }
+        }
     }
 }

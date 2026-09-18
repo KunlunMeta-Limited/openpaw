@@ -219,6 +219,59 @@ async fn openai_streaming_text_contract() {
     }
 }
 
+// Contract: `Final` carries the fully assembled response, so the text that
+// arrived as deltas must be present in `Final.content` too. Consumers that
+// read only `Final` (non-streaming replay, persisted transcripts) depend on it.
+#[tokio::test]
+async fn openai_streaming_final_carries_assembled_text() {
+    let addr = spawn_mock(vec![http_sse(&[
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}",
+        "data: [DONE]",
+    ])]);
+    let p = OpenAiProvider::new("sk-test", "gpt-4o").with_base_url(format!("http://{addr}"));
+    use futures::StreamExt;
+    let stream = p.stream(req("gpt-4o")).await.unwrap();
+    let events: Vec<StreamEvent> = stream.map(|e| e.expect("event ok")).collect().await;
+
+    match events.last() {
+        Some(StreamEvent::Final(resp)) => {
+            let assembled: String = resp.content.iter().filter_map(|b| b.as_text()).collect();
+            assert_eq!(assembled, "Hello");
+        }
+        other => panic!("expected Final, got {other:?}"),
+    }
+}
+
+// Regression: an upstream that reports failure as an `error` frame inside an
+// HTTP 200 stream (real case: "Our servers are currently overloaded") must not
+// be swallowed. Dropping it produced an empty-but-successful turn, which the
+// OpenWork frontend could only render as "no result arrived".
+#[tokio::test]
+async fn openai_stream_error_frame_is_surfaced() {
+    let addr = spawn_mock(vec![http_sse(&[
+        "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}",
+        "data: {\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\",\"type\":\"upstream_error\"}}",
+    ])]);
+    let p = OpenAiProvider::new("sk-test", "gpt-4o").with_base_url(format!("http://{addr}"));
+    use futures::StreamExt;
+    let stream = p.stream(req("gpt-4o")).await.unwrap();
+    let events: Vec<_> = stream.collect().await;
+
+    let err = events
+        .into_iter()
+        .find_map(|e| e.err())
+        .expect("an error frame must surface as an Err, not vanish");
+    match err {
+        Error::ServerError { status, message } => {
+            assert_eq!(status, 503);
+            assert!(message.contains("overloaded"), "message: {message}");
+        }
+        other => panic!("expected ServerError, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn openai_rate_limit_classified() {
     let addr = spawn_mock(vec![http_error(

@@ -135,7 +135,7 @@ pub async fn exec_bwrap(
                 args.push(root.to_string_lossy().to_string());
             } else {
                 // Create the directory if it doesn't exist
-                std::fs::create_dir_all(root).map_err(|e| {
+                std::fs::create_dir_all(&root).map_err(|e| {
                     SandboxError::ExecutionFailed(format!(
                         "failed to create writable root {}: {e}",
                         root.display()

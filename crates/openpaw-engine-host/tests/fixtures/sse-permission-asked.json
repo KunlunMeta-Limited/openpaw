@@ -1,0 +1,15 @@
+{
+  "type": "permission.asked",
+  "properties": {
+    "id": "prm_3c4d5e6f708192a3b4c5d6e7f8091a2b",
+    "sessionID": "ses_1f2e3d4c5b6a79880a1b2c3d4e5f6071",
+    "permission": "read_file",
+    "patterns": ["read a workspace file"],
+    "metadata": {
+      "input": {
+        "path": "/opt/openwork/README.md"
+      }
+    },
+    "always": []
+  }
+}

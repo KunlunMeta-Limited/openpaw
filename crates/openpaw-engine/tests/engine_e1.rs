@@ -110,6 +110,35 @@ async fn streaming_text_forwards_deltas() {
     assert_eq!(session.messages[1].text(), "hello world");
 }
 
+// Regression: a provider whose stream emits only `Final` — the trait's
+// documented shape for providers without native streaming, used by
+// `MockProvider::fixed`, `EchoProvider` and the default `stream` impl — must
+// still forward the assistant text as events. Before the `Final` replay this
+// produced a turn with no assistant event at all, which the host could only
+// surface as "accepted, but no result arrived".
+#[tokio::test]
+async fn final_only_provider_still_forwards_content_events() {
+    let p = Arc::new(MockProvider::fixed("pong"));
+    let l = AgentLoop::new(p);
+    let mut session = Session::new("mock-1", "mock");
+    session.messages.push(Message::user_text("ping"));
+
+    let (stop, events) = run_simple(&l, &mut session, &[]).await;
+    assert_eq!(stop.unwrap(), StopReason::EndTurn);
+
+    let kinds: Vec<&str> = events.iter().map(|e| e.kind()).collect();
+    assert_eq!(kinds[0], "message_start", "got {kinds:?}");
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas.concat(), "pong", "got {kinds:?}");
+    assert_eq!(session.messages[1].text(), "pong");
+}
+
 #[tokio::test]
 async fn single_tool_serial_roundtrip() {
     let p = Arc::new(MockProvider::scripted(vec![

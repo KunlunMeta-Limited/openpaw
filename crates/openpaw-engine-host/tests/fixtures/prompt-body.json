@@ -1,0 +1,12 @@
+{
+  "model": {
+    "providerID": "mock",
+    "modelID": "mock-1"
+  },
+  "parts": [
+    {
+      "type": "text",
+      "text": "user prompt"
+    }
+  ]
+}
