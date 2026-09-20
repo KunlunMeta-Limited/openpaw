@@ -50,6 +50,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/message", get(messages).post(message))
         .route("/session/{id}/turns", get(turns))
         .route("/session/{id}/command", post(no_content))
+        // §3.2 显式降级：session 作用域调用返回 204 而不是 404。
+        .route("/session/{id}/shell", post(no_content))
+        .route("/session/{id}/fork", post(no_content))
+        .route("/session/{id}/revert", post(no_content))
+        .route("/session/{id}/summarize", post(no_content))
         .route("/session/{id}/prompt_async", post(prompt_async))
         .route("/session/{id}/abort", post(abort))
         .route("/session/{id}/todo", get(todo))
@@ -275,7 +280,8 @@ async fn create_session(
                 "session.created",
                 properties,
             ));
-            (StatusCode::CREATED, Json(wire)).into_response()
+            // openwork 代理端到端验收断言 200（OpenCode v1 服务端亦为 200）。
+            (StatusCode::OK, Json(wire)).into_response()
         }
         Err(error) => bad(StatusCode::BAD_REQUEST, error),
     }
@@ -584,8 +590,9 @@ async fn event_stream(
     State(state): State<Arc<AppState>>,
     Query(query): Query<EventQuery>,
 ) -> Response {
+    // §3.2：三条路径都提供 SSE；OpenWork 订阅 `/event` 时不带 session 标识，缺省走全局流。
     let Some(id) = query.session_id.or(query.session_id_alias) else {
-        return bad(StatusCode::BAD_REQUEST, "必须提供 session_id 查询参数");
+        return global_event_stream(State(state)).await;
     };
     let handle = match state.get_typed(&id).await {
         Ok(handle) => handle,
@@ -658,6 +665,14 @@ async fn permission_reply(
     Path(id): Path<String>,
     body: Result<Json<PermissionReply>, JsonRejection>,
 ) -> Response {
+    // §3.2：permission 不存在返回 404，先于请求体校验（openwork 验收用未知 id 断言 404）。
+    let mut known = false;
+    for session in state.sessions.read().await.values() {
+        known |= session.approvals.list().await.iter().any(|p| p.id == id);
+    }
+    if !known {
+        return bad(StatusCode::NOT_FOUND, "审批请求不存在");
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
@@ -974,7 +989,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
             .as_str()

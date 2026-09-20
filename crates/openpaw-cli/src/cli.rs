@@ -38,7 +38,7 @@ pub struct Cli {
     #[cfg(feature = "engine-host")]
     #[arg(long)]
     pub engine_host: bool,
-    /// engine-host 的回环监听地址；当前配置校验只允许 `127.0.0.1`。
+    /// engine-host 的监听地址；默认回环 `127.0.0.1`，容器部署可显式使用 `0.0.0.0`。
     #[cfg(feature = "engine-host")]
     #[arg(long, default_value = "127.0.0.1")]
     pub engine_host_hostname: String,
@@ -46,10 +46,10 @@ pub struct Cli {
     #[cfg(feature = "engine-host")]
     #[arg(long, default_value_t = 0)]
     pub engine_host_port: u16,
-    /// Provider used by `--engine-host`.
+    /// Provider used by `--engine-host`；未给定时回退 `OPENPAW_ENGINE_PROVIDER`，再回退 `mock`。
     #[cfg(feature = "engine-host")]
-    #[arg(long, default_value = "mock")]
-    pub provider: String,
+    #[arg(long)]
+    pub provider: Option<String>,
     /// `--engine-host` 使用的 OpenPaw home，会保存 session 等运行数据。
     #[cfg(feature = "engine-host")]
     #[arg(long)]

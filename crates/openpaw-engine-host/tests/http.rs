@@ -53,7 +53,7 @@ async fn health_and_session_wire_contract() {
         serde_json::json!({"healthy":true})
     );
     let response = request(&app, "POST", "/session", r#"{"title":"demo"}"#).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     let session = response_json(response).await;
     assert_eq!(session["title"], "demo");
     assert!(session["time"]["created"].is_number());
@@ -274,7 +274,7 @@ async fn workspace_header_precedes_query_and_body() {
         r#"{"directory":"body"}"#,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     let session = response_json(response).await;
     assert_eq!(
         session["directory"],

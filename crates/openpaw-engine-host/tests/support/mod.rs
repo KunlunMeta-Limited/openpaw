@@ -71,7 +71,8 @@ pub async fn create_session(app: &Router) -> String {
 
 pub async fn create_session_with(app: &Router, config: serde_json::Value) -> String {
     let response = request(app, "POST", "/session", config.to_string()).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
+    // 合并 A 线后创建统一返回 200，见 src/http.rs 的 create_session。
+    assert_eq!(response.status(), StatusCode::OK);
     response_json(response).await["id"]
         .as_str()
         .expect("session id")

@@ -37,7 +37,12 @@ fn main() {
         let config = openpaw_engine_host::HostConfig {
             hostname: cli.engine_host_hostname,
             port: cli.engine_host_port,
-            provider: cli.provider,
+            // 合并 A 线：provider 解析顺序回到 `--provider` > `OPENPAW_ENGINE_PROVIDER` > `mock`。
+            // B 线原先只取 clap 默认值，环境变量被静默忽略，容器里改 `.env` 不生效。
+            provider: cli
+                .provider
+                .or_else(|| std::env::var("OPENPAW_ENGINE_PROVIDER").ok())
+                .unwrap_or_else(|| "mock".into()),
             home: cli
                 .home
                 .or_else(|| std::env::var_os("OPENPAW_HOME").map(PathBuf::from))

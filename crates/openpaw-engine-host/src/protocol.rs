@@ -190,7 +190,7 @@ impl TurnOutcome {
 /// 关联：`REQ-B-HOST-001`、`REQ-B-HOST-003`、`REQ-B-HOST-008`。
 #[derive(Debug, Clone)]
 pub struct HostConfig {
-    /// 功能：指定监听主机；当前只允许回环地址 `127.0.0.1`。
+    /// 功能：指定监听主机；默认回环 `127.0.0.1`，容器部署可显式使用通配地址 `0.0.0.0`。
     pub hostname: String,
     /// 功能：指定监听端口；0 表示由操作系统分配空闲端口。
     pub port: u16,
@@ -227,16 +227,18 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
-    /// 功能：校验回环监听、成对凭据和 provider 白名单。
+    /// 功能：校验监听地址、成对凭据和 provider 白名单。
     /// 返回：校验成功返回 `Ok(())`；失败返回中文原因。
-    /// 错误：非回环地址、半配置凭据或未知 provider 会被拒绝。
+    /// 错误：既非回环也非通配地址、半配置凭据或未知 provider 会被拒绝。
     /// 关联：`API-HOST-HEALTH-001`、`REQ-B-HOST-003`。
     pub fn validate(&self) -> Result<(), String> {
-        if self.hostname.trim().is_empty() {
+        let hostname = self.hostname.trim();
+        if hostname.is_empty() {
             return Err("引擎主机 hostname 不能为空".into());
         }
-        if self.hostname != "127.0.0.1" {
-            return Err("引擎主机必须绑定 127.0.0.1".into());
+        // `Dockerfile.engine-host` 以 `0.0.0.0` 启动；仍拒绝绑定具体外部地址。
+        if hostname != "127.0.0.1" && hostname != "0.0.0.0" {
+            return Err("引擎主机必须绑定 127.0.0.1，容器部署可显式使用 0.0.0.0".into());
         }
         if self.username.is_some() != self.password.is_some() {
             return Err("引擎主机鉴权必须同时设置用户名和密码".into());
@@ -713,7 +715,17 @@ mod tests {
         assert_eq!(default.hostname, "127.0.0.1");
         assert_eq!(default.port, 0);
         assert!(default.validate().is_ok());
-        for hostname in ["localhost", "::1", "0.0.0.0", "192.0.2.1"] {
+        // 容器部署的显式例外：A 线 `Dockerfile.engine-host` 以通配地址启动，
+        // 否则 OpenWork 与 AI Office 无法经 Docker 网络访问 host。
+        let wildcard = HostConfig {
+            hostname: "0.0.0.0".into(),
+            ..HostConfig::default()
+        };
+        assert!(
+            wildcard.validate().is_ok(),
+            "0.0.0.0 must be accepted for container deployments"
+        );
+        for hostname in ["localhost", "::1", "192.0.2.1", "example.com", ""] {
             let config = HostConfig {
                 hostname: hostname.into(),
                 ..HostConfig::default()

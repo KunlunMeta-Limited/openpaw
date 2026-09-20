@@ -33,6 +33,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,11 +42,11 @@ use openpaw_goal_ledger::{last_next_action, FsGoalStore, GoalStore};
 use openpaw_memory::{Confidence, FsMemoryStore, MemoryFrontmatter, MemoryStore, Scope, Source};
 use openpaw_reflect_lite::scan_unverified;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, Content, JsonObject,
-    ListToolsResult, ServerJsonRpcMessage, Tool,
+    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ClientRequest, Content,
+    GetExtensions, JsonObject, JsonRpcMessage, ListToolsResult, ServerJsonRpcMessage, Tool,
 };
 use rmcp::serde_json::{self, Value};
-use rmcp::service::RequestContext;
+use rmcp::service::{RequestContext, RxJsonRpcMessage, TxJsonRpcMessage};
 use rmcp::transport::Transport;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use std::future::Future;
@@ -55,22 +56,32 @@ use std::future::Future;
 /// The MCP sidecar server handler. Holds the OpenPaw home root; every tool
 /// derives its store from it, matching the CLI domain rules.
 ///
-/// Tool calls are serialized through an internal gate: the MCP protocol
-/// permits a client to issue requests concurrently, and unordered execution
-/// would let a `memory_get` observe the store before an in-flight
-/// `memory_set` finishes writing. Local, single-user, file-backed tools —
-/// strict ordering costs nothing and makes call semantics predictable.
+/// Tool calls are serialized through an internal gate, and — when the
+/// transport stamps arrival tickets (stdio) — executed in the order the client
+/// issued them: the MCP protocol permits a client to pipeline requests, and
+/// unordered execution would let a `memory_get` observe the store before an
+/// in-flight `memory_set` finishes writing. Local, single-user, file-backed
+/// tools — strict ordering costs nothing and makes call semantics predictable.
 pub struct SidecarServer {
     home: PathBuf,
     gate: tokio::sync::Mutex<()>,
+    order: Arc<ArrivalOrder>,
 }
 
 impl SidecarServer {
     /// Build the handler for an OpenPaw home (OPENPAW_HOME or ~/.openpaw).
     pub fn new(home: PathBuf) -> Self {
+        Self::with_arrival_order(home, Arc::new(ArrivalOrder::new()))
+    }
+
+    /// Build the handler sharing the arrival order that the transport stamps
+    /// its tickets with. Without stamped tickets (the HTTP shell) the gate
+    /// alone serializes the calls.
+    fn with_arrival_order(home: PathBuf, order: Arc<ArrivalOrder>) -> Self {
         Self {
             home,
             gate: tokio::sync::Mutex::new(()),
+            order,
         }
     }
 
@@ -395,9 +406,15 @@ impl ServerHandler for SidecarServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Serialize all tool invocations (see struct doc).
+        // Calls are serialized (gate) and, on transports that stamp arrival
+        // tickets, executed in arrival order (see `ArrivalOrder`). The turn is
+        // taken before the gate so a late call never blocks an earlier one.
+        let _turn = match context.extensions.get::<ArrivalTicket>() {
+            Some(ticket) => Some(self.order.wait(*ticket).await),
+            None => None,
+        };
         let _gate = self.gate.lock().await;
         let args = request.arguments.unwrap_or_default();
         match request.name.as_ref() {
@@ -430,6 +447,118 @@ impl ServerHandler for SidecarServer {
                 None,
             )),
         }
+    }
+}
+
+// ── arrival order ────────────────────────────────────────────────────────
+
+/// Ticket stamped on an inbound `tools/call` by the transport that read it.
+///
+/// rmcp 1.8 dispatches every inbound request in its own task (`serve_inner`),
+/// so the order in which handlers first run is scheduler order, not the order
+/// the client sent the frames. The transport is the only place that observes
+/// arrival, so it stamps a ticket into the request extensions; rmcp moves those
+/// into `RequestContext::extensions` and `call_tool` reads the ticket back.
+#[derive(Debug, Clone, Copy)]
+struct ArrivalTicket(u64);
+
+/// Turns arrival tickets back into strict first-arrived-first-served execution.
+#[derive(Debug)]
+struct ArrivalOrder {
+    next: AtomicU64,
+    turn: tokio::sync::watch::Sender<u64>,
+}
+
+impl ArrivalOrder {
+    /// Tickets start at zero and increase in arrival order.
+    fn new() -> Self {
+        let (turn, _) = tokio::sync::watch::channel(0u64);
+        Self {
+            next: AtomicU64::new(0),
+            turn,
+        }
+    }
+
+    /// Stamp the next arriving request.
+    fn stamp(&self) -> ArrivalTicket {
+        ArrivalTicket(self.next.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Wait for every earlier ticket to finish, then take this ticket's turn.
+    ///
+    /// The wait never holds the serialization gate, so a later call can only
+    /// wait for its turn — it can never block the call that owns the current
+    /// one.
+    async fn wait(&self, ticket: ArrivalTicket) -> ArrivalTurn<'_> {
+        let mut turn = self.turn.subscribe();
+        while *turn.borrow_and_update() != ticket.0 {
+            if turn.changed().await.is_err() {
+                break;
+            }
+        }
+        ArrivalTurn {
+            order: self,
+            ticket: ticket.0,
+        }
+    }
+}
+
+/// Holds one ticket's turn; dropping it releases the next ticket. A guard
+/// (rather than a plain counter bump) keeps the queue moving even when a tool
+/// call unwinds.
+struct ArrivalTurn<'a> {
+    order: &'a ArrivalOrder,
+    ticket: u64,
+}
+
+impl Drop for ArrivalTurn<'_> {
+    fn drop(&mut self) {
+        let _ = self.order.turn.send_replace(self.ticket + 1);
+    }
+}
+
+/// Wraps a transport and stamps every inbound `tools/call` with its arrival
+/// ticket, so `ArrivalOrder` can restore arrival order across rmcp's
+/// per-request tasks.
+struct ArrivalOrderTransport<T> {
+    inner: T,
+    order: Arc<ArrivalOrder>,
+}
+
+impl<T> ArrivalOrderTransport<T> {
+    fn new(inner: T, order: Arc<ArrivalOrder>) -> Self {
+        Self { inner, order }
+    }
+}
+
+impl<T> Transport<RoleServer> for ArrivalOrderTransport<T>
+where
+    T: Transport<RoleServer>,
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleServer>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    fn receive(&mut self) -> impl Future<Output = Option<RxJsonRpcMessage<RoleServer>>> + Send {
+        async move {
+            let mut message = self.inner.receive().await?;
+            if let JsonRpcMessage::Request(request) = &mut message {
+                if let ClientRequest::CallToolRequest(_) = &request.request {
+                    let ticket = self.order.stamp();
+                    request.request.extensions_mut().insert(ticket);
+                }
+            }
+            Some(message)
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
     }
 }
 
@@ -480,10 +609,17 @@ fn run_stdio_server() -> i32 {
         }
     };
     rt.block_on(async move {
-        let server = SidecarServer::new(openpaw_core::openpaw_home());
+        let order = Arc::new(ArrivalOrder::new());
+        let server = SidecarServer::with_arrival_order(openpaw_core::openpaw_home(), order.clone());
         // The stdio transport owns stdout for the protocol; nothing else may
-        // print there while the server runs.
-        match server.serve(rmcp::transport::stdio()).await {
+        // print there while the server runs. It is wrapped so every inbound
+        // `tools/call` carries its arrival ticket.
+        let (stdin, stdout) = rmcp::transport::stdio();
+        let transport = ArrivalOrderTransport::new(
+            rmcp::transport::async_rw::AsyncRwTransport::<RoleServer, _, _>::new(stdin, stdout),
+            order,
+        );
+        match server.serve(transport).await {
             Ok(running) => match running.waiting().await {
                 Ok(_) => 0,
                 Err(e) => {
@@ -528,14 +664,16 @@ async fn http_main() -> i32 {
         }
     });
 
-    // Dynamic port on loopback only; the bound URL goes to stdout so
-    // scripts/launchers can pick it up (stdio keeps stdout protocol-clean).
-    let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+    // Bind address and port are configurable for container deployments while
+    // preserving the loopback-only dynamic-port default for local clients.
+    let host = std::env::var("OPENPAW_SIDECAR_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port = std::env::var("OPENPAW_SIDECAR_PORT").unwrap_or_else(|_| "0".into());
+    let bind_addr = format!("{host}:{port}");
+    let listener = match std::net::TcpListener::bind(&bind_addr) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("error: cannot bind sidecar http listener on 127.0.0.1:0: {e}");
-            eprintln!("why: the sidecar HTTP transport binds loopback only, with a dynamic port.");
-            eprintln!("next: free a loopback listener slot or use --sidecar-transport stdio.");
+            eprintln!("error: cannot bind sidecar http listener on {bind_addr}: {e}");
+            eprintln!("next: set OPENPAW_SIDECAR_HOST/PORT or use --sidecar-transport stdio.");
             return 1;
         }
     };
@@ -924,6 +1062,62 @@ mod tests {
     #[test]
     fn unknown_transport_is_rejected() {
         assert_eq!(run_server("carrier-pigeon"), 1);
+    }
+
+    #[tokio::test]
+    async fn arrival_order_serves_tickets_in_stamp_order() {
+        let order = Arc::new(ArrivalOrder::new());
+        let first = order.stamp();
+        let second = order.stamp();
+        let log = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+
+        // The later ticket is started first and gets a full scheduler turn;
+        // the ticket order must still hold it back.
+        let late = {
+            let order = Arc::clone(&order);
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let _turn = order.wait(second).await;
+                log.lock().unwrap().push(2);
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "the later ticket ran before the earlier one"
+        );
+
+        let early = {
+            let order = Arc::clone(&order);
+            let log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let _turn = order.wait(first).await;
+                log.lock().unwrap().push(1);
+                // Hold the turn across a yield so the next ticket only runs
+                // after this call is really done.
+                tokio::task::yield_now().await;
+            })
+        };
+        early.await.unwrap();
+        late.await.unwrap();
+        assert_eq!(*log.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn arrival_order_releases_the_next_ticket_when_a_call_unwinds() {
+        let order = Arc::new(ArrivalOrder::new());
+        let first = order.stamp();
+        let second = order.stamp();
+        let panicked = tokio::spawn({
+            let order = Arc::clone(&order);
+            async move {
+                let _turn = order.wait(first).await;
+                panic!("tool call blew up");
+            }
+        });
+        assert!(panicked.await.is_err());
+        // The guard released the cursor, so the next ticket is served.
+        let _turn = order.wait(second).await;
     }
 
     fn text_of(result: &CallToolResult) -> String {

@@ -29,7 +29,12 @@ const CRATE_CAPS: &[(&str, usize)] = &[
 ];
 
 /// Shared budget for xtask + all test directories ("tests and helpers").
-const AUX_CAP: usize = 10_000;
+///
+/// 合并 A 线（openwork-attached-engine_host）后，`openpaw-cli/tests/sidecar_e2e.rs`
+/// 带入 A 线的 sidecar 到达顺序回归夹具：`recv_response` 改为缓冲乱序帧而不是丢弃，
+/// 修掉了「丢帧导致下一次等待永久挂起」的抖动。该夹具 +12 行，使 aux 由 9,991 升至
+/// 10,003。这里按合并范围把上限从 10,000 调到 10,100，而不是删除这条可靠性夹具。
+const AUX_CAP: usize = 10_100;
 /// B 线 engine-host 独立验证预算。
 ///
 /// engine-host 已作为独立 feature 扩展并拥有单独业务代码上限；其 HTTP、并发、持久化和重启

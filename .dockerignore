@@ -1,0 +1,7 @@
+.git
+.github
+.cargo
+target
+docs
+tests
+*.log
