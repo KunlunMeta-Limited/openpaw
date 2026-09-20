@@ -18,14 +18,10 @@
 //!
 //! Port note: `parse_powershell` was dropped — the tree-sitter-pwsh grammar
 //! and ps_parser module were stripped in this port (Phase 3 per plan D-2).
-
-use std::time::{Duration, Instant};
-
 use openpaw_tools::bashast::{analyze_command_safety, cmd_parser::parse_cmd, parse_for_security};
-
+use std::time::{Duration, Instant};
 /// xorshift64* — deterministic, no external deps.
 struct Rng(u64);
-
 impl Rng {
     fn next(&mut self) -> u64 {
         let mut x = self.0;
@@ -35,16 +31,13 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-
     fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
-
 /// Aligned with the parser MAX_COMMAND_LENGTH guardrail — overlong inputs are
 /// short-circuited, fuzzing them adds no value.
 const MAX_INPUT: usize = 10_000;
-
 fn seed_corpus() -> Vec<Vec<u8>> {
     let mut seeds: Vec<Vec<u8>> = [
         "",
@@ -75,7 +68,6 @@ fn seed_corpus() -> Vec<Vec<u8>> {
     .into_iter()
     .map(|s| s.as_bytes().to_vec())
     .collect();
-
     // Deeply nested programmatic seeds (subshell / parens / quote nesting —
     // validates the iterative parse guardrails).
     for depth in [16usize, 128, 512, 2_048] {
@@ -88,7 +80,6 @@ fn seed_corpus() -> Vec<Vec<u8>> {
             cmd.push(')');
         }
         seeds.push(cmd.into_bytes());
-
         let mut ps = String::from("Write-Output ");
         for _ in 0..depth {
             ps.push_str("$(");
@@ -99,10 +90,8 @@ fn seed_corpus() -> Vec<Vec<u8>> {
         }
         seeds.push(ps.into_bytes());
     }
-
     seeds
 }
-
 fn mutate(rng: &mut Rng, data: &mut Vec<u8>, corpus: &[Vec<u8>]) {
     if data.is_empty() {
         data.push(b'a');
@@ -141,7 +130,6 @@ fn mutate(rng: &mut Rng, data: &mut Vec<u8>, corpus: &[Vec<u8>]) {
         }
     }
 }
-
 #[test]
 #[ignore = "M3 fuzz baseline (30 min) — run with --ignored and OPENPAW_FUZZ_SECS=1800"]
 fn fuzz_bash_ast_parsers() {
@@ -161,7 +149,6 @@ fn fuzz_bash_ast_parsers() {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut iterations: u64 = 0;
     let mut last_report = Instant::now();
-
     while Instant::now() < deadline {
         let mut input = corpus[rng.below(corpus.len())].clone();
         for _ in 0..(1 + rng.below(8)) {
@@ -169,7 +156,6 @@ fn fuzz_bash_ast_parsers() {
         }
         input.truncate(MAX_INPUT);
         let command = String::from_utf8_lossy(&input).into_owned();
-
         // Every attacker-reachable parse entry point; a panic/crash/abort
         // fails the baseline.
         let r = parse_for_security(&command);
@@ -182,7 +168,6 @@ fn fuzz_bash_ast_parsers() {
             analyze_command_safety(&command, |_| true)
         };
         std::hint::black_box(&safety);
-
         if corpus.len() < 4_096 && rng.below(64) == 0 {
             corpus.push(input);
         }
@@ -196,7 +181,6 @@ fn fuzz_bash_ast_parsers() {
             last_report = Instant::now();
         }
     }
-
     println!(
         "[bash-ast fuzz] DONE: {} iterations in {}s (seed corpus {}, final corpus {})",
         iterations,

@@ -34,6 +34,30 @@ pub struct Cli {
     #[cfg(feature = "sidecar")]
     #[arg(long, default_value = "http")]
     pub sidecar_transport: String,
+    /// 是否启动兼容 OpenCode 的 engine-host（需要 `engine-host` feature）。
+    #[cfg(feature = "engine-host")]
+    #[arg(long)]
+    pub engine_host: bool,
+    /// engine-host 的回环监听地址；当前配置校验只允许 `127.0.0.1`。
+    #[cfg(feature = "engine-host")]
+    #[arg(long, default_value = "127.0.0.1")]
+    pub engine_host_hostname: String,
+    /// engine-host 的 TCP 端口；`0` 请求操作系统分配空闲端口。
+    #[cfg(feature = "engine-host")]
+    #[arg(long, default_value_t = 0)]
+    pub engine_host_port: u16,
+    /// Provider used by `--engine-host`.
+    #[cfg(feature = "engine-host")]
+    #[arg(long, default_value = "mock")]
+    pub provider: String,
+    /// `--engine-host` 使用的 OpenPaw home，会保存 session 等运行数据。
+    #[cfg(feature = "engine-host")]
+    #[arg(long)]
+    pub home: Option<PathBuf>,
+    /// `--engine-host` 使用的工作区根目录，工具访问不得越界。
+    #[cfg(feature = "engine-host")]
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
 }
 
 /// All top-level subcommands (the M5 selection).

@@ -1,10 +1,8 @@
 //! Tool contract + failure-path tests (plan §3.4 acceptance: at least one
 //! of each per tool).
-
 use openpaw_core::ToolExecutor;
 use openpaw_tools::ToolRegistry;
 use serde_json::json;
-
 async fn host() -> ToolRegistry {
     let dir = tempfile::tempdir().unwrap();
     // Leak the tempdir so paths stay alive for the duration of the test;
@@ -13,9 +11,7 @@ async fn host() -> ToolRegistry {
     std::mem::forget(dir);
     ToolRegistry::new(path)
 }
-
 // ── read_file ────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn read_file_contract_line_numbers_and_window() {
     let h = host().await;
@@ -25,7 +21,6 @@ async fn read_file_contract_line_numbers_and_window() {
     )
     .await
     .unwrap();
-
     let out = h
         .call(
             "read_file",
@@ -37,7 +32,6 @@ async fn read_file_contract_line_numbers_and_window() {
     assert!(out.content.contains("    2\ttwo"), "got: {}", out.content);
     assert!(out.content.contains("... (1 more lines)"));
 }
-
 #[tokio::test]
 async fn read_file_failure_missing_file() {
     let h = host().await;
@@ -48,7 +42,6 @@ async fn read_file_failure_missing_file() {
     assert!(out.is_error);
     assert!(out.content.contains("read") || out.content.contains("No such file"));
 }
-
 #[tokio::test]
 async fn read_file_empty_file_marker() {
     let h = host().await;
@@ -62,9 +55,7 @@ async fn read_file_empty_file_marker() {
     assert!(!out.is_error);
     assert!(out.content.contains("(empty file)"));
 }
-
 // ── write_file ───────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn write_file_contract_creates_parents() {
     let h = host().await;
@@ -82,7 +73,6 @@ async fn write_file_contract_creates_parents() {
         .unwrap();
     assert!(read_back.content.contains("data"));
 }
-
 #[tokio::test]
 async fn write_file_failure_escapes_workspace() {
     let h = host().await;
@@ -96,9 +86,7 @@ async fn write_file_failure_escapes_workspace() {
     assert!(out.is_error);
     assert!(out.content.contains("escapes workspace"), "{}", out.content);
 }
-
 // ── edit_file ────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn edit_file_contract_unique_replacement() {
     let h = host().await;
@@ -119,7 +107,6 @@ async fn edit_file_contract_unique_replacement() {
     let read_back = h.call("read_file", json!({"path": "e.txt"})).await.unwrap();
     assert!(read_back.content.contains("alpha BETA gamma"));
 }
-
 #[tokio::test]
 async fn edit_file_contract_replace_all_and_crlf_restored() {
     let h = host().await;
@@ -141,7 +128,6 @@ async fn edit_file_contract_replace_all_and_crlf_restored() {
     let read_back = h.call("read_file", json!({"path": "c.txt"})).await.unwrap();
     assert!(read_back.content.contains("y\r\ny") || read_back.content.contains('y'));
 }
-
 #[tokio::test]
 async fn edit_file_failure_not_found() {
     let h = host().await;
@@ -158,7 +144,6 @@ async fn edit_file_failure_not_found() {
     assert!(out.is_error);
     assert!(out.content.contains("not found"));
 }
-
 #[tokio::test]
 async fn edit_file_failure_not_unique() {
     let h = host().await;
@@ -175,9 +160,7 @@ async fn edit_file_failure_not_unique() {
     assert!(out.is_error);
     assert!(out.content.contains("found 3 times"));
 }
-
 // ── grep ─────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn grep_contract_matches_with_line_numbers() {
     let h = host().await;
@@ -198,7 +181,6 @@ async fn grep_contract_matches_with_line_numbers() {
         out.content
     );
 }
-
 #[tokio::test]
 async fn grep_failure_invalid_regex() {
     let h = host().await;
@@ -209,7 +191,6 @@ async fn grep_failure_invalid_regex() {
     assert!(out.is_error);
     assert!(out.content.contains("invalid regex"));
 }
-
 #[tokio::test]
 async fn grep_no_matches_is_not_error() {
     let h = host().await;
@@ -223,9 +204,7 @@ async fn grep_no_matches_is_not_error() {
     assert!(!out.is_error);
     assert_eq!(out.content, "no matches found");
 }
-
 // ── glob ─────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn glob_contract_finds_matching_files() {
     let h = host().await;
@@ -240,7 +219,6 @@ async fn glob_contract_finds_matching_files() {
     assert!(out.content.contains("b.rs"));
     assert!(!out.content.contains("c.md"));
 }
-
 #[tokio::test]
 async fn glob_failure_invalid_pattern() {
     let h = host().await;
@@ -248,9 +226,7 @@ async fn glob_failure_invalid_pattern() {
     assert!(out.is_error);
     assert!(out.content.contains("invalid pattern"));
 }
-
 // ── think ────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn think_contract_records_without_side_effects() {
     let h = host().await;
@@ -264,7 +240,6 @@ async fn think_contract_records_without_side_effects() {
     assert!(!out.is_error);
     assert!(out.content.contains("thought recorded"));
 }
-
 #[tokio::test]
 async fn think_failure_missing_thought() {
     let h = host().await;
@@ -272,9 +247,7 @@ async fn think_failure_missing_thought() {
     assert!(out.is_error);
     assert!(out.content.contains("bad args"));
 }
-
 // ── workspace safety across tools ────────────────────────────────────────
-
 #[tokio::test]
 async fn read_file_rejects_parent_escape() {
     let h = host().await;

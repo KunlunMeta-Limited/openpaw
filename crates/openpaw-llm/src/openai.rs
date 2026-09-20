@@ -12,6 +12,7 @@ use openpaw_core::{
 use serde_json::json;
 
 use crate::http::{classify_http_error, complete_client, stream_client};
+use crate::sse::MAX_STREAM_ACCUMULATED_BYTES;
 
 pub struct OpenAiProvider {
     api_key: String,
@@ -41,7 +42,11 @@ impl OpenAiProvider {
     /// - system prompt → leading `system` message
     /// - assistant tool_use → `tool_calls`
     /// - user tool_result → `role: tool` messages
-    fn build_messages(&self, req: &CompletionRequest) -> Vec<serde_json::Value> {
+    fn build_messages(
+        &self,
+        req: &CompletionRequest,
+        include_reasoning: bool,
+    ) -> Vec<serde_json::Value> {
         let mut messages: Vec<serde_json::Value> = Vec::new();
         if let Some(system) = &req.system {
             messages.push(json!({"role": "system", "content": system}));
@@ -75,10 +80,14 @@ impl OpenAiProvider {
                 }
                 Role::Assistant => {
                     let mut text_parts: Vec<String> = Vec::new();
+                    let mut reasoning_parts: Vec<String> = Vec::new();
                     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
                     for block in &m.content {
                         match block {
                             ContentBlock::Text { text } => text_parts.push(text.clone()),
+                            ContentBlock::Thinking { thinking, .. } => {
+                                reasoning_parts.push(thinking.clone())
+                            }
                             ContentBlock::ToolUse { id, name, input } => {
                                 tool_calls.push(json!({
                                     "id": id,
@@ -96,6 +105,9 @@ impl OpenAiProvider {
                     if !text_parts.is_empty() {
                         msg["content"] = json!(text_parts.join("\n"));
                     }
+                    if include_reasoning && !reasoning_parts.is_empty() {
+                        msg["reasoning_content"] = json!(reasoning_parts.join("\n"));
+                    }
                     if !tool_calls.is_empty() {
                         msg["tool_calls"] = json!(tool_calls);
                     }
@@ -112,9 +124,11 @@ impl OpenAiProvider {
         } else {
             req.model.clone()
         };
+        let deepseek_dialect = model.to_ascii_lowercase().starts_with("deepseek-")
+            || self.base_url.to_ascii_lowercase().contains("deepseek");
         let mut body = json!({
             "model": model,
-            "messages": self.build_messages(req),
+            "messages": self.build_messages(req, deepseek_dialect),
             "max_tokens": if req.max_tokens > 0 { req.max_tokens } else { 4096 },
             "stream": stream,
         });
@@ -155,12 +169,21 @@ impl OpenAiProvider {
         }
     }
 
-    fn map_finish_reason(fr: Option<&str>) -> StopReason {
+    fn map_finish_reason(fr: Option<&str>) -> Result<StopReason> {
         match fr {
-            Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
-            Some("length") => StopReason::MaxTokens,
-            Some("stop") => StopReason::EndTurn,
-            _ => StopReason::Other,
+            Some("tool_calls") | Some("function_call") => Ok(StopReason::ToolUse),
+            Some("length") => Ok(StopReason::MaxTokens),
+            Some("stop") => Ok(StopReason::EndTurn),
+            Some(reason @ ("aborted" | "insufficient_system_resource")) => {
+                Err(Error::server_error(
+                    503,
+                    format!("OpenAI 兼容服务中断生成：finish_reason={reason}"),
+                ))
+            }
+            Some(reason) => Err(Error::Provider(format!(
+                "OpenAI 兼容服务返回未支持的 finish_reason={reason}"
+            ))),
+            None => Err(Error::Provider("OpenAI 兼容服务缺少 finish_reason".into())),
         }
     }
 }
@@ -200,6 +223,14 @@ impl LlmProvider for OpenAiProvider {
             .ok_or_else(|| Error::Provider("openai: no choices in response".into()))?;
         let message = choice.get("message").cloned().unwrap_or(json!({}));
         let mut content: Vec<ContentBlock> = Vec::new();
+        if let Some(thinking) = message.get("reasoning_content").and_then(|c| c.as_str()) {
+            if !thinking.is_empty() {
+                content.push(ContentBlock::Thinking {
+                    thinking: thinking.into(),
+                    signature: None,
+                });
+            }
+        }
         if let Some(text) = message.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
                 content.push(ContentBlock::Text { text: text.into() });
@@ -221,8 +252,17 @@ impl LlmProvider for OpenAiProvider {
                 let args_str = function
                     .get("arguments")
                     .and_then(|a| a.as_str())
-                    .unwrap_or("{}");
-                let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                    .ok_or_else(|| {
+                        Error::Provider("OpenAI tool_call 缺少 arguments 字符串".into())
+                    })?;
+                let input: serde_json::Value = serde_json::from_str(args_str).map_err(|error| {
+                    Error::Provider(format!("OpenAI tool_call arguments JSON 无效：{error}"))
+                })?;
+                if !input.is_object() {
+                    return Err(Error::Provider(
+                        "OpenAI tool_call arguments 必须是 JSON object".into(),
+                    ));
+                }
                 content.push(ContentBlock::ToolUse { id, name, input });
             }
         }
@@ -230,7 +270,7 @@ impl LlmProvider for OpenAiProvider {
             content,
             stop_reason: Self::map_finish_reason(
                 choice.get("finish_reason").and_then(|f| f.as_str()),
-            ),
+            )?,
             usage: Self::parse_usage(v.get("usage")),
         })
     }
@@ -284,17 +324,46 @@ impl LlmProvider for OpenAiProvider {
                         return None;
                     }
                     match stream.next().await {
-                        Some(Ok(bytes)) => {
-                            for frame in decoder.feed(&bytes) {
-                                state.absorb(&frame, &mut queue);
+                        Some(Ok(bytes)) => match decoder.feed(&bytes) {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    if let Err(error) = state.absorb(&frame, &mut queue) {
+                                        queue.push_back(Err(error));
+                                        finished = true;
+                                        break;
+                                    }
+                                }
                             }
-                        }
+                            Err(error) => {
+                                queue.push_back(Err(error));
+                                finished = true;
+                            }
+                        },
                         Some(Err(e)) => {
                             queue.push_back(Err(e));
                             finished = true;
                         }
                         None => {
-                            state.finish(&mut queue);
+                            match decoder.finish() {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        if let Err(error) = state.absorb(&frame, &mut queue) {
+                                            queue.push_back(Err(error));
+                                            finished = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    queue.push_back(Err(error));
+                                    finished = true;
+                                }
+                            }
+                            if !finished {
+                                if let Err(error) = state.finish(&mut queue) {
+                                    queue.push_back(Err(error));
+                                }
+                            }
                             finished = true;
                         }
                     }
@@ -326,30 +395,204 @@ impl LlmProvider for OpenAiProvider {
 /// finish (OpenAI has no per-tool block lifecycle).
 #[derive(Default)]
 struct OpenAiStreamState {
+    reasoning: String,
+    text: String,
     tool_calls: std::collections::BTreeMap<usize, (String, String, String)>, // id, name, args
     usage: Usage,
     stop_reason: Option<StopReason>,
+    error: Option<OpenAiStreamError>,
+    done: bool,
+    accumulated_bytes: usize,
+}
+
+#[derive(Debug)]
+struct OpenAiStreamError {
+    status: Option<u16>,
+    code: Option<String>,
+    error_type: Option<String>,
+    message: String,
+    retry_after_secs: Option<u64>,
+}
+
+impl OpenAiStreamError {
+    /// 把 OpenAI 兼容服务的流内错误转换为 OpenPaw 稳定错误分类。
+    fn into_error(self) -> Error {
+        let status = self.status.or_else(|| {
+            [&self.code, &self.error_type, &Some(self.message.clone())]
+                .into_iter()
+                .flatten()
+                .find_map(|value| parse_status(value))
+        });
+        let detail = self
+            .code
+            .as_deref()
+            .or(self.error_type.as_deref())
+            .map(|kind| format!("{kind}: "))
+            .unwrap_or_default();
+        let message = format!("OpenAI 兼容服务流式请求失败：{detail}{}", self.message);
+        if let Some(status @ 500..=599) = status {
+            return Error::server_error(status, message);
+        }
+        if status == Some(429)
+            || self.retry_after_secs.is_some()
+            || is_rate_limit_text(&self.message)
+            || self.code.as_deref().is_some_and(is_rate_limit_text)
+            || self.error_type.as_deref().is_some_and(is_rate_limit_text)
+        {
+            return Error::rate_limited(message, self.retry_after_secs);
+        }
+        if is_unavailable_text(&self.message)
+            || self.code.as_deref().is_some_and(is_unavailable_text)
+            || self.error_type.as_deref().is_some_and(is_unavailable_text)
+        {
+            return Error::server_error(503, message);
+        }
+        Error::Provider(message)
+    }
+}
+
+/// 识别兼容服务在 HTTP 200 流内返回的过载或暂时不可用标记。
+fn is_unavailable_text(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("overloaded")
+        || lower.contains("capacity")
+        || lower.contains("service unavailable")
+        || lower.contains("service_unavailable")
+        || lower.contains("too busy")
+        || lower.contains("insufficient_system_resource")
+}
+
+fn is_rate_limit_text(value: &str) -> bool {
+    let lower = value.to_lowercase();
+    lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
+        || lower.contains("too_many_requests")
+        || lower.contains("too-many-requests")
+}
+
+fn parse_status(value: &str) -> Option<u16> {
+    if let Ok(status) = value.trim().parse::<u16>() {
+        return Some(status);
+    }
+    let lower = value.to_lowercase();
+    [500u16, 502, 503, 529, 429].into_iter().find(|status| {
+        lower.contains(&format!("http {status}"))
+            || lower.contains(&format!("status {status}"))
+            || lower.contains(&format!("http_{status}"))
+            || lower.contains(&format!("status_{status}"))
+    })
+}
+
+fn parse_retry_after(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
 }
 
 impl OpenAiStreamState {
+    fn reserve_bytes(&mut self, amount: usize) -> Result<()> {
+        let Some(total) = self.accumulated_bytes.checked_add(amount) else {
+            return Err(Error::Provider("OpenAI 流累计内容长度计算溢出".into()));
+        };
+        if total > MAX_STREAM_ACCUMULATED_BYTES {
+            return Err(Error::Provider(format!(
+                "OpenAI 流累计内容超过上限：{total} > {MAX_STREAM_ACCUMULATED_BYTES} 字节"
+            )));
+        }
+        self.accumulated_bytes = total;
+        Ok(())
+    }
+
     fn absorb(
         &mut self,
         frame: &crate::sse::Frame,
         queue: &mut std::collections::VecDeque<openpaw_core::Result<StreamEvent>>,
-    ) {
-        let data = &frame.data;
-        if data.as_str() == Some("[DONE]") {
-            return;
+    ) -> Result<()> {
+        let data = match &frame.data {
+            crate::sse::SseData::Done => {
+                if self.done {
+                    return Err(Error::Provider("OpenAI 重复返回 [DONE] 终止帧".into()));
+                }
+                self.done = true;
+                return Ok(());
+            }
+            crate::sse::SseData::Json(data) => data,
+        };
+        if self.done {
+            return Err(Error::Provider("OpenAI [DONE] 之后仍收到数据帧".into()));
+        }
+        if let Some(error) = data.get("error") {
+            let message = error
+                .get("message")
+                .and_then(|value| value.as_str())
+                .or_else(|| error.as_str())
+                .unwrap_or("OpenAI 兼容服务返回了未知流式错误");
+            let status = error
+                .get("status")
+                .or_else(|| data.get("status"))
+                .and_then(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|status| u16::try_from(status).ok())
+                        .or_else(|| value.as_str().and_then(|value| value.parse::<u16>().ok()))
+                })
+                .or_else(|| {
+                    [
+                        Some(message),
+                        error.get("code").and_then(|value| value.as_str()),
+                        error.get("type").and_then(|value| value.as_str()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .find_map(parse_status)
+                });
+            let retry_after_secs = error
+                .get("retry_after")
+                .or_else(|| error.get("retry_after_secs"))
+                .or_else(|| data.get("retry_after"))
+                .or_else(|| data.get("retry_after_secs"))
+                .and_then(parse_retry_after);
+            self.error = Some(OpenAiStreamError {
+                status,
+                code: error
+                    .get("code")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                error_type: error
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                message: message.to_string(),
+                retry_after_secs,
+            });
+            return Ok(());
+        }
+        if self.error.is_some() {
+            return Ok(());
         }
         if let Some(u) = data.get("usage") {
             self.usage = OpenAiProvider::parse_usage(Some(u));
         }
         let Some(choice) = data.get("choices").and_then(|c| c.get(0)) else {
-            return;
+            return Ok(());
         };
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
+        if let Some(thinking) = delta.get("reasoning_content").and_then(|c| c.as_str()) {
+            if !thinking.is_empty() {
+                self.reserve_bytes(thinking.len())?;
+                self.reasoning.push_str(thinking);
+                queue.push_back(Ok(StreamEvent::ThinkingDelta {
+                    index: 0,
+                    text: thinking.to_string(),
+                }));
+            }
+        }
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
+                self.reserve_bytes(text.len())?;
+                self.text.push_str(text);
                 queue.push_back(Ok(StreamEvent::TextDelta {
                     index: 0,
                     text: text.to_string(),
@@ -359,41 +602,61 @@ impl OpenAiStreamState {
         if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
             for tc in tcs {
                 let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
-                let entry = self.tool_calls.entry(idx).or_insert_with(|| {
-                    (
-                        tc.get("id")
-                            .and_then(|i| i.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        String::new(),
-                        String::new(),
-                    )
-                });
-                if let Some(name) = tc
+                if idx >= 1024 {
+                    return Err(Error::Provider(format!(
+                        "OpenAI tool_call index 超过上限：{idx} >= 1024"
+                    )));
+                }
+                let id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let name = tc
                     .get("function")
                     .and_then(|f| f.get("name"))
-                    .and_then(|n| n.as_str())
-                {
-                    entry.1.push_str(name);
-                }
-                if let Some(args) = tc
+                    .and_then(|n| n.as_str());
+                let args = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                {
+                    .and_then(|a| a.as_str());
+                self.reserve_bytes(
+                    id.len()
+                        .saturating_add(name.map_or(0, str::len))
+                        .saturating_add(args.map_or(0, str::len)),
+                )?;
+                let entry = self
+                    .tool_calls
+                    .entry(idx)
+                    .or_insert_with(|| (id.to_string(), String::new(), String::new()));
+                if entry.0.is_empty() && !id.is_empty() {
+                    entry.0.push_str(id);
+                }
+                if let Some(name) = name {
+                    entry.1.push_str(name);
+                }
+                if let Some(args) = args {
                     entry.2.push_str(args);
                 }
             }
         }
         if let Some(fr) = choice.get("finish_reason").and_then(|f| f.as_str()) {
-            self.stop_reason = Some(OpenAiProvider::map_finish_reason(Some(fr)));
+            self.stop_reason = Some(OpenAiProvider::map_finish_reason(Some(fr))?);
         }
+        Ok(())
     }
 
     fn finish(
         &mut self,
         queue: &mut std::collections::VecDeque<openpaw_core::Result<StreamEvent>>,
-    ) {
+    ) -> Result<()> {
+        if let Some(message) = self.error.take() {
+            return Err(message.into_error());
+        }
+        if !self.done {
+            return Err(Error::Provider(
+                "OpenAI 流在 [DONE] 前结束，拒绝生成成功响应".into(),
+            ));
+        }
+        let stop_reason = self.stop_reason.ok_or_else(|| {
+            Error::Provider("OpenAI 流缺少合法 finish_reason，拒绝生成成功响应".into())
+        })?;
         // Assemble accumulated tool_call fragments: emit a ToolUseStart per
         // call, and the Final response carries the assembled blocks.
         let calls: Vec<(usize, String, String, String)> = std::mem::take(&mut self.tool_calls)
@@ -401,8 +664,33 @@ impl OpenAiStreamState {
             .map(|(idx, (id, name, args))| (idx, id, name, args))
             .collect();
         let mut final_content: Vec<ContentBlock> = Vec::new();
+        if !self.reasoning.is_empty() {
+            final_content.push(ContentBlock::Thinking {
+                thinking: std::mem::take(&mut self.reasoning),
+                signature: None,
+            });
+        }
+        if !self.text.is_empty() {
+            final_content.push(ContentBlock::Text {
+                text: std::mem::take(&mut self.text),
+            });
+        }
         for (idx, id, name, args) in &calls {
-            let input: serde_json::Value = serde_json::from_str(args).unwrap_or(json!({}));
+            if id.is_empty() || name.is_empty() {
+                return Err(Error::Provider(format!(
+                    "OpenAI tool_call {idx} 缺少 id 或 function.name"
+                )));
+            }
+            let input: serde_json::Value = serde_json::from_str(args).map_err(|error| {
+                Error::Provider(format!(
+                    "OpenAI tool_call {idx} arguments JSON 不完整或无效：{error}"
+                ))
+            })?;
+            if !input.is_object() {
+                return Err(Error::Provider(format!(
+                    "OpenAI tool_call {idx} arguments 必须是 JSON object"
+                )));
+            }
             final_content.push(ContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
@@ -416,8 +704,80 @@ impl OpenAiStreamState {
         }
         queue.push_back(Ok(StreamEvent::Final(Box::new(CompletionResponse {
             content: final_content,
-            stop_reason: self.stop_reason.unwrap_or(StopReason::Other),
+            stop_reason,
             usage: self.usage,
         }))));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stream_state_tests {
+    use super::*;
+    use crate::sse::{Frame, SseData};
+    use openpaw_core::{Message, ToolSpec};
+
+    #[test]
+    fn openai_stream_state_enforces_accumulated_limit() {
+        let mut state = OpenAiStreamState::default();
+        let mut queue = std::collections::VecDeque::new();
+        let megabyte = "x".repeat(1024 * 1024);
+        for _ in 0..16 {
+            let frame = Frame {
+                event: String::new(),
+                data: SseData::Json(json!({
+                    "choices": [{"delta": {"content": megabyte}}]
+                })),
+            };
+            state
+                .absorb(&frame, &mut queue)
+                .expect("exact accumulated limit remains valid");
+        }
+        assert_eq!(state.accumulated_bytes, MAX_STREAM_ACCUMULATED_BYTES);
+
+        let over = Frame {
+            event: String::new(),
+            data: SseData::Json(json!({
+                "choices": [{"delta": {"content": "x"}}]
+            })),
+        };
+        let error = state.absorb(&over, &mut queue).unwrap_err();
+        assert!(error.to_string().contains("累计内容超过上限"));
+        assert!(!queue
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::Final(_)))));
+    }
+
+    #[test]
+    fn deepseek_tool_followup_body_preserves_reasoning_and_tool_schema() {
+        let provider =
+            OpenAiProvider::new("sk", "deepseek-chat").with_base_url("https://api.deepseek.com");
+        let request = CompletionRequest {
+            model: "deepseek-chat".into(),
+            max_tokens: 100,
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        thinking: "分析".into(),
+                        signature: None,
+                    },
+                    ContentBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "read_file".into(),
+                        input: json!({"path":"a.md"}),
+                    },
+                ],
+                ..Default::default()
+            }],
+            tools: vec![ToolSpec::new("read_file", "读取文件")],
+            ..Default::default()
+        };
+        let body = provider.build_body(&request, true);
+        assert_eq!(body["max_tokens"], json!(100));
+        assert_eq!(body["messages"][0]["reasoning_content"], json!("分析"));
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], json!("call_1"));
+        assert_eq!(body["tools"][0]["function"]["name"], json!("read_file"));
+        assert!(body.get("reasoning_effort").is_none());
     }
 }

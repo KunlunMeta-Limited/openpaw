@@ -171,24 +171,54 @@ impl LlmProvider for AnthropicProvider {
                         return None;
                     }
                     match stream.next().await {
-                        Some(Ok(bytes)) => {
-                            for frame in decoder.feed(&bytes) {
-                                queue.extend(assembler.absorb(&frame));
+                        Some(Ok(bytes)) => match decoder.feed(&bytes) {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    match assembler.absorb(&frame) {
+                                        Ok(events) => queue.extend(events.into_iter().map(Ok)),
+                                        Err(error) => {
+                                            queue.push_back(Err(error));
+                                            finished = true;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                        }
+                            Err(error) => {
+                                queue.push_back(Err(error));
+                                finished = true;
+                            }
+                        },
                         Some(Err(e)) => {
                             queue.push_back(Err(e));
                             finished = true; // don't finalize after a read error
                         }
                         None => {
-                            for frame in decoder.finish() {
-                                queue.extend(assembler.absorb(&frame));
-                            }
-                            match assembler.finalize() {
-                                Ok(resp) => {
-                                    queue.push_back(Ok(StreamEvent::Final(Box::new(resp))));
+                            match decoder.finish() {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        match assembler.absorb(&frame) {
+                                            Ok(events) => queue.extend(events.into_iter().map(Ok)),
+                                            Err(error) => {
+                                                queue.push_back(Err(error));
+                                                finished = true;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
-                                Err(e) => queue.push_back(Err(e)),
+                                Err(error) => {
+                                    queue.push_back(Err(error));
+                                    finished = true;
+                                }
+                            }
+                            if !finished {
+                                match assembler.finalize() {
+                                    Ok(resp) => {
+                                        queue.push_back(Ok(StreamEvent::Final(Box::new(resp))));
+                                    }
+                                    Err(error) => queue.push_back(Err(error)),
+                                }
                             }
                             finished = true;
                         }

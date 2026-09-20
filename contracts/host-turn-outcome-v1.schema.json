@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpaw.local/contracts/host-turn-outcome-v1.schema.json",
+  "title": "OpenPaw 回合状态数组契约 v1",
+  "description": "约束 Host GET /session/:id/turns 返回的回合最新状态数组；失败内容已经脱敏且不属于模型消息。",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/turnOutcome"
+  },
+  "$defs": {
+    "turnOutcome": {
+      "title": "单个回合状态",
+      "description": "按回合首次出现顺序返回的最新状态快照。",
+      "type": "object",
+      "required": ["turnID", "userMessageID", "state"],
+      "properties": {
+        "turnID": {
+          "title": "回合编号",
+          "description": "Host 为本回合生成的稳定编号。",
+          "type": "string",
+          "minLength": 1
+        },
+        "userMessageID": {
+          "title": "用户消息编号",
+          "description": "触发本回合的 user message 稳定编号。",
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "title": "回合状态",
+          "description": "状态只能从 queued/running 进入 completed、failed 或 cancelled 终态。",
+          "type": "string",
+          "enum": ["queued", "running", "completed", "failed", "cancelled"]
+        },
+        "queuedAt": {
+          "title": "排队时间",
+          "description": "进入全局等待队列的 Unix 毫秒时间；立即运行时省略。",
+          "type": "integer"
+        },
+        "startedAt": {
+          "title": "开始时间",
+          "description": "取得 Provider permit 并开始运行的 Unix 毫秒时间。",
+          "type": "integer"
+        },
+        "completedAt": {
+          "title": "结束时间",
+          "description": "completed、failed 或 cancelled 终态的 Unix 毫秒时间。",
+          "type": "integer"
+        },
+        "error": {
+          "$ref": "#/$defs/turnError"
+        }
+      },
+      "additionalProperties": false
+    },
+    "turnError": {
+      "title": "脱敏回合错误",
+      "description": "只包含稳定错误码、安全中文说明和可重试标志，不得包含原始上游响应。",
+      "type": "object",
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "provider_rate_limited",
+            "provider_overloaded",
+            "provider_server_error",
+            "provider_timeout",
+            "provider_protocol_error",
+            "provider_auth_failed",
+            "context_too_long",
+            "cancelled",
+            "host_restarted",
+            "persistence_failed",
+            "turn_failed"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

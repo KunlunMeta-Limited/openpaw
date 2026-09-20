@@ -146,7 +146,12 @@ pub fn run(args: ChatArgs) -> i32 {
         let user_msg = openpaw_core::Message::user_text(trimmed.to_string());
         let pre_len = session.messages.len();
         session.messages.push(user_msg.clone());
-        let _ = writer.append(&SessionEvent::Message(user_msg.clone()));
+        // The transcript is the durable conversation record: a failed append
+        // means the session on disk no longer matches this run, so the
+        // command must fail loudly instead of returning 0.
+        if let Err(error) = writer.append(&SessionEvent::Message(user_msg.clone())) {
+            return report_persistence_error("persist the user message", &transcript_path, &error);
+        }
         if let Some(db) = &session_db {
             if let Err(e) =
                 db.index_event(&session.meta.id, pre_len, &SessionEvent::Message(user_msg))
@@ -183,7 +188,13 @@ pub fn run(args: ChatArgs) -> i32 {
             if matches!(msg.role, openpaw_core::Role::User) {
                 continue;
             }
-            let _ = writer.append(&SessionEvent::Message(msg.clone()));
+            if let Err(error) = writer.append(&SessionEvent::Message(msg.clone())) {
+                return report_persistence_error(
+                    "persist the assistant message",
+                    &transcript_path,
+                    &error,
+                );
+            }
             if let Some(db) = &session_db {
                 if let Err(e) = db.index_event(
                     &session.meta.id,
@@ -203,12 +214,18 @@ pub fn run(args: ChatArgs) -> i32 {
                 ..
             } = ev
             {
-                let _ = writer.append(&SessionEvent::ToolCallComplete {
+                if let Err(error) = writer.append(&SessionEvent::ToolCallComplete {
                     call_id: String::new(),
                     tool_name: name.clone().unwrap_or_default(),
                     success: !*is_error,
                     duration_ms: None,
-                });
+                }) {
+                    return report_persistence_error(
+                        "persist the tool result",
+                        &transcript_path,
+                        &error,
+                    );
+                }
                 if interactive {
                     let mark = if *is_error { "!" } else { "·" };
                     let preview: String = content.chars().take(80).collect();
@@ -241,4 +258,22 @@ pub fn run(args: ChatArgs) -> i32 {
         println!("bye. session saved to {}", transcript_path.display());
     }
     0
+}
+
+/// 功能：报告 transcript 写入失败并返回非零退出码。
+/// 参数：`operation` 是失败的写入动作，`path` 是 session 文件，`error` 是存储错误。
+/// 返回：失败操作固定返回 1。
+/// 安全：只输出路径与错误文本，不输出消息正文。
+fn report_persistence_error(
+    operation: &str,
+    path: &std::path::Path,
+    error: &openpaw_store::SessionError,
+) -> i32 {
+    eprintln!("error: failed to {operation}: {error}");
+    eprintln!(
+        "why: the session file {} could not be written completely.",
+        path.display()
+    );
+    eprintln!("next: check disk space and permissions under OPENPAW_HOME, then re-run.");
+    1
 }

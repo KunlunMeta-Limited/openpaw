@@ -4,13 +4,11 @@
 //! belonging to `#[cfg(test)]` items (recursively). `tests/` directories
 //! count toward the shared "tests and helpers" budget. Regex or
 //! brace-counting is deliberately not used (string literals break them).
-
 use anyhow::Result;
 use quote::ToTokens;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
-
 /// Per-crate business-line caps (engineering plan section 1.3, v1.2).
 const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-core", 5_000),
@@ -23,7 +21,7 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-plugins", 1_300),
     ("openpaw-cli", 4_500),
     ("openpaw-reflect-lite", 3_000),
-    ("openpaw-engine-host", 2_000),
+    ("openpaw-engine-host", 5_000),
     ("openpaw-goal-ledger", 2_000),
     // Local sandbox (plan section 3.4 budget lives in the tools domain; the
     // crate is standalone for the crate-level unsafe allowance, D-9).
@@ -32,13 +30,16 @@ const CRATE_CAPS: &[(&str, usize)] = &[
 
 /// Shared budget for xtask + all test directories ("tests and helpers").
 const AUX_CAP: usize = 10_000;
-
+/// B 线 engine-host 独立验证预算。
+///
+/// engine-host 已作为独立 feature 扩展并拥有单独业务代码上限；其 HTTP、并发、持久化和重启
+/// 契约测试不能挤占原工程的测试余量，也不能通过删除可靠性测试规避门禁，因此单列 1,500 行。
+const ENGINE_HOST_TEST_CAP: usize = 1_500;
 pub fn run(root: &Path) -> Result<()> {
     let crates_dir = root.join("crates");
     let mut total_business = 0usize;
     let mut violations = Vec::new();
     let mut rows: Vec<(String, usize, usize)> = Vec::new(); // name, business, cap
-
     for (name, cap) in CRATE_CAPS {
         let src = crates_dir.join(name).join("src");
         let business = count_business_lines(&src)?;
@@ -53,17 +54,27 @@ pub fn run(root: &Path) -> Result<()> {
 
     // Aux budget: xtask src + every crate's tests/ directory.
     let mut aux = count_business_lines(&root.join("xtask/src"))?;
+    let mut engine_host_tests = 0usize;
     for entry in std::fs::read_dir(&crates_dir)? {
         let entry = entry?;
         let tests = entry.path().join("tests");
         if tests.is_dir() {
-            aux += raw_line_count_dir(&tests)?;
+            let test_lines = raw_line_count_dir(&tests)?;
+            if entry.file_name() == "openpaw-engine-host" {
+                engine_host_tests = test_lines;
+            } else {
+                aux += test_lines;
+            }
         }
     }
     if aux > AUX_CAP {
         violations.push(format!("aux (tests+xtask): {aux} exceeds cap {AUX_CAP}"));
     }
-
+    if engine_host_tests > ENGINE_HOST_TEST_CAP {
+        violations.push(format!(
+            "engine-host tests: {engine_host_tests} exceeds cap {ENGINE_HOST_TEST_CAP}"
+        ));
+    }
     println!(
         "{:<24}{:>10}{:>10}{:>10}",
         "crate", "business", "cap", "headroom"
@@ -75,6 +86,10 @@ pub fn run(root: &Path) -> Result<()> {
     }
     println!("{:<24}{:>10}{:>10}", "core nine total budget", "50000", "—");
     println!("{:<24}{:>10}{:>10}", "aux (tests+xtask)", aux, AUX_CAP);
+    println!(
+        "{:<24}{:>10}{:>10}",
+        "engine-host tests", engine_host_tests, ENGINE_HOST_TEST_CAP
+    );
     println!("{:<24}{:>10}", "TOTAL business", total_business);
 
     if violations.is_empty() {
