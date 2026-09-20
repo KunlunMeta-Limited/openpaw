@@ -1,0 +1,8 @@
+{
+  "id": "permission-id",
+  "sessionID": "session-id",
+  "permission": "read_file",
+  "patterns": ["workspace file"],
+  "metadata": {},
+  "always": []
+}

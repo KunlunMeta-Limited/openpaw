@@ -8,6 +8,8 @@
     {
       "error_tools": [],
       "event_kinds": [
+        "message_start",
+        "text_delta",
         "turn_usage"
       ],
       "stop": "end_turn",

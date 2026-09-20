@@ -77,6 +77,17 @@ fn root_help_lists_all_twelve_subcommands_and_version() {
         help.contains("Usage:"),
         "root help must render a usage block:\n{help}"
     );
+    #[cfg(feature = "engine-host")]
+    for flag in [
+        "--engine-host",
+        "--engine-host-hostname",
+        "--engine-host-port",
+    ] {
+        assert!(
+            help.contains(flag),
+            "root help must mention `{flag}`:\n{help}"
+        );
+    }
 }
 
 #[test]

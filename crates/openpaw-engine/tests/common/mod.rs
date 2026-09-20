@@ -14,18 +14,15 @@
 //! mock through `LlmProvider`, so fixtures are reproducible and
 //! model-independent; the upstream side replays the identical script and
 //! compares fixtures.
-
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-
 use openpaw_core::{
     AllowlistGuardrail, Error, Message, Session, StopReason, ToolCallOutcome, ToolHost, ToolSpec,
 };
 use openpaw_engine::{AgentEvent, AgentLoop, CompactOptions};
 use openpaw_llm::{MockMode, MockProvider};
 use serde_json::Value;
-
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 #[derive(Debug, Clone)]
 pub struct Expect {
     pub stop: String,
@@ -37,7 +34,6 @@ pub struct Expect {
     /// The run must show a compaction event.
     pub expect_compaction: bool,
 }
-
 #[derive(Debug, Clone)]
 pub struct Scenario {
     pub name: String,
@@ -48,11 +44,9 @@ pub struct Scenario {
     pub compact: Option<CompactOptions>,
     pub expect: Expect,
 }
-
 pub fn scenario_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/parity/scenarios")
 }
-
 pub fn parse_scenario(path: &PathBuf) -> Scenario {
     let raw = std::fs::read_to_string(path).expect("read scenario");
     let name = path
@@ -66,7 +60,6 @@ pub fn parse_scenario(path: &PathBuf) -> Scenario {
     let mut allow_tools: Option<Vec<String>> = None;
     let mut compact: Option<CompactOptions> = None;
     let mut expect: Option<Expect> = None;
-
     for line in raw.lines().filter(|l| !l.trim().is_empty()) {
         let v: Value = serde_json::from_str(line).expect("scenario line is JSON");
         let step = v
@@ -152,7 +145,6 @@ pub fn parse_scenario(path: &PathBuf) -> Scenario {
             other => panic!("unknown scenario step: {other}"),
         }
     }
-
     Scenario {
         name,
         mock,
@@ -163,7 +155,6 @@ pub fn parse_scenario(path: &PathBuf) -> Scenario {
         expect: expect.expect("scenario needs an expect step"),
     }
 }
-
 fn parse_mock_mode(v: &Value) -> MockMode {
     let mode = v.get("mode").and_then(|m| m.as_str()).expect("mock mode");
     let text = |k: &str| v.get(k).and_then(|t| t.as_str()).unwrap_or("").to_string();
@@ -195,7 +186,6 @@ fn parse_mock_mode(v: &Value) -> MockMode {
         other => panic!("unknown mock mode: {other}"),
     }
 }
-
 /// Structure-only transcript record (fixture content).
 #[derive(Debug)]
 pub struct TurnRecord {
@@ -205,7 +195,6 @@ pub struct TurnRecord {
     pub error_tools: Vec<String>,
     pub event_kinds: Vec<String>,
 }
-
 pub struct ParityTranscript {
     pub scenario: String,
     pub turns: Vec<TurnRecord>,
@@ -213,14 +202,12 @@ pub struct ParityTranscript {
     pub max_tool_concurrency: usize,
     pub provider_calls: u32,
 }
-
 /// A tiny host exposing the demo tools the scenarios reference, with
 /// async-sleep concurrency observation for the parallel assertion.
 struct DemoHost {
     max_concurrent: Arc<AtomicUsize>,
     active: Arc<AtomicUsize>,
 }
-
 #[async_trait::async_trait]
 impl openpaw_core::ToolExecutor for DemoHost {
     async fn list_tools(&self) -> openpaw_core::Result<Vec<ToolSpec>> {
@@ -231,7 +218,6 @@ impl openpaw_core::ToolExecutor for DemoHost {
             ToolSpec::new("bash", "run shell"),
         ])
     }
-
     async fn call(
         &self,
         name: &str,
@@ -252,24 +238,20 @@ impl openpaw_core::ToolExecutor for DemoHost {
         }
     }
 }
-
 #[async_trait::async_trait]
 impl openpaw_core::ToolHostValidator for DemoHost {}
-
 fn demo_host(max_concurrent: Arc<AtomicUsize>, active: Arc<AtomicUsize>) -> Arc<dyn ToolHost> {
     Arc::new(DemoHost {
         max_concurrent,
         active,
     })
 }
-
 /// Run a scenario end-to-end and return the structural transcript.
 pub async fn run_scenario(sc: &Scenario) -> ParityTranscript {
     let provider = Arc::new(MockProvider::scripted(sc.mock.clone()));
     let max_conc = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let host = demo_host(Arc::clone(&max_conc), Arc::clone(&active));
-
     let mut loop_ = AgentLoop::new(provider.clone()).with_tool_host(host);
     if let Some(allow) = &sc.allow_tools {
         loop_ = loop_.with_guardrail(Arc::new(AllowlistGuardrail {
@@ -279,7 +261,6 @@ pub async fn run_scenario(sc: &Scenario) -> ParityTranscript {
     if let Some(opts) = &sc.compact {
         loop_ = loop_.with_compact_options(opts.clone());
     }
-
     let mut session = Session::new("parity", "mock");
     for i in 0..sc.seed_pairs {
         session.messages.push(Message::user_text(format!(
@@ -289,7 +270,6 @@ pub async fn run_scenario(sc: &Scenario) -> ParityTranscript {
             "seed answer {i} with padding"
         )));
     }
-
     let mut turns: Vec<TurnRecord> = Vec::new();
     for text in &sc.user {
         session.messages.push(Message::user_text(text.clone()));
@@ -326,13 +306,11 @@ pub async fn run_scenario(sc: &Scenario) -> ParityTranscript {
             event_kinds: events.iter().map(|e| e.kind().to_string()).collect(),
         });
     }
-
     let final_reply = session
         .messages
         .last()
         .filter(|m| m.role == openpaw_core::Role::Assistant)
         .map(|m| m.text());
-
     ParityTranscript {
         scenario: sc.name.clone(),
         turns,
@@ -341,7 +319,6 @@ pub async fn run_scenario(sc: &Scenario) -> ParityTranscript {
         provider_calls: provider.call_count(),
     }
 }
-
 fn stop_to_str(s: &StopReason) -> String {
     match s {
         StopReason::EndTurn => "end_turn".into(),
@@ -352,7 +329,6 @@ fn stop_to_str(s: &StopReason) -> String {
         StopReason::Other => "other".into(),
     }
 }
-
 /// Assert scenario expectations against the transcript.
 pub fn assert_expectations(sc: &Scenario, t: &ParityTranscript) {
     let all_tool_calls: Vec<String> = t
@@ -401,12 +377,9 @@ pub fn assert_expectations(sc: &Scenario, t: &ParityTranscript) {
         );
     }
 }
-
-/// Export the transcript fixture (JSON) under `tests/parity/fixtures/` and
-/// return its path. Fixtures are the cross-repo parity evidence committed
-/// to the repo (plan §6.2: "证据以 JSON 转录 fixture 形式导出入库"); the
-/// upstream side replays the same script and compares structure keys.
-pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
+/// Serialize a transcript into the normalized fixture representation used by
+/// both in-memory comparisons and persisted parity evidence.
+pub fn fixture_json(t: &ParityTranscript) -> String {
     let fixture = serde_json::json!({
         "schema": "openpaw-parity-transcript/1",
         "scenario": t.scenario,
@@ -420,9 +393,15 @@ pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
             "event_kinds": turn.event_kinds,
         })).collect::<Vec<_>>(),
     });
+    serde_json::to_string_pretty(&fixture).expect("serialize parity fixture")
+}
+/// Export the transcript fixture (JSON) under `tests/parity/fixtures/` and
+/// return its path. Fixtures are the cross-repo parity evidence committed
+/// to the repo (plan §6.2: "证据以 JSON 转录 fixture 形式导出入库").
+pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/parity/fixtures");
     std::fs::create_dir_all(&dir).expect("create fixture dir");
     let path = dir.join(format!("{}.json", t.scenario));
-    std::fs::write(&path, serde_json::to_string_pretty(&fixture).unwrap()).expect("write fixture");
+    std::fs::write(&path, fixture_json(t)).expect("write fixture");
     path
 }

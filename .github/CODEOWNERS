@@ -1,0 +1,13 @@
+# OpenPaw B 线治理责任映射；提交前必须将中文占位符替换为真实 GitHub 用户或团队。
+/Cargo.toml @待替换-构建负责人
+/Cargo.lock @待替换-构建负责人
+/crates/openpaw-core/ @待替换-核心架构负责人
+/crates/openpaw-engine/src/agent_loop.rs @待替换-引擎负责人
+/crates/openpaw-engine-host/src/protocol.rs @待替换-Host接口负责人
+/crates/openpaw-engine-host/src/http.rs @待替换-Host接口负责人
+/crates/openpaw-engine-host/src/events.rs @待替换-Host接口负责人
+/crates/openpaw-engine-host/src/runtime.rs @待替换-Host运行时负责人
+/crates/openpaw-engine-host/src/approval.rs @待替换-安全负责人
+/crates/openpaw-engine-host/src/office.rs @待替换-跨项目接口负责人
+/.github/workflows/ @待替换-发布与安全负责人
+/.github/CODEOWNERS @待替换-架构负责人

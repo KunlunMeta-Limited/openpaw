@@ -2,14 +2,11 @@
 //!
 //! Each test uses its own leaked tempdir workspace; no global state is
 //! touched, so tests are safe to run in parallel.
-
-use std::path::PathBuf;
-
 use openpaw_tools::exec::environment::{
     Environment, LocalEnvironment, SandboxPolicy, SandboxedEnvironment,
 };
 use openpaw_tools::exec::{bash, clipboard, sleep};
-
+use std::path::PathBuf;
 fn workspace() -> PathBuf {
     let dir = tempfile::tempdir().unwrap();
     // Leak the tempdir so the workspace stays alive for the async test body.
@@ -17,9 +14,7 @@ fn workspace() -> PathBuf {
     std::mem::forget(dir);
     path
 }
-
 // ── bash ─────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn bash_contract_echo_output() {
     let ws = workspace();
@@ -34,7 +29,6 @@ async fn bash_contract_echo_output() {
         out.content
     );
 }
-
 #[tokio::test]
 async fn bash_nonzero_exit_code_is_error_outcome() {
     let ws = workspace();
@@ -49,7 +43,6 @@ async fn bash_nonzero_exit_code_is_error_outcome() {
         out.content
     );
 }
-
 #[tokio::test]
 async fn bash_dangerous_command_blocked() {
     let ws = workspace();
@@ -59,7 +52,6 @@ async fn bash_dangerous_command_blocked() {
     assert!(out.is_error, "got: {}", out.content);
     assert!(out.content.contains("blocked"), "got: {}", out.content);
 }
-
 #[tokio::test]
 async fn bash_command_substitution_requires_approval() {
     let ws = workspace();
@@ -70,7 +62,6 @@ async fn bash_command_substitution_requires_approval() {
     assert!(out.is_error, "got: {}", out.content);
     assert!(out.content.contains("approval"), "got: {}", out.content);
 }
-
 #[tokio::test]
 async fn bash_bad_args_error_outcome() {
     let ws = workspace();
@@ -80,9 +71,7 @@ async fn bash_bad_args_error_outcome() {
     assert!(out.is_error, "got: {}", out.content);
     assert!(out.content.contains("bad args"), "got: {}", out.content);
 }
-
 // ── sleep ────────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn sleep_contract_short_duration() {
     let ws = workspace();
@@ -98,7 +87,6 @@ async fn sleep_contract_short_duration() {
         start.elapsed()
     );
 }
-
 #[tokio::test]
 async fn sleep_bad_params_fall_back_to_zero() {
     let ws = workspace();
@@ -113,9 +101,7 @@ async fn sleep_bad_params_fall_back_to_zero() {
     assert!(!out.is_error, "got: {}", out.content);
     assert!(out.content.contains("slept 0ms"), "got: {}", out.content);
 }
-
 // ── clipboard ────────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn clipboard_unknown_action_is_error_outcome() {
     let ws = workspace();
@@ -129,16 +115,13 @@ async fn clipboard_unknown_action_is_error_outcome() {
         out.content
     );
 }
-
 #[tokio::test]
 async fn clipboard_missing_action_is_error_outcome() {
     let ws = workspace();
     let out = clipboard::run(&ws, serde_json::json!({})).await.unwrap();
     assert!(out.is_error, "got: {}", out.content);
 }
-
 // ── environment ──────────────────────────────────────────────────────────
-
 #[tokio::test]
 async fn local_environment_exec_echo_contract() {
     let ws = workspace();
@@ -151,7 +134,6 @@ async fn local_environment_exec_echo_contract() {
         result.stdout
     );
 }
-
 #[test]
 fn sandboxed_environment_construction_and_policy() {
     // Construction surface only: restricted/isolated execution paths are
@@ -160,7 +142,6 @@ fn sandboxed_environment_construction_and_policy() {
     let restricted = SandboxedEnvironment::new(SandboxPolicy::Restricted, ws);
     assert_eq!(restricted.name(), "sandboxed-restricted");
     assert_eq!(restricted.policy(), &SandboxPolicy::Restricted);
-
     let none = SandboxedEnvironment::new(SandboxPolicy::None, PathBuf::from("nowhere"));
     assert_eq!(none.name(), "local");
     assert_eq!(none.policy(), &SandboxPolicy::None);

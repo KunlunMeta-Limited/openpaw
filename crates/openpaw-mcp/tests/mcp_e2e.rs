@@ -2,10 +2,6 @@
 //! breaker, and reconnection — fully in-process. A mock rmcp server runs
 //! on one end of a duplex pair; `ServerSession::connect_over_transport`
 //! takes the other, so no external process or network is involved.
-
-use std::sync::Arc;
-use std::time::Duration;
-
 use openpaw_mcp::server::ServerSession;
 use openpaw_mcp::{CircuitBreaker, CircuitState, McpError};
 use rmcp::model::{
@@ -15,17 +11,16 @@ use rmcp::model::{
 use rmcp::service::RequestContext;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
-
+use std::sync::Arc;
+use std::time::Duration;
 const T: Duration = Duration::from_secs(5);
 const CALL_TIMEOUT: Duration = Duration::from_millis(400);
-
 /// A controllable MCP server: `echo` answers, `fail` answers with a
 /// tool-level error result, everything else is invalid. `call_delay`
 /// stalls every call (timeout tests).
 struct MockServer {
     call_delay: Option<Duration>,
 }
-
 impl ServerHandler for MockServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -35,7 +30,6 @@ impl ServerHandler for MockServer {
                 .build(),
         )
     }
-
     async fn list_tools(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -46,7 +40,6 @@ impl ServerHandler for MockServer {
             tool("fail", "always answers is_error"),
         ]))
     }
-
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
@@ -76,7 +69,6 @@ impl ServerHandler for MockServer {
             ))])),
         }
     }
-
     async fn list_resources(
         &self,
         _request: Option<rmcp::model::PaginatedRequestParams>,
@@ -92,7 +84,6 @@ impl ServerHandler for MockServer {
             meta: None,
         })
     }
-
     async fn read_resource(
         &self,
         request: rmcp::model::ReadResourceRequestParams,
@@ -114,7 +105,6 @@ impl ServerHandler for MockServer {
         ]))
     }
 }
-
 fn tool(name: &str, description: &str) -> Tool {
     let schema: JsonObject = rmcp::serde_json::from_value(rmcp::serde_json::json!({
         "type": "object",
@@ -123,7 +113,6 @@ fn tool(name: &str, description: &str) -> Tool {
     .expect("static schema is an object");
     Tool::new(name.to_string(), description.to_string(), Arc::new(schema))
 }
-
 /// Wire a mock server and a connected client session over one duplex
 /// pair. The server task dies with the handle (abort), which is exactly
 /// how the breaker test simulates a server crash.
@@ -131,7 +120,6 @@ async fn mock_pair(call_delay: Option<Duration>) -> (ServerSession, tokio::task:
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let (client_read, client_write) = tokio::io::split(client_io);
     let (server_read, server_write) = tokio::io::split(server_io);
-
     let server = MockServer { call_delay };
     let handle = tokio::spawn(async move {
         let transport = AsyncRwTransport::new_server(server_read, server_write);
@@ -142,7 +130,6 @@ async fn mock_pair(call_delay: Option<Duration>) -> (ServerSession, tokio::task:
             Err(e) => eprintln!("mock server failed to start: {e}"),
         }
     });
-
     let session = ServerSession::connect_over_transport(
         "mock",
         AsyncRwTransport::new_client(client_read, client_write),
@@ -152,7 +139,6 @@ async fn mock_pair(call_delay: Option<Duration>) -> (ServerSession, tokio::task:
     .expect("in-process handshake");
     (session, handle)
 }
-
 #[tokio::test]
 async fn handshake_and_list_tools() {
     let (session, handle) = mock_pair(None).await;
@@ -162,7 +148,6 @@ async fn handshake_and_list_tools() {
     session.shutdown().await.unwrap();
     handle.abort();
 }
-
 #[tokio::test]
 async fn echo_roundtrip() {
     let (session, handle) = mock_pair(None).await;
@@ -174,7 +159,6 @@ async fn echo_roundtrip() {
     session.shutdown().await.unwrap();
     handle.abort();
 }
-
 #[tokio::test]
 async fn tool_error_result_is_ok_transport_never_fails() {
     let (session, handle) = mock_pair(None).await;
@@ -187,7 +171,6 @@ async fn tool_error_result_is_ok_transport_never_fails() {
     session.shutdown().await.unwrap();
     handle.abort();
 }
-
 #[tokio::test]
 async fn resources_list_and_read() {
     let (session, handle) = mock_pair(None).await;
@@ -198,7 +181,6 @@ async fn resources_list_and_read() {
     session.shutdown().await.unwrap();
     handle.abort();
 }
-
 #[tokio::test]
 async fn slow_tool_hits_call_timeout() {
     let (session, handle) = mock_pair(Some(Duration::from_secs(30))).await;
@@ -211,15 +193,13 @@ async fn slow_tool_hits_call_timeout() {
     session.shutdown().await.unwrap();
     handle.abort();
 }
-
 #[tokio::test]
 async fn breaker_trips_on_transport_failure_then_reconnects() {
     let (session, handle) = mock_pair(None).await;
     let mut breaker = CircuitBreaker::new(3, Duration::from_millis(120));
-
     // Crash the server: every subsequent call is a transport failure.
     handle.abort();
-
+    let _ = handle.await;
     for _ in 0..3 {
         assert!(breaker.can_attempt());
         let err = session.call_tool("echo", JsonObject::new(), T).await;
@@ -228,7 +208,6 @@ async fn breaker_trips_on_transport_failure_then_reconnects() {
     }
     assert_eq!(breaker.state(), CircuitState::Open);
     assert!(!breaker.can_attempt(), "open rejects without a round trip");
-
     // Fresh cooldown; reconnect and probe.
     tokio::time::sleep(Duration::from_millis(140)).await;
     assert!(breaker.can_attempt(), "cooldown elapsed admits the probe");
@@ -238,7 +217,6 @@ async fn breaker_trips_on_transport_failure_then_reconnects() {
     assert!(probe.is_ok(), "reconnected server answers the probe");
     breaker.record_success();
     assert_eq!(breaker.state(), CircuitState::Closed);
-
     session.shutdown().await.unwrap();
     handle.abort();
 }

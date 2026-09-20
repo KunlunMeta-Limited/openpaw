@@ -2,18 +2,14 @@
 //! profile creation → three turns (one blocked on the user) → single-step
 //! resume → full ledger replay, plus cross-repo JSONL interoperability and
 //! goal-id path-injection rejection.
-
-use std::collections::BTreeSet;
-
 use chrono::Utc;
 use openpaw_goal_ledger::{
     decide_resume, parse_user_gate_question, record_resumed, record_run_summary, run_summary_event,
     FsGoalStore, GoalEvent, GoalEventLedger, GoalFrontmatter, GoalStatus, GoalStore,
     ResumeDecision, RunOutcome, RunSummary, UserGate,
 };
-
+use std::collections::BTreeSet;
 const GOAL_ID: &str = "goal_beef0001"; // hex-only suffix on purpose
-
 fn make_goal() -> GoalFrontmatter {
     let mut fm = GoalFrontmatter::new("publish the project wiki");
     fm.id = GOAL_ID.to_string();
@@ -21,7 +17,6 @@ fn make_goal() -> GoalFrontmatter {
     fm.success_criteria = "wiki pages live under docs/".to_string();
     fm
 }
-
 fn make_summary(turns: u32, outcome: RunOutcome, text: &str, next_action: &str) -> RunSummary {
     RunSummary {
         session_id: format!("session_t{turns}"),
@@ -34,7 +29,6 @@ fn make_summary(turns: u32, outcome: RunOutcome, text: &str, next_action: &str) 
         next_action: next_action.to_string(),
     }
 }
-
 fn ledger_line_count(goals_dir: &std::path::Path, goal_id: &str) -> usize {
     let path = goals_dir.join(".events").join(format!("{goal_id}.jsonl"));
     std::fs::read_to_string(path)
@@ -43,7 +37,6 @@ fn ledger_line_count(goals_dir: &std::path::Path, goal_id: &str) -> usize {
         .filter(|l| !l.trim().is_empty())
         .count()
 }
-
 /// 1–4: profile creation → three turns → resume → full ledger replay.
 #[test]
 fn passbook_full_flow_e2e() {
@@ -51,14 +44,12 @@ fn passbook_full_flow_e2e() {
     let goals_dir = tmp.path().to_path_buf();
     let store = FsGoalStore::new(goals_dir.clone());
     let ledger = GoalEventLedger::new(&goals_dir);
-
     // ── 1. Create the profile and read it back ──────────────────────────
     let goal = make_goal();
     let path = store
         .create_goal(goal.clone(), "passbook e2e body\n")
         .expect("profile creation must succeed");
     assert!(path.to_string_lossy().ends_with(".md"));
-
     let doc = store
         .load_goal(GOAL_ID)
         .unwrap()
@@ -72,7 +63,6 @@ fn passbook_full_flow_e2e() {
     );
     assert!(doc.body.contains("passbook e2e body"));
     assert_eq!(store.list_goals().unwrap().len(), 1);
-
     ledger
         .append(&GoalEvent::new(
             "created",
@@ -81,10 +71,8 @@ fn passbook_full_flow_e2e() {
         ))
         .unwrap();
     assert_eq!(ledger_line_count(&goals_dir, GOAL_ID), 1);
-
     // ── 2. Three ledger turns (every append is fsynced to disk) ─────────
     let mut fm = doc.frontmatter;
-
     // Turn 1: [GOAL_PROGRESS:0.3]
     let text1 = "drafted the outline [GOAL_PROGRESS:0.3]";
     let (outcome1, progress1) = RunOutcome::parse_from_summary(text1);
@@ -97,7 +85,6 @@ fn passbook_full_flow_e2e() {
     fm.last_run_at = Some(Utc::now());
     store.save_goal(&fm, "").unwrap();
     assert_eq!(ledger_line_count(&goals_dir, GOAL_ID), 2);
-
     // Turn 2: [GOAL_PROGRESS:0.6] (value > 1 parsed as a percentage)
     let text2 = "wrote half the pages [GOAL_PROGRESS:60]";
     let (outcome2, progress2) = RunOutcome::parse_from_summary(text2);
@@ -109,7 +96,6 @@ fn passbook_full_flow_e2e() {
     fm.last_run_at = Some(Utc::now());
     store.save_goal(&fm, "").unwrap();
     assert_eq!(ledger_line_count(&goals_dir, GOAL_ID), 3);
-
     // Turn 3: blocked on the user → marker parse path opens a user gate.
     let text3 =
         "the wiki needs a toolchain decision [GOAL_BLOCKED_ON_USER: Which wiki engine should we use?]";
@@ -117,7 +103,6 @@ fn passbook_full_flow_e2e() {
     assert_eq!(question, "Which wiki engine should we use?");
     let gate = UserGate::new(&question);
     fm.user_gates.push(gate);
-
     let (outcome3, _) = RunOutcome::parse_from_summary(text3);
     assert_eq!(
         outcome3,
@@ -142,10 +127,8 @@ fn passbook_full_flow_e2e() {
     fm.last_run_at = Some(Utc::now());
     store.save_goal(&fm, "").unwrap();
     assert_eq!(ledger_line_count(&goals_dir, GOAL_ID), 5);
-
     // ── 3. Resume: decision from the ledger's last run summary ──────────
     let events = ledger.query(GOAL_ID).unwrap();
-
     // The unresolved gate wins: surface the question.
     assert_eq!(
         decide_resume(&fm, &events),
@@ -153,7 +136,6 @@ fn passbook_full_flow_e2e() {
             question: "Which wiki engine should we use?".to_string()
         }
     );
-
     // The user answers → gate resolved → resume seeded by the recorded
     // next_action of the newest run summary.
     fm.user_gates[0].resolved = true;
@@ -166,13 +148,11 @@ fn passbook_full_flow_e2e() {
             serde_json::json!({ "resolved": 1, "answer": "plain markdown" }),
         ))
         .unwrap();
-
     let reloaded = store.load_goal(GOAL_ID).unwrap().unwrap().frontmatter;
     assert!(
         reloaded.user_gates[0].resolved,
         "gate resolution must persist"
     );
-
     let events = ledger.query(GOAL_ID).unwrap();
     assert_eq!(
         decide_resume(&reloaded, &events),
@@ -182,11 +162,9 @@ fn passbook_full_flow_e2e() {
         "resume decision must be seeded by the last run summary's next_action"
     );
     record_resumed(&ledger, GOAL_ID, "wait for the user's engine choice").unwrap();
-
     // ── 4. Full ledger replay from a freshly opened ledger ──────────────
     let reopened = GoalEventLedger::new(&goals_dir);
     let all = reopened.query(GOAL_ID).unwrap();
-
     let kinds: Vec<&str> = all.iter().map(|e| e.event_type.as_str()).collect();
     assert_eq!(
         kinds,
@@ -205,7 +183,6 @@ fn passbook_full_flow_e2e() {
         all.iter().all(|e| e.goal_id == GOAL_ID),
         "every event carries the goal id"
     );
-
     // Field spot-checks on the replayed events.
     assert_eq!(all[0].payload["objective"], "publish the project wiki");
     assert_eq!(all[1].payload["next_action"], "write the pages");
@@ -227,19 +204,16 @@ fn passbook_full_flow_e2e() {
         all[6].payload["next_action"],
         "wait for the user's engine choice"
     );
-
     // Timestamps are monotonic in append order.
     for pair in all.windows(2) {
         assert!(pair[0].timestamp <= pair[1].timestamp);
     }
-
     // The last run summary payload deserializes back into RunSummary.
     let last: RunSummary = serde_json::from_value(all[3].payload.clone()).unwrap();
     assert_eq!(last.turns, 3);
     assert_eq!(last.outcome, RunOutcome::Blocked);
     assert_eq!(last.next_action, "wait for the user's engine choice");
 }
-
 /// 5: cross-repo ledger interoperability — an upstream-schema JSONL line
 /// parses on this side, and lines written here carry the same JSON key set.
 #[test]
@@ -248,8 +222,7 @@ fn ledger_lines_are_interoperable_with_upstream_schema() {
     let goals_dir = tmp.path().to_path_buf();
     let ledger = GoalEventLedger::new(&goals_dir);
     let id = "goal_dead0042"; // hex-only suffix
-
-    // (a) Hand-written upstream-schema event line → parseable here.
+                              // (a) Hand-written upstream-schema event line → parseable here.
     let upstream_line = concat!(
         r#"{"type":"run_summary","timestamp":"2026-08-30T12:00:00Z","goal_id":"goal_dead0042","payload":"#,
         r#"{"session_id":"session_upstream","started_at":"2026-08-30T11:59:00Z","ended_at":"2026-08-30T12:00:00Z","turns":2,"tokens_used":900,"outcome":"progress","summary":"draft done [GOAL_PROGRESS:0.5]","next_action":"review the draft"}}"#
@@ -261,7 +234,6 @@ fn ledger_lines_are_interoperable_with_upstream_schema() {
         format!("{upstream_line}\n"),
     )
     .unwrap();
-
     let parsed = ledger.query(id).unwrap();
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[0].event_type, "run_summary");
@@ -272,15 +244,12 @@ fn ledger_lines_are_interoperable_with_upstream_schema() {
     assert_eq!(upstream_summary.outcome, RunOutcome::Progress);
     assert_eq!(upstream_summary.turns, 2);
     assert_eq!(upstream_summary.tokens_used, 900);
-
     // (b) A line written here → raw JSON key set matches the upstream shape.
     let ours = make_summary(1, RunOutcome::Progress, "local turn", "next local step");
     record_run_summary(&ledger, id, &ours).unwrap();
-
     let raw = std::fs::read_to_string(events_dir.join(format!("{id}.jsonl"))).unwrap();
     let lines: Vec<&str> = raw.lines().collect();
     assert_eq!(lines.len(), 2, "one upstream line + one local line");
-
     let local: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
     let local_keys: BTreeSet<&str> = local
         .as_object()
@@ -295,12 +264,10 @@ fn ledger_lines_are_interoperable_with_upstream_schema() {
         local_keys, expected_keys,
         "local ledger line must carry exactly the upstream key set"
     );
-
     // The timestamp field round-trips as an RFC3339 DateTime.
     let ts: chrono::DateTime<Utc> =
         serde_json::from_value(local["timestamp"].clone()).expect("timestamp must be RFC3339");
     let _ = ts;
-
     // The payload key set matches the upstream RunSummary field set.
     let payload_keys: BTreeSet<&str> = local["payload"]
         .as_object()
@@ -324,7 +291,6 @@ fn ledger_lines_are_interoperable_with_upstream_schema() {
         payload_keys, expected_payload,
         "run_summary payload must match the upstream schema field set"
     );
-
     // And the profile schema round-trips through the frontmatter codec too:
     // an upstream-style goal document loads here unchanged.
     let store = FsGoalStore::new(goals_dir.clone());
@@ -344,7 +310,6 @@ fn ledger_lines_are_interoperable_with_upstream_schema() {
     assert_eq!(loaded.frontmatter.quota.spent_turns, 5);
     assert_eq!(loaded.frontmatter.quota.window_hours, 24);
 }
-
 /// 6: goal-id path injection is rejected at every entry point, and an
 /// injected id produces no files.
 #[test]
@@ -353,7 +318,6 @@ fn path_injection_ids_are_rejected() {
     let goals_dir = tmp.path().to_path_buf();
     let store = FsGoalStore::new(goals_dir.clone());
     let ledger = GoalEventLedger::new(&goals_dir);
-
     let bad_ids = [
         "../evil",
         "goal_abc/../def",
@@ -365,12 +329,10 @@ fn path_injection_ids_are_rejected() {
         "missing_prefix", // no goal_ prefix
         "",
     ];
-
     for bad in bad_ids {
         let event = GoalEvent::new("created", bad, serde_json::json!({}));
         assert!(ledger.append(&event).is_err(), "append must reject {bad:?}");
         assert!(ledger.query(bad).is_err(), "query must reject {bad:?}");
-
         let mut fm = GoalFrontmatter::new("injection probe");
         fm.id = bad.to_string();
         assert!(
@@ -378,7 +340,6 @@ fn path_injection_ids_are_rejected() {
             "create_goal must reject {bad:?}"
         );
     }
-
     // No injected id may leave any file behind.
     assert!(
         !goals_dir.join(".events").exists(),
@@ -392,7 +353,6 @@ fn path_injection_ids_are_rejected() {
         leftovers.is_empty(),
         "no file may be created from an injected id"
     );
-
     // Sanity: a legitimate hex id still works after all the rejections.
     let good = make_summary(1, RunOutcome::Progress, "ok", "keep going");
     let ledger = GoalEventLedger::new(&goals_dir);

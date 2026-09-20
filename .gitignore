@@ -1,4 +1,5 @@
 # Rust build artifacts
+/target-*/
 /target/
 **/target/
 # Local MSRV verification builds (e.g. target-msrv85 with CARGO_TARGET_DIR)
@@ -19,11 +20,16 @@ Thumbs.db
 
 # Local env / secrets
 .env
+.env.*
+!.env.example
 *.pem
 *.key
 
 # Test / scratch output
 *.log
+*.profraw
+/coverage/
+/.runtime/
 /g_*.txt
 /verify_fmt.txt
 /scrub_result.txt
