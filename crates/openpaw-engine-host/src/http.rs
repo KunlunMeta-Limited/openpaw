@@ -59,7 +59,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/abort", post(abort))
         .route("/session/{id}/todo", get(todo))
         .route("/session/status", get(status))
-        .route("/event", get(event_stream))
+        .route("/event", get(global_event_stream))
         .route("/global/event", get(global_event_stream))
         .route("/api/event", get(global_event_stream))
         .route("/provider", get(provider))
@@ -67,14 +67,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/permission/{id}/reply", post(permission_reply))
         .route("/config", get(empty_object))
         .route("/mcp", get(empty_object))
-        .route("/command", get(empty_array).post(no_content))
+        .route("/command", get(empty_array))
         .route("/project", get(empty_array))
         .route("/agent", get(empty_array))
         .route("/find/file", get(empty_array))
-        .route("/shell", post(no_content))
-        .route("/fork", post(no_content))
-        .route("/revert", post(no_content))
-        .route("/summarize", post(no_content))
         .with_state(state.clone());
     router.layer(middleware::from_fn_with_state(state, auth_middleware))
 }
@@ -579,52 +575,18 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     Json(serde_json::Value::Object(result))
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct EventQuery {
-    session_id: Option<String>,
-    #[serde(rename = "sessionID")]
-    session_id_alias: Option<String>,
-}
-
-async fn event_stream(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<EventQuery>,
-) -> Response {
-    // §3.2：三条路径都提供 SSE；OpenWork 订阅 `/event` 时不带 session 标识，缺省走全局流。
-    let Some(id) = query.session_id.or(query.session_id_alias) else {
-        return global_event_stream(State(state)).await;
-    };
-    let handle = match state.get_typed(&id).await {
-        Ok(handle) => handle,
-        Err(error) => return session_load_error(error),
-    };
-    let stream = sse_stream(
-        handle.events.subscribe(),
-        "session",
-        Some(id),
-        state.shutdown_token(),
-    );
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-/// 全局订阅按 SDK 要求不携带 session id，并接收与会话订阅相同的新事件。
+/// §3.2：`/event`、`/global/event`、`/api/event` 三条路径提供同一个全局 SSE。
 async fn global_event_stream(State(state): State<Arc<AppState>>) -> Response {
-    let stream = sse_stream(
-        state.global_events.subscribe(),
-        "global",
-        None,
-        state.shutdown_token(),
-    );
+    let stream = sse_stream(state.global_events.subscribe(), state.shutdown_token());
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
 }
 
 async fn provider(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let anthropic_models = provider_models("claude-sonnet-4", "OPENPAW_ANTHROPIC_MODEL");
-    let openai_models = provider_models("gpt-4o", "OPENPAW_OPENAI_MODEL");
+    let anthropic_models =
+        provider_models(runtime::DEFAULT_ANTHROPIC_MODEL, "OPENPAW_ANTHROPIC_MODEL");
+    let openai_models = provider_models(runtime::DEFAULT_OPENAI_MODEL, "OPENPAW_OPENAI_MODEL");
     Json(serde_json::json!({
         "all":[
             {"id":"mock","name":"OpenPaw mock","models":{"mock-1":{"id":"mock-1","name":"mock-1"}}},
@@ -867,46 +829,40 @@ fn sha256_hex(input: &[u8]) -> String {
 
 fn sse_stream(
     receiver: broadcast::Receiver<SseEnvelope>,
-    scope: &'static str,
-    session_id: Option<String>,
     shutdown: CancellationToken,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> {
-    futures::stream::unfold(
-        Some((receiver, scope, session_id, shutdown)),
-        |state| async move {
-            let (mut receiver, scope, session_id, shutdown) = state?;
-            let received = tokio::select! {
-                _ = shutdown.cancelled() => return None,
-                received = receiver.recv() => received,
-            };
-            match received {
-                Ok(event) => Some((
-                    Ok(Event::default()
-                        .json_data(event)
-                        .unwrap_or_else(|_| Event::default())),
-                    Some((receiver, scope, session_id, shutdown)),
-                )),
-                Err(broadcast::error::RecvError::Closed) => None,
-                Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                    let mut properties = serde_json::json!({
-                        "scope": scope,
+    futures::stream::unfold(Some((receiver, shutdown)), |state| async move {
+        let (mut receiver, shutdown) = state?;
+        let received = tokio::select! {
+            _ = shutdown.cancelled() => return None,
+            received = receiver.recv() => received,
+        };
+        match received {
+            Ok(event) => Some((
+                Ok(Event::default()
+                    .json_data(event)
+                    .unwrap_or_else(|_| Event::default())),
+                Some((receiver, shutdown)),
+            )),
+            Err(broadcast::error::RecvError::Closed) => None,
+            Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                let gap = OpenCodeEvent::new(
+                    "stream.gap",
+                    serde_json::json!({
+                        "scope": "global",
                         "dropped": dropped.max(1),
                         "recoverVia": ["status", "turns", "message"]
-                    });
-                    if let Some(id) = session_id {
-                        properties["sessionID"] = serde_json::json!(id);
-                    }
-                    let gap = OpenCodeEvent::new("stream.gap", properties);
-                    Some((
-                        Ok(Event::default()
-                            .json_data(gap)
-                            .unwrap_or_else(|_| Event::default())),
-                        None,
-                    ))
-                }
+                    }),
+                );
+                Some((
+                    Ok(Event::default()
+                        .json_data(gap)
+                        .unwrap_or_else(|_| Event::default())),
+                    None,
+                ))
             }
-        },
-    )
+        }
+    })
 }
 
 fn message_wire(
@@ -962,13 +918,13 @@ mod tests {
         let shutdown = CancellationToken::new();
         let _ = sender.send(OpenCodeEvent::new("first", serde_json::json!({})));
         let _ = sender.send(OpenCodeEvent::new("second", serde_json::json!({})));
-        let stream = sse_stream(receiver, "session", Some("session-1".into()), shutdown);
+        let stream = sse_stream(receiver, shutdown);
         futures::pin_mut!(stream);
 
         let gap = stream.next().await.expect("gap event").expect("sse event");
         let rendered = format!("{gap:?}");
         assert!(rendered.contains("stream.gap"));
-        assert!(rendered.contains("session-1"));
+        assert!(rendered.contains("global"));
         assert!(stream.next().await.is_none());
     }
 
@@ -1105,13 +1061,13 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "GET {route}");
         }
+        // §3.2：降级路由只在 session 作用域，全部返回 204。
         for route in [
             format!("/session/{id}/command"),
-            "/command".into(),
-            "/shell".into(),
-            "/fork".into(),
-            "/revert".into(),
-            "/summarize".into(),
+            format!("/session/{id}/shell"),
+            format!("/session/{id}/fork"),
+            format!("/session/{id}/revert"),
+            format!("/session/{id}/summarize"),
         ] {
             let response = app
                 .clone()
@@ -1126,6 +1082,37 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "POST {route}");
         }
+        // §3.2 的 `/command` 只有 GET → []；根路径不存在 shell/fork/revert/summarize。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/command")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "POST /command"
+        );
+        for route in ["/shell", "/fork", "/revert", "/summarize"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(route)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "POST {route}");
+        }
         for route in [
             "/api/health",
             "/opencode2/session",
@@ -1138,19 +1125,31 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "GET {route}");
         }
-        for route in [
-            format!("/event?session_id={id}"),
-            "/global/event".into(),
-            "/api/event".into(),
-        ] {
+        // 三条路径提供同一个全局 SSE；不存在第四条（含 session 作用域）。
+        for route in ["/event", "/global/event", "/api/event"] {
             let response = app
                 .clone()
-                .oneshot(Request::builder().uri(&route).body(Body::empty()).unwrap())
+                .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "GET {route}");
             assert_eq!(response.headers()["content-type"], "text/event-stream");
         }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/session/{id}/event"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "GET /session/{{id}}/event"
+        );
     }
 
     #[tokio::test]

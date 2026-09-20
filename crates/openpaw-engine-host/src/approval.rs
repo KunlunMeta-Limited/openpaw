@@ -24,7 +24,7 @@ struct Pending {
 /// 功能：提供一个 session 范围内的人工审批管理器。
 /// 字段/状态：内部保存待审批请求、当前回合取消令牌和中止标记。
 /// 数据来源：AgentLoop 发起的 `ApprovalRequest`。
-/// 数据去向：Host SSE 订阅者、全局事件订阅者和等待中的工具调用。
+/// 数据去向：全局 Host SSE 订阅者和等待中的工具调用。
 /// 约束：审批请求必须在同一 session 内回复；回合中止后拒绝迟到回复。
 /// 并发与取消：所有生命周期状态通过互斥锁线性化；`abort_all` 会唤醒全部等待者。
 /// 权限：只传递审批结果，不记录 Basic Authentication 凭据。
@@ -33,7 +33,6 @@ struct Pending {
 pub struct HostApprovalManager {
     session_id: String,
     lifecycle: Mutex<ApprovalLifecycle>,
-    events: broadcast::Sender<OpenCodeEvent>,
     global_events: broadcast::Sender<OpenCodeEvent>,
 }
 
@@ -44,7 +43,7 @@ struct ApprovalLifecycle {
 }
 
 impl HostApprovalManager {
-    /// 向 session 和全局事件通道发布一次审批结束事件。
+    /// 向全局事件通道发布一次带 sessionID 的审批结束事件。
     /// 参数：`id` 为请求编号；`status` 为 approved/rejected；`reason` 为中文原因。
     /// 约束：调用方应已在线程安全的生命周期锁内移除 pending，避免重复结束通知。
     fn emit_replied(&self, id: &str, status: &str, reason: &str) {
@@ -57,13 +56,12 @@ impl HostApprovalManager {
                 "reason": reason,
             }),
         );
-        let _ = self.events.send(event.clone());
         let _ = self.global_events.send(event);
     }
 
     /// 功能：为一个 session 创建审批管理器并绑定事件通道与回合取消令牌。
-    /// 参数：`session_id` 为 session 稳定编号；`events` 为 session 事件通道；
-    /// `global_events` 为全局事件通道；`cancelled` 为当前回合取消令牌。
+    /// 参数：`session_id` 为 session 稳定编号；`global_events` 为全局事件通道；
+    /// `cancelled` 为当前回合取消令牌。
     /// 返回：可在线程间共享的审批管理器。
     /// 错误：不会主动返回错误；通道关闭时事件发送被忽略，等待者收到拒绝结果。
     /// 状态：初始没有待审批项，回合未中止。
@@ -72,7 +70,6 @@ impl HostApprovalManager {
     /// 关联：`REQ-B-HOST-007`、`CHG-2026-0003`。
     pub fn new(
         session_id: impl Into<String>,
-        events: broadcast::Sender<OpenCodeEvent>,
         global_events: broadcast::Sender<OpenCodeEvent>,
         cancelled: CancellationToken,
     ) -> Arc<Self> {
@@ -83,7 +80,6 @@ impl HostApprovalManager {
                 cancelled,
                 aborted: false,
             }),
-            events,
             global_events,
         })
     }
@@ -130,7 +126,7 @@ impl HostApprovalManager {
             .collect()
     }
 
-    /// 功能：回复指定审批请求，并向 session 与全局事件通道发布结果事件。
+    /// 功能：回复指定审批请求，并向全局事件通道发布带 sessionID 的结果事件。
     /// 参数：`id` 为待审批请求编号；`approved` 表示批准或拒绝；`reason` 为处理原因。
     /// 返回：请求存在且成功交付回复时返回 `true`；请求不存在、已中止或已被处理时返回 `false`。
     /// 错误：不会抛出错误；底层 oneshot 或广播通道关闭只表示对应接收方已离开。
@@ -228,7 +224,6 @@ impl ApprovalManager for HostApprovalManager {
             // 在生命周期锁内发布事件，使 asked 与 abort 线性化：abort_all 返回后，
             // 当前回合不会再产生迟到的 asked 事件。
             let event = OpenCodeEvent::new("permission.asked", info.clone());
-            let _ = self.events.send(event.clone());
             let _ = self.global_events.send(event);
             cancelled
         };
@@ -264,10 +259,8 @@ mod tests {
 
     #[tokio::test]
     async fn pending_permission_roundtrip_and_reply_event() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         let waiting = {
             let manager = manager.clone();
             tokio::spawn(async move {
@@ -294,10 +287,8 @@ mod tests {
 
     #[tokio::test]
     async fn abort_after_request_wakes_waiter_and_next_turn_resets_state() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         manager.begin_turn();
         let waiting = {
             let manager = manager.clone();
@@ -344,10 +335,8 @@ mod tests {
 
     #[tokio::test]
     async fn begin_turn_closes_stale_permission_with_replied_event() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         manager.begin_turn();
         let waiting = {
             let manager = manager.clone();
@@ -373,10 +362,8 @@ mod tests {
 
     #[tokio::test]
     async fn request_after_abort_is_denied_without_a_late_asked_event() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         manager.begin_turn();
         manager.abort_all();
 
