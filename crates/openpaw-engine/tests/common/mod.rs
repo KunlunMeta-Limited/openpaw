@@ -402,11 +402,13 @@ pub fn assert_expectations(sc: &Scenario, t: &ParityTranscript) {
     }
 }
 
-/// Export the transcript fixture (JSON) under `tests/parity/fixtures/` and
-/// return its path. Fixtures are the cross-repo parity evidence committed
-/// to the repo (plan §6.2: "证据以 JSON 转录 fixture 形式导出入库"); the
-/// upstream side replays the same script and compares structure keys.
-pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
+/// Render the transcript fixture (JSON) without touching the disk.
+///
+/// The determinism check compares two runs through this function instead of
+/// through the exported file: parallel tests in one binary export the same
+/// path, and `std::fs::write` truncates before it writes, so a reader can
+/// observe an empty or half-written fixture.
+pub fn fixture_json(t: &ParityTranscript) -> String {
     let fixture = serde_json::json!({
         "schema": "openpaw-parity-transcript/1",
         "scenario": t.scenario,
@@ -420,9 +422,22 @@ pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
             "event_kinds": turn.event_kinds,
         })).collect::<Vec<_>>(),
     });
+    serde_json::to_string_pretty(&fixture).unwrap()
+}
+
+/// Export the transcript fixture (JSON) under `tests/parity/fixtures/` and
+/// return its path. Fixtures are the cross-repo parity evidence committed
+/// to the repo (plan §6.2: "证据以 JSON 转录 fixture 形式导出入库"); the
+/// upstream side replays the same script and compares structure keys.
+pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/parity/fixtures");
     std::fs::create_dir_all(&dir).expect("create fixture dir");
     let path = dir.join(format!("{}.json", t.scenario));
-    std::fs::write(&path, serde_json::to_string_pretty(&fixture).unwrap()).expect("write fixture");
+    // Write beside the target and replace it in one step: a concurrent reader
+    // then sees either the previous content or the new one, never a truncated
+    // file.
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, fixture_json(t)).expect("write fixture");
+    std::fs::rename(&temp, &path).expect("replace fixture");
     path
 }

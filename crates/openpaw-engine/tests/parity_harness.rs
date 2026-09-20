@@ -7,7 +7,9 @@
 
 mod common;
 
-use common::{assert_expectations, export_fixture, parse_scenario, run_scenario, scenario_dir};
+use common::{
+    assert_expectations, export_fixture, fixture_json, parse_scenario, run_scenario, scenario_dir,
+};
 
 #[tokio::test]
 async fn scenario_01_pure_chat() {
@@ -36,18 +38,18 @@ async fn scenario_05_compaction_trigger() {
 
 #[tokio::test]
 async fn fixtures_are_deterministic_across_replays() {
-    // Same scenario, two runs → identical fixture bytes (structure keys
-    // only; no timing or text beyond scripted replies).
+    // Same scenario, two runs → identical fixture JSON (structure keys
+    // only; no timing or text beyond scripted replies). The comparison stays
+    // in memory: parallel tests export the same fixture path, so reading the
+    // file back could observe a concurrent writer's truncation.
     let path = scenario_dir().join("01-pure-chat.jsonl");
     let sc = parse_scenario(&path);
 
     let t1 = run_scenario(&sc).await;
-    let f1 = export_fixture(&t1);
-    let bytes1 = std::fs::read_to_string(&f1).unwrap();
+    let bytes1 = fixture_json(&t1);
 
     let t2 = run_scenario(&sc).await;
-    let f2 = export_fixture(&t2);
-    let bytes2 = std::fs::read_to_string(&f2).unwrap();
+    let bytes2 = fixture_json(&t2);
 
     assert_eq!(bytes1, bytes2, "parity transcripts must be deterministic");
 }
