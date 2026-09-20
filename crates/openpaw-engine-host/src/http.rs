@@ -390,16 +390,8 @@ pub async fn permission_reply(
     }
 }
 
-pub async fn events(
-    Path(id): Path<String>,
-    State(state): State<RuntimeState>,
-) -> impl IntoResponse {
-    let Some(tx) = state.event_sender(&id) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    sse(tx.subscribe()).into_response()
-}
-
+/// SSE for the three agreed paths only (§3.2): `/event`, `/global/event` and
+/// `/api/event`. Every other GET answers JSON, never an event stream.
 pub async fn global_events(State(state): State<RuntimeState>) -> impl IntoResponse {
     sse(state.subscribe_global())
 }
@@ -887,5 +879,62 @@ mod contract_tests {
             .expect("body");
         let session: serde_json::Value = serde_json::from_slice(&body).expect("session json");
         assert_eq!(session["directory"], serde_json::json!("/opt/header"));
+    }
+
+    #[tokio::test]
+    async fn only_the_agreed_paths_serve_sse() {
+        let app = app("sse", None);
+
+        for path in ["/event", "/global/event", "/api/event"] {
+            let response = app.clone().oneshot(get(path)).await.expect("sse response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                content_type.starts_with("text/event-stream"),
+                "{path} content-type: {content_type}"
+            );
+        }
+
+        // §3.2 lists exactly three SSE paths: the retired per-session stream
+        // must stay unrouted and every other GET (data routes included) must
+        // answer JSON.
+        let id = create_session(&app).await;
+        let retired = app
+            .clone()
+            .oneshot(get(&format!("/session/{id}/event")))
+            .await
+            .expect("retired route");
+        assert_eq!(
+            retired.status(),
+            StatusCode::NOT_FOUND,
+            "/session/:id/event must not serve SSE any more"
+        );
+
+        for path in [
+            "/global/health".to_string(),
+            format!("/session/{id}/message"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(get(&path))
+                .await
+                .expect("json response");
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                content_type.starts_with("application/json"),
+                "{path} content-type: {content_type}"
+            );
+        }
     }
 }

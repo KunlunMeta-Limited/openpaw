@@ -141,7 +141,6 @@ pub fn router(state: RuntimeState, auth: Option<BasicAuth>) -> Router {
         .route("/session/{id}/todo", get(http::todo))
         .route("/session/{id}/prompt_async", post(http::prompt))
         .route("/session/{id}/abort", post(http::abort))
-        .route("/session/{id}/event", get(http::events))
         .route("/event", get(http::global_events))
         .route("/global/event", get(http::global_events))
         .route("/api/event", get(http::global_events))
