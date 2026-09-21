@@ -266,7 +266,6 @@ pub struct SessionHandle {
     pub writer: std::sync::Mutex<Option<SessionWriter>>,
     session_path: PathBuf,
     pub agent: AgentLoop,
-    pub events: broadcast::Sender<OpenCodeEvent>,
     pub approvals: Arc<HostApprovalManager>,
     pub active: AtomicBool,
     pub workspace: PathBuf,
@@ -405,7 +404,6 @@ impl SessionHandle {
         format!("{sequence}_{}", Uuid::new_v4().simple())
     }
     pub fn emit(&self, event: OpenCodeEvent) {
-        let _ = self.events.send(event.clone());
         let _ = self.global_events.send(event);
     }
     pub fn set_activity(&self, kind: &str, tool: Option<&str>, task: &str) {
@@ -599,7 +597,6 @@ struct SessionHandleInit {
     writer: SessionWriter,
     session_path: PathBuf,
     agent: AgentLoop,
-    events: broadcast::Sender<OpenCodeEvent>,
     approvals: Arc<HostApprovalManager>,
     workspace: PathBuf,
     tools: Vec<openpaw_core::ToolSpec>,
@@ -1009,10 +1006,8 @@ impl AppState {
         let mut session = Session::new(read.meta.model.clone(), read.meta.provider.clone());
         session.meta = read.meta;
         session.messages = messages.clone();
-        let (events_tx, _) = broadcast::channel(256);
         let approvals = HostApprovalManager::new(
             id.to_string(),
-            events_tx.clone(),
             self.global_events.clone(),
             CancellationToken::new(),
         );
@@ -1030,7 +1025,6 @@ impl AppState {
             writer,
             session_path: path,
             agent,
-            events: events_tx,
             approvals,
             workspace,
             tools,
@@ -1098,7 +1092,6 @@ impl AppState {
             writer,
             session_path: path,
             agent,
-            events: events_tx,
             approvals,
             workspace,
             tools,
@@ -1116,7 +1109,6 @@ impl AppState {
             writer,
             session_path,
             agent,
-            events,
             approvals,
             workspace,
             tools,
@@ -1136,7 +1128,6 @@ impl AppState {
             writer: std::sync::Mutex::new(Some(writer)),
             session_path,
             agent,
-            events,
             approvals,
             active: AtomicBool::new(false),
             workspace,
@@ -1240,13 +1231,20 @@ impl AppState {
                     .unwrap_or_else(|| unix_millis(meta.created_at));
                 let active = active_ids.contains(&meta.id);
                 out.push(SessionSummary {
-                    id: meta.id,
-                    title,
+                    session: SessionWire {
+                        slug: meta.id.clone(),
+                        id: meta.id,
+                        title,
+                        directory,
+                        time: SessionTime {
+                            created: unix_millis(meta.created_at),
+                            updated,
+                        },
+                    },
                     created_at: unix_millis(meta.created_at),
                     updated_at: updated,
                     provider: meta.provider,
                     model: meta.model,
-                    directory,
                     active,
                 });
             }
@@ -1318,6 +1316,12 @@ fn configured_agent(
     }
     Ok(agent.with_approval_manager(approvals))
 }
+/// Anthropic provider 的缺省模型，未设置 `OPENPAW_ANTHROPIC_MODEL` 时使用。
+/// 单一来源：`build_provider`、`default_model` 与 `/provider` 列表都引用它，避免多处漂移。
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4";
+/// OpenAI 兼容 provider 的缺省模型，未设置 `OPENPAW_OPENAI_MODEL` 时使用。
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
+
 /// 功能：按 provider 标识创建 Host 使用的 LLM provider。
 /// 并发与取消：provider 可被多个 session 独占使用，回合取消由 AgentLoop 负责。
 pub fn build_provider(name: &str) -> Result<Arc<dyn LlmProvider>, String> {
@@ -1345,7 +1349,7 @@ pub fn build_provider(name: &str) -> Result<Arc<dyn LlmProvider>, String> {
             let key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| "未设置 ANTHROPIC_API_KEY".to_string())?;
             let model = std::env::var("OPENPAW_ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4".into());
+                .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.into());
             let mut provider = openpaw_llm::AnthropicProvider::new(key, model);
             if let Some(base_url) = provider_base_url("OPENPAW_ANTHROPIC_BASE_URL")? {
                 provider = provider.with_base_url(base_url);
@@ -1355,7 +1359,8 @@ pub fn build_provider(name: &str) -> Result<Arc<dyn LlmProvider>, String> {
         "openai" => {
             let key =
                 std::env::var("OPENAI_API_KEY").map_err(|_| "未设置 OPENAI_API_KEY".to_string())?;
-            let model = std::env::var("OPENPAW_OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into());
+            let model = std::env::var("OPENPAW_OPENAI_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into());
             let mut provider = openpaw_llm::OpenAiProvider::new(key, model);
             if let Some(base_url) = provider_base_url("OPENPAW_OPENAI_BASE_URL")? {
                 provider = provider.with_base_url(base_url);
@@ -1371,11 +1376,12 @@ pub fn default_model(name: &str) -> Result<String, String> {
     match name {
         "echo" => Ok("echo-1".into()),
         "mock" => Ok("mock-1".into()),
-        "anthropic" => {
-            Ok(std::env::var("OPENPAW_ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4".into()))
+        "anthropic" => Ok(std::env::var("OPENPAW_ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.into())),
+        "openai" => {
+            Ok(std::env::var("OPENPAW_OPENAI_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into()))
         }
-        "openai" => Ok(std::env::var("OPENPAW_OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".into())),
         other => Err(format!("不支持的 provider：`{other}`")),
     }
 }
@@ -1809,6 +1815,14 @@ pub(crate) fn accept_turn(
                 AcceptTurnResult::IdempotencyConflict
             };
         }
+    }
+    // 不允许不同 requestID 重用同一消息身份，否则重启恢复会把新回合正文去重丢弃。
+    if handle
+        .turn_outcomes()
+        .iter()
+        .any(|turn| turn.user_message_id == user_message_id)
+    {
+        return AcceptTurnResult::IdempotencyConflict;
     }
     if handle.deleting.load(Ordering::Acquire) {
         return AcceptTurnResult::Deleting;
@@ -2780,7 +2794,7 @@ mod tests {
                 .await
                 .expect("session");
             let id = handle.id.clone();
-            let mut events = handle.events.subscribe();
+            let mut events = handle.global_events.subscribe();
             assert!(handle.reserve_turn());
             let turn_id = handle.next_turn_id();
             let user_message_id = format!("msg_{id}_{turn_id}_user");
@@ -2915,9 +2929,15 @@ mod tests {
         let summaries = restarted.summaries().await;
         let summary = summaries
             .iter()
-            .find(|summary| summary.id == id)
+            .find(|summary| summary.session.id == id)
             .expect("session summary");
-        assert_eq!(PathBuf::from(&summary.directory), original_workspace.path());
+        assert_eq!(
+            PathBuf::from(&summary.session.directory),
+            original_workspace.path()
+        );
+        assert_eq!(summary.session.slug, id);
+        assert_eq!(summary.session.time.created, summary.created_at);
+        assert_eq!(summary.session.time.updated, summary.updated_at);
     }
 
     #[tokio::test]
@@ -2996,7 +3016,7 @@ mod tests {
             .create_session(None, None, None, None)
             .await
             .expect("session");
-        let mut events = handle.events.subscribe();
+        let mut events = handle.global_events.subscribe();
         assert!(handle.reserve_turn());
         run_turn(
             handle.clone(),
@@ -3095,7 +3115,7 @@ mod tests {
             .create_session(None, None, None, None)
             .await
             .expect("session");
-        let mut events = handle.events.subscribe();
+        let mut events = handle.global_events.subscribe();
         assert!(handle.reserve_turn());
         let turn = tokio::spawn(run_turn(
             handle.clone(),
@@ -3198,7 +3218,7 @@ mod tests {
             .create_session(None, None, None, None)
             .await
             .expect("session");
-        let mut events = handle.events.subscribe();
+        let mut events = handle.global_events.subscribe();
         assert!(handle.reserve_turn());
         let turn = tokio::spawn(run_turn(
             handle.clone(),

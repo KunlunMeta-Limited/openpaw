@@ -247,14 +247,18 @@ pub fn assistant_completed_for_turn_response(
 }
 
 /// 功能：生成用户消息已写入的 message.updated 事件。
-/// 参数：`turn_id` 用于构造稳定 user message id。
+/// 参数：`session_id` 为会话编号，`message_id` 为已接受并持久化的用户消息编号。
 /// 返回：带 created/completed 时间的用户消息事件。
+/// 错误：无。
+/// 状态：不修改会话。
+/// 并发与取消：纯投影，无锁或取消点。
+/// 权限：由 HTTP 接收路径执行鉴权。
 /// 关联：`EVT-HOST-MESSAGE-001`。
-pub fn user_message_updated(session_id: &str, turn_id: &str) -> OpenCodeEvent {
+pub fn user_message_updated(session_id: &str, message_id: &str) -> OpenCodeEvent {
     let now = chrono::Utc::now().timestamp_millis();
     OpenCodeEvent::new(
         "message.updated",
-        serde_json::json!({"info":{"id":format!("msg_{session_id}_{turn_id}_user"),"sessionID":session_id,"role":"user","time":{"created":now,"completed":now}}}),
+        serde_json::json!({"info":{"id":message_id,"sessionID":session_id,"role":"user","time":{"created":now,"completed":now}}}),
     )
 }
 

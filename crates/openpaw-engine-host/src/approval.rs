@@ -1,12 +1,12 @@
 //! 功能：管理 Host 侧的人工审批请求，并把审批结果回传给 AgentLoop。
 //! 输入输出边界：输入来自引擎的 `ApprovalManager::request`，输出为
 //! `permission.asked`/`permission.replied` 事件和单次审批响应。
-//! 设计约束：待审批项只保存在当前 session 和当前回合内；`once` 与
-//! `always` 在本实现中都只影响当前请求，不形成跨回合授权。
+//! 设计约束：待审批项只保存在当前 session 和当前回合内；`always` 只在
+//! 当前 session 内记住对应工具，重启或新 session 不继承该授权。
 //! 关联：`API-HOST-PERMISSION-001`、`EVT-HOST-PERMISSION-001`、
 //! `REQ-B-HOST-007`。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use openpaw_core::{ApprovalManager, ApprovalRequest, ApprovalResponse};
@@ -24,7 +24,7 @@ struct Pending {
 /// 功能：提供一个 session 范围内的人工审批管理器。
 /// 字段/状态：内部保存待审批请求、当前回合取消令牌和中止标记。
 /// 数据来源：AgentLoop 发起的 `ApprovalRequest`。
-/// 数据去向：Host SSE 订阅者、全局事件订阅者和等待中的工具调用。
+/// 数据去向：全局 Host SSE 订阅者和等待中的工具调用。
 /// 约束：审批请求必须在同一 session 内回复；回合中止后拒绝迟到回复。
 /// 并发与取消：所有生命周期状态通过互斥锁线性化；`abort_all` 会唤醒全部等待者。
 /// 权限：只传递审批结果，不记录 Basic Authentication 凭据。
@@ -33,7 +33,7 @@ struct Pending {
 pub struct HostApprovalManager {
     session_id: String,
     lifecycle: Mutex<ApprovalLifecycle>,
-    events: broadcast::Sender<OpenCodeEvent>,
+    session_allowed: Mutex<HashSet<String>>,
     global_events: broadcast::Sender<OpenCodeEvent>,
 }
 
@@ -60,8 +60,8 @@ impl HostApprovalManager {
     }
 
     /// 功能：为一个 session 创建审批管理器并绑定事件通道与回合取消令牌。
-    /// 参数：`session_id` 为 session 稳定编号；`events` 为 session 事件通道；
-    /// `global_events` 为全局事件通道；`cancelled` 为当前回合取消令牌。
+    /// 参数：`session_id` 为 session 稳定编号；`global_events` 为全局事件通道；
+    /// `cancelled` 为当前回合取消令牌。
     /// 返回：可在线程间共享的审批管理器。
     /// 错误：不会主动返回错误；通道关闭时事件发送被忽略，等待者收到拒绝结果。
     /// 状态：初始没有待审批项，回合未中止。
@@ -70,7 +70,6 @@ impl HostApprovalManager {
     /// 关联：`REQ-B-HOST-007`、`CHG-2026-0003`。
     pub fn new(
         session_id: impl Into<String>,
-        events: broadcast::Sender<OpenCodeEvent>,
         global_events: broadcast::Sender<OpenCodeEvent>,
         cancelled: CancellationToken,
     ) -> Arc<Self> {
@@ -81,7 +80,7 @@ impl HostApprovalManager {
                 cancelled,
                 aborted: false,
             }),
-            events,
+            session_allowed: Mutex::new(HashSet::new()),
             global_events,
         })
     }
@@ -128,7 +127,7 @@ impl HostApprovalManager {
             .collect()
     }
 
-    /// 功能：回复指定审批请求，并向 session 与全局事件通道发布结果事件。
+    /// 功能：回复指定审批请求，并向全局事件通道发布带 sessionID 的结果事件。
     /// 参数：`id` 为待审批请求编号；`approved` 表示批准或拒绝；`reason` 为处理原因。
     /// 返回：请求存在且成功交付回复时返回 `true`；请求不存在、已中止或已被处理时返回 `false`。
     /// 错误：不会抛出错误；底层 oneshot 或广播通道关闭只表示对应接收方已离开。
@@ -137,6 +136,19 @@ impl HostApprovalManager {
     /// 权限：鉴权由 HTTP 层负责；不得把凭据写入 `reason` 或事件。
     /// 关联：`API-HOST-PERMISSION-001`、`EVT-HOST-PERMISSION-001`。
     pub async fn reply(&self, id: &str, approved: bool, reason: String) -> bool {
+        self.reply_with_scope(id, approved, false, reason).await
+    }
+
+    /// 回复审批，并可把本次批准的工具记为当前 session 的授权。
+    /// `remember_for_session` 对应 OpenWork 的 `always`；授权不跨回合、session
+    /// 或 Host 重启传播。
+    pub async fn reply_with_scope(
+        &self,
+        id: &str,
+        approved: bool,
+        remember_for_session: bool,
+        reason: String,
+    ) -> bool {
         let mut lifecycle = self
             .lifecycle
             .lock()
@@ -146,6 +158,12 @@ impl HostApprovalManager {
         }
         let pending = lifecycle.pending.remove(id);
         let Some(pending) = pending else { return false };
+        if approved && remember_for_session {
+            self.session_allowed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(pending.info.permission.clone());
+        }
         let response = if approved {
             ApprovalResponse::Approved
         } else {
@@ -214,6 +232,14 @@ impl ApprovalManager for HostApprovalManager {
                     reason: "回合已取消".into(),
                 };
             }
+            if self
+                .session_allowed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains(&req.tool_name)
+            {
+                return ApprovalResponse::Approved;
+            }
             let cancelled = lifecycle.cancelled.clone();
             lifecycle.pending.insert(
                 id.clone(),
@@ -225,7 +251,6 @@ impl ApprovalManager for HostApprovalManager {
             // 在生命周期锁内发布事件，使 asked 与 abort 线性化：abort_all 返回后，
             // 当前回合不会再产生迟到的 asked 事件。
             let event = OpenCodeEvent::new("permission.asked", info.clone());
-            let _ = self.events.send(event.clone());
             let _ = self.global_events.send(event);
             cancelled
         };
@@ -261,10 +286,8 @@ mod tests {
 
     #[tokio::test]
     async fn pending_permission_roundtrip_and_reply_event() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         let waiting = {
             let manager = manager.clone();
             tokio::spawn(async move {
@@ -294,10 +317,8 @@ mod tests {
 
     #[tokio::test]
     async fn abort_after_request_wakes_waiter_and_next_turn_resets_state() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         manager.begin_turn();
         let waiting = {
             let manager = manager.clone();
@@ -349,10 +370,8 @@ mod tests {
 
     #[tokio::test]
     async fn begin_turn_closes_stale_permission_with_replied_event() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         manager.begin_turn();
         let waiting = {
             let manager = manager.clone();
@@ -381,10 +400,8 @@ mod tests {
 
     #[tokio::test]
     async fn request_after_abort_is_denied_without_a_late_asked_event() {
-        let (events, mut rx) = broadcast::channel(8);
-        let (global, _global_rx) = broadcast::channel(8);
-        let manager =
-            HostApprovalManager::new("session-1", events, global, CancellationToken::new());
+        let (global, mut rx) = broadcast::channel(8);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         manager.begin_turn();
         manager.abort_all();
 
@@ -401,5 +418,71 @@ mod tests {
             Err(broadcast::error::TryRecvError::Empty)
         ));
         assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn always_remembers_tool_for_current_session_only() {
+        let (global, mut rx) = broadcast::channel(16);
+        let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
+        manager.begin_turn();
+
+        let first = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .request(ApprovalRequest::new("read_file", json!({}), "read"))
+                    .await
+            })
+        };
+        let asked = rx.recv().await.expect("first permission asked");
+        let permission_id = asked.properties["id"].as_str().unwrap().to_string();
+        assert!(
+            manager
+                .reply_with_scope(&permission_id, true, true, String::new())
+                .await
+        );
+        assert!(first.await.unwrap().is_approved());
+        let _ = rx.recv().await.expect("first permission replied");
+
+        manager.begin_turn();
+        let second = manager
+            .request(ApprovalRequest::new("read_file", json!({}), "read again"))
+            .await;
+        assert!(second.is_approved());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let third = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .request(ApprovalRequest::new("write_file", json!({}), "write"))
+                    .await
+            })
+        };
+        let asked = rx.recv().await.expect("different tool still asks");
+        let different_id = asked.properties["id"].as_str().unwrap().to_string();
+        assert!(manager.reply(&different_id, false, "拒绝".into()).await);
+        assert!(matches!(
+            third.await.unwrap(),
+            ApprovalResponse::Denied { .. }
+        ));
+
+        let (other_global, mut other_rx) = broadcast::channel(4);
+        let other = HostApprovalManager::new("session-2", other_global, CancellationToken::new());
+        let other_waiting = {
+            let other = other.clone();
+            tokio::spawn(async move {
+                other
+                    .request(ApprovalRequest::new("read_file", json!({}), "new session"))
+                    .await
+            })
+        };
+        let _ = other_rx.recv().await.expect("new session asks again");
+        assert_eq!(other.list().await.len(), 1);
+        other.abort_all();
+        let _ = other_waiting.await;
     }
 }

@@ -46,6 +46,7 @@ async fn health_and_session_wire_contract() {
         ..Default::default()
     };
     let app = build_router(AppState::new(config));
+    assert_eq!(get_json(&app, "/session").await, serde_json::json!([]));
     let response = request(&app, "GET", "/global/health", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -53,11 +54,18 @@ async fn health_and_session_wire_contract() {
         serde_json::json!({"healthy":true})
     );
     let response = request(&app, "POST", "/session", r#"{"title":"demo"}"#).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     let session = response_json(response).await;
     assert_eq!(session["title"], "demo");
     assert!(session["time"]["created"].is_number());
     let id = session["id"].as_str().unwrap();
+    let listed = get_json(&app, "/session").await;
+    for field in ["id", "slug", "title", "directory"] {
+        assert_eq!(listed[0][field], session[field]);
+    }
+    assert_eq!(listed[0]["time"]["created"], session["time"]["created"]);
+    assert_eq!(listed[0]["time"]["updated"], listed[0]["updatedAt"]);
+    assert_eq!(listed[0]["time"]["created"], listed[0]["createdAt"]);
     assert!(get_json(&app, "/session/status").await.is_object());
     assert_eq!(
         get_json(&app, format!("/session/{id}/message")).await,

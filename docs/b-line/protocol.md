@@ -31,7 +31,8 @@ host 实现 `master-plan.md` 第 3.2 节规定的 OpenCode v1 子集。所有 SS
 - `message.part.delta` 使用 `partID`、`sessionID`、`messageID`、`field` 和
   `delta`；tool state 为 `running`、`completed` 或 `error`。
 - Permission 使用 `id`、`sessionID`、`permission`、`patterns`、`metadata` 和
-  `always`。`once` 与 `always` 都只批准当前请求。
+  `always`。`once` 只批准当前请求；`always` 还会记住当前 session 的同名工具授权，
+  不跨 session 或 Host 重启继承。
 - Provider 为 `mock/mock-1`、`echo/echo-1`、`anthropic/claude-sonnet-4` 和
   `openai/gpt-4o`。
 

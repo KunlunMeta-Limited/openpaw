@@ -190,7 +190,7 @@ impl TurnOutcome {
 /// 关联：`REQ-B-HOST-001`、`REQ-B-HOST-003`、`REQ-B-HOST-008`。
 #[derive(Debug, Clone)]
 pub struct HostConfig {
-    /// 功能：指定监听主机；当前只允许回环地址 `127.0.0.1`。
+    /// 功能：指定监听主机；默认回环 `127.0.0.1`，容器部署可显式使用通配地址 `0.0.0.0`。
     pub hostname: String,
     /// 功能：指定监听端口；0 表示由操作系统分配空闲端口。
     pub port: u16,
@@ -227,16 +227,18 @@ impl Default for HostConfig {
 }
 
 impl HostConfig {
-    /// 功能：校验回环监听、成对凭据和 provider 白名单。
+    /// 功能：校验监听地址、成对凭据和 provider 白名单。
     /// 返回：校验成功返回 `Ok(())`；失败返回中文原因。
-    /// 错误：非回环地址、半配置凭据或未知 provider 会被拒绝。
+    /// 错误：既非回环也非通配地址、半配置凭据或未知 provider 会被拒绝。
     /// 关联：`API-HOST-HEALTH-001`、`REQ-B-HOST-003`。
     pub fn validate(&self) -> Result<(), String> {
-        if self.hostname.trim().is_empty() {
+        let hostname = self.hostname.trim();
+        if hostname.is_empty() {
             return Err("引擎主机 hostname 不能为空".into());
         }
-        if self.hostname != "127.0.0.1" {
-            return Err("引擎主机必须绑定 127.0.0.1".into());
+        // `Dockerfile.engine-host` 以 `0.0.0.0` 启动；仍拒绝绑定具体外部地址。
+        if hostname != "127.0.0.1" && hostname != "0.0.0.0" {
+            return Err("引擎主机必须绑定 127.0.0.1，容器部署可显式使用 0.0.0.0".into());
         }
         if self.username.is_some() != self.password.is_some() {
             return Err("引擎主机鉴权必须同时设置用户名和密码".into());
@@ -285,10 +287,9 @@ impl OpenCodeEvent {
 /// 关联：`API-HOST-SESSION-002`、`REQ-B-OFFICE-005`。
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
-    /// 会话稳定编号。
-    pub id: String,
-    /// 会话显示标题；未命名时使用默认标题。
-    pub title: String,
+    /// OpenCode 会话公共投影；列表与创建、详情使用相同字段。
+    #[serde(flatten)]
+    pub session: SessionWire,
     #[serde(rename = "createdAt")]
     /// 会话创建时间，Unix 毫秒。
     pub created_at: i64,
@@ -299,8 +300,6 @@ pub struct SessionSummary {
     pub provider: String,
     /// 创建会话使用的模型标识。
     pub model: String,
-    /// 会话工作区规范化路径。
-    pub directory: String,
     /// 当前进程是否存在活动回合。
     pub active: bool,
 }
@@ -335,7 +334,7 @@ pub struct SessionTime {
 }
 
 /// 功能：解析 `POST /session` 的可选创建参数。
-/// 参数/字段：provider、model、title 均可省略，由 Host 默认值补齐；工作区只由请求头或查询参数指定。
+/// 参数/字段：provider、model、directory、title 均可省略，由 Host 默认值补齐。
 /// 错误：非法 JSON 由 HTTP 层返回 400。
 /// 关联：`API-HOST-SESSION-001`。
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -355,6 +354,9 @@ pub struct CreateSessionRequest {
 /// 关联：`API-HOST-SESSION-006`。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MessageRequest {
+    /// 客户端用户消息编号；同时作为缺省幂等键，供页面确认接收事实。
+    #[serde(rename = "messageID")]
+    pub message_id: Option<String>,
     /// 客户端提供的单 session 幂等键；省略时保持旧版非幂等行为。
     #[serde(rename = "requestID", alias = "requestId")]
     pub request_id: Option<String>,
@@ -711,7 +713,17 @@ mod tests {
         assert_eq!(default.hostname, "127.0.0.1");
         assert_eq!(default.port, 0);
         assert!(default.validate().is_ok());
-        for hostname in ["localhost", "::1", "0.0.0.0", "192.0.2.1"] {
+        // 容器部署的显式例外：A 线 `Dockerfile.engine-host` 以通配地址启动，
+        // 否则 OpenWork 与 AI Office 无法经 Docker 网络访问 host。
+        let wildcard = HostConfig {
+            hostname: "0.0.0.0".into(),
+            ..HostConfig::default()
+        };
+        assert!(
+            wildcard.validate().is_ok(),
+            "0.0.0.0 must be accepted for container deployments"
+        );
+        for hostname in ["localhost", "::1", "192.0.2.1", "example.com", ""] {
             let config = HostConfig {
                 hostname: hostname.into(),
                 ..HostConfig::default()
