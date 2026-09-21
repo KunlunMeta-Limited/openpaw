@@ -44,7 +44,7 @@ struct ApprovalLifecycle {
 }
 
 impl HostApprovalManager {
-    /// 向 session 和全局事件通道发布一次审批结束事件。
+    /// 向全局事件通道发布一次审批结束事件。
     /// 参数：`id` 为请求编号。
     /// 约束：调用方应已在线程安全的生命周期锁内移除 pending，避免重复结束通知。
     fn emit_replied(&self, id: &str) {
@@ -55,7 +55,6 @@ impl HostApprovalManager {
                 "requestID": id,
             }),
         );
-        let _ = self.events.send(event.clone());
         let _ = self.global_events.send(event);
     }
 

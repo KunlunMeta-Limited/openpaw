@@ -681,7 +681,11 @@ async fn permission_reply(
         }
     });
     for session in state.sessions.read().await.values() {
-        if session.approvals.reply(&id, approved, reason.clone()).await {
+        if session
+            .approvals
+            .reply_with_scope(&id, approved, remember_for_session, reason.clone())
+            .await
+        {
             return StatusCode::NO_CONTENT.into_response();
         }
     }

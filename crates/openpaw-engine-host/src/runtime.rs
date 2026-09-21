@@ -1053,14 +1053,8 @@ impl AppState {
         let id = Uuid::new_v4().simple().to_string();
         let mut session = Session::new(model_name.clone(), provider.name());
         session.meta.id = id.clone();
-        let (events_tx, _) = broadcast::channel(256);
         let cancel = CancellationToken::new();
-        let approvals = HostApprovalManager::new(
-            id.clone(),
-            events_tx.clone(),
-            self.global_events.clone(),
-            cancel,
-        );
+        let approvals = HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel);
         let tool_host = openpaw_tools::arc_registry(&workspace);
         let tools = tool_host.list_tools().await.map_err(|e| e.to_string())?;
         let agent = configured_agent(provider, model_name, tool_host, approvals.clone())?;

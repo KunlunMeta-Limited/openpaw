@@ -284,7 +284,7 @@ async fn workspace_uses_header_then_query_then_cli_default() {
     }));
     let body = serde_json::json!({"directory": body_workspace.path()}).to_string();
     let response = request(&app, "POST", "/session", body.clone()).await;
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await["directory"], default_path);
     let response = request(
         &app,
@@ -293,7 +293,7 @@ async fn workspace_uses_header_then_query_then_cli_default() {
         body.clone(),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await["directory"], query_path);
     let response = request_with_headers(
         &app,
@@ -303,7 +303,7 @@ async fn workspace_uses_header_then_query_then_cli_default() {
         body,
     )
     .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response_json(response).await["directory"], header_path);
 }
 #[tokio::test]
