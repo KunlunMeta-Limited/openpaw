@@ -255,8 +255,7 @@ async fn create_session(
         .get("x-opencode-directory")
         .and_then(|v| v.to_str().ok())
         .map(std::path::PathBuf::from)
-        .or_else(|| query.directory.map(std::path::PathBuf::from))
-        .or_else(|| body.directory.as_ref().map(std::path::PathBuf::from));
+        .or_else(|| query.directory.map(std::path::PathBuf::from));
     match state
         .create_session(
             body.provider.as_deref(),
@@ -674,15 +673,17 @@ async fn permission_reply(
             )
         }
     };
+    let reason = body.reason.clone().unwrap_or_else(|| {
+        if approved {
+            "用户已批准".into()
+        } else {
+            "用户拒绝".into()
+        }
+    });
     for session in state.sessions.read().await.values() {
         if session
             .approvals
-            .reply_with_scope(
-                &id,
-                approved,
-                remember_for_session,
-                body.reason.clone().unwrap_or_else(|| "用户拒绝".into()),
-            )
+            .reply_with_scope(&id, approved, remember_for_session, reason.clone())
             .await
         {
             return StatusCode::NO_CONTENT.into_response();

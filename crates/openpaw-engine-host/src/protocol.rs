@@ -343,8 +343,6 @@ pub struct CreateSessionRequest {
     pub provider: Option<String>,
     /// 默认 model 覆盖值。
     pub model: Option<String>,
-    /// 会话工作区覆盖值。
-    pub directory: Option<String>,
     /// 会话显示标题。
     pub title: Option<String>,
 }
