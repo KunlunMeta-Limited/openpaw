@@ -48,12 +48,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/session", get(list_sessions).post(create_session))
         .route("/session/{id}", get(get_session).delete(delete_session))
         .route("/session/{id}/message", get(messages).post(message))
+        .route("/session/{id}/message/{message_id}", get(messages))
         .route("/session/{id}/turns", get(turns))
         .route("/session/{id}/command", post(no_content))
-        // §3.2 显式降级：session 作用域调用返回 204 而不是 404。
+        // 显式降级：fork/revert 返回原会话 no-op，避免 SDK 空对象导航。
         .route("/session/{id}/shell", post(no_content))
-        .route("/session/{id}/fork", post(no_content))
-        .route("/session/{id}/revert", post(no_content))
+        .route("/session/{id}/fork", post(get_session))
+        .route("/session/{id}/revert", post(get_session))
         .route("/session/{id}/summarize", post(no_content))
         .route("/session/{id}/prompt_async", post(prompt_async))
         .route("/session/{id}/abort", post(abort))
@@ -244,12 +245,12 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<WorkspaceQuery>,
-    body: Result<Json<CreateSessionRequest>, JsonRejection>,
+    body: Option<Json<CreateSessionRequest>>,
 ) -> Response {
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
-    };
+    // OpenWork's generated client omits both body and Content-Type for the
+    // default session-create request. Optional JSON accepts that request while
+    // still rejecting malformed JSON when a body is supplied.
+    let body = body.map(|Json(body)| body).unwrap_or_default();
     let workspace = headers
         .get("x-opencode-directory")
         .and_then(|v| v.to_str().ok())
@@ -308,8 +309,11 @@ async fn delete_session(State(state): State<Arc<AppState>>, Path(id): Path<Strin
     }
 }
 
-async fn messages(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let handle = match state.get_typed(&id).await {
+async fn messages(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<std::collections::HashMap<String, String>>,
+) -> Response {
+    let handle = match state.get_typed(&path["id"]).await {
         Ok(handle) => handle,
         Err(error) => return session_load_error(error),
     };
@@ -318,9 +322,18 @@ async fn messages(State(state): State<Arc<AppState>>, Path(id): Path<String>) ->
     let result: Vec<serde_json::Value> = messages
         .iter()
         .enumerate()
-        .map(|(index, message)| message_wire(&id, index, message))
+        .map(|(index, message)| message_wire(&handle, index, message))
         .collect();
-    Json(result).into_response()
+    match path.get("message_id") {
+        Some(id) => match result
+            .into_iter()
+            .find(|message| message["info"]["id"] == *id)
+        {
+            Some(message) => Json(message).into_response(),
+            None => bad(StatusCode::NOT_FOUND, "消息不存在"),
+        },
+        None => Json(result).into_response(),
+    }
 }
 
 async fn turns(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -358,21 +371,22 @@ async fn prompt_async(
 async fn schedule_turn(
     state: Arc<AppState>,
     id: String,
-    body: MessageRequest,
+    mut body: MessageRequest,
     asynchronous: bool,
 ) -> Response {
     let text = body.text();
     if text.trim().is_empty() {
         return bad(StatusCode::BAD_REQUEST, "消息文本不能为空");
     }
-    if let Some(request_id) = body.request_id.as_deref() {
+    body.request_id = body.request_id.or_else(|| body.message_id.clone());
+    for request_id in body.request_id.iter().chain(body.message_id.iter()) {
         if request_id.is_empty()
             || request_id.len() > 128
             || !request_id.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
         {
             return bad_with_code(
                 StatusCode::BAD_REQUEST,
-                "requestID 必须为 1..128 字节的可打印 ASCII",
+                "requestID/messageID 必须为 1..128 字节的可打印 ASCII",
                 "invalid_request_id",
                 false,
             );
@@ -438,12 +452,13 @@ async fn schedule_turn(
     }
     let provider = match runtime::build_provider(&provider_name) {
         Ok(provider) => provider,
-        Err(error) => {
-            return bad(StatusCode::BAD_REQUEST, error);
-        }
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error),
     };
     let turn_id = handle.next_turn_id();
-    let user_message_id = format!("msg_{id}_{turn_id}_user");
+    let user_message_id = body
+        .message_id
+        .clone()
+        .unwrap_or_else(|| format!("msg_{id}_{turn_id}_user"));
     let user = Message::user_text(text.clone()).with_uuid(user_message_id.clone());
     let request_admission =
         body.request_id
@@ -503,7 +518,10 @@ async fn schedule_turn(
         chrono::Utc::now().timestamp_millis(),
         std::sync::atomic::Ordering::Release,
     );
-    handle.emit(crate::events::user_message_updated(&id, &accepted.turn_id));
+    handle.emit(crate::events::user_message_updated(
+        &id,
+        &accepted.user_message_id,
+    ));
     let response_turn_id = accepted.turn_id.clone();
     let task = state.spawn_turn(
         host_admission,
@@ -645,9 +663,10 @@ async fn permission_reply(
             "reply 必须是 once、always 或 reject",
         );
     };
-    let approved = match reply {
-        "once" | "always" => true,
-        "reject" => false,
+    let (approved, remember_for_session) = match reply {
+        "once" => (true, false),
+        "always" => (true, true),
+        "reject" => (false, false),
         _ => {
             return bad(
                 StatusCode::BAD_REQUEST,
@@ -658,9 +677,10 @@ async fn permission_reply(
     for session in state.sessions.read().await.values() {
         if session
             .approvals
-            .reply(
+            .reply_with_scope(
                 &id,
                 approved,
+                remember_for_session,
                 body.reason.clone().unwrap_or_else(|| "用户拒绝".into()),
             )
             .await
@@ -753,6 +773,9 @@ fn request_fingerprint(body: &MessageRequest, provider: &str, model: &str) -> St
     for field in ["openpaw-message-v1", text.as_str(), provider, model] {
         canonical.extend_from_slice(&(field.len() as u64).to_be_bytes());
         canonical.extend_from_slice(field.as_bytes());
+    }
+    if let Some(message_id) = &body.message_id {
+        canonical.extend_from_slice(message_id.as_bytes());
     }
     sha256_hex(&canonical)
 }
@@ -866,10 +889,11 @@ fn sse_stream(
 }
 
 fn message_wire(
-    session_id: &str,
+    handle: &SessionHandle,
     index: usize,
     message: &openpaw_core::Message,
 ) -> serde_json::Value {
+    let session_id = &handle.id;
     let message_id = message
         .uuid
         .clone()
@@ -888,7 +912,22 @@ fn message_wire(
             _ => None,
         }
     }).collect::<Vec<_>>();
-    serde_json::json!({"info":{"id":message_id,"sessionID":session_id,"role":role,"time":{"created":0,"completed":0}},"parts":parts})
+    let turn = handle.turn_outcomes().into_iter().find(|turn| {
+        turn.user_message_id == message_id
+            || message_id.starts_with(&format!("msg_{session_id}_{}_", turn.turn_id))
+    });
+    let created = message
+        .timestamp
+        .as_deref()
+        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        .map(|time| time.timestamp_millis())
+        .or_else(|| {
+            turn.as_ref()
+                .and_then(|turn| turn.started_at.or(turn.queued_at))
+        })
+        .unwrap_or(handle.created_at);
+    let completed = turn.as_ref().and_then(|turn| turn.completed_at);
+    serde_json::json!({"info":{"id":message_id,"sessionID":session_id,"role":role,"time":{"created":created,"completed":completed}},"parts":parts})
 }
 
 #[cfg(test)]
@@ -903,6 +942,83 @@ mod tests {
     use tower::ServiceExt;
 
     static PROVIDER_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    #[tokio::test]
+    async fn client_message_identity_survives_replay_and_restart() {
+        let home = tempdir().unwrap();
+        let config = HostConfig {
+            home: home.path().into(),
+            provider: "echo".into(),
+            ..Default::default()
+        };
+        let app = build_router(AppState::new(config.clone()));
+        let id = create_session_id(&app).await;
+        let body = r#"{"messageID":"msg_client_test","text":"synthetic identity check"}"#;
+        let request = |method: &str, path: &str, body: &str| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(request("POST", &format!("/session/{id}/message"), body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let turn = response.headers()[OPENPAW_TURN_ID].clone();
+        for router in [app.clone(), build_router(AppState::new(config))] {
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    &format!("/session/{id}/prompt_async"),
+                    body,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            assert_eq!(response.headers()[OPENPAW_TURN_ID], turn);
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    &format!("/session/{id}/message/msg_client_test"),
+                    "",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(value["info"]["id"], "msg_client_test");
+            assert!(value["info"]["time"]["created"].as_i64().unwrap() > 0);
+            let response = router
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    &format!("/session/{id}/message"),
+                    r#"{"messageID":"msg_client_test","text":"different"}"#,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let response = router
+                .oneshot(request(
+                    "GET",
+                    &format!("/session/{id}/message/missing"),
+                    "",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+        let event = crate::events::user_message_updated(&id, "msg_client_test");
+        assert_eq!(event.properties["info"]["id"], "msg_client_test");
+    }
 
     #[test]
     fn sha256_matches_known_vector() {
@@ -951,6 +1067,30 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn create_session_accepts_empty_sdk_post_without_content_type() {
+        let home = tempdir().expect("home");
+        let app = build_router(AppState::new(HostConfig {
+            home: home.path().into(),
+            provider: "mock".into(),
+            ..Default::default()
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(session["id"].as_str().is_some());
     }
 
     #[tokio::test]
@@ -1061,7 +1201,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "GET {route}");
         }
-        // §3.2：降级路由只在 session 作用域，全部返回 204。
+        // 降级路由只在 session 作用域；fork/revert 只读返回原会话。
         for route in [
             format!("/session/{id}/command"),
             format!("/session/{id}/shell"),
@@ -1080,7 +1220,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NO_CONTENT, "POST {route}");
+            if route.ends_with("/fork") || route.ends_with("/revert") {
+                assert_eq!(response.status(), StatusCode::OK, "POST {route}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(session["id"], id);
+                assert!(session.get("revert").is_none());
+            } else {
+                assert_eq!(response.status(), StatusCode::NO_CONTENT, "POST {route}");
+            }
         }
         // §3.2 的 `/command` 只有 GET → []；根路径不存在 shell/fork/revert/summarize。
         let response = app

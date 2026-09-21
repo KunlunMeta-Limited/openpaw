@@ -75,6 +75,11 @@ async function openworkSuite() {
   const list = await req('GET', '/session');
   check('GET /session -> array containing the session',
     list.status === 200 && Array.isArray(list.json) && list.json.some((s) => s.id === sid));
+  const summary = list.json?.find((s) => s.id === sid);
+  check('session list -> OpenCode time/slug and compatible summary fields',
+    summary?.slug === sid && Number.isFinite(summary?.time?.created)
+      && summary.time.created === summary.createdAt && summary.time.updated === summary.updatedAt
+      && summary.directory === created.json.directory && typeof summary.active === 'boolean');
 
   const one = await req('GET', `/session/${sid}`);
   check('GET /session/:id -> session object', one.status === 200 && one.json?.id === sid);
@@ -131,12 +136,21 @@ async function openworkSuite() {
   }
   for (const p of ['command', 'shell', 'fork', 'revert', 'summarize']) {
     const r = await req('POST', `/session/${sid}/${p}`, {});
-    check(`POST /session/:id/${p} -> 204`, r.status === 204, `got ${r.status}`);
+    if (p === 'fork' || p === 'revert') {
+      check(`POST /session/:id/${p} -> current session no-op`, r.status === 200 && r.json.id === sid && !r.json.revert, `got ${r.status}`);
+    } else {
+      check(`POST /session/:id/${p} -> 204`, r.status === 204, `got ${r.status}`);
+    }
   }
   for (const p of ['/api/health', '/session/execution']) {
     const r = await req('GET', p);
     check(`GET ${p} (v2) -> 404`, r.status === 404, `got ${r.status}`);
   }
+  for (const p of ['/shell', '/fork', '/revert', '/summarize']) {
+    const r = await req('POST', p, {});
+    check(`POST ${p} -> 404 after deduplication`, r.status === 404, `got ${r.status}`);
+  }
+  check('POST /command -> 405 (GET only)', (await req('POST', '/command', {})).status === 405);
 
   // ── drive a turn while collecting SSE ──
   const events = [];

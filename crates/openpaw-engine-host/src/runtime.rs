@@ -1220,13 +1220,20 @@ impl AppState {
                     .unwrap_or_else(|| unix_millis(meta.created_at));
                 let active = active_ids.contains(&meta.id);
                 out.push(SessionSummary {
-                    id: meta.id,
-                    title,
+                    session: SessionWire {
+                        slug: meta.id.clone(),
+                        id: meta.id,
+                        title,
+                        directory,
+                        time: SessionTime {
+                            created: unix_millis(meta.created_at),
+                            updated,
+                        },
+                    },
                     created_at: unix_millis(meta.created_at),
                     updated_at: updated,
                     provider: meta.provider,
                     model: meta.model,
-                    directory,
                     active,
                 });
             }
@@ -1797,6 +1804,14 @@ pub(crate) fn accept_turn(
                 AcceptTurnResult::IdempotencyConflict
             };
         }
+    }
+    // 不允许不同 requestID 重用同一消息身份，否则重启恢复会把新回合正文去重丢弃。
+    if handle
+        .turn_outcomes()
+        .iter()
+        .any(|turn| turn.user_message_id == user_message_id)
+    {
+        return AcceptTurnResult::IdempotencyConflict;
     }
     if handle.deleting.load(Ordering::Acquire) {
         return AcceptTurnResult::Deleting;
@@ -2857,9 +2872,15 @@ mod tests {
         let summaries = restarted.summaries().await;
         let summary = summaries
             .iter()
-            .find(|summary| summary.id == id)
+            .find(|summary| summary.session.id == id)
             .expect("session summary");
-        assert_eq!(PathBuf::from(&summary.directory), original_workspace.path());
+        assert_eq!(
+            PathBuf::from(&summary.session.directory),
+            original_workspace.path()
+        );
+        assert_eq!(summary.session.slug, id);
+        assert_eq!(summary.session.time.created, summary.created_at);
+        assert_eq!(summary.session.time.updated, summary.updated_at);
     }
 
     #[tokio::test]

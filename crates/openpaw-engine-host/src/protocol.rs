@@ -287,10 +287,9 @@ impl OpenCodeEvent {
 /// 关联：`API-HOST-SESSION-002`、`REQ-B-OFFICE-005`。
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
-    /// 会话稳定编号。
-    pub id: String,
-    /// 会话显示标题；未命名时使用默认标题。
-    pub title: String,
+    /// OpenCode 会话公共投影；列表与创建、详情使用相同字段。
+    #[serde(flatten)]
+    pub session: SessionWire,
     #[serde(rename = "createdAt")]
     /// 会话创建时间，Unix 毫秒。
     pub created_at: i64,
@@ -301,8 +300,6 @@ pub struct SessionSummary {
     pub provider: String,
     /// 创建会话使用的模型标识。
     pub model: String,
-    /// 会话工作区规范化路径。
-    pub directory: String,
     /// 当前进程是否存在活动回合。
     pub active: bool,
 }
@@ -359,6 +356,9 @@ pub struct CreateSessionRequest {
 /// 关联：`API-HOST-SESSION-006`。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MessageRequest {
+    /// 客户端用户消息编号；同时作为缺省幂等键，供页面确认接收事实。
+    #[serde(rename = "messageID")]
+    pub message_id: Option<String>,
     /// 客户端提供的单 session 幂等键；省略时保持旧版非幂等行为。
     #[serde(rename = "requestID", alias = "requestId")]
     pub request_id: Option<String>,
