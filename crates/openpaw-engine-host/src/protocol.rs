@@ -335,7 +335,7 @@ pub struct SessionTime {
 }
 
 /// 功能：解析 `POST /session` 的可选创建参数。
-/// 参数/字段：provider、model、directory、title 均可省略，由 Host 默认值补齐。
+/// 参数/字段：provider、model、title 均可省略，由 Host 默认值补齐；工作区只由请求头或查询参数指定。
 /// 错误：非法 JSON 由 HTTP 层返回 400。
 /// 关联：`API-HOST-SESSION-001`。
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -344,8 +344,6 @@ pub struct CreateSessionRequest {
     pub provider: Option<String>,
     /// 默认 model 覆盖值。
     pub model: Option<String>,
-    /// 会话工作区覆盖值。
-    pub directory: Option<String>,
     /// 会话显示标题。
     pub title: Option<String>,
 }

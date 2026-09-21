@@ -45,16 +45,14 @@ struct ApprovalLifecycle {
 
 impl HostApprovalManager {
     /// 向 session 和全局事件通道发布一次审批结束事件。
-    /// 参数：`id` 为请求编号；`status` 为 approved/rejected；`reason` 为中文原因。
+    /// 参数：`id` 为请求编号。
     /// 约束：调用方应已在线程安全的生命周期锁内移除 pending，避免重复结束通知。
-    fn emit_replied(&self, id: &str, status: &str, reason: &str) {
+    fn emit_replied(&self, id: &str) {
         let event = OpenCodeEvent::new(
             "permission.replied",
             serde_json::json!({
                 "sessionID": self.session_id,
                 "requestID": id,
-                "status": status,
-                "reason": reason,
             }),
         );
         let _ = self.events.send(event.clone());
@@ -103,10 +101,10 @@ impl HostApprovalManager {
             .unwrap_or_else(|error| error.into_inner());
         lifecycle.cancelled.cancel();
         for (id, request) in lifecycle.pending.drain() {
+            self.emit_replied(&id);
             let _ = request.tx.send(ApprovalResponse::Denied {
                 reason: "审批回合已结束".into(),
             });
-            self.emit_replied(&id, "rejected", "审批回合已结束");
         }
         lifecycle.cancelled = CancellationToken::new();
         lifecycle.aborted = false;
@@ -155,9 +153,8 @@ impl HostApprovalManager {
                 reason: reason.clone(),
             }
         };
+        self.emit_replied(id);
         let _ = pending.tx.send(response);
-        let status = if approved { "approved" } else { "rejected" };
-        self.emit_replied(id, status, &reason);
         true
     }
 
@@ -177,10 +174,10 @@ impl HostApprovalManager {
         lifecycle.aborted = true;
         lifecycle.cancelled.cancel();
         for (id, request) in lifecycle.pending.drain() {
+            self.emit_replied(&id);
             let _ = request.tx.send(ApprovalResponse::Denied {
                 reason: "回合已取消".into(),
             });
-            self.emit_replied(&id, "rejected", "回合已取消");
         }
     }
 }
@@ -285,10 +282,13 @@ mod tests {
         let permission_id = asked.properties["id"].as_str().unwrap().to_string();
         assert_eq!(manager.list().await.len(), 1);
         assert!(manager.reply(&permission_id, true, String::new()).await);
-        assert!(waiting.await.unwrap().is_approved());
         let replied = rx.recv().await.expect("permission replied");
         assert_eq!(replied.event_type, "permission.replied");
-        assert_eq!(replied.properties["requestID"], permission_id);
+        assert_eq!(
+            replied.properties,
+            json!({"sessionID":"session-1","requestID":permission_id})
+        );
+        assert!(waiting.await.unwrap().is_approved());
         assert!(manager.list().await.is_empty());
     }
 
@@ -311,8 +311,13 @@ mod tests {
         manager.abort_all();
         let aborted_event = rx.recv().await.expect("permission replied after abort");
         assert_eq!(aborted_event.event_type, "permission.replied");
-        assert_eq!(aborted_event.properties["status"], "rejected");
-        assert_eq!(aborted_event.properties["reason"], "回合已取消");
+        assert_eq!(
+            aborted_event
+                .properties
+                .as_object()
+                .map(|value| value.len()),
+            Some(2)
+        );
         let response = tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
             .await
             .expect("abort must wake request")
@@ -363,7 +368,10 @@ mod tests {
         let replied = rx.recv().await.expect("permission replied after reset");
         assert_eq!(replied.event_type, "permission.replied");
         assert_eq!(replied.properties["requestID"], permission_id);
-        assert_eq!(replied.properties["reason"], "审批回合已结束");
+        assert_eq!(
+            replied.properties.as_object().map(|value| value.len()),
+            Some(2)
+        );
         assert!(matches!(
             waiting.await.unwrap(),
             ApprovalResponse::Denied { .. }

@@ -1059,23 +1059,6 @@ impl AppState {
         let id = Uuid::new_v4().simple().to_string();
         let mut session = Session::new(model_name.clone(), provider.name());
         session.meta.id = id.clone();
-        let home = self.config.home.clone();
-        let path = home.join("sessions").join(format!("{id}.jsonl"));
-        let mut writer = SessionWriter::create(&path).map_err(|e| e.to_string())?;
-        writer
-            .append(&SessionEvent::Meta(session.meta.clone()))
-            .map_err(|e| e.to_string())?;
-        writer
-            .append(&SessionEvent::Metadata {
-                title: title.map(str::to_string),
-                mode: None,
-                model_override: None,
-                cwd: Some(workspace.to_string_lossy().into_owned()),
-                workspace_id: None,
-                workspace_name: None,
-                task_id: None,
-            })
-            .map_err(|e| e.to_string())?;
         let (events_tx, _) = broadcast::channel(256);
         let cancel = CancellationToken::new();
         let approvals = HostApprovalManager::new(
@@ -1087,6 +1070,28 @@ impl AppState {
         let tool_host = openpaw_tools::arc_registry(&workspace);
         let tools = tool_host.list_tools().await.map_err(|e| e.to_string())?;
         let agent = configured_agent(provider, model_name, tool_host, approvals.clone())?;
+        let home = self.config.home.clone();
+        let path = home.join("sessions").join(format!("{id}.jsonl"));
+        let mut writer = SessionWriter::create(&path).map_err(|e| e.to_string())?;
+        let metadata = SessionEvent::Metadata {
+            title: title.map(str::to_string),
+            mode: None,
+            model_override: None,
+            cwd: Some(workspace.to_string_lossy().into_owned()),
+            workspace_id: None,
+            workspace_name: None,
+            task_id: None,
+        };
+        if let Err(error) = writer
+            .append(&SessionEvent::Meta(session.meta.clone()))
+            .and_then(|_| writer.append(&metadata))
+        {
+            drop(writer);
+            if let Err(cleanup_error) = std::fs::remove_file(&path) {
+                tracing::warn!(%cleanup_error, "创建会话失败后无法清理未完成的 session 文件");
+            }
+            return Err(error.to_string());
+        }
         let handle = self.build_session_handle(SessionHandleInit {
             session,
             messages: Vec::new(),
@@ -2261,11 +2266,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         if cancelled {
             session.messages.truncate(before);
         }
-        if !cancelled
-            && result.is_ok()
-            && response_index > 0
-            && completed_responses.insert(active_response_index)
-        {
+        if response_index > 0 && completed_responses.insert(active_response_index) {
             handle.emit(events::assistant_completed_for_turn_response(
                 &handle.id,
                 Some(&turn_id),
@@ -2504,6 +2505,44 @@ fn repair_torn_session_tail(path: &std::path::Path) -> Result<(), SessionLoadErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openpaw_core::StreamEvent;
+
+    #[tokio::test]
+    async fn failed_agent_configuration_leaves_no_ghost_session() {
+        const TEST_NAME: &str =
+            "runtime::tests::failed_agent_configuration_leaves_no_ghost_session";
+        if std::env::var_os("OPENPAW_GHOST_SESSION_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env("OPENPAW_GHOST_SESSION_CHILD", "1")
+                .env("OPENPAW_MAX_OUTPUT_TOKENS", "invalid")
+                .output()
+                .expect("spawn isolated test");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+
+        let home = tempfile::tempdir().expect("home");
+        let state = AppState::new(HostConfig {
+            home: home.path().into(),
+            ..Default::default()
+        });
+        assert!(state.create_session(None, None, None, None).await.is_err());
+        assert!(state.summaries().await.is_empty());
+        let session_dir = home.path().join("sessions");
+        let count = std::fs::read_dir(session_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .count();
+        assert_eq!(count, 0);
+    }
 
     #[test]
     fn retryable_provider_failures_use_stable_retryable_turn_codes() {
@@ -2576,10 +2615,16 @@ mod tests {
                 if self.panic_after_tool {
                     panic!("intentional provider panic after tool result");
                 }
-                return Err(openpaw_core::Error::server_error(
-                    503,
-                    "provider failed after tool result",
-                ));
+                return Ok(Box::pin(futures::stream::iter([
+                    Ok(StreamEvent::TextDelta {
+                        index: 0,
+                        text: "partial failure".into(),
+                    }),
+                    Err(openpaw_core::Error::server_error(
+                        503,
+                        "provider failed after tool result",
+                    )),
+                ])));
             }
             let response = openpaw_core::CompletionResponse {
                 content: vec![
@@ -2811,10 +2856,16 @@ mod tests {
                 outcomes[0].error.as_ref().map(|error| error.retryable),
                 Some(!panic_after_tool)
             );
-            assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
-                event.properties["info"]["id"] == format!("msg_{id}_{turn_id}_assistant_1")
-                    && event.properties["info"]["time"]["completed"].is_number()
-            }));
+            assert!(
+                panic_after_tool
+                    || std::iter::from_fn(|| events.try_recv().ok())
+                        .take_while(|event| event.event_type != "session.idle")
+                        .any(|event| {
+                            event.properties["info"]["id"]
+                                == format!("msg_{id}_{turn_id}_assistant_1")
+                                && event.properties["info"]["time"]["completed"].is_number()
+                        })
+            );
 
             drop(handle);
             drop(state);
@@ -3178,10 +3229,15 @@ mod tests {
             .iter()
             .position(|event| event.event_type == "session.idle")
             .expect("idle event");
-        assert!(remaining
-            .iter()
-            .skip(idle_index + 1)
-            .all(|event| event.event_type != "message.part.delta"));
-        assert!(!handle.is_active());
+        assert!(
+            remaining[..idle_index]
+                .iter()
+                .any(|event| event.properties["info"]["time"]["completed"].is_number())
+                && remaining
+                    .iter()
+                    .skip(idle_index + 1)
+                    .all(|event| event.event_type != "message.part.delta")
+                && !handle.is_active()
+        );
     }
 }

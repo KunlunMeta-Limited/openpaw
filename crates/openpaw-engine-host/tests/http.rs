@@ -258,28 +258,45 @@ async fn corrupt_session_returns_typed_safe_error() {
     assert!(!String::from_utf8_lossy(&body).contains(home.path().to_string_lossy().as_ref()));
 }
 #[tokio::test]
-async fn workspace_header_precedes_query_and_body() {
+async fn workspace_uses_header_then_query_then_cli_default() {
     let home = tempdir().expect("home");
-    let workspace = tempdir().expect("workspace");
+    let default_workspace = tempdir().expect("default workspace");
+    let header_workspace = tempdir().expect("header workspace");
+    let body_workspace = tempdir().expect("body workspace");
+    let query_workspace = std::env::current_dir()
+        .expect("cwd")
+        .join("query-workspace");
+    let default_path = default_workspace.path().to_string_lossy().into_owned();
+    let query_path = query_workspace.to_string_lossy().into_owned();
+    let header_path = header_workspace.path().to_string_lossy().into_owned();
     let app = build_router(AppState::new(HostConfig {
         home: home.path().into(),
+        workspace: default_workspace.path().into(),
         ..Default::default()
     }));
-    let workspace_header = workspace.path().to_string_lossy();
-    let response = request_with_headers(
+    let body = serde_json::json!({"directory": body_workspace.path()}).to_string();
+    let response = request(&app, "POST", "/session", body.clone()).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response_json(response).await["directory"], default_path);
+    let response = request(
         &app,
         "POST",
-        "/session?directory=query",
-        &[("x-opencode-directory", workspace_header.as_ref())],
-        r#"{"directory":"body"}"#,
+        "/session?directory=query-workspace",
+        body.clone(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let session = response_json(response).await;
-    assert_eq!(
-        session["directory"],
-        workspace.path().to_string_lossy().as_ref()
-    );
+    assert_eq!(response_json(response).await["directory"], query_path);
+    let response = request_with_headers(
+        &app,
+        "POST",
+        "/session?directory=query-workspace",
+        &[("x-opencode-directory", header_path.as_ref())],
+        body,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(response_json(response).await["directory"], header_path);
 }
 #[tokio::test]
 async fn wrong_basic_auth_credentials_are_rejected() {
