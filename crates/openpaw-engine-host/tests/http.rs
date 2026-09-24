@@ -6,7 +6,7 @@
 use axum::body::Body;
 use axum::http::StatusCode;
 use openpaw_core::{ContentBlock, Message, SessionEvent};
-use openpaw_engine_host::{build_router, run_with_shutdown, AppState, HostConfig};
+use openpaw_engine_host::{build_router, run_with_shutdown, AppState, HostConfig, OpenCodeEvent};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -66,6 +66,34 @@ async fn wait_until_listening(address: SocketAddr) {
     .await
     .expect("Host should start listening");
 }
+
+async fn next_session_event(
+    events: &mut tokio::sync::broadcast::Receiver<OpenCodeEvent>,
+    event_type: &str,
+) -> OpenCodeEvent {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.expect("session event");
+            if event.event_type == event_type {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("session event timeout")
+}
+
+fn assert_session_event(event: &OpenCodeEvent, event_type: &str, session_id: &str) {
+    assert_eq!(event.event_type, event_type);
+    let properties = event
+        .properties
+        .as_object()
+        .expect("session event properties");
+    assert_eq!(properties.len(), 2);
+    assert_eq!(properties["sessionID"], session_id);
+    assert_eq!(properties["info"]["id"], session_id);
+}
+
 #[tokio::test]
 async fn health_and_session_wire_contract() {
     let home = tempdir().expect("home");
@@ -111,6 +139,278 @@ async fn health_and_session_wire_contract() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = request(&app, "GET", format!("/session/{id}"), Body::empty()).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn session_created_and_updated_events_use_the_info_envelope() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let mut events = state.global_events.subscribe();
+
+    let id = create_session(&app).await;
+    let event = next_session_event(&mut events, "session.created").await;
+    assert_session_event(&event, "session.created", &id);
+
+    let response = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Envelope"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = next_session_event(&mut events, "session.updated").await;
+    assert_session_event(&event, "session.updated", &id);
+    assert_eq!(event.properties["info"]["title"], "Envelope");
+
+    let fork = request(&app, "POST", format!("/session/{id}/fork"), "{}").await;
+    assert_eq!(fork.status(), StatusCode::OK);
+    let fork_id = response_json(fork).await["id"]
+        .as_str()
+        .expect("fork id")
+        .to_string();
+    let event = next_session_event(&mut events, "session.created").await;
+    assert_session_event(&event, "session.created", &fork_id);
+
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/message"),
+        r#"{"text":"event boundary"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    while events.try_recv().is_ok() {}
+    let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let boundary_id = messages[1]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = next_session_event(&mut events, "session.updated").await;
+    assert_session_event(&event, "session.updated", &id);
+    assert_eq!(event.properties["info"]["revert"]["messageID"], boundary_id);
+
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = next_session_event(&mut events, "session.updated").await;
+    assert_session_event(&event, "session.updated", &id);
+    assert!(event.properties["info"].get("revert").is_none());
+}
+
+#[tokio::test]
+async fn session_mutations_linearize_with_prompt_acceptance() {
+    let home = tempdir().expect("home");
+    let app = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    }));
+
+    let archive_id = create_session(&app).await;
+    let archive = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{archive_id}"),
+        &[("content-type", "application/json")],
+        r#"{"time":{"archived":111}}"#,
+    );
+    let prompt = sync_prompt_with_request_id(&app, &archive_id, "archive-race", "archive race");
+    let (archive, prompt) = tokio::join!(archive, prompt);
+    assert_eq!(prompt.status(), StatusCode::OK);
+    assert!(matches!(
+        archive.status(),
+        StatusCode::OK | StatusCode::CONFLICT
+    ));
+    let archived = get_json(&app, format!("/session/{archive_id}")).await;
+    if archive.status() == StatusCode::OK {
+        assert_eq!(archived["time"]["archived"], 111);
+    } else {
+        assert!(archived["time"].get("archived").is_none());
+    }
+
+    let fork_source_id = create_session(&app).await;
+    let fork = request(
+        &app,
+        "POST",
+        format!("/session/{fork_source_id}/fork"),
+        "{}",
+    );
+    let prompt = sync_prompt_with_request_id(&app, &fork_source_id, "fork-race", "fork race");
+    let (fork, prompt) = tokio::join!(fork, prompt);
+    assert_eq!(prompt.status(), StatusCode::OK);
+    assert!(matches!(
+        fork.status(),
+        StatusCode::OK | StatusCode::CONFLICT
+    ));
+    if fork.status() == StatusCode::OK {
+        let fork_id = response_json(fork).await["id"]
+            .as_str()
+            .expect("fork id")
+            .to_string();
+        let copied = get_json(&app, format!("/session/{fork_id}/message")).await;
+        assert!(matches!(copied.as_array().unwrap().len(), 0 | 2));
+    }
+
+    let revert_id = create_session(&app).await;
+    for (request_id, text) in [("revert-seed-1", "kept"), ("revert-seed-2", "removed")] {
+        let response = sync_prompt_with_request_id(&app, &revert_id, request_id, text).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let before = get_json(&app, format!("/session/{revert_id}/message")).await;
+    let boundary_id = before[2]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+    let revert = request(
+        &app,
+        "POST",
+        format!("/session/{revert_id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    );
+    let prompt = sync_prompt_with_request_id(&app, &revert_id, "revert-race", "replacement race");
+    let (revert, prompt) = tokio::join!(revert, prompt);
+    assert_eq!(prompt.status(), StatusCode::OK);
+    assert!(matches!(
+        revert.status(),
+        StatusCode::OK | StatusCode::CONFLICT
+    ));
+    let session = get_json(&app, format!("/session/{revert_id}")).await;
+    let messages = get_json(&app, format!("/session/{revert_id}/message")).await;
+    match (revert.status(), session.get("revert")) {
+        (StatusCode::CONFLICT, None) => assert_eq!(messages.as_array().unwrap().len(), 6),
+        (StatusCode::OK, None) => assert_eq!(messages.as_array().unwrap().len(), 4),
+        (StatusCode::OK, Some(cursor)) => {
+            assert_eq!(cursor["messageID"], boundary_id);
+            assert_eq!(messages.as_array().unwrap().len(), 2);
+        }
+        outcome => panic!("non-linearized revert/prompt outcome: {outcome:?}"),
+    }
+}
+
+#[tokio::test]
+async fn session_mutations_linearize_with_delete() {
+    let home = tempdir().expect("home");
+    let app = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    }));
+
+    let archive_id = create_session(&app).await;
+    let archive = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{archive_id}"),
+        &[("content-type", "application/json")],
+        r#"{"time":{"archived":222}}"#,
+    );
+    let delete = request(
+        &app,
+        "DELETE",
+        format!("/session/{archive_id}"),
+        Body::empty(),
+    );
+    let (archive, delete) = tokio::join!(archive, delete);
+    assert!(matches!(
+        archive.status(),
+        StatusCode::OK | StatusCode::NOT_FOUND
+    ));
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        request(&app, "GET", format!("/session/{archive_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let fork_source_id = create_session(&app).await;
+    let fork = request(
+        &app,
+        "POST",
+        format!("/session/{fork_source_id}/fork"),
+        "{}",
+    );
+    let delete = request(
+        &app,
+        "DELETE",
+        format!("/session/{fork_source_id}"),
+        Body::empty(),
+    );
+    let (fork, delete) = tokio::join!(fork, delete);
+    assert!(matches!(
+        fork.status(),
+        StatusCode::OK | StatusCode::NOT_FOUND
+    ));
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    if fork.status() == StatusCode::OK {
+        let fork_id = response_json(fork).await["id"]
+            .as_str()
+            .expect("fork id")
+            .to_string();
+        assert_eq!(
+            request(&app, "GET", format!("/session/{fork_id}"), Body::empty())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let revert_id = create_session(&app).await;
+    let response = sync_prompt_with_request_id(&app, &revert_id, "delete-seed", "seed").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let messages = get_json(&app, format!("/session/{revert_id}/message")).await;
+    let boundary_id = messages[1]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+    let revert = request(
+        &app,
+        "POST",
+        format!("/session/{revert_id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    );
+    let delete = request(
+        &app,
+        "DELETE",
+        format!("/session/{revert_id}"),
+        Body::empty(),
+    );
+    let (revert, delete) = tokio::join!(revert, delete);
+    assert!(matches!(
+        revert.status(),
+        StatusCode::OK | StatusCode::NOT_FOUND
+    ));
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        request(&app, "GET", format!("/session/{revert_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
 }
 
 #[tokio::test]
@@ -891,6 +1191,125 @@ async fn basic_auth_is_required_when_configured() {
         "GET",
         "/global/health",
         &[("authorization", "Basic YWxpY2U6c2VjcmV0")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_mutation_routes_require_basic_auth() {
+    const AUTH: (&str, &str) = ("authorization", "Basic YWxpY2U6c2VjcmV0");
+    let home = tempdir().expect("home");
+    let app = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        username: Some("alice".into()),
+        password: Some("secret".into()),
+        ..Default::default()
+    }));
+    let response = request_with_headers(
+        &app,
+        "POST",
+        "/session",
+        &[AUTH],
+        r#"{"title":"Protected"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = response_json(response).await["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let response = request_with_headers(
+        &app,
+        "POST",
+        format!("/session/{id}/message"),
+        &[AUTH],
+        r#"{"text":"protected history"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = request_with_headers(
+        &app,
+        "GET",
+        format!("/session/{id}/message"),
+        &[AUTH],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let boundary_id = response_json(response).await[1]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+
+    for (method, uri, body) in [
+        (
+            "PATCH",
+            format!("/session/{id}"),
+            r#"{"title":"Unauthorized"}"#.to_string(),
+        ),
+        ("POST", format!("/session/{id}/fork"), "{}".to_string()),
+        (
+            "POST",
+            format!("/session/{id}/revert"),
+            serde_json::json!({"messageID":boundary_id}).to_string(),
+        ),
+        ("POST", format!("/session/{id}/unrevert"), String::new()),
+    ] {
+        let response = request_with_headers(
+            &app,
+            method,
+            uri,
+            &[("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+    }
+
+    let response = request_with_headers(
+        &app,
+        "GET",
+        format!("/session/{id}"),
+        &[AUTH],
+        Body::empty(),
+    )
+    .await;
+    let unchanged = response_json(response).await;
+    assert_eq!(unchanged["title"], "Protected");
+    assert!(unchanged.get("revert").is_none());
+    let response = request_with_headers(&app, "GET", "/session", &[AUTH], Body::empty()).await;
+    assert_eq!(response_json(response).await.as_array().unwrap().len(), 1);
+
+    let response = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[AUTH, ("content-type", "application/json")],
+        r#"{"title":"Authorized"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response =
+        request_with_headers(&app, "POST", format!("/session/{id}/fork"), &[AUTH], "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = request_with_headers(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        &[AUTH],
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = request_with_headers(
+        &app,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        &[AUTH],
         Body::empty(),
     )
     .await;
