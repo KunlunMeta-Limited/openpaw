@@ -1153,7 +1153,9 @@ impl AppState {
             time: SessionTime {
                 created: handle.created_at,
                 updated: handle.updated_at.load(Ordering::Acquire),
+                archived: None,
             },
+            revert: None,
         }
     }
     /// 约束：不读取模型锁，避免慢模型或工具调用阻塞 REST/SSE 轮询。
@@ -1233,7 +1235,9 @@ impl AppState {
                         time: SessionTime {
                             created: unix_millis(meta.created_at),
                             updated,
+                            archived: None,
                         },
+                        revert: None,
                     },
                     created_at: unix_millis(meta.created_at),
                     updated_at: updated,
@@ -2119,14 +2123,11 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     time: SessionTime {
                         created: unix_millis(session.meta.created_at),
                         updated: handle.updated_at.load(Ordering::Acquire),
+                        archived: None,
                     },
+                    revert: None,
                 };
-                let mut properties =
-                    serde_json::to_value(&session_wire).unwrap_or_else(|_| serde_json::json!({}));
-                if let Some(object) = properties.as_object_mut() {
-                    object.insert("sessionID".into(), serde_json::json!(handle.id));
-                }
-                handle.emit(OpenCodeEvent::new("session.updated", properties));
+                handle.emit(events::session_changed("session.updated", &session_wire));
             }
             let mut sink = |event: openpaw_engine::AgentEvent| {
                 match &event {

@@ -267,15 +267,7 @@ async fn create_session(
     {
         Ok(handle) => {
             let wire = state.wire_session(&handle).await;
-            let mut properties =
-                serde_json::to_value(&wire).unwrap_or_else(|_| serde_json::json!({}));
-            if let Some(object) = properties.as_object_mut() {
-                object.insert("sessionID".into(), serde_json::json!(handle.id));
-            }
-            handle.emit(crate::protocol::OpenCodeEvent::new(
-                "session.created",
-                properties,
-            ));
+            handle.emit(crate::events::session_changed("session.created", &wire));
             // openwork 代理端到端验收断言 200（OpenCode v1 服务端亦为 200）。
             (StatusCode::OK, Json(wire)).into_response()
         }

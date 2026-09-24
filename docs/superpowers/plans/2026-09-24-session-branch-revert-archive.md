@@ -116,6 +116,8 @@ git commit -s -m "feat(engine-host): add session mutation projection"
 **Files:**
 - Modify: `crates/openpaw-engine-host/src/protocol.rs`
 - Modify: `crates/openpaw-engine-host/src/events.rs`
+- Modify: `crates/openpaw-engine-host/src/http.rs`
+- Modify: `crates/openpaw-engine-host/src/runtime.rs`
 - Modify: `crates/openpaw-engine-host/tests/fixtures/session.json`
 - Test: `crates/openpaw-engine-host/src/protocol.rs`
 - Test: `crates/openpaw-engine-host/src/events.rs`
@@ -124,7 +126,7 @@ git commit -s -m "feat(engine-host): add session mutation projection"
 - Consumes: private runtime mutation state.
 - Produces: `SessionTime.archived`, `SessionWire.revert`, `UpdateSessionRequest`, `ForkSessionRequest`, `RevertSessionRequest`, and `events::session_changed`.
 
-- [ ] **Step 1: Add failing serde and SSE tests**
+- [x] **Step 1: Add failing serde and SSE tests**
 
 ```rust
 #[test]
@@ -143,13 +145,13 @@ fn session_event_uses_info_envelope() {
 }
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 2: Verify RED**
 
 Run: `cargo test -p openpaw-engine-host --features engine-host session_wire session_event`
 
 Expected: FAIL because optional fields, request bodies, and the shared event constructor are absent.
 
-- [ ] **Step 3: Implement the wire types**
+- [x] **Step 3: Implement the wire types**
 
 ```rust
 pub struct SessionRevert {
@@ -177,16 +179,16 @@ pub struct RevertSessionRequest {
 
 All new response fields use `skip_serializing_if = "Option::is_none"`. `events::session_changed(kind, session)` always returns `properties={sessionID,info}` and replaces every ad hoc `session.created`/`session.updated` constructor.
 
-- [ ] **Step 4: Verify GREEN and fixture compatibility**
+- [x] **Step 4: Verify GREEN and fixture compatibility**
 
 Run: `cargo test -p openpaw-engine-host --features engine-host protocol::tests events::tests`
 
 Expected: PASS; the old fixture without optional fields still deserializes.
 
-- [ ] **Step 5: Commit the public wire contract**
+- [x] **Step 5: Commit the public wire contract**
 
 ```text
-git add crates/openpaw-engine-host/src/protocol.rs crates/openpaw-engine-host/src/events.rs crates/openpaw-engine-host/tests/fixtures/session.json
+git add crates/openpaw-engine-host/src/protocol.rs crates/openpaw-engine-host/src/events.rs crates/openpaw-engine-host/src/http.rs crates/openpaw-engine-host/src/runtime.rs crates/openpaw-engine-host/tests/fixtures/session.json
 git commit -s -m "feat(engine-host): define session mutation wire contract"
 ```
 

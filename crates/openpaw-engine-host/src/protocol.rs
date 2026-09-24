@@ -320,6 +320,9 @@ pub struct SessionWire {
     pub directory: String,
     /// 创建和更新时间的 Unix 毫秒。
     pub time: SessionTime,
+    /// 暂存回退游标；没有可取消回退时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revert: Option<SessionRevert>,
 }
 
 /// 功能：表示会话创建和更新时间。
@@ -331,6 +334,20 @@ pub struct SessionTime {
     pub created: i64,
     /// 会话最近更新时间，Unix 毫秒。
     pub updated: i64,
+    /// 会话归档时间，Unix 毫秒；活动会话省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<i64>,
+}
+
+/// 功能：表示客户端仍可取消的会话级暂存回退。
+/// 数据来源：Host 私有 `session_revert_staged_v1` 投影。
+/// 数据去向：Session REST 响应、SSE 和 OpenWork transcript。
+/// 关联：`API-HOST-SESSION-F02`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRevert {
+    /// 第一条被隐藏消息的稳定编号。
+    #[serde(rename = "messageID")]
+    pub message_id: String,
 }
 
 /// 功能：解析 `POST /session` 的可选创建参数。
@@ -345,6 +362,61 @@ pub struct CreateSessionRequest {
     pub model: Option<String>,
     /// 会话显示标题。
     pub title: Option<String>,
+}
+
+/// 功能：解析 `PATCH /session/:id` 的可选标题与时间更新。
+/// 参数/字段：至少提供 `title` 或 `time.archived` 之一。
+/// 错误：空请求、空标题和负归档时间由 HTTP/runtime 返回 400。
+/// 状态：请求本身不持有旧值，runtime 以单条事件原子合并。
+/// 并发与取消：反序列化同步完成；会话 gate 由 runtime 获取。
+/// 权限：沿用路由 Basic Authentication。
+/// 关联：`API-HOST-SESSION-UPDATE-001`。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UpdateSessionRequest {
+    /// 新会话标题；省略表示不修改。
+    pub title: Option<String>,
+    /// 会话时间字段更新；当前只登记 archived。
+    pub time: Option<UpdateSessionTime>,
+}
+
+/// 功能：表示会话更新时间对象中允许写入的字段。
+/// 数据边界：正数表示归档，零表示取消归档。
+/// 关联：`API-HOST-SESSION-F01`。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct UpdateSessionTime {
+    /// 归档 Unix 毫秒；零表示恢复会话。
+    pub archived: Option<i64>,
+}
+
+/// 功能：解析创建会话分支的可选消息边界。
+/// 参数/字段：`messageID` 存在时复制严格早于该消息的可见前缀。
+/// 错误：未知或隐藏边界由 runtime 返回 400。
+/// 状态：不携带源会话之外的可变状态。
+/// 并发与取消：反序列化同步完成；源会话 gate 由 runtime 获取。
+/// 权限：沿用路由 Basic Authentication。
+/// 关联：`API-HOST-SESSION-FORK-001`。
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ForkSessionRequest {
+    /// 严格排除的首条消息编号；省略时复制全部可见消息。
+    #[serde(rename = "messageID")]
+    pub message_id: Option<String>,
+}
+
+/// 功能：解析暂存会话回退的消息边界。
+/// 参数/字段：`messageID` 必填；`partID` 仅用于显式拒绝未支持能力。
+/// 错误：缺失消息、未知边界或任意 partID 返回 400。
+/// 状态：请求不直接修改会话。
+/// 并发与取消：反序列化同步完成；状态变更由 runtime gate 线性化。
+/// 权限：沿用路由 Basic Authentication。
+/// 关联：`API-HOST-SESSION-REVERT-001`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RevertSessionRequest {
+    /// 第一条需要隐藏的消息编号。
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    /// 消息内部 part 边界；本版本不支持。
+    #[serde(rename = "partID")]
+    pub part_id: Option<String>,
 }
 
 /// 功能：解析 prompt/message 请求，支持旧的 text 字段和 OpenCode parts。
@@ -696,7 +768,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::wire::{MessageWire, ProviderListWire, SessionStatusWire, ToolStatusWire};
-    use super::{HostConfig, OpenCodeEvent, PermissionInfo, SessionWire, TodoItem};
+    use super::{
+        HostConfig, OpenCodeEvent, PermissionInfo, SessionRevert, SessionTime, SessionWire,
+        TodoItem,
+    };
 
     fn roundtrip<T>(input: &str) -> T
     where
@@ -741,6 +816,8 @@ mod tests {
         assert_eq!(session.id, session.slug);
         assert_eq!(session.time.created, 0);
         assert_eq!(session.time.updated, 0);
+        assert_eq!(session.time.archived, None);
+        assert_eq!(session.revert, None);
 
         let messages: Vec<MessageWire> = roundtrip(include_str!("../tests/fixtures/messages.json"));
         assert_eq!(messages.len(), 2);
@@ -818,5 +895,27 @@ mod tests {
         assert!(tool_json.get("sessionId").is_none());
         assert!(tool_json.get("messageId").is_none());
         assert!(tool_json.get("callId").is_none());
+    }
+
+    #[test]
+    fn session_wire_serializes_optional_archive_and_revert_without_parent_id() {
+        let session = SessionWire {
+            id: "s1".into(),
+            title: "Session".into(),
+            slug: "s1".into(),
+            directory: "/workspace".into(),
+            time: SessionTime {
+                created: 1,
+                updated: 2,
+                archived: Some(42),
+            },
+            revert: Some(SessionRevert {
+                message_id: "m2".into(),
+            }),
+        };
+        let value = serde_json::to_value(session).unwrap();
+        assert_eq!(value["time"]["archived"], 42);
+        assert_eq!(value["revert"]["messageID"], "m2");
+        assert!(value.get("parentID").is_none());
     }
 }
