@@ -32,6 +32,21 @@ fn append_session_events(home: &std::path::Path, id: &str, events: &[SessionEven
     }
     file.sync_all().expect("sync session fixture");
 }
+
+async fn sync_prompt_with_request_id(
+    app: &axum::Router,
+    id: &str,
+    request_id: &str,
+    text: &str,
+) -> axum::response::Response {
+    request(
+        app,
+        "POST",
+        format!("/session/{id}/message"),
+        serde_json::json!({"requestID":request_id,"text":text}).to_string(),
+    )
+    .await
+}
 fn unused_loopback_port() -> u16 {
     std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("bind temporary listener")
@@ -631,6 +646,224 @@ async fn revert_session_validates_boundaries_part_ids_and_active_state() {
     .await;
     assert_eq!(active.status(), StatusCode::CONFLICT);
     handle.release_turn();
+}
+
+#[tokio::test]
+async fn revert_commit_replaces_tail_atomically_and_survives_restart() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let first = sync_prompt_with_request_id(&app, &id, "first-key", "first").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_turn = first.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let second = sync_prompt_with_request_id(&app, &id, "second-key", "second").await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_turn = second.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let boundary_id = messages[2]["info"]["id"]
+        .as_str()
+        .expect("second user id")
+        .to_string();
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let replay = prompt_with_request_id(&app, &id, "second-key", "second").await;
+    assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+    assert_eq!(replay.headers()["openpaw-turn-id"], second_turn);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
+        boundary_id
+    );
+    let conflict = prompt_with_request_id(&app, &id, "second-key", "different").await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(conflict).await["code"],
+        "idempotency_conflict"
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
+        boundary_id
+    );
+
+    let mut events = state.global_events.subscribe();
+    let replacement =
+        sync_prompt_with_request_id(&app, &id, "replacement-key", "replacement").await;
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let replacement_turn = replacement.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(replacement_turn.starts_with("3_"));
+    let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(emitted.iter().any(|event| {
+        event.event_type == "session.updated"
+            && event.properties["sessionID"] == id
+            && event.properties["info"].get("revert").is_none()
+    }));
+    let session = get_json(&app, format!("/session/{id}")).await;
+    assert!(session.get("revert").is_none());
+    let committed_messages = get_json(&app, format!("/session/{id}/message")).await;
+    let texts: Vec<_> = committed_messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["parts"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        ["first", "Echo: first", "replacement", "Echo: replacement"]
+    );
+    let turns = get_json(&app, format!("/session/{id}/turns")).await;
+    assert_eq!(turns.as_array().unwrap().len(), 2);
+    assert_eq!(turns[0]["turnID"], first_turn);
+    assert_eq!(turns[1]["turnID"], replacement_turn);
+    assert!(!turns
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|turn| turn["turnID"] == second_turn));
+
+    let file = std::fs::read_to_string(home.path().join("sessions").join(format!("{id}.jsonl")))
+        .expect("session jsonl");
+    let event_types: Vec<_> = file
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("jsonl event"))
+        .filter_map(|event| event["type"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "session_revert_committed_v1")
+            .count(),
+        1
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "turn_accept_v1")
+            .count(),
+        2,
+        "replacement prompt must not append a second standalone accept"
+    );
+    let unrevert = request(
+        &app,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(unrevert.status(), StatusCode::OK);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        committed_messages
+    );
+    drop(app);
+    drop(state);
+
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        committed_messages
+    );
+    let restored_turns = get_json(&restarted, format!("/session/{id}/turns")).await;
+    assert_eq!(restored_turns.as_array().unwrap().len(), 2);
+    let reused = sync_prompt_with_request_id(&restarted, &id, "second-key", "after restart").await;
+    assert_eq!(reused.status(), StatusCode::OK);
+    assert!(reused.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .starts_with("4_"));
+    let final_messages = get_json(&restarted, format!("/session/{id}/message")).await;
+    assert!(!final_messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["parts"][0]["text"] == "second"));
+    assert_eq!(
+        final_messages.as_array().unwrap().last().unwrap()["parts"][0]["text"],
+        "Echo: after restart"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn revert_commit_persistence_failure_keeps_file_and_memory_unchanged() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let response = sync_prompt_with_request_id(&app, &id, "first-key", "first").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let boundary_id = messages[1]["info"]["id"]
+        .as_str()
+        .expect("assistant boundary")
+        .to_string();
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let visible_before = get_json(&app, format!("/session/{id}/message")).await;
+    let session_path = home.path().join("sessions").join(format!("{id}.jsonl"));
+    let file_before = std::fs::read(&session_path).expect("session before failure");
+    let handle = state.get(&id).await.expect("session");
+    let original_writer = handle
+        .writer
+        .lock()
+        .unwrap()
+        .take()
+        .expect("session writer");
+    *handle.writer.lock().unwrap() =
+        Some(openpaw_store::SessionWriter::open_append("/dev/full").expect("/dev/full writer"));
+
+    let failed = sync_prompt_with_request_id(&app, &id, "replacement-failure", "replacement").await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    *handle.writer.lock().unwrap() = Some(original_writer);
+    assert_eq!(
+        std::fs::read(&session_path).expect("session after failure"),
+        file_before
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        visible_before
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
+        boundary_id
+    );
+    assert_eq!(handle.session.lock().await.messages.len(), 2);
+    assert!(!handle.is_active());
+
+    let retry = sync_prompt_with_request_id(&app, &id, "replacement-failure", "replacement").await;
+    assert_eq!(retry.status(), StatusCode::OK);
 }
 #[tokio::test]
 async fn malformed_json_is_a_bad_request() {

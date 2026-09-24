@@ -13,7 +13,8 @@ use crate::protocol::{
 };
 use crate::session_mutation::{
     clone_messages_for_fork, visible_prefix_len, SessionForkOriginV1, SessionMetadataV1,
-    SessionMutationEvent, SessionMutationProjection, SessionRevertStagedV1,
+    SessionMutationEvent, SessionMutationProjection, SessionRevertCommittedV1,
+    SessionRevertStagedV1,
 };
 use futures::FutureExt;
 use openpaw_core::{LlmProvider, Session, SessionEvent};
@@ -339,6 +340,10 @@ impl SessionHandle {
     /// 功能：读取已持久化的 requestID 接收事实，供 HTTP 层在构造 Provider 前完成重放判断。
     /// 并发与取消：只读锁不跨 await；返回副本，避免调用方持有内部锁。
     pub(crate) fn request_admission(&self, request_id: &str) -> Option<RequestAdmission> {
+        let _snapshot = self
+            .snapshot_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         self.request_admissions
             .read()
             .unwrap_or_else(|error| error.into_inner())
@@ -621,6 +626,7 @@ struct SessionHandleInit {
     tools: Vec<openpaw_core::ToolSpec>,
     title: String,
     mutation: SessionMutationProjection,
+    turn_sequence: u64,
     turn_outcomes: Vec<TurnOutcome>,
     request_admissions: HashMap<String, RequestAdmission>,
 }
@@ -1018,12 +1024,13 @@ impl AppState {
             .await
             .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
-        let projection = restored_session_projection(&read.events)?;
+        let projection = restored_session_projection(id, &read.events)?;
         let messages = projection.messages;
         let mut turn_outcomes = projection.turn_outcomes;
         recover_hanging_outcomes(&mut turn_outcomes, &mut writer)?;
         let request_admissions = projection.request_admissions;
         let mutation = projection.mutation;
+        let turn_sequence = projection.turn_sequence_high_water;
         let visible_messages = restored_visible_messages(id, &messages, &mutation)?;
         let mut session = Session::new(read.meta.model.clone(), read.meta.provider.clone());
         session.meta = read.meta;
@@ -1052,6 +1059,7 @@ impl AppState {
             tools,
             title,
             mutation,
+            turn_sequence,
             turn_outcomes,
             request_admissions,
         }))
@@ -1117,6 +1125,7 @@ impl AppState {
                 title: title.map(str::to_string),
                 ..Default::default()
             },
+            turn_sequence: 0,
             turn_outcomes: Vec::new(),
             request_admissions: HashMap::new(),
         });
@@ -1135,13 +1144,13 @@ impl AppState {
             tools,
             title,
             mutation,
+            turn_sequence,
             turn_outcomes,
             request_admissions,
         } = init;
         let id = session.meta.id.clone();
         let created_at = unix_millis(session.meta.created_at);
         let updated_at = session_file_updated_at(&session_path, created_at);
-        let turn_sequence = restored_turn_sequence(&turn_outcomes);
         Arc::new(SessionHandle {
             id,
             session_provider: session.meta.provider.clone(),
@@ -1175,33 +1184,7 @@ impl AppState {
         })
     }
     pub async fn wire_session(&self, handle: &SessionHandle) -> SessionWire {
-        let _snapshot = handle
-            .snapshot_gate
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
-        let mutation = handle
-            .mutation
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        SessionWire {
-            id: handle.id.clone(),
-            title: handle
-                .title
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone(),
-            slug: handle.id.clone(),
-            directory: handle.workspace.display().to_string(),
-            time: SessionTime {
-                created: handle.created_at,
-                updated: handle.updated_at.load(Ordering::Acquire),
-                archived: mutation.archived,
-            },
-            revert: mutation
-                .revert_message_id
-                .map(|message_id| crate::protocol::SessionRevert { message_id }),
-        }
+        wire_session_snapshot(handle)
     }
     /// 功能：原子更新会话标题和归档状态，并发布完整 Session 更新事件。
     /// 参数：`id` 为目标会话；`patch` 至少包含非空标题或归档时间。
@@ -1458,6 +1441,7 @@ impl AppState {
                     fork_origin: Some(origin),
                     ..Default::default()
                 },
+                turn_sequence: 0,
                 turn_outcomes: Vec::new(),
                 request_admissions: HashMap::new(),
             })
@@ -1676,7 +1660,8 @@ impl AppState {
                 let Ok(read) = SessionReader::read(&path) else {
                     continue;
                 };
-                let Ok(projection) = restored_session_projection(&read.events) else {
+                let Ok(projection) = restored_session_projection(&read.meta.id, &read.events)
+                else {
                     continue;
                 };
                 let title = session_title(&projection.mutation, &projection.messages);
@@ -1868,6 +1853,35 @@ fn provider_base_url(variable: &str) -> Result<Option<String>, String> {
     }
     Ok(Some(value.to_string()))
 }
+fn wire_session_snapshot(handle: &SessionHandle) -> SessionWire {
+    let _snapshot = handle
+        .snapshot_gate
+        .read()
+        .unwrap_or_else(|error| error.into_inner());
+    let mutation = handle
+        .mutation
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    SessionWire {
+        id: handle.id.clone(),
+        title: handle
+            .title
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone(),
+        slug: handle.id.clone(),
+        directory: handle.workspace.display().to_string(),
+        time: SessionTime {
+            created: handle.created_at,
+            updated: handle.updated_at.load(Ordering::Acquire),
+            archived: mutation.archived,
+        },
+        revert: mutation
+            .revert_message_id
+            .map(|message_id| crate::protocol::SessionRevert { message_id }),
+    }
+}
 fn session_title(
     mutation: &SessionMutationProjection,
     messages: &[openpaw_core::Message],
@@ -1913,6 +1927,7 @@ struct RestoredSessionProjection {
     turn_outcomes: Vec<TurnOutcome>,
     request_admissions: HashMap<String, RequestAdmission>,
     mutation: SessionMutationProjection,
+    turn_sequence_high_water: u64,
 }
 struct PendingFinishTransaction {
     turn_id: String,
@@ -1920,6 +1935,7 @@ struct PendingFinishTransaction {
 }
 const MAX_FINISH_TRANSACTION_MESSAGES: usize = 4096;
 fn restored_session_projection(
+    session_id: &str,
     events: &[SessionEvent],
 ) -> Result<RestoredSessionProjection, SessionLoadError> {
     let mut projection = RestoredSessionProjection {
@@ -1927,6 +1943,7 @@ fn restored_session_projection(
         turn_outcomes: Vec::new(),
         request_admissions: HashMap::new(),
         mutation: SessionMutationProjection::default(),
+        turn_sequence_high_water: 0,
     };
     let mut message_ids = HashSet::new();
     let mut pending_finish: Option<PendingFinishTransaction> = None;
@@ -1938,7 +1955,22 @@ fn restored_session_projection(
             projection.mutation.title = Some(title.clone());
         }
         if let Some(mutation) = SessionMutationEvent::from_session_event(event) {
-            projection.mutation.apply(mutation);
+            pending_finish = None;
+            match mutation {
+                SessionMutationEvent::RevertCommitted(commit) => {
+                    apply_revert_commit(
+                        session_id,
+                        &mut projection,
+                        &mut message_ids,
+                        commit.clone(),
+                    )?;
+                    projection
+                        .mutation
+                        .apply(SessionMutationEvent::RevertCommitted(commit));
+                }
+                mutation => projection.mutation.apply(mutation),
+            }
+            continue;
         }
         if let Some(prepare) = TurnFinishPrepareV1::from_session_event(event) {
             pending_finish = Some(PendingFinishTransaction {
@@ -1967,6 +1999,9 @@ fn restored_session_projection(
         if let Some(accept) = TurnAcceptV1::from_session_event(event) {
             apply_turn_accept(&mut projection, &mut message_ids, accept)?;
         } else if let Some(outcome) = TurnOutcome::from_session_event(event) {
+            projection.turn_sequence_high_water = projection
+                .turn_sequence_high_water
+                .max(turn_sequence_number(&outcome.turn_id));
             apply_restored_outcome(&mut projection.turn_outcomes, outcome)?;
         } else if let Some(admission) = RequestAdmission::from_session_event(event) {
             apply_restored_admission(&mut projection.request_admissions, admission)?;
@@ -1998,12 +2033,47 @@ fn apply_turn_accept(
             return Err(SessionLoadError::Corrupt);
         }
     }
+    projection.turn_sequence_high_water = projection
+        .turn_sequence_high_water
+        .max(turn_sequence_number(&accept.outcome.turn_id));
     push_restored_message(&mut projection.messages, message_ids, accept.message);
     apply_restored_outcome(&mut projection.turn_outcomes, accept.outcome)?;
     if let Some(admission) = accept.request_admission {
         apply_restored_admission(&mut projection.request_admissions, admission)?;
     }
     Ok(())
+}
+fn apply_revert_commit(
+    session_id: &str,
+    projection: &mut RestoredSessionProjection,
+    message_ids: &mut HashSet<String>,
+    commit: SessionRevertCommittedV1,
+) -> Result<(), SessionLoadError> {
+    if projection.mutation.revert_message_id.as_deref() != Some(commit.message_id.as_str()) {
+        return Err(SessionLoadError::Corrupt);
+    }
+    let prefix_len = visible_prefix_len(session_id, &projection.messages, &commit.message_id)
+        .ok_or(SessionLoadError::Corrupt)?;
+    projection.messages.truncate(prefix_len);
+    *message_ids = projection
+        .messages
+        .iter()
+        .filter_map(|message| message.uuid.clone())
+        .collect();
+    let retained_user_ids = retained_user_message_ids(&projection.messages);
+    projection
+        .turn_outcomes
+        .retain(|outcome| retained_user_ids.contains(&outcome.user_message_id));
+    let retained_turn_ids: HashSet<_> = projection
+        .turn_outcomes
+        .iter()
+        .map(|outcome| outcome.turn_id.clone())
+        .collect();
+    projection.request_admissions.retain(|_, admission| {
+        retained_user_ids.contains(&admission.user_message_id)
+            && retained_turn_ids.contains(&admission.turn_id)
+    });
+    apply_turn_accept(projection, message_ids, commit.accept)
 }
 fn apply_finish_commit(
     projection: &mut RestoredSessionProjection,
@@ -2034,7 +2104,17 @@ fn apply_finish_commit(
     for message in pending.messages {
         push_restored_message(&mut projection.messages, message_ids, message);
     }
+    projection.turn_sequence_high_water = projection
+        .turn_sequence_high_water
+        .max(turn_sequence_number(&commit.terminal.turn_id));
     apply_restored_outcome(&mut projection.turn_outcomes, commit.terminal)
+}
+fn retained_user_message_ids(messages: &[openpaw_core::Message]) -> HashSet<String> {
+    messages
+        .iter()
+        .filter(|message| message.role == openpaw_core::Role::User)
+        .filter_map(|message| message.uuid.clone())
+        .collect()
 }
 fn push_restored_message(
     messages: &mut Vec<openpaw_core::Message>,
@@ -2111,7 +2191,7 @@ fn recover_orphaned_turns_in_file(path: &std::path::Path) -> Result<usize, Sessi
         repair_torn_session_tail(path)?;
         read = SessionReader::read(path).map_err(classify_session_error)?;
     }
-    let mut outcomes = restored_session_projection(&read.events)?.turn_outcomes;
+    let mut outcomes = restored_session_projection(&read.meta.id, &read.events)?.turn_outcomes;
     let mut writer = SessionWriter::open_append(path).map_err(classify_session_error)?;
     recover_hanging_outcomes(&mut outcomes, &mut writer)
 }
@@ -2160,11 +2240,11 @@ fn upsert_turn_outcome(outcomes: &mut Vec<TurnOutcome>, outcome: TurnOutcome) {
         outcomes.push(outcome);
     }
 }
-fn restored_turn_sequence(outcomes: &[TurnOutcome]) -> u64 {
-    outcomes
-        .iter()
-        .filter_map(|outcome| outcome.turn_id.split('_').next()?.parse::<u64>().ok())
-        .max()
+fn turn_sequence_number(turn_id: &str) -> u64 {
+    turn_id
+        .split('_')
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0)
 }
 fn turn_error(code: &str, message: &str, retryable: bool) -> TurnError {
@@ -2399,22 +2479,76 @@ pub(crate) fn append_user_and_turn(
         outcome: outcome.clone(),
         request_admission: request_admission.clone(),
     };
-    if let Err(error) = append_event(handle, &accept.to_session_event()) {
+    let staged_message_id = handle
+        .mutation
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .revert_message_id
+        .clone();
+    let revert_prefix_len = staged_message_id
+        .as_deref()
+        .map(|message_id| {
+            visible_prefix_len(&handle.id, &session.messages, message_id)
+                .ok_or_else(|| "会话回退游标无法匹配完整消息历史".to_string())
+        })
+        .transpose()?;
+    let mutation_event = staged_message_id.map(|message_id| {
+        SessionMutationEvent::RevertCommitted(SessionRevertCommittedV1 {
+            message_id,
+            accept: accept.clone(),
+        })
+    });
+    let persisted_event = mutation_event
+        .as_ref()
+        .map(SessionMutationEvent::to_session_event)
+        .unwrap_or_else(|| accept.to_session_event());
+    if let Err(error) = append_event(handle, &persisted_event) {
         restore_writer_snapshot(handle, &path, length)
             .map_err(|rollback_error| format!("{error}；接收事务回滚失败：{rollback_error}"))?;
         return Err(error);
     }
+    if let Some(prefix_len) = revert_prefix_len {
+        session.messages.truncate(prefix_len);
+    }
     session.messages.push(message.clone());
+    let published_messages = session.messages.clone();
     {
         let _snapshot = handle
             .snapshot_gate
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        handle
+        *handle
             .message_cache
             .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .push(message);
+            .unwrap_or_else(|error| error.into_inner()) = published_messages.clone();
+        if let Some(event) = mutation_event.as_ref() {
+            let retained_user_ids = retained_user_message_ids(&published_messages);
+            let mut outcomes = handle
+                .turn_outcomes
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            outcomes.retain(|outcome| retained_user_ids.contains(&outcome.user_message_id));
+            let retained_turn_ids: HashSet<_> = outcomes
+                .iter()
+                .map(|outcome| outcome.turn_id.clone())
+                .collect();
+            handle
+                .request_admissions
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|_, admission| {
+                    retained_user_ids.contains(&admission.user_message_id)
+                        && retained_turn_ids.contains(&admission.turn_id)
+                });
+            handle
+                .mutation
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .apply(event.clone());
+            handle
+                .updated_at
+                .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
+        }
         upsert_turn_outcome(
             &mut handle
                 .turn_outcomes
@@ -2422,13 +2556,13 @@ pub(crate) fn append_user_and_turn(
                 .unwrap_or_else(|error| error.into_inner()),
             outcome.clone(),
         );
-    }
-    if let Some(admission) = request_admission {
-        handle
-            .request_admissions
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(admission.request_id.clone(), admission);
+        if let Some(admission) = request_admission {
+            handle
+                .request_admissions
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(admission.request_id.clone(), admission);
+        }
     }
     *handle
         .current_turn
@@ -2437,6 +2571,12 @@ pub(crate) fn append_user_and_turn(
         outcome,
         queue_ticket,
     });
+    if mutation_event.is_some() {
+        handle.emit(events::session_changed(
+            "session.updated",
+            &wire_session_snapshot(handle),
+        ));
+    }
     Ok(())
 }
 struct TurnCleanup {
@@ -2874,7 +3014,7 @@ fn next_fork_ordinal(home: &std::path::Path, source_id: &str) -> Result<u64, Ses
         let Ok(read) = SessionReader::read(&path) else {
             continue;
         };
-        let Ok(projection) = restored_session_projection(&read.events) else {
+        let Ok(projection) = restored_session_projection(&read.meta.id, &read.events) else {
             continue;
         };
         if let Some(origin) = projection.mutation.fork_origin {
