@@ -28,9 +28,11 @@ use tokio_util::sync::CancellationToken;
 use crate::protocol::wire::SseEnvelope;
 use crate::protocol::{
     CreateSessionRequest, HostConfig, MessageRequest, OpenCodeEvent, PermissionReply,
-    RequestAdmission, TurnState,
+    RequestAdmission, TurnState, UpdateSessionRequest,
 };
-use crate::runtime::{self, AcceptTurnResult, AppState, SessionHandle, SessionLoadError};
+use crate::runtime::{
+    self, AcceptTurnResult, AppState, SessionHandle, SessionLoadError, SessionMutationError,
+};
 
 const OPENPAW_TURN_ID: &str = "openpaw-turn-id";
 const HOST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,7 +48,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/global/health", get(health))
         .route("/session", get(list_sessions).post(create_session))
-        .route("/session/{id}", get(get_session).delete(delete_session))
+        .route(
+            "/session/{id}",
+            get(get_session)
+                .patch(update_session)
+                .delete(delete_session),
+        )
         .route("/session/{id}/message", get(messages).post(message))
         .route("/session/{id}/message/{message_id}", get(messages))
         .route("/session/{id}/turns", get(turns))
@@ -287,6 +294,26 @@ async fn get_session(State(state): State<Arc<AppState>>, Path(id): Path<String>)
         Err(error) => return session_load_error(error),
     };
     Json(state.wire_session(&handle).await).into_response()
+}
+
+async fn update_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateSessionRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    match state.update_session(&id, body).await {
+        Ok(session) => Json(session).into_response(),
+        Err(SessionMutationError::BadRequest(error)) => bad(StatusCode::BAD_REQUEST, error),
+        Err(SessionMutationError::NotFound) => bad(StatusCode::NOT_FOUND, "会话不存在"),
+        Err(SessionMutationError::Conflict(error)) => bad(StatusCode::CONFLICT, error),
+        Err(SessionMutationError::Persistence(error)) => {
+            bad(StatusCode::INTERNAL_SERVER_ERROR, error)
+        }
+    }
 }
 
 async fn delete_session(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {

@@ -82,6 +82,124 @@ async fn health_and_session_wire_contract() {
     let response = request(&app, "GET", format!("/session/{id}"), Body::empty()).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn patch_session_persists_title_archive_and_unarchive_across_restart() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let config = HostConfig {
+        home: home.path().into(),
+        workspace: workspace.path().into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let mut events = state.global_events.subscribe();
+    let response = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Renamed","time":{"archived":123}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response_json(response).await;
+    assert_eq!(session["title"], "Renamed");
+    assert_eq!(session["time"]["archived"], 123);
+    let event = events.recv().await.expect("session.updated event");
+    assert_eq!(event.event_type, "session.updated");
+    assert_eq!(event.properties["sessionID"], id);
+    assert_eq!(event.properties["info"]["title"], "Renamed");
+    assert_eq!(event.properties["info"]["time"]["archived"], 123);
+    drop(app);
+    drop(state);
+
+    let restarted = build_router(AppState::new(config.clone()));
+    let restored = get_json(&restarted, format!("/session/{id}")).await;
+    assert_eq!(restored["title"], "Renamed");
+    assert_eq!(restored["time"]["archived"], 123);
+    let response = request_with_headers(
+        &restarted,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"time":{"archived":0}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_json(response).await["time"]
+        .get("archived")
+        .is_none());
+    let listed = get_json(&restarted, "/session").await;
+    let listed = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == id)
+        .expect("listed session");
+    assert_eq!(listed["title"], "Renamed");
+    assert!(listed["time"].get("archived").is_none());
+}
+
+#[tokio::test]
+async fn patch_session_validates_input_and_rejects_active_archive_atomically() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    for body in [r#"{}"#, r#"{"title":"  "}"#, r#"{"time":{"archived":-1}}"#] {
+        let response = request_with_headers(
+            &app,
+            "PATCH",
+            format!("/session/{id}"),
+            &[("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let missing = request_with_headers(
+        &app,
+        "PATCH",
+        "/session/missing",
+        &[("content-type", "application/json")],
+        r#"{"title":"Missing"}"#,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let handle = state.get(&id).await.expect("session");
+    assert!(handle.reserve_turn());
+    let conflict = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Must not apply","time":{"archived":456}}"#,
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let title_only = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Allowed while active"}"#,
+    )
+    .await;
+    assert_eq!(title_only.status(), StatusCode::OK);
+    handle.release_turn();
+    let session = get_json(&app, format!("/session/{id}")).await;
+    assert_eq!(session["title"], "Allowed while active");
+    assert!(session["time"].get("archived").is_none());
+}
 #[tokio::test]
 async fn malformed_json_is_a_bad_request() {
     let home = tempdir().expect("home");

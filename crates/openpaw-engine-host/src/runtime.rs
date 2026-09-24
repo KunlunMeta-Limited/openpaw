@@ -9,8 +9,9 @@ use crate::office::OfficeDispatcher;
 use crate::protocol::{
     unix_millis, HostConfig, OpenCodeEvent, RequestAdmission, SessionSummary, SessionTime,
     SessionWire, TurnAcceptV1, TurnError, TurnFinishCommitV1, TurnFinishPrepareV1, TurnOutcome,
-    TurnSchedulerConfig, TurnState,
+    TurnSchedulerConfig, TurnState, UpdateSessionRequest,
 };
+use crate::session_mutation::{SessionMetadataV1, SessionMutationEvent, SessionMutationProjection};
 use futures::FutureExt;
 use openpaw_core::{LlmProvider, Session, SessionEvent};
 use openpaw_engine::AgentLoop;
@@ -39,6 +40,20 @@ pub(crate) enum SessionLoadError {
     Corrupt,
     PermissionDenied,
     Unavailable,
+}
+/// 功能：表示会话元数据、分支或回退变更的稳定失败分类。
+/// 数据边界：只携带可公开的中文错误，不包含路径、正文、凭据或底层 I/O 细节。
+/// 关联：`API-HOST-SESSION-UPDATE-001`、`API-HOST-SESSION-FORK-001`、`API-HOST-SESSION-REVERT-001`。
+#[derive(Debug)]
+pub(crate) enum SessionMutationError {
+    /// 请求字段或消息边界不合法。
+    BadRequest(String),
+    /// 目标会话不存在或正在删除。
+    NotFound,
+    /// 活动回合与本次变更冲突。
+    Conflict(String),
+    /// JSONL 持久化或回滚失败。
+    Persistence(String),
 }
 /// 功能：表示 Host 已停止接收新回合。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +289,8 @@ pub struct SessionHandle {
     pub created_at: i64,
     pub office: OfficeDispatcher,
     pub tools: Vec<openpaw_core::ToolSpec>,
-    pub title: Mutex<String>,
+    pub title: std::sync::Mutex<String>,
+    mutation: std::sync::RwLock<SessionMutationProjection>,
     pub updated_at: std::sync::atomic::AtomicI64,
     pub cancel_requested: AtomicBool,
     deleting: AtomicBool,
@@ -601,6 +617,7 @@ struct SessionHandleInit {
     workspace: PathBuf,
     tools: Vec<openpaw_core::ToolSpec>,
     title: String,
+    mutation: SessionMutationProjection,
     turn_outcomes: Vec<TurnOutcome>,
     request_admissions: HashMap<String, RequestAdmission>,
 }
@@ -1003,6 +1020,7 @@ impl AppState {
         let mut turn_outcomes = projection.turn_outcomes;
         recover_hanging_outcomes(&mut turn_outcomes, &mut writer)?;
         let request_admissions = projection.request_admissions;
+        let mutation = projection.mutation;
         let mut session = Session::new(read.meta.model.clone(), read.meta.provider.clone());
         session.meta = read.meta;
         session.messages = messages.clone();
@@ -1018,7 +1036,7 @@ impl AppState {
             approvals.clone(),
         )
         .map_err(|_| SessionLoadError::Unavailable)?;
-        let title = session_title(&read.events, &messages);
+        let title = session_title(&mutation, &messages);
         Ok(self.build_session_handle(SessionHandleInit {
             session,
             messages,
@@ -1029,6 +1047,7 @@ impl AppState {
             workspace,
             tools,
             title,
+            mutation,
             turn_outcomes,
             request_admissions,
         }))
@@ -1090,6 +1109,10 @@ impl AppState {
             workspace,
             tools,
             title: title.unwrap_or("New session").to_string(),
+            mutation: SessionMutationProjection {
+                title: title.map(str::to_string),
+                ..Default::default()
+            },
             turn_outcomes: Vec::new(),
             request_admissions: HashMap::new(),
         });
@@ -1107,11 +1130,13 @@ impl AppState {
             workspace,
             tools,
             title,
+            mutation,
             turn_outcomes,
             request_admissions,
         } = init;
         let id = session.meta.id.clone();
         let created_at = unix_millis(session.meta.created_at);
+        let updated_at = session_file_updated_at(&session_path, created_at);
         let turn_sequence = restored_turn_sequence(&turn_outcomes);
         Arc::new(SessionHandle {
             id,
@@ -1128,8 +1153,9 @@ impl AppState {
             created_at,
             office: self.office.clone(),
             tools,
-            title: Mutex::new(title),
-            updated_at: std::sync::atomic::AtomicI64::new(created_at),
+            title: std::sync::Mutex::new(title),
+            mutation: std::sync::RwLock::new(mutation),
+            updated_at: std::sync::atomic::AtomicI64::new(updated_at),
             cancel_requested: AtomicBool::new(false),
             deleting: AtomicBool::new(false),
             global_events: self.global_events.clone(),
@@ -1145,18 +1171,123 @@ impl AppState {
         })
     }
     pub async fn wire_session(&self, handle: &SessionHandle) -> SessionWire {
+        let _snapshot = handle
+            .snapshot_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let mutation = handle
+            .mutation
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         SessionWire {
             id: handle.id.clone(),
-            title: handle.title.lock().await.clone(),
+            title: handle
+                .title
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
             slug: handle.id.clone(),
             directory: handle.workspace.display().to_string(),
             time: SessionTime {
                 created: handle.created_at,
                 updated: handle.updated_at.load(Ordering::Acquire),
-                archived: None,
+                archived: mutation.archived,
             },
-            revert: None,
+            revert: mutation
+                .revert_message_id
+                .map(|message_id| crate::protocol::SessionRevert { message_id }),
         }
+    }
+    /// 功能：原子更新会话标题和归档状态，并发布完整 Session 更新事件。
+    /// 参数：`id` 为目标会话；`patch` 至少包含非空标题或归档时间。
+    /// 返回：成功时返回已经持久化并发布到内存的公共 Session 投影。
+    /// 错误：非法字段、会话缺失、活动归档冲突或 JSONL 写入失败返回稳定分类。
+    /// 状态：先追加一条 `session_metadata_v1`，成功后同时发布标题、归档和更新时间。
+    /// 并发与取消：`turn_gate` 与回合接收线性化；同步持久化临界区不可取消。
+    /// 权限：只修改目标 session JSONL，不读取或写入工作区文件。
+    /// 关联：`API-HOST-SESSION-UPDATE-001`、`DAT-HOST-SESSION-MUTATION-001`。
+    pub(crate) async fn update_session(
+        &self,
+        id: &str,
+        patch: UpdateSessionRequest,
+    ) -> Result<SessionWire, SessionMutationError> {
+        let title = match patch.title {
+            Some(title) if title.trim().is_empty() => {
+                return Err(SessionMutationError::BadRequest("title 不能为空".into()))
+            }
+            Some(title) => Some(title),
+            None => None,
+        };
+        let archived = patch.time.and_then(|time| time.archived);
+        if archived.is_some_and(|value| value < 0) {
+            return Err(SessionMutationError::BadRequest(
+                "time.archived 不能为负数".into(),
+            ));
+        }
+        if title.is_none() && archived.is_none() {
+            return Err(SessionMutationError::BadRequest(
+                "PATCH 至少需要 title 或 time.archived".into(),
+            ));
+        }
+
+        let handle = self.get_typed(id).await.map_err(|error| match error {
+            SessionLoadError::NotFound => SessionMutationError::NotFound,
+            SessionLoadError::Corrupt
+            | SessionLoadError::PermissionDenied
+            | SessionLoadError::Unavailable => {
+                SessionMutationError::Persistence("无法读取会话状态".into())
+            }
+        })?;
+        let metadata = SessionMetadataV1 { title, archived };
+        {
+            let _gate = handle
+                .turn_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if handle.deleting.load(Ordering::Acquire) {
+                return Err(SessionMutationError::NotFound);
+            }
+            if metadata.archived.is_some() && handle.active.load(Ordering::Acquire) {
+                return Err(SessionMutationError::Conflict(
+                    "会话正在执行，无法更改归档状态".into(),
+                ));
+            }
+            let event = SessionMutationEvent::Metadata(metadata.clone());
+            let (path, length) =
+                writer_snapshot(&handle).map_err(SessionMutationError::Persistence)?;
+            if let Err(error) = append_event(&handle, &event.to_session_event()) {
+                restore_writer_snapshot(&handle, &path, length).map_err(|rollback_error| {
+                    SessionMutationError::Persistence(format!(
+                        "{error}；会话更新回滚失败：{rollback_error}"
+                    ))
+                })?;
+                return Err(SessionMutationError::Persistence(error));
+            }
+            {
+                let _snapshot = handle
+                    .snapshot_gate
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner());
+                if let Some(title) = metadata.title.as_ref() {
+                    *handle
+                        .title
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = title.clone();
+                }
+                handle
+                    .mutation
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .apply(event);
+                handle
+                    .updated_at
+                    .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
+            }
+        }
+        let wire = self.wire_session(&handle).await;
+        handle.emit(events::session_changed("session.updated", &wire));
+        Ok(wire)
     }
     /// 约束：不读取模型锁，避免慢模型或工具调用阻塞 REST/SSE 轮询。
     pub fn message_snapshot(&self, handle: &SessionHandle) -> Vec<openpaw_core::Message> {
@@ -1212,20 +1343,20 @@ impl AppState {
                 let Ok(projection) = restored_session_projection(&read.events) else {
                     continue;
                 };
-                let title = session_title(&read.events, &projection.messages);
+                let title = session_title(&projection.mutation, &projection.messages);
                 let directory =
                     absolute_workspace(session_workspace(&read.events, &default_workspace))
                         .unwrap_or_else(|_| default_workspace.clone())
                         .to_string_lossy()
                         .into_owned();
                 let meta = read.meta;
-                let updated = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-                    .unwrap_or_else(|| unix_millis(meta.created_at));
+                let updated = session_file_updated_at(&path, unix_millis(meta.created_at));
                 let active = active_ids.contains(&meta.id);
+                let archived = projection.mutation.archived;
+                let revert = projection
+                    .mutation
+                    .revert_message_id
+                    .map(|message_id| crate::protocol::SessionRevert { message_id });
                 out.push(SessionSummary {
                     session: SessionWire {
                         slug: meta.id.clone(),
@@ -1235,9 +1366,9 @@ impl AppState {
                         time: SessionTime {
                             created: unix_millis(meta.created_at),
                             updated,
-                            archived: None,
+                            archived,
                         },
-                        revert: None,
+                        revert,
                     },
                     created_at: unix_millis(meta.created_at),
                     updated_at: updated,
@@ -1401,15 +1532,13 @@ fn provider_base_url(variable: &str) -> Result<Option<String>, String> {
     }
     Ok(Some(value.to_string()))
 }
-fn session_title(events: &[SessionEvent], messages: &[openpaw_core::Message]) -> String {
-    events
-        .iter()
-        .find_map(|event| match event {
-            SessionEvent::Metadata {
-                title: Some(title), ..
-            } => Some(title.clone()),
-            _ => None,
-        })
+fn session_title(
+    mutation: &SessionMutationProjection,
+    messages: &[openpaw_core::Message],
+) -> String {
+    mutation
+        .title
+        .clone()
         .or_else(|| {
             messages
                 .iter()
@@ -1425,6 +1554,7 @@ struct RestoredSessionProjection {
     messages: Vec<openpaw_core::Message>,
     turn_outcomes: Vec<TurnOutcome>,
     request_admissions: HashMap<String, RequestAdmission>,
+    mutation: SessionMutationProjection,
 }
 struct PendingFinishTransaction {
     turn_id: String,
@@ -1438,10 +1568,20 @@ fn restored_session_projection(
         messages: Vec::new(),
         turn_outcomes: Vec::new(),
         request_admissions: HashMap::new(),
+        mutation: SessionMutationProjection::default(),
     };
     let mut message_ids = HashSet::new();
     let mut pending_finish: Option<PendingFinishTransaction> = None;
     for event in events {
+        if let SessionEvent::Metadata {
+            title: Some(title), ..
+        } = event
+        {
+            projection.mutation.title = Some(title.clone());
+        }
+        if let Some(mutation) = SessionMutationEvent::from_session_event(event) {
+            projection.mutation.apply(mutation);
+        }
         if let Some(prepare) = TurnFinishPrepareV1::from_session_event(event) {
             pending_finish = Some(PendingFinishTransaction {
                 turn_id: prepare.turn_id,
@@ -2099,7 +2239,14 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         if handle.cancel_requested.load(Ordering::Acquire) {
             (before, Ok(openpaw_core::StopReason::EndTurn))
         } else {
-            if !text.trim().is_empty() && handle.title.lock().await.as_str() == "New session" {
+            if !text.trim().is_empty()
+                && handle
+                    .title
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_str()
+                    == "New session"
+            {
                 let title: String = text.chars().take(80).collect();
                 let metadata = SessionEvent::Metadata {
                     title: Some(title.clone()),
@@ -2113,7 +2260,15 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 if let Err(error) = append_event(&handle, &metadata) {
                     tracing::error!(session_id = %handle.id, %error, "无法持久化会话标题");
                 } else {
-                    *handle.title.lock().await = title.clone();
+                    *handle
+                        .title
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = title.clone();
+                    handle
+                        .mutation
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .title = Some(title.clone());
                 }
                 let session_wire = SessionWire {
                     id: handle.id.clone(),
@@ -2339,6 +2494,14 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     };
     drop(snapshot);
     cleanup.finish();
+}
+fn session_file_updated_at(path: &std::path::Path, fallback: i64) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(fallback)
 }
 fn finish_turn_projection(handle: &SessionHandle) {
     handle.clear_activity();
