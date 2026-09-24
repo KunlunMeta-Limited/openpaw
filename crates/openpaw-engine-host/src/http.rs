@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::wire::SseEnvelope;
 use crate::protocol::{
-    CreateSessionRequest, HostConfig, MessageRequest, OpenCodeEvent, PermissionReply,
-    RequestAdmission, TurnState, UpdateSessionRequest,
+    CreateSessionRequest, ForkSessionRequest, HostConfig, MessageRequest, OpenCodeEvent,
+    PermissionReply, RequestAdmission, TurnState, UpdateSessionRequest,
 };
 use crate::runtime::{
     self, AcceptTurnResult, AppState, SessionHandle, SessionLoadError, SessionMutationError,
@@ -58,9 +58,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/message/{message_id}", get(messages))
         .route("/session/{id}/turns", get(turns))
         .route("/session/{id}/command", post(no_content))
-        // 显式降级：fork/revert 返回原会话 no-op，避免 SDK 空对象导航。
+        // 显式降级：revert 暂时返回原会话，避免 SDK 空对象导航。
         .route("/session/{id}/shell", post(no_content))
-        .route("/session/{id}/fork", post(get_session))
+        .route("/session/{id}/fork", post(fork_session))
         .route("/session/{id}/revert", post(get_session))
         .route("/session/{id}/summarize", post(no_content))
         .route("/session/{id}/prompt_async", post(prompt_async))
@@ -307,12 +307,19 @@ async fn update_session(
     };
     match state.update_session(&id, body).await {
         Ok(session) => Json(session).into_response(),
-        Err(SessionMutationError::BadRequest(error)) => bad(StatusCode::BAD_REQUEST, error),
-        Err(SessionMutationError::NotFound) => bad(StatusCode::NOT_FOUND, "会话不存在"),
-        Err(SessionMutationError::Conflict(error)) => bad(StatusCode::CONFLICT, error),
-        Err(SessionMutationError::Persistence(error)) => {
-            bad(StatusCode::INTERNAL_SERVER_ERROR, error)
-        }
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+async fn fork_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<ForkSessionRequest>>,
+) -> Response {
+    let message_id = body.and_then(|Json(body)| body.message_id);
+    match state.fork_session(&id, message_id.as_deref()).await {
+        Ok(handle) => Json(state.wire_session(&handle).await).into_response(),
+        Err(error) => session_mutation_error(error),
     }
 }
 
@@ -723,6 +730,15 @@ async fn no_content() -> StatusCode {
 
 fn bad(status: StatusCode, error: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({"error":error.into()}))).into_response()
+}
+
+fn session_mutation_error(error: SessionMutationError) -> Response {
+    match error {
+        SessionMutationError::BadRequest(error) => bad(StatusCode::BAD_REQUEST, error),
+        SessionMutationError::NotFound => bad(StatusCode::NOT_FOUND, "会话不存在"),
+        SessionMutationError::Conflict(error) => bad(StatusCode::CONFLICT, error),
+        SessionMutationError::Persistence(error) => bad(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
 }
 
 fn bad_with_code(
@@ -1221,7 +1237,7 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "GET {route}");
         }
-        // 降级路由只在 session 作用域；fork/revert 只读返回原会话。
+        // 降级路由只在 session 作用域；revert 暂时只读返回原会话。
         for route in [
             format!("/session/{id}/command"),
             format!("/session/{id}/shell"),
@@ -1240,7 +1256,13 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            if route.ends_with("/fork") || route.ends_with("/revert") {
+            if route.ends_with("/fork") {
+                assert_eq!(response.status(), StatusCode::OK, "POST {route}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_ne!(session["id"], id);
+                assert!(session.get("parentID").is_none());
+            } else if route.ends_with("/revert") {
                 assert_eq!(response.status(), StatusCode::OK, "POST {route}");
                 let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
                 let session: serde_json::Value = serde_json::from_slice(&body).unwrap();

@@ -5,7 +5,9 @@
 #![cfg(feature = "engine-host")]
 use axum::body::Body;
 use axum::http::StatusCode;
+use openpaw_core::{ContentBlock, Message, SessionEvent};
 use openpaw_engine_host::{build_router, run_with_shutdown, AppState, HostConfig};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -14,9 +16,22 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 mod support;
 use support::{
-    create_session, get_json, prompt_with_request_id, request, request_with_headers,
-    response_bytes, response_json,
+    create_session, create_session_with, get_json, prompt_with_request_id, request,
+    request_with_headers, response_bytes, response_json,
 };
+
+fn append_session_events(home: &std::path::Path, id: &str, events: &[SessionEvent]) {
+    let path = home.join("sessions").join(format!("{id}.jsonl"));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open session fixture");
+    for event in events {
+        serde_json::to_writer(&mut file, event).expect("serialize session fixture");
+        file.write_all(b"\n").expect("append session fixture");
+    }
+    file.sync_all().expect("sync session fixture");
+}
 fn unused_loopback_port() -> u16 {
     std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("bind temporary listener")
@@ -199,6 +214,248 @@ async fn patch_session_validates_input_and_rejects_active_archive_atomically() {
     let session = get_json(&app, format!("/session/{id}")).await;
     assert_eq!(session["title"], "Allowed while active");
     assert!(session["time"].get("archived").is_none());
+}
+
+#[tokio::test]
+async fn fork_session_copies_boundaries_numbers_titles_and_survives_restart() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_id = create_session_with(&app, serde_json::json!({"title":"Plan"})).await;
+    for text in ["first", "second"] {
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{source_id}/message"),
+            serde_json::json!({"text":text}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let source_messages = get_json(&app, format!("/session/{source_id}/message")).await;
+    assert_eq!(source_messages.as_array().unwrap().len(), 4);
+    let boundary_id = source_messages[2]["info"]["id"]
+        .as_str()
+        .expect("boundary message id")
+        .to_string();
+    let mut events = state.global_events.subscribe();
+
+    let full = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(full.status(), StatusCode::OK);
+    let full = response_json(full).await;
+    let full_id = full["id"].as_str().expect("full fork id").to_string();
+    assert_ne!(full_id, source_id);
+    assert_eq!(full["title"], "Plan (1)");
+    assert!(full.get("parentID").is_none());
+    let event = events.recv().await.expect("session.created event");
+    assert_eq!(event.event_type, "session.created");
+    assert_eq!(event.properties["sessionID"], full_id);
+    assert_eq!(event.properties["info"]["title"], "Plan (1)");
+    let full_messages = get_json(&app, format!("/session/{full_id}/message")).await;
+    assert_eq!(full_messages.as_array().unwrap().len(), 4);
+    for (source, forked) in source_messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(full_messages.as_array().unwrap())
+    {
+        assert_eq!(forked["info"]["role"], source["info"]["role"]);
+        assert_eq!(forked["parts"][0]["text"], source["parts"][0]["text"]);
+        assert_ne!(forked["info"]["id"], source["info"]["id"]);
+    }
+
+    let boundary = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/fork"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(boundary.status(), StatusCode::OK);
+    let boundary = response_json(boundary).await;
+    let boundary_fork_id = boundary["id"]
+        .as_str()
+        .expect("boundary fork id")
+        .to_string();
+    assert_eq!(boundary["title"], "Plan (2)");
+    assert_eq!(
+        get_json(&app, format!("/session/{boundary_fork_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let nested = request(&app, "POST", format!("/session/{full_id}/fork"), "{}").await;
+    assert_eq!(nested.status(), StatusCode::OK);
+    assert_eq!(response_json(nested).await["title"], "Plan (1) (1)");
+    assert_eq!(
+        get_json(&app, format!("/session/{source_id}/message")).await,
+        source_messages
+    );
+
+    drop(app);
+    drop(state);
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{full_id}")).await["title"],
+        "Plan (1)"
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{full_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn fork_session_rekeys_tool_links_and_validates_source_state() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_id = create_session_with(&app, serde_json::json!({"title":"Tools"})).await;
+    drop(app);
+    drop(state);
+    append_session_events(
+        home.path(),
+        &source_id,
+        &[
+            SessionEvent::Message(Message {
+                role: openpaw_core::Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-source".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path":"README.md"}),
+                }],
+                uuid: Some("message-tool-source".into()),
+                ..Default::default()
+            }),
+            SessionEvent::Message(Message {
+                role: openpaw_core::Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-source".into(),
+                    content: "done".into(),
+                    is_error: false,
+                    name: Some("read_file".into()),
+                    protected: false,
+                }],
+                uuid: Some("message-result-source".into()),
+                ..Default::default()
+            }),
+        ],
+    );
+    let state = AppState::new(config);
+    let app = build_router(state.clone());
+    let source_messages = get_json(&app, format!("/session/{source_id}/message")).await;
+    let response = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fork_id = response_json(response).await["id"]
+        .as_str()
+        .expect("fork id")
+        .to_string();
+    let fork_messages = get_json(&app, format!("/session/{fork_id}/message")).await;
+    assert_ne!(
+        fork_messages[0]["info"]["id"],
+        source_messages[0]["info"]["id"]
+    );
+    assert_ne!(fork_messages[0]["parts"][0]["callID"], "call-source");
+    assert_eq!(
+        fork_messages[1]["parts"][0]["callID"],
+        fork_messages[0]["parts"][0]["callID"]
+    );
+
+    let unknown = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/fork"),
+        r#"{"messageID":"missing"}"#,
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    let missing = request(&app, "POST", "/session/missing/fork", "{}").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let handle = state.get(&source_id).await.expect("source session");
+    assert!(handle.reserve_turn());
+    let active = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(active.status(), StatusCode::CONFLICT);
+    handle.release_turn();
+}
+
+#[tokio::test]
+async fn fork_session_uses_staged_revert_visible_prefix() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_id = create_session(&app).await;
+    for text in ["kept", "hidden"] {
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{source_id}/message"),
+            serde_json::json!({"text":text}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let messages = get_json(&app, format!("/session/{source_id}/message")).await;
+    let hidden_id = messages[2]["info"]["id"]
+        .as_str()
+        .expect("hidden boundary")
+        .to_string();
+    drop(app);
+    drop(state);
+    append_session_events(
+        home.path(),
+        &source_id,
+        &[SessionEvent::Unknown(Box::new(serde_json::json!({
+            "type":"session_revert_staged_v1",
+            "messageID":hidden_id,
+        })))],
+    );
+
+    let app = build_router(AppState::new(config));
+    let response = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fork_id = response_json(response).await["id"]
+        .as_str()
+        .expect("fork id")
+        .to_string();
+    assert_eq!(
+        get_json(&app, format!("/session/{fork_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let hidden = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/fork"),
+        serde_json::json!({"messageID":hidden_id}).to_string(),
+    )
+    .await;
+    assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
 }
 #[tokio::test]
 async fn malformed_json_is_a_bad_request() {

@@ -11,7 +11,10 @@ use crate::protocol::{
     SessionWire, TurnAcceptV1, TurnError, TurnFinishCommitV1, TurnFinishPrepareV1, TurnOutcome,
     TurnSchedulerConfig, TurnState, UpdateSessionRequest,
 };
-use crate::session_mutation::{SessionMetadataV1, SessionMutationEvent, SessionMutationProjection};
+use crate::session_mutation::{
+    clone_messages_for_fork, visible_prefix_len, SessionForkOriginV1, SessionMetadataV1,
+    SessionMutationEvent, SessionMutationProjection,
+};
 use futures::FutureExt;
 use openpaw_core::{LlmProvider, Session, SessionEvent};
 use openpaw_engine::AgentLoop;
@@ -1289,6 +1292,196 @@ impl AppState {
         handle.emit(events::session_changed("session.updated", &wire));
         Ok(wire)
     }
+    /// 功能：从源会话当前可见历史创建一个独立、持久化的新根会话。
+    /// 参数：`source_id` 为直接源会话；`message_id` 可选，存在时复制严格早于该消息的前缀。
+    /// 返回：成功时返回已加入运行时表的新会话句柄。
+    /// 错误：源会话缺失、边界非法、源会话活动或分支文件事务失败时返回稳定分类。
+    /// 状态：消息、工具调用和内部引用全部换新编号；不复制归档、回退、回合或幂等状态。
+    /// 并发与取消：源 `turn_gate` 线性化活动检查、序号分配和文件发布；文件事务同步不可取消。
+    /// 权限：只在 Host session 目录创建新 JSONL，不读取或修改工作区文件。
+    /// 关联：`API-HOST-SESSION-FORK-001`、`DAT-HOST-SESSION-MUTATION-002`。
+    pub(crate) async fn fork_session(
+        &self,
+        source_id: &str,
+        message_id: Option<&str>,
+    ) -> Result<Arc<SessionHandle>, SessionMutationError> {
+        let source = self
+            .get_typed(source_id)
+            .await
+            .map_err(|error| match error {
+                SessionLoadError::NotFound => SessionMutationError::NotFound,
+                SessionLoadError::Corrupt
+                | SessionLoadError::PermissionDenied
+                | SessionLoadError::Unavailable => {
+                    SessionMutationError::Persistence("无法读取源会话状态".into())
+                }
+            })?;
+        let new_id = Uuid::new_v4().simple().to_string();
+        let final_path = self
+            .config
+            .home
+            .join("sessions")
+            .join(format!("{new_id}.jsonl"));
+        let temporary_path = final_path.with_extension("jsonl.tmp");
+        let handle = {
+            let _gate = source
+                .turn_gate
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if source.deleting.load(Ordering::Acquire) {
+                return Err(SessionMutationError::NotFound);
+            }
+            if source.active.load(Ordering::Acquire) {
+                return Err(SessionMutationError::Conflict(
+                    "会话正在执行，无法创建分支".into(),
+                ));
+            }
+            let (source_messages, source_mutation, source_title) = {
+                let _snapshot = source
+                    .snapshot_gate
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                (
+                    source
+                        .message_cache
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone(),
+                    source
+                        .mutation
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone(),
+                    source
+                        .title
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone(),
+                )
+            };
+            let visible_len = match source_mutation.revert_message_id.as_deref() {
+                Some(revert_id) => visible_prefix_len(source_id, &source_messages, revert_id)
+                    .ok_or_else(|| {
+                        SessionMutationError::Persistence("源会话回退游标无法匹配消息历史".into())
+                    })?,
+                None => source_messages.len(),
+            };
+            let visible_messages = &source_messages[..visible_len];
+            let fork_len = match message_id {
+                Some(message_id) => visible_prefix_len(source_id, visible_messages, message_id)
+                    .ok_or_else(|| {
+                        SessionMutationError::BadRequest("messageID 不存在或已被回退隐藏".into())
+                    })?,
+                None => visible_messages.len(),
+            };
+            let messages = clone_messages_for_fork(&visible_messages[..fork_len]);
+            let ordinal = next_fork_ordinal(&self.config.home, source_id)?;
+            let title = format!("{source_title} ({ordinal})");
+            let origin = SessionForkOriginV1 {
+                source_session_id: source_id.to_string(),
+                ordinal,
+            };
+            let (provider_name, model_name) = source.provider_model();
+            let provider = build_provider(&provider_name).unwrap_or_else(|error| {
+                Arc::new(openpaw_core::NullProvider::new(error)) as Arc<dyn LlmProvider>
+            });
+            let approvals = HostApprovalManager::new(
+                new_id.clone(),
+                self.global_events.clone(),
+                CancellationToken::new(),
+            );
+            let tool_host = openpaw_tools::arc_registry(&source.workspace);
+            let agent =
+                configured_agent(provider, model_name.clone(), tool_host, approvals.clone())
+                    .map_err(|_| {
+                        SessionMutationError::Persistence("无法创建会话分支运行时".into())
+                    })?;
+            let mut session = Session::new(model_name, provider_name);
+            session.meta.id = new_id.clone();
+            session.messages = messages.clone();
+            let metadata = SessionEvent::Metadata {
+                title: Some(title.clone()),
+                mode: None,
+                model_override: None,
+                cwd: Some(source.workspace.to_string_lossy().into_owned()),
+                workspace_id: None,
+                workspace_name: None,
+                task_id: None,
+            };
+            let write_result = (|| {
+                let mut writer = SessionWriter::create(&temporary_path).map_err(|_| {
+                    SessionMutationError::Persistence("无法创建会话分支临时文件".into())
+                })?;
+                writer
+                    .append(&SessionEvent::Meta(session.meta.clone()))
+                    .and_then(|_| writer.append(&metadata))
+                    .and_then(|_| {
+                        writer.append(
+                            &SessionMutationEvent::ForkOrigin(origin.clone()).to_session_event(),
+                        )
+                    })
+                    .map_err(|_| {
+                        SessionMutationError::Persistence("无法写入会话分支元数据".into())
+                    })?;
+                for message in &messages {
+                    writer
+                        .append(&SessionEvent::Message(message.clone()))
+                        .map_err(|_| {
+                            SessionMutationError::Persistence("无法写入会话分支消息".into())
+                        })?;
+                }
+                drop(writer);
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&temporary_path)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|_| {
+                        SessionMutationError::Persistence("无法同步会话分支临时文件".into())
+                    })?;
+                std::fs::rename(&temporary_path, &final_path)
+                    .map_err(|_| SessionMutationError::Persistence("无法发布会话分支文件".into()))
+            })();
+            if let Err(error) = write_result {
+                cleanup_unpublished_session_file(&temporary_path);
+                return Err(error);
+            }
+            let writer = match SessionWriter::open_append(&final_path) {
+                Ok(writer) => writer,
+                Err(_) => {
+                    cleanup_unpublished_session_file(&final_path);
+                    return Err(SessionMutationError::Persistence(
+                        "无法打开已发布的会话分支".into(),
+                    ));
+                }
+            };
+            self.build_session_handle(SessionHandleInit {
+                session,
+                messages,
+                writer,
+                session_path: final_path,
+                agent,
+                approvals,
+                workspace: source.workspace.clone(),
+                tools: source.tools.clone(),
+                title: title.clone(),
+                mutation: SessionMutationProjection {
+                    title: Some(title),
+                    fork_origin: Some(origin),
+                    ..Default::default()
+                },
+                turn_outcomes: Vec::new(),
+                request_admissions: HashMap::new(),
+            })
+        };
+        self.sessions
+            .write()
+            .await
+            .insert(handle.id.clone(), handle.clone());
+        let wire = self.wire_session(&handle).await;
+        handle.emit(events::session_changed("session.created", &wire));
+        Ok(handle)
+    }
     /// 约束：不读取模型锁，避免慢模型或工具调用阻塞 REST/SSE 轮询。
     pub fn message_snapshot(&self, handle: &SessionHandle) -> Vec<openpaw_core::Message> {
         let _snapshot = handle
@@ -2502,6 +2695,39 @@ fn session_file_updated_at(path: &std::path::Path, fallback: i64) -> i64 {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(fallback)
+}
+fn next_fork_ordinal(home: &std::path::Path, source_id: &str) -> Result<u64, SessionMutationError> {
+    let directory = home.join("sessions");
+    let entries = std::fs::read_dir(directory)
+        .map_err(|_| SessionMutationError::Persistence("无法扫描会话分支序号".into()))?;
+    let mut maximum = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(read) = SessionReader::read(&path) else {
+            continue;
+        };
+        let Ok(projection) = restored_session_projection(&read.events) else {
+            continue;
+        };
+        if let Some(origin) = projection.mutation.fork_origin {
+            if origin.source_session_id == source_id {
+                maximum = maximum.max(origin.ordinal);
+            }
+        }
+    }
+    maximum
+        .checked_add(1)
+        .ok_or_else(|| SessionMutationError::Persistence("会话分支序号已耗尽".into()))
+}
+fn cleanup_unpublished_session_file(path: &std::path::Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(%error, "无法清理未发布的会话分支文件");
+        }
+    }
 }
 fn finish_turn_projection(handle: &SessionHandle) {
     handle.clear_activity();
