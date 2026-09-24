@@ -35,7 +35,7 @@
 - Consumes: `openpaw_core::{ContentBlock, Message, SessionEvent}` and `crate::protocol::TurnAcceptV1`.
 - Produces: `SessionMetadataV1`, `SessionForkOriginV1`, `SessionRevertStagedV1`, `SessionRevertCommittedV1`, `SessionMutationEvent::from_session_event`, `visible_prefix_len`, `clone_messages_for_fork`.
 
-- [ ] **Step 1: Register the module and write failing roundtrip/projection tests**
+- [x] **Step 1: Register the module and write failing roundtrip/projection tests**
 
 ```rust
 #[test]
@@ -58,13 +58,13 @@ fn fork_clone_rekeys_messages_and_tool_links() {
 }
 ```
 
-- [ ] **Step 2: Run the focused unit target and verify RED**
+- [x] **Step 2: Run the focused unit target and verify RED**
 
 Run: `cargo test -p openpaw-engine-host --features engine-host session_mutation`
 
 Expected: FAIL because the module and event/projection types do not exist.
 
-- [ ] **Step 3: Implement exact private event shapes and pure helpers**
+- [x] **Step 3: Implement exact private event shapes and pure helpers**
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,13 +98,13 @@ pub(crate) struct SessionRevertCommittedV1 {
 
 Use distinct `type` values `session_metadata_v1`, `session_fork_origin_v1`, `session_revert_staged_v1`, `session_revert_cleared_v1`, and `session_revert_committed_v1`. `clone_messages_for_fork` must generate new message UUIDs, remap `ToolUse.id` and matching `ToolResult.tool_use_id`, and remap `CompactBoundary.last_user_message_uuid` when present.
 
-- [ ] **Step 4: Re-run the focused target and verify GREEN**
+- [x] **Step 4: Re-run the focused target and verify GREEN**
 
 Run: `cargo test -p openpaw-engine-host --features engine-host session_mutation`
 
 Expected: PASS for roundtrip, visible-prefix validation, staged/cleared/committed folding, and ID remapping.
 
-- [ ] **Step 5: Commit the pure state layer**
+- [x] **Step 5: Commit the pure state layer**
 
 ```text
 git add crates/openpaw-engine-host/src/lib.rs crates/openpaw-engine-host/src/session_mutation.rs

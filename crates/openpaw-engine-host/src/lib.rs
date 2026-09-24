@@ -16,6 +16,8 @@ mod office;
 mod protocol;
 #[cfg(feature = "engine-host")]
 mod runtime;
+#[cfg(feature = "engine-host")]
+mod session_mutation;
 
 #[cfg(feature = "engine-host")]
 pub use http::{build_router, run, run_blocking, run_with_shutdown};
