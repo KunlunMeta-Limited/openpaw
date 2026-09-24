@@ -1,8 +1,8 @@
 //! 功能：把 AgentLoop 的工具和状态事件投影为 AI Office 动作。
 //! 输入输出边界：输入为引擎事件和回合生命周期，输出为 `/actions` Gateway
 //! 队列；Office 请求失败只记录日志，不反向改变引擎回合结果。
-//! 设计约束：同一回合最多产生一次桌面拜访；角色状态按 session owner 计数，
-//! 避免一个 session 结束时错误地把另一个 session 的角色置为空闲。
+//! 设计约束：首个工具由 1 号协调角色交接，后续工具由上一工具角色交接；角色状态按
+//! session owner 计数，避免一个 session 结束时错误地把另一个 session 的角色置为空闲。
 //! 关联：`API-OFFICE-ACTION-001`、`REQ-B-OFFICE-003`、`CHG-2026-0003`。
 
 use std::collections::{HashMap, HashSet};
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 /// 功能：表示发送给 AI Office Gateway 的单个动作。
-/// 字段/变体语义：`set_state` 更新角色状态；`desk_visit` 表示 1 号角色拜访目标角色。
+/// 字段/变体语义：`set_state` 更新角色状态；`desk_visit` 表示两个角色之间的工作交接。
 /// 数据来源：`OfficeDispatcher` 根据 AgentEvent 和回合生命周期转换。
 /// 数据去向：AI Office `/actions` 接口；序列化名称必须保持网关兼容。
 /// 约束：角色编号使用 Office 名册编号；`task` 为空时不输出该字段。
@@ -38,7 +38,7 @@ pub enum OfficeAction {
     #[serde(rename = "desk_visit")]
     /// 表示一个回合内的角色拜访动作。
     DeskVisit {
-        /// 发起拜访的 Office 名册编号，当前固定由 1 号角色发起。
+        /// 发起拜访的 Office 名册编号；首站为 1 号角色，后续为上一工具角色。
         visitor: u8,
         /// 被拜访的目标角色名册编号。
         host: u8,
@@ -205,10 +205,10 @@ impl OfficeDispatcher {
 
     /// 功能：观察单个 AgentEvent，并按工具类别更新 Office 角色状态。
     /// 参数：`owner` 为 session 所有者；`event` 为引擎事件；`working` 为角色占用集合；
-    /// `visited` 标记当前回合是否已经产生桌面拜访。
+    /// `last_tool_role` 保存当前工具链末端；`active_tool_roles` 记录仍在执行的工具调用与角色映射。
     /// 返回：无；未知工具不产生动作，审批等待只更新 6 号审核角色。
     /// 错误：无；投影发送失败由队列记录并忽略。
-    /// 状态：首个已登记工具触发一次拜访，后续工具只更新工作状态。
+    /// 状态：工具角色变化时由上一角色发起交接；链尾在工具完成后保持工作，直到后续交接或回合结束。
     /// 并发与取消：调用顺序即事件顺序；取消由回合结束逻辑统一清理。
     /// 权限：只使用工具名和脱敏状态，不读取或发送工具输入。
     /// 关联：`EVT-HOST-TOOL-001`、`REQ-B-OFFICE-003`。
@@ -217,12 +217,48 @@ impl OfficeDispatcher {
         owner: &str,
         event: &AgentEvent,
         working: &mut HashSet<u8>,
-        visited: &mut bool,
+        last_tool_role: &mut Option<u8>,
+        active_tool_roles: &mut HashMap<String, u8>,
     ) {
         match event {
-            AgentEvent::ToolUseStart { name, .. } => {
+            AgentEvent::ToolUseStart { tool_use_id, name } => {
                 if let Some(role) = tool_role(name) {
-                    self.send_tool_working(owner, role, name, working, visited);
+                    active_tool_roles.insert(tool_use_id.clone(), role);
+                    self.send_tool_working(
+                        owner,
+                        role,
+                        name,
+                        working,
+                        last_tool_role,
+                        active_tool_roles,
+                    );
+                }
+            }
+            AgentEvent::ToolResult {
+                tool_use_id, name, ..
+            } => {
+                let role = active_tool_roles
+                    .remove(tool_use_id)
+                    .or_else(|| name.as_deref().and_then(tool_role));
+                if let Some(role) = role {
+                    let role_still_active =
+                        active_tool_roles.values().any(|active| *active == role);
+                    if !role_still_active {
+                        if Some(role) == *last_tool_role {
+                            self.set_working(
+                                owner,
+                                role,
+                                "working",
+                                Some(format!(
+                                    "{} 已完成，等待后续处理",
+                                    name.as_deref().unwrap_or("任务")
+                                )),
+                                working,
+                            );
+                        } else if working.remove(&role) {
+                            self.release(owner, role);
+                        }
+                    }
                 }
             }
             AgentEvent::ClassifierStatus {
@@ -241,17 +277,27 @@ impl OfficeDispatcher {
         role: u8,
         name: &str,
         working: &mut HashSet<u8>,
-        visited: &mut bool,
+        last_tool_role: &mut Option<u8>,
+        active_tool_roles: &HashMap<String, u8>,
     ) {
-        if !*visited {
+        let previous = last_tool_role.unwrap_or(1);
+        if previous != role {
             self.send(OfficeAction::DeskVisit {
-                visitor: 1,
+                visitor: previous,
                 host: role,
                 message: name.to_string(),
             });
-            *visited = true;
         }
         self.set_working(owner, role, "working", Some(name.to_string()), working);
+        *last_tool_role = Some(role);
+
+        if previous != 1
+            && previous != role
+            && !active_tool_roles.values().any(|active| *active == previous)
+            && working.remove(&previous)
+        {
+            self.release(owner, previous);
+        }
     }
 
     /// 功能：结束一个 session 回合并释放本 owner 持有的全部 Office 角色。
@@ -302,47 +348,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_role_and_single_visit_mapping() {
+    async fn tool_roles_form_a_handoff_chain_in_event_order() {
         assert_eq!(tool_role("read_file"), Some(3));
         assert_eq!(tool_role("todo_add"), None);
         assert_eq!(tool_role("unknown"), None);
         let (d, mut actions) = recording_dispatcher();
         let mut roles = HashSet::new();
-        let mut visit = false;
+        let mut last_tool_role = None;
+        let mut active_tool_roles = HashMap::new();
         d.observe(
             "session-a",
             &AgentEvent::ToolUseStart {
                 tool_use_id: "1".into(),
-                name: "grep".into(),
+                name: "web_search".into(),
             },
             &mut roles,
-            &mut visit,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+        d.observe(
+            "session-a",
+            &AgentEvent::ToolResult {
+                tool_use_id: "1".into(),
+                content: "ok".into(),
+                is_error: false,
+                name: Some("web_search".into()),
+                duration_ms: Some(1),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
         );
         d.observe(
             "session-a",
             &AgentEvent::ToolUseStart {
                 tool_use_id: "2".into(),
-                name: "glob".into(),
+                name: "read_file".into(),
             },
             &mut roles,
-            &mut visit,
+            &mut last_tool_role,
+            &mut active_tool_roles,
         );
-        assert!(visit);
-        assert!(roles.contains(&3));
-        let mut visits = 0;
-        while let Ok(action) = actions.try_recv() {
-            if matches!(action, OfficeAction::DeskVisit { .. }) {
-                visits += 1;
-            }
-        }
-        assert_eq!(visits, 1);
+        d.observe(
+            "session-a",
+            &AgentEvent::ToolResult {
+                tool_use_id: "2".into(),
+                content: "ok".into(),
+                is_error: false,
+                name: Some("read_file".into()),
+                duration_ms: Some(1),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+        d.observe(
+            "session-a",
+            &AgentEvent::ToolUseStart {
+                tool_use_id: "3".into(),
+                name: "write_file".into(),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+        assert_eq!(last_tool_role, Some(4));
+        assert!(!roles.contains(&2));
+        assert!(!roles.contains(&3));
+        assert!(roles.contains(&4));
+        let visits: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok())
+            .filter_map(|action| match action {
+                OfficeAction::DeskVisit { visitor, host, .. } => Some((visitor, host)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(visits, vec![(1, 2), (2, 3), (3, 4)]);
     }
 
     #[tokio::test]
     async fn todo_tools_do_not_emit_office_actions() {
         let (dispatcher, mut actions) = recording_dispatcher();
         let mut roles = HashSet::new();
-        let mut visited = false;
+        let mut last_tool_role = None;
+        let mut active_tool_roles = HashMap::new();
 
         for (index, name) in ["todo_add", "todo_update", "todo_list"].iter().enumerate() {
             dispatcher.observe(
@@ -352,11 +440,12 @@ mod tests {
                     name: (*name).into(),
                 },
                 &mut roles,
-                &mut visited,
+                &mut last_tool_role,
+                &mut active_tool_roles,
             );
         }
 
-        assert!(!visited);
+        assert_eq!(last_tool_role, None);
         assert!(roles.is_empty());
         assert!(actions.try_recv().is_err());
     }
@@ -365,7 +454,8 @@ mod tests {
     async fn approval_sets_reviewer_without_adding_a_visit() {
         let (dispatcher, mut actions) = recording_dispatcher();
         let mut roles = HashSet::new();
-        let mut visit = false;
+        let mut last_tool_role = None;
+        let mut active_tool_roles = HashMap::new();
         dispatcher.observe(
             "session-a",
             &AgentEvent::ToolUseStart {
@@ -373,7 +463,8 @@ mod tests {
                 name: "read_file".into(),
             },
             &mut roles,
-            &mut visit,
+            &mut last_tool_role,
+            &mut active_tool_roles,
         );
         dispatcher.observe(
             "session-a",
@@ -384,9 +475,10 @@ mod tests {
                 },
             },
             &mut roles,
-            &mut visit,
+            &mut last_tool_role,
+            &mut active_tool_roles,
         );
-        assert!(visit);
+        assert_eq!(last_tool_role, Some(3));
         assert!(roles.contains(&3));
         assert!(roles.contains(&6));
         let emitted: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
@@ -405,6 +497,125 @@ mod tests {
                 ..
             } if state == "working"
         )));
+    }
+
+    #[tokio::test]
+    async fn chain_tail_stays_working_after_its_last_tool_result() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let mut roles = HashSet::new();
+        let mut last_tool_role = None;
+        let mut active_tool_roles = HashMap::new();
+
+        for tool_use_id in ["read-1", "read-2"] {
+            dispatcher.observe(
+                "session-a",
+                &AgentEvent::ToolUseStart {
+                    tool_use_id: tool_use_id.into(),
+                    name: "read_file".into(),
+                },
+                &mut roles,
+                &mut last_tool_role,
+                &mut active_tool_roles,
+            );
+        }
+        while actions.try_recv().is_ok() {}
+
+        dispatcher.observe(
+            "session-a",
+            &AgentEvent::ToolResult {
+                tool_use_id: "read-1".into(),
+                content: "ok".into(),
+                is_error: false,
+                name: Some("read_file".into()),
+                duration_ms: Some(1),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+        assert!(roles.contains(&3));
+        assert!(actions.try_recv().is_err());
+
+        dispatcher.observe(
+            "session-a",
+            &AgentEvent::ToolResult {
+                tool_use_id: "read-2".into(),
+                content: "ok".into(),
+                is_error: false,
+                name: Some("read_file".into()),
+                duration_ms: Some(1),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+        assert!(roles.contains(&3));
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(OfficeAction::SetState {
+                roster_no: 3,
+                state,
+                ..
+            }) if state == "working"
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_previous_role_is_released_only_after_its_last_result() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let mut roles = HashSet::new();
+        let mut last_tool_role = None;
+        let mut active_tool_roles = HashMap::new();
+
+        dispatcher.observe(
+            "session-a",
+            &AgentEvent::ToolUseStart {
+                tool_use_id: "web".into(),
+                name: "web_search".into(),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+        dispatcher.observe(
+            "session-a",
+            &AgentEvent::ToolUseStart {
+                tool_use_id: "read".into(),
+                name: "read_file".into(),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+        assert_eq!(last_tool_role, Some(3));
+        assert!(roles.contains(&2));
+        assert!(roles.contains(&3));
+        while actions.try_recv().is_ok() {}
+
+        dispatcher.observe(
+            "session-a",
+            &AgentEvent::ToolResult {
+                tool_use_id: "web".into(),
+                content: "ok".into(),
+                is_error: false,
+                name: Some("web_search".into()),
+                duration_ms: Some(1),
+            },
+            &mut roles,
+            &mut last_tool_role,
+            &mut active_tool_roles,
+        );
+
+        assert!(!roles.contains(&2));
+        assert!(roles.contains(&3));
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(OfficeAction::SetState {
+                roster_no: 2,
+                state,
+                ..
+            }) if state == "idle"
+        ));
     }
 
     #[test]
@@ -438,9 +649,17 @@ mod tests {
     async fn turn_ended_releases_all_roles_without_fake_review_work() {
         let (dispatcher, mut actions) = recording_dispatcher();
         let mut working = HashSet::new();
-        let mut visited = false;
+        let mut last_tool_role = None;
+        let active_tool_roles = HashMap::from([("read".to_string(), 3)]);
         dispatcher.turn_started("session-a", &mut working);
-        dispatcher.send_tool_working("session-a", 3, "read_file", &mut working, &mut visited);
+        dispatcher.send_tool_working(
+            "session-a",
+            3,
+            "read_file",
+            &mut working,
+            &mut last_tool_role,
+            &active_tool_roles,
+        );
         while actions.try_recv().is_ok() {}
 
         dispatcher.turn_ended("session-a", &mut working, "done", false);
