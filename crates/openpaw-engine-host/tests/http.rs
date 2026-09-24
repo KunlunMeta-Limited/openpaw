@@ -457,6 +457,181 @@ async fn fork_session_uses_staged_revert_visible_prefix() {
     .await;
     assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn revert_session_hides_tail_and_unrevert_restores_it_across_restart() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    for text in ["kept", "reverted"] {
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{id}/message"),
+            serde_json::json!({"text":text}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let original = get_json(&app, format!("/session/{id}/message")).await;
+    let boundary_id = original[2]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+    let hidden_id = original[3]["info"]["id"]
+        .as_str()
+        .expect("hidden message")
+        .to_string();
+    let mut events = state.global_events.subscribe();
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reverted = response_json(response).await;
+    assert_eq!(reverted["revert"]["messageID"], boundary_id);
+    let event = events.recv().await.expect("session.updated event");
+    assert_eq!(event.event_type, "session.updated");
+    assert_eq!(event.properties["sessionID"], id);
+    assert_eq!(event.properties["info"]["revert"]["messageID"], boundary_id);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let hidden = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":hidden_id}).to_string(),
+    )
+    .await;
+    assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
+    drop(app);
+    drop(state);
+
+    let restarted_state = AppState::new(config.clone());
+    let restarted = build_router(restarted_state.clone());
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}")).await["revert"]["messageID"],
+        boundary_id
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut events = restarted_state.global_events.subscribe();
+    let response = request(
+        &restarted,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_json(response).await.get("revert").is_none());
+    let event = events.recv().await.expect("session.updated event");
+    assert_eq!(event.event_type, "session.updated");
+    assert!(event.properties["info"].get("revert").is_none());
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        original
+    );
+    drop(restarted);
+    drop(restarted_state);
+
+    let restored = build_router(AppState::new(config));
+    assert!(get_json(&restored, format!("/session/{id}"))
+        .await
+        .get("revert")
+        .is_none());
+    assert_eq!(
+        get_json(&restored, format!("/session/{id}/message")).await,
+        original
+    );
+    let idempotent = request(
+        &restored,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(idempotent.status(), StatusCode::OK);
+    assert!(response_json(idempotent).await.get("revert").is_none());
+}
+
+#[tokio::test]
+async fn revert_session_validates_boundaries_part_ids_and_active_state() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let missing_message = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        r#"{"messageID":"missing"}"#,
+    )
+    .await;
+    assert_eq!(missing_message.status(), StatusCode::BAD_REQUEST);
+    let part = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        r#"{"messageID":"missing","partID":"part-1"}"#,
+    )
+    .await;
+    assert_eq!(part.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(part).await["code"], "unsupported_part_revert");
+    let missing = request(
+        &app,
+        "POST",
+        "/session/missing/revert",
+        r#"{"messageID":"missing"}"#,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing = request(&app, "POST", "/session/missing/unrevert", Body::empty()).await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let handle = state.get(&id).await.expect("session");
+    handle
+        .message_cache
+        .write()
+        .unwrap()
+        .push(Message::user_text("active").with_uuid("active-message"));
+    assert!(handle.reserve_turn());
+    let active = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        r#"{"messageID":"active-message"}"#,
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::CONFLICT);
+    handle.release_turn();
+}
 #[tokio::test]
 async fn malformed_json_is_a_bad_request() {
     let home = tempdir().expect("home");

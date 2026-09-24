@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::protocol::wire::SseEnvelope;
 use crate::protocol::{
     CreateSessionRequest, ForkSessionRequest, HostConfig, MessageRequest, OpenCodeEvent,
-    PermissionReply, RequestAdmission, TurnState, UpdateSessionRequest,
+    PermissionReply, RequestAdmission, RevertSessionRequest, TurnState, UpdateSessionRequest,
 };
 use crate::runtime::{
     self, AcceptTurnResult, AppState, SessionHandle, SessionLoadError, SessionMutationError,
@@ -58,10 +58,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/message/{message_id}", get(messages))
         .route("/session/{id}/turns", get(turns))
         .route("/session/{id}/command", post(no_content))
-        // 显式降级：revert 暂时返回原会话，避免 SDK 空对象导航。
         .route("/session/{id}/shell", post(no_content))
         .route("/session/{id}/fork", post(fork_session))
-        .route("/session/{id}/revert", post(get_session))
+        .route("/session/{id}/revert", post(revert_session))
+        .route("/session/{id}/unrevert", post(unrevert_session))
         .route("/session/{id}/summarize", post(no_content))
         .route("/session/{id}/prompt_async", post(prompt_async))
         .route("/session/{id}/abort", post(abort))
@@ -319,6 +319,36 @@ async fn fork_session(
     let message_id = body.and_then(|Json(body)| body.message_id);
     match state.fork_session(&id, message_id.as_deref()).await {
         Ok(handle) => Json(state.wire_session(&handle).await).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+async fn revert_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<RevertSessionRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    if body.part_id.is_some() {
+        return bad_with_code(
+            StatusCode::BAD_REQUEST,
+            "暂不支持按 partID 回退",
+            "unsupported_part_revert",
+            false,
+        );
+    }
+    match state.revert_session(&id, &body.message_id).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+async fn unrevert_session(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.unrevert_session(&id).await {
+        Ok(session) => Json(session).into_response(),
         Err(error) => session_mutation_error(error),
     }
 }
@@ -1237,12 +1267,11 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "GET {route}");
         }
-        // 降级路由只在 session 作用域；revert 暂时只读返回原会话。
+        // 降级路由只在 session 作用域；fork 已升级为真实分支。
         for route in [
             format!("/session/{id}/command"),
             format!("/session/{id}/shell"),
             format!("/session/{id}/fork"),
-            format!("/session/{id}/revert"),
             format!("/session/{id}/summarize"),
         ] {
             let response = app
@@ -1262,17 +1291,37 @@ mod tests {
                 let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_ne!(session["id"], id);
                 assert!(session.get("parentID").is_none());
-            } else if route.ends_with("/revert") {
-                assert_eq!(response.status(), StatusCode::OK, "POST {route}");
-                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(session["id"], id);
-                assert!(session.get("revert").is_none());
             } else {
                 assert_eq!(response.status(), StatusCode::NO_CONTENT, "POST {route}");
             }
         }
-        // §3.2 的 `/command` 只有 GET → []；根路径不存在 shell/fork/revert/summarize。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/session/{id}/revert"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/session/{id}/unrevert"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // §3.2 的 `/command` 只有 GET → []；根路径不存在会话作用域操作。
         let response = app
             .clone()
             .oneshot(
@@ -1289,7 +1338,7 @@ mod tests {
             StatusCode::METHOD_NOT_ALLOWED,
             "POST /command"
         );
-        for route in ["/shell", "/fork", "/revert", "/summarize"] {
+        for route in ["/shell", "/fork", "/revert", "/unrevert", "/summarize"] {
             let response = app
                 .clone()
                 .oneshot(
