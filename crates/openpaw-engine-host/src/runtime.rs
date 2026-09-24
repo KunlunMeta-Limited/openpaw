@@ -2076,7 +2076,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         let mut previous = handle.office_working.lock().await;
         std::mem::take(&mut *previous)
     };
-    let mut visited = false;
+    let mut last_tool_role = None;
+    let mut active_tool_roles = HashMap::new();
     let mut text_parts_started = HashSet::new();
     let mut reasoning_parts_started = HashSet::new();
     let mut completed_responses = HashSet::new();
@@ -2181,9 +2182,13 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     }
                     _ => {}
                 }
-                handle
-                    .office
-                    .observe(&handle.id, &event, &mut roles, &mut visited);
+                handle.office.observe(
+                    &handle.id,
+                    &event,
+                    &mut roles,
+                    &mut last_tool_role,
+                    &mut active_tool_roles,
+                );
                 if !matches!(
                     event,
                     openpaw_engine::AgentEvent::ClassifierStatus { .. }
