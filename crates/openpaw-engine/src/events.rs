@@ -26,6 +26,13 @@ pub enum AgentEvent {
         tool_use_id: String,
         name: String,
     },
+    /// 已通过校验和审批、即将真实执行的工具调用。
+    /// `input` 只保留供活动界面使用的限长白名单字段，不包含正文或命令。
+    ToolExecutionStart {
+        tool_use_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
     ToolResult {
         tool_use_id: String,
         content: String,
@@ -56,6 +63,7 @@ impl AgentEvent {
             AgentEvent::TextDelta { .. } => "text_delta",
             AgentEvent::ThinkingDelta { .. } => "thinking_delta",
             AgentEvent::ToolUseStart { .. } => "tool_use_start",
+            AgentEvent::ToolExecutionStart { .. } => "tool_execution_start",
             AgentEvent::ToolResult { .. } => "tool_result",
             AgentEvent::ClassifierStatus { .. } => "classifier_status",
             AgentEvent::CompactionPerformed { .. } => "compaction_performed",
@@ -85,6 +93,15 @@ mod tests {
             }
             .kind(),
             "tool_result"
+        );
+        assert_eq!(
+            AgentEvent::ToolExecutionStart {
+                tool_use_id: "c2".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path":"README.md"}),
+            }
+            .kind(),
+            "tool_execution_start"
         );
     }
 }

@@ -17,6 +17,8 @@
         "classifier_status",
         "classifier_status",
         "classifier_status",
+        "tool_execution_start",
+        "tool_execution_start",
         "tool_result",
         "tool_result",
         "message_start",

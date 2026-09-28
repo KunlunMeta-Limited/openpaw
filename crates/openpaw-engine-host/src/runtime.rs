@@ -2077,7 +2077,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         std::mem::take(&mut *previous)
     };
     let mut last_tool_role = None;
-    let mut active_tool_roles = HashMap::new();
+    let mut tool_failed = false;
+    let mut active_tools = HashMap::new();
     let mut text_parts_started = HashSet::new();
     let mut reasoning_parts_started = HashSet::new();
     let mut completed_responses = HashSet::new();
@@ -2131,11 +2132,16 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             }
             let mut sink = |event: openpaw_engine::AgentEvent| {
                 match &event {
-                    openpaw_engine::AgentEvent::ToolUseStart { name, .. } => {
+                    openpaw_engine::AgentEvent::ToolExecutionStart { name, input, .. } => {
+                        let task = crate::office::tool_activity_summary(name, input);
+                        handle.set_activity("tool", safe_activity_tool(name), &task);
+                    }
+                    openpaw_engine::AgentEvent::ToolResult { name, is_error, .. } => {
+                        let task = crate::office::tool_result_activity(name.as_deref(), *is_error);
                         handle.set_activity(
-                            "tool",
-                            safe_activity_tool(name),
-                            &tool_activity_task(name),
+                            if *is_error { "tool" } else { "thinking" },
+                            name.as_deref().and_then(safe_activity_tool),
+                            task,
                         );
                     }
                     openpaw_engine::AgentEvent::MessageStart => {
@@ -2187,7 +2193,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     &event,
                     &mut roles,
                     &mut last_tool_role,
-                    &mut active_tool_roles,
+                    &mut tool_failed,
+                    &mut active_tools,
                 );
                 if !matches!(
                     event,
@@ -2237,15 +2244,6 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             (before, result)
         }
     };
-    let reason = result
-        .as_ref()
-        .map(|reason| format!("{reason:?}"))
-        .unwrap_or_else(|error| error.to_string());
-    let cancelled = handle.cancel_requested.load(Ordering::Acquire) || turn_cancel.is_cancelled();
-    handle
-        .office
-        .turn_ended(&handle.id, &mut roles, &reason, cancelled);
-    *handle.office_working.lock().await = roles.clone();
     let snapshot = {
         let mut session = handle.session.lock().await;
         // terminal commit 与 abort 共用 turn_gate。先取得 gate 的一方决定本轮最终是
@@ -2335,12 +2333,17 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 intended_terminal
             }
         };
+        let office_completed = terminal.state == TurnState::Completed && !tool_failed;
+        handle
+            .office
+            .turn_ended(&handle.id, &mut roles, last_tool_role, office_completed);
         let snapshot = session.messages.clone();
         handle.publish_terminal_snapshot(snapshot.clone(), terminal);
         finish_turn_projection(&handle);
         handle.active.store(false, Ordering::Release);
         snapshot
     };
+    *handle.office_working.lock().await = roles.clone();
     drop(snapshot);
     cleanup.finish();
 }
@@ -2368,26 +2371,6 @@ fn finish_turn_with_outcome(
     }
     finish_turn_projection(handle);
     handle.active.store(false, Ordering::Release);
-}
-/// 将内部工具名转换为可读的中文活动提示；不暴露参数和工具结果。
-fn tool_activity_task(name: &str) -> String {
-    let label = match name {
-        "web_search" => "搜索网页",
-        "web_fetch" => "读取网页",
-        "web_extract" => "提取网页内容",
-        "read_file" => "读取文件",
-        "grep" => "搜索文件",
-        "glob" => "扫描文件",
-        "write_file" => "撰写文件",
-        "edit_file" => "修改文件",
-        "notebook_edit" => "更新笔记",
-        "bash" => "执行受控命令",
-        "todo_add" => "新增任务记录",
-        "todo_update" => "更新任务记录",
-        "todo_list" => "读取任务记录",
-        _ => "调用工具",
-    };
-    format!("正在{label}")
 }
 /// 只把已登记的工具名暴露给状态接口；未知或异常超长名称统一脱敏。
 fn safe_activity_tool(name: &str) -> Option<&str> {

@@ -844,33 +844,34 @@ impl AgentLoop {
             let ctx = ctx.clone();
             let hook_chain = self.hook_chain.clone();
             let mut tasks = tokio::task::JoinSet::new();
-            let metadata: Vec<_> = safe
-                .into_iter()
-                .enumerate()
-                .map(|(index, (id, name, input))| {
-                    let started = Instant::now();
-                    let metadata = (id.clone(), name.clone(), started);
-                    let host = Arc::clone(&host);
-                    let ctx = ctx.clone();
-                    let hooks = hook_chain.clone();
-                    let cancel = cancel.clone();
-                    tasks.spawn(async move {
-                        let outcome = std::panic::AssertUnwindSafe(execute_prepared_cancelled(
-                            hooks.as_deref(),
-                            &*host,
-                            &name,
-                            input,
-                            &ctx,
-                            &cancel,
-                        ))
-                        .catch_unwind()
-                        .await
-                        .unwrap_or_else(|_| ToolCallOutcome::error("tool task panicked"));
-                        (index, outcome)
-                    });
-                    metadata
-                })
-                .collect();
+            let mut metadata = Vec::with_capacity(safe.len());
+            for (index, (id, name, input)) in safe.into_iter().enumerate() {
+                event_sink(AgentEvent::ToolExecutionStart {
+                    tool_use_id: id.clone(),
+                    name: name.clone(),
+                    input: observable_tool_input(&name, &input),
+                });
+                let started = Instant::now();
+                metadata.push((id.clone(), name.clone(), started));
+                let host = Arc::clone(&host);
+                let ctx = ctx.clone();
+                let hooks = hook_chain.clone();
+                let cancel = cancel.clone();
+                tasks.spawn(async move {
+                    let outcome = std::panic::AssertUnwindSafe(execute_prepared_cancelled(
+                        hooks.as_deref(),
+                        &*host,
+                        &name,
+                        input,
+                        &ctx,
+                        &cancel,
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| ToolCallOutcome::error("tool task panicked"));
+                    (index, outcome)
+                });
+            }
             let mut completed: Vec<Option<ToolCallOutcome>> =
                 (0..metadata.len()).map(|_| None).collect();
             let mut cancelled = false;
@@ -932,6 +933,11 @@ impl AgentLoop {
             let outcome = match response {
                 None => ToolCallOutcome::error("cancelled by user"),
                 Some(openpaw_core::ApprovalResponse::Approved) => {
+                    event_sink(AgentEvent::ToolExecutionStart {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input: observable_tool_input(&name, &input),
+                    });
                     execute_prepared_cancelled(
                         self.hook_chain.as_deref(),
                         &*self.tool_host,
@@ -1029,6 +1035,11 @@ impl AgentLoop {
                     match response {
                         None => ToolCallOutcome::error("cancelled by user"),
                         Some(openpaw_core::ApprovalResponse::Approved) => {
+                            event_sink(AgentEvent::ToolExecutionStart {
+                                tool_use_id: id.clone(),
+                                name: name.clone(),
+                                input: observable_tool_input(&name, &input),
+                            });
                             execute_prepared_cancelled(
                                 self.hook_chain.as_deref(),
                                 &*self.tool_host,
@@ -1050,6 +1061,11 @@ impl AgentLoop {
                         status: ClassifierStatus::AutoApproved {
                             reason: "guardrail allowed".into(),
                         },
+                    });
+                    event_sink(AgentEvent::ToolExecutionStart {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input: observable_tool_input(&name, &input),
                     });
                     execute_prepared_cancelled(
                         self.hook_chain.as_deref(),
@@ -1175,6 +1191,28 @@ fn tool_result_event(
         name: Some(name.to_string()),
         duration_ms,
     }
+}
+
+/// 将活动事件限制为少量白名单字段，禁止携带文件正文、替换文本、命令和任意工具负载。
+fn observable_tool_input(name: &str, input: &serde_json::Value) -> serde_json::Value {
+    const MAX_FIELD_CHARS: usize = 512;
+    let keys: &[&str] = match name {
+        "web_search" => &["query"],
+        "web_fetch" | "web_extract" => &["url"],
+        "read_file" | "write_file" | "edit_file" | "notebook_edit" => &["path"],
+        "grep" => &["pattern", "path"],
+        "glob" => &["pattern"],
+        _ => &[],
+    };
+    let mut projected = serde_json::Map::new();
+    for key in keys {
+        let Some(value) = input.get(*key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let prefix = value.chars().take(MAX_FIELD_CHARS).collect::<String>();
+        projected.insert((*key).to_string(), serde_json::Value::String(prefix));
+    }
+    serde_json::Value::Object(projected)
 }
 
 fn tool_result_block(id: &str, name: &str, outcome: &ToolCallOutcome) -> ContentBlock {

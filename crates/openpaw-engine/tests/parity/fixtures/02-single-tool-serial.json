@@ -14,6 +14,7 @@
         "tool_use_start",
         "classifier_status",
         "classifier_status",
+        "tool_execution_start",
         "tool_result",
         "message_start",
         "text_delta",
