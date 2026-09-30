@@ -10,8 +10,12 @@ host 实现 `master-plan.md` 第 3.2 节规定的 OpenCode v1 子集。所有 SS
 | `POST /session` | `id,title,slug,directory,time` | 400 |
 | `GET /session` | session 摘要数组，最多 50 条 | 401 |
 | `GET /session/:id` | session 对象 | 404 |
+| `PATCH /session/:id` | 更新 title/archive 后的 session 对象 | 400, 404, 409 |
 | `DELETE /session/:id` | 删除非活动 session；204 | 404, 409 |
 | `GET /session/:id/message` | message 数组 | 404 |
+| `POST /session/:id/fork` | 具有新 ID 的根 session 对象 | 400, 404, 409 |
+| `POST /session/:id/revert` | 带 `revert.messageID` 的 session 对象 | 400, 404, 409 |
+| `POST /session/:id/unrevert` | 清除暂存回退后的 session 对象 | 404 |
 | `POST /session/:id/prompt_async` | 204 | 400, 404, 409 |
 | `POST /session/:id/abort` | `true` | 404 |
 | `GET /session/status` | 以 session id 为键的对象；busy 时可带脱敏 `activity` | 401 |
@@ -21,12 +25,14 @@ host 实现 `master-plan.md` 第 3.2 节规定的 OpenCode v1 子集。所有 SS
 | `POST /permission/:id/reply` | 204 | 400, 404 |
 
 降级路由分别返回 `{}`（`/config`、`/mcp`）、`[]`（`/command`、`/project`、
-`/agent`、`/find/file`）或 204（`/session/:id/command`、`/shell`、`/fork`、
-`/revert`、`/summarize`）。v2 路由返回 404。
+`/agent`、`/find/file`）或 204（`/session/:id/command`、`/session/:id/shell`、
+`/session/:id/summarize`）。v2 路由返回 404。
 
 ## 字段规则
 
 - Session 的 `time.created` 和 `time.updated` 使用 Unix 毫秒。
+- 已归档 Session 额外返回正数 Unix 毫秒 `time.archived`；unarchive 请求写 `0`，响应省略该字段。
+- staged revert 返回 `revert.messageID`；Branch 是新根会话，不返回 `parentID`。
 - Text part 按输入顺序直接拼接，不插入分隔符；非文本 part 被忽略。
 - `message.part.delta` 使用 `partID`、`sessionID`、`messageID`、`field` 和
   `delta`；tool state 为 `running`、`completed` 或 `error`。
@@ -62,9 +68,22 @@ Anthropic/OpenAI 缺少 API key 或 base URL 无效时，请求在预留 active 
 | `metadata` | `title` | 显式标题或首条用户文本前 80 字符 |
 | `metadata` | `cwd` | 创建时解析出的绝对 workspace，供重启恢复 |
 | `message` | core Message | user、assistant 和 tool result 历史 |
+| `session_metadata_v1` | `title/archived` | PATCH 的原子元数据更新；零 archived 表示恢复 |
+| `session_fork_origin_v1` | `sourceSessionID/ordinal` | 私有分支来源和同源序号，不投影为 `parentID` |
+| `session_revert_staged_v1` / `session_revert_cleared_v1` | `messageID` 或无字段 | 暂存或取消会话级回退 |
+| `session_revert_committed_v1` | `messageID/accept` | 与下一条 prompt 接收原子提交逻辑裁剪 |
 
 旧 session 没有 `metadata.cwd` 时回退 host CLI workspace。列表摘要直接只读这些
 字段和文件 mtime，不装载运行时对象。
+
+所有会话变更继续使用追加写 JSONL。staged revert 只在 REST、SSE、模型上下文和 message cache
+隐藏边界及尾部；unrevert 在下一条 prompt 被接收前可以恢复。下一条 prompt 将回退和 turn accept
+写入同一条 committed 记录，之后 unrevert 为幂等 no-op。包含 committed 记录的数据不能直接交给
+不识别 `session_revert_committed_v1` 的旧 Host，否则旧 reader 会重新显示逻辑删除的尾部。
+
+`session.created` 和 `session.updated` 的 properties 固定为 `{sessionID,info}`，其中 `info`
+符合 `contracts/host-session-v1.schema.json`。archive、unarchive、rename、revert、unrevert 和
+revert commit 都发布完整的 `session.updated`。
 
 ## SSE 顺序与响应边界
 
@@ -101,9 +120,11 @@ response 都在对应 `TurnUsage` 边界发送 completed 时间。
 | 条件 | HTTP | 是否改变 session |
 |---|---:|---|
 | JSON 无法解析、文本为空、provider/model/base URL 无效 | 400 | 否 |
+| PATCH 空对象、空标题、负 archived，或 fork/revert 边界非法 | 400 | 否 |
+| revert 提供 `partID` | 400 `unsupported_part_revert` | 否 |
 | Basic Auth 缺失或错误 | 401 | 否 |
 | session/permission 不存在，或 stale handle 正在删除 | 404 | 否 |
-| session 已 active、DELETE active session | 409 | 否 |
+| session 已 active 时 archive、fork、revert、DELETE 或第二个 prompt | 409 | 否 |
 | user JSONL append 失败 | 500 | 不加入内存，不启动 AgentLoop |
 | Office gateway 超时/拒绝/断开 | 原请求不变 | 仅日志，回合继续 |
 | v2 路由 | 404 | 否 |

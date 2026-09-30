@@ -40,6 +40,14 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
 - 旧记录中的前端 Vitest 29 项、Playwright 2 项和四组联调只覆盖早期范围，不能替代当前多会话、长回复、恢复、压力和动画因果测试。
 - 所有新增验证报告、演示日志和错误提示均使用中文；仅保留 HTTP 路径、命令、包名和
   provider/model 标识等必要技术原文。
+- CHG-2026-0019 的 Session mutation 增量使用隔离容器验证，未替换或重启现有服务。
+  Host HTTP 合同矩阵为 32/32；OpenWork direct Host 与 `bootAttachedWorld` 代理 journey
+  为 8/8、零 skip。`pnpm typecheck` 退出 0；`pnpm evals:typecheck` 因缓存镜像中的既有
+  Bun/enterprise schema/NodeNext/Node 22 类型环境问题退出 2，且没有错误指向本次测试文件。
+- Rust 格式、默认依赖树和 engine-host CLI 构建退出 0；Host 全量 92/92。`xtask lines`
+  退出 1：Host 6156/5700、Host tests 2707/1900，aux 10008/10100。严格 Clippy
+  退出 101，原因是 `openpaw-sandbox` 11 条既有 warning。五项治理命令均因缺少固定版本
+  `AI_GOVERNANCE_FRAMEWORK` 退出 1。
 
 ## 当前强证据与失败证据
 
@@ -48,6 +56,7 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
 | LLM mock contract | `mock_server_contract` 为 `8/8` | 局部通过；不覆盖 UTF-8 字节边界、截断流、终止 sentinel 和缓冲上限 |
 | LLM SSE 单元 | `sse::tests` 为 `3/3` | 局部通过；ASCII 拆分不能替代中文/emoji 和畸形流矩阵 |
 | Host reliability/runtime/HTTP | `7/7`、`10/10`、`15/15` | 局部通过；不覆盖冷加载隔离、全部孤儿恢复和真实 listener shutdown |
+| Session archive/fork/revert | PATCH/fork/revert/unrevert、Basic Auth、SSE 包络、并发和重启 HTTP 32/32；OpenWork 8/8 | 本次能力范围通过；全仓 `evals:typecheck` 仍受既有环境基线阻断 |
 | 50K 助手正文 | provider 长度 50000；Host/JSONL 长度 50004，哈希不同并出现 `U+FFFD` | 失败 |
 | 180K 助手正文 | JSONL assistant 长度 180004，替换字符 7 个 | 失败 |
 | 动画可靠性 | v1 动作无 session/turn/eventId/sequence，MPSC `try_send` 和 HTTP POST 可丢 | 失败/未实现 |
@@ -81,7 +90,7 @@ G01/G02 可能新增公共请求字段、响应头、JSONL 幂等事实和 SSE �
 - CHG-2026-0015 的主合同及 G03/G04/G05/G06 关闭边界/G08 session 历史预算附录均未获人工批准和实施。
 - 协调动画变更 `XCHG-2026-ANIMATION-001` 已收敛为 OpenPaw CHG-2026-0014 单一主合同，但仍是 draft；没有 v2 Schema、outbox、journal、ACK、cursor、snapshot 或自动化证据。
 - 固定 fixtures、Host help 旗标、永不返回 future 取消、并行工具最终输入校验、fsync 临界故障和 1000 次竞态压力未执行。
-- OpenWork attached/evals/三方联调、受保护分支、真实 CODEOWNER、PR/Required Checks 和回滚演练未完成。
+- OpenWork attached Session mutation journey 已完成；完整三方联调、受保护分支、真实 CODEOWNER、PR/Required Checks 和回滚演练仍未完成。
 - 全仓公共中文注释迁移未完成；B10 修改 `sse.rs` 时必须按框架栏目补齐其公共声明 Rustdoc。
 
 最终裁决：**未通过，不建议发布。** 任何历史“所有命令退出 0”只适用于当时列出的命令和代码范围，不能覆盖当前确认缺陷，也不能把 T10-T12/M5 或整个 master-plan 标记完成。

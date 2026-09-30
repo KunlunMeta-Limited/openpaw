@@ -17,8 +17,8 @@
 | 共同祖先 | main `60a531a` | 无 |
 | A 线 | feature/openwork-attached-engine_host `26c741c` | 交付与兼容能力来源 |
 | B 线 | feature/ai-office-attached-engine_host `f085218` | Host 运行时、Office 投影及可靠性来源 |
-| 合并 Host | merge/openpaw-unified `ef1a8f8`，此前合并 `bb0f22b` | SessionSummary 复用 SessionWire；客户端 messageID/只读单消息查询；时间投影；fork/revert no-op；鉴权健康检查与契约测试 |
-| OpenWork | 独立 openwork-ui，`3e58d9559dd25c3f30017b39309770628e44cb81` | 保留核对过的 JYZS connection/eval/world/Docker 修改；环境可配默认模型；分支/回退不支持提示 |
+| 合并 Host | bugfix/openwork-session-branch-revert-archive `e1ded8a`（基于合并 Host） | SessionSummary 复用 SessionWire；真实 PATCH/fork/revert/unrevert；追加式恢复；鉴权与 SSE 契约测试 |
+| OpenWork | 独立 openwork-ui `7ce6381` | 产品代码不变；attached eval 覆盖 archive、分支、回退、重启与代理路径 |
 | AI Office | Gitee SSH 独立获取，detached `37a76fdf36cf44f2bb2978b286d6752c467fad59` | Gateway 监听地址配置；Docker/静态服务；E2E 画布截图断言 |
 | 根编排 | compose.yaml、compose.verify.yaml、deploy、workspace | 不在三个源码仓提交中，必须随部署一起交付 |
 
@@ -44,9 +44,9 @@
 | 会话创建与错误优先级 | 整合 A 兼容 | POST session 为 200；不存在 permission 先返回 404，保持 SDK 消费行为 |
 | 会话列表字段 | 本轮修复 | 列表补 slug/time.created/time.updated；保留 createdAt/updatedAt/provider/model/active；只读扫描不创建 AgentLoop |
 | 消息接收/时间投影 | 本轮修复 | GET 单消息与 SSE 使用已接受 ID；历史时间用已有消息/回合元数据，旧无元数据以 session 时间兜底；不改 Core/存储 schema |
-| fork / revert | 显式降级 | POST 返回当前 SessionWire（200、无副作用）；前端检查未产生新分支/回退游标，提示不支持并留在有效会话 |
+| archive / fork / revert | 本轮补齐 | PATCH 支持 archive/unarchive；fork 返回新根会话并支持边界；revert/unrevert 暂存或恢复尾部，替换 prompt 原子提交逻辑裁剪 |
 | shell / command / summarize | 保留降级 | session 范围占位 204，未实现真实行为；不能当作完整 OpenCode 能力 |
-| 根路径重复写操作 | 删除 R1 | `/shell /fork /revert /summarize` 根路径 404；POST `/command` 为 405；只保留登记的 session 路由 |
+| 根路径重复写操作 | 删除 R1 | `/shell /fork /revert /summarize` 根路径 404；POST `/command` 为 405；会话变更只保留登记的 session 路由 |
 | 重复审批等待封装 | 删除/整合 R2 | 删除多余异步包装，保留同步互斥、取消和 pending 清理，不复制新的权限队列 |
 | provider 默认值重复 | 整合 R3 | 统一配置来源与常量，保留协议消费者所需的模型列表 |
 | A 的 28 份旧类型夹具 | 未移植 | 合并采用 B 协议与测试；不能声称覆盖等价。本轮发现的列表/客户端 ID 缺口证明历史验收覆盖不完整 |
@@ -59,7 +59,7 @@
 2. 首次进入 OpenWork 默认选择 opencode/big-pickle，本 Host 无此 provider。增加两个可选 VITE 默认配置，部署使用 openai/deepseek-v4-pro；用户已有浏览器偏好仍优先。
 3. Host 忽略客户端 messageID，OpenWork 无法对账乐观消息和接收事实。补保留 ID、SSE ID、只读单消息查询及重启幂等回归；不同 requestID 不能覆盖既有消息身份。
 4. 消息 time 原为 0，刷新后显示 1970。改为读取已有消息/回合时间；历史无明确信息的消息只能使用 session 创建时间，不能伪造精确发送时刻。
-5. revert 的 204 在 SDK 中成为空对象，页面静默 no-op。按已批准方案返回当前会话，前端检测不支持并提示；没有假装实现撤销/分支。
+5. revert 的旧 204/原 Session 响应会让页面静默 no-op。现已实现 staged revert/unrevert、替换 prompt 提交，以及完整和边界 Branch；Session 事件统一为 `{sessionID,info}`。
 6. Gateway 默认只监听回环；容器显式 0.0.0.0，默认行为不变。sessions/skills 只读，任务 goals 单独可写，避免任务创建被只读挂载阻断。
 
 取消后的旧 user 请求仍保留于历史，这是 B 线行为。真实模型曾在收到故事请求后选择补做刚取消的 read_file；Host 接收的 messageID 和正文已核对正确，并非偷偷重发。测试在同一会话明确“放弃旧任务”后完成真实流式取消。OpenWork 对没有 assistant 结果的取消回合可能显示恢复提示；引擎 idle 与 pending 清理需以状态/SSE 断言为准，不能仅凭该提示推断仍在执行。
@@ -90,7 +90,7 @@ OpenWork 实际请求经过 `/workspace/:id/opencode/*`，server 使用容器内
 | 检查 | 命令/入口 | 当前结果与证据 |
 | --- | --- | --- |
 | Rust 格式 | cargo fmt --all -- --check | 0，artifacts/fmt.log |
-| 代码行数 | cargo run -p xtask -- lines | 0；Host 4999/5000，Host tests 1488/1500，aux 10008/10100；lines.log |
+| 代码行数 | cargo run -p xtask -- lines | 1；Host 6156/5700、Host tests 2707/1900 超限，aux 10008/10100 通过 |
 | Host | cargo test -p openpaw-engine-host --features engine-host | 0；37 单元 +13 reliability +19 HTTP =69；host.log |
 | CLI Host | cargo test -p openpaw-cli --features engine-host | 0；13，cli-host.log |
 | CLI sidecar | cargo test -p openpaw-cli --features sidecar | 0；27（含3个E2E），sidecar.log |
@@ -101,7 +101,7 @@ OpenWork 实际请求经过 `/workspace/:id/opencode/*`，server 使用容器内
 | Host clippy | 上项增加 --no-deps | 101，office.rs 既有 collapsible_else_if；源码该处未改，clippy-no-deps.log |
 | Office lint/build/test | deploy/check-office.sh | 0/0/0，114个测试通过；office-{lint,build,test}.log |
 | Office E2E | Chromium + 原仓 Playwright | 初轮8/9；修正失效 readPixels 断言后9/9、退出0；office-e2e-final.log |
-| OpenWork official attached | pnpm evals:pr specs/openpaw-engine-attach.test.ts | 最新源码结果见收口记录；包含真实 spawned attached server 代理，0 skip 才记通过 |
+| OpenWork official attached | pnpm evals:pr specs/openpaw-engine-attach.test.ts | 0；8/8、0 skip，覆盖 direct Host 与 spawned attached server 代理 |
 | mock tools/stream | node harness/verify.mjs tools / stream | 最新镜像结果见收口记录；分开运行、清空隔离动作队列 |
 | 双页面真实对话/工具/取消 | deploy/stack-e2e.mjs、stack-journey.mjs | journey 11项通过、0 pageerror；stack-journey.json；取消前截图与跨端工具结果截图 |
 | Office 真实任务 API | node deploy/verify-live-api.mjs | 0；五接口、创建/取消/重试完成、列表新旧字段；live-api.json |
@@ -118,7 +118,7 @@ OpenWork 实际请求经过 `/workspace/:id/opencode/*`，server 使用容器内
 标准只读取 JYZS `.feishu-oauth/inbox/1-工作流规范.md`、`2-团队大纲.md`，未访问飞书。CHG 先登记范围、接口、测试和回滚；用户已批准实施，不等于代签 CODEOWNER。
 
 - B 线全部 idle 是用户明确选择；可靠动画 v2 独立后续。v1 `/actions` 读后清空、多页面消费者可能竞争，不能承诺可靠重放、多消费者零丢失或跨会话因果动画。
-- aux 从10000放宽到10100是此前合并中已有例外，本轮没有再放宽；当前10008仍超过原大纲10000。Host上限仍5000，余量仅1。
+- aux 从10000放宽到10100是此前合并中已有例外，本轮没有再放宽；Session mutation 按批准的 CHG 将 Host/Host tests 上限分别调整为 5700/1900。
 - 没有移植 A 全部旧类型夹具；现有测试不能等同于所有原分支验收。完整发布压力矩阵、v2动画万次事件与全套OpenCode能力不属于已通过项。
 - Office 页面有会话和工具展示，但本版本未提供独立人工审批按钮；真实人工批准/拒绝在 OpenWork 页面操作，共享 Host pending。
 - AI Office 与 OpenWork 共享 Host/session 是当前合并部署的设计；Compose 使用 `manual` 审批时，AI Office 不会绕过 Host 自动批准。AI Office 只保留审批 API 代理，当前前端未渲染独立审批控件；因此需要在 OpenWork 批准，不能把“自动分派智能体”理解成“自动批准工具”。
@@ -134,3 +134,9 @@ OpenWork 实际请求经过 `/workspace/:id/opencode/*`，server 使用容器内
 ## 最终收口记录
 
 本次后续修复已完成源码和格式检查：Host 空 body session 回归已加入，`always` session 授权回归已加入，AI Office Gateway 注释已同步。运行中的旧 Host 镜像仍可复现原始 400；由于本轮 Docker Desktop API 的自动审批通道连续返回 503，未能重建/替换容器，因此新镜像、页面点击和重启复验暂不记为通过。恢复 Docker 通道后执行 `docker compose build engine-host openwork`、`docker compose up -d --no-build --wait --wait-timeout 180`，再补录空 POST、OpenWork 新建会话和同工具二次回合的页面证据。
+
+2026-09-24 的 Session mutation 修复在独立临时容器中验证，没有重建、停止或重启现有四服务。
+Host 全量 92/92、HTTP 32/32；OpenWork attached journey 8/8、零 skip；`pnpm typecheck` 退出 0。
+`pnpm evals:typecheck` 因缓存镜像既有类型环境问题退出 2，没有错误指向改动文件；该项保留为阻断，
+不能写成通过。行数门禁也因 6156/5700、2707/1900 退出 1；预算必须精简或重新审批，不能写成通过。
+写入 committed revert 后只能回滚到仍识别 `session_revert_committed_v1` 的 Host。
