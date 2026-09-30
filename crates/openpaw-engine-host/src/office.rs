@@ -6,7 +6,7 @@
 //! 关联：`API-OFFICE-ACTION-001`、`REQ-B-OFFICE-003`、`CHG-2026-0003`。
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -14,6 +14,10 @@ use openpaw_engine::{AgentEvent, ClassifierStatus};
 use reqwest::{Client, Url};
 use serde_json::Value;
 use tokio::sync::mpsc;
+
+const MAX_SUBAGENT_OUTPUT_CHARS: usize = 20_000;
+const SUBAGENT_OUTPUT_CHUNK_CHARS: usize = 96;
+const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。对于可以独立并行完成的研究、设计、实现或审核子任务，可以调用 delegate_task 委派给真实子 Agent；简单问答、单一步骤和高度耦合的工作不要委派。委派前先检查职责边界并合并重复或高度重叠的子任务；同一阶段通常不超过四个子 Agent。每个逻辑子 Agent 使用稳定、唯一、能概括职责的 name，后续补充或重试继续复用相同 name，不得用近义名称重复创建空间。调研、实现与审核应按依赖关系分阶段进行，审核只在已有可审核结果后创建。每个子 Agent 必须获得清晰、完整、可独立执行的任务说明，主 Agent 负责整合结果。回答涉及系统结构、接口关系、数据流、业务流程、角色协作、时间线、层级关系或方案比较时，只要图示能明显提升理解，就优先补充一幅简洁的 Mermaid 图。涉及真实的数量比较、阶段进度或趋势数据时，优先额外写入一个以 .chart.json 结尾的图表产物；格式为 {"type":"bar|line|area","title":"标题","subtitle":"说明","unit":"单位","categories":["分类"],"series":[{"name":"系列","data":[数值]}]}，分类与各系列数据必须等长，不得虚构数据。图表使用中文短标签、清晰标题、有限分类和必要文字说明；普通事实问答或图示无收益时不要强行生成。用户要求保存交付物时，把文档或图表写入工作区中的独立文件。"#;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -28,6 +32,18 @@ pub enum OfficeAction {
     #[serde(rename = "set_state")]
     /// 更新一个 Office 角色的工作状态和可选任务描述。
     SetState {
+        #[serde(rename = "workspaceId")]
+        /// 当前会话的主空间编号；使用 session id 隔离并行对话的动画状态。
+        workspace_id: String,
+        #[serde(rename = "workspaceName")]
+        /// 主空间显示名称。
+        workspace_name: String,
+        #[serde(rename = "sessionId")]
+        /// 动作所属会话编号，供 Gateway 和前端按对话筛选空间。
+        session_id: String,
+        #[serde(rename = "parentWorkspaceId", skip_serializing_if = "Option::is_none")]
+        /// 子 Agent 空间所属的父空间；主空间省略。
+        parent_workspace_id: Option<String>,
         #[serde(rename = "rosterNo")]
         /// Office 名册中的角色编号，序列化字段名为 `rosterNo`。
         roster_no: u8,
@@ -40,6 +56,18 @@ pub enum OfficeAction {
     #[serde(rename = "desk_visit")]
     /// 表示一个回合内的角色拜访动作。
     DeskVisit {
+        #[serde(rename = "workspaceId")]
+        /// 当前会话的主空间编号。
+        workspace_id: String,
+        #[serde(rename = "workspaceName")]
+        /// 主空间显示名称。
+        workspace_name: String,
+        #[serde(rename = "sessionId")]
+        /// 动作所属会话编号。
+        session_id: String,
+        #[serde(rename = "parentWorkspaceId", skip_serializing_if = "Option::is_none")]
+        /// 子 Agent 空间所属的父空间；主空间省略。
+        parent_workspace_id: Option<String>,
         /// 发起拜访的 Office 名册编号；首站为 1 号角色，后续为上一工具角色。
         visitor: u8,
         /// 被拜访的目标角色名册编号。
@@ -47,6 +75,83 @@ pub enum OfficeAction {
         /// 触发拜访的工具名或简短消息，不承载凭据和完整用户输入。
         message: String,
     },
+    #[serde(rename = "workspace_handoff")]
+    /// 表示两个真实 Agent 空间之间的任务交接。
+    WorkspaceHandoff {
+        #[serde(rename = "fromWorkspaceId")]
+        from_workspace_id: String,
+        #[serde(rename = "toWorkspaceId")]
+        to_workspace_id: String,
+        #[serde(rename = "fromWorkspaceName")]
+        from_workspace_name: String,
+        #[serde(rename = "toWorkspaceName")]
+        to_workspace_name: String,
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        /// going、returning 或 complete。
+        phase: String,
+        #[serde(rename = "rosterNo", skip_serializing_if = "Option::is_none")]
+        roster_no: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    #[serde(rename = "register_artifact")]
+    /// 把子 Agent 成功写入的工作区文件登记到所属子空间。
+    RegisterArtifact {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        /// 相对于 OpenPaw 工作区的路径；不包含文件正文或工具命令。
+        path: String,
+    },
+    #[serde(rename = "workspace_output")]
+    /// 把子 Agent 可展示的模型正文增量或最终文本投影到所属空间。
+    WorkspaceOutput {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "workspaceId")]
+        workspace_id: String,
+        #[serde(rename = "workspaceName")]
+        workspace_name: String,
+        #[serde(rename = "parentWorkspaceId", skip_serializing_if = "Option::is_none")]
+        parent_workspace_id: Option<String>,
+        /// `model_delta` 表示增量块，`model_final` 表示完整最终正文。
+        kind: String,
+        /// 只包含 assistant 可展示正文，不包含 reasoning 或工具输入输出。
+        text: String,
+    },
+}
+
+impl OfficeAction {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::SetState { session_id, .. }
+            | Self::DeskVisit { session_id, .. }
+            | Self::WorkspaceHandoff { session_id, .. }
+            | Self::RegisterArtifact { session_id, .. }
+            | Self::WorkspaceOutput { session_id, .. } => session_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OfficeScope {
+    workspace_id: String,
+    workspace_name: String,
+    session_id: String,
+    parent_workspace_id: Option<String>,
+}
+
+impl OfficeScope {
+    fn main(session_id: &str) -> Self {
+        Self {
+            workspace_id: session_id.to_string(),
+            workspace_name: "我的空间".into(),
+            session_id: session_id.to_string(),
+            parent_workspace_id: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -61,6 +166,9 @@ pub enum OfficeAction {
 pub struct OfficeDispatcher {
     tx: mpsc::Sender<OfficeAction>,
     owners: Arc<Mutex<HashMap<u8, HashSet<String>>>>,
+    scopes: Arc<Mutex<HashMap<String, OfficeScope>>>,
+    removed_sessions: Arc<Mutex<HashSet<String>>>,
+    enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,7 +180,36 @@ pub(crate) struct ActiveToolProjection {
     failed_task: String,
 }
 
+/// 子 Agent 单回合的办公室投影状态，仅由 engine-host 委派执行器持有。
+pub(crate) struct SubagentOfficeTurn {
+    working: HashSet<u8>,
+    last_tool_role: Option<u8>,
+    tool_failed: bool,
+    artifact_count: usize,
+    active_tools: HashMap<String, ActiveToolProjection>,
+    workspace: PathBuf,
+    pending_artifacts: HashMap<String, String>,
+    model_output: String,
+    model_pending: String,
+    model_output_chars: usize,
+}
+
 impl OfficeDispatcher {
+    #[cfg(test)]
+    pub(crate) fn recording() -> (Self, mpsc::Receiver<OfficeAction>) {
+        let (tx, rx) = mpsc::channel(128);
+        (
+            Self {
+                tx,
+                owners: Arc::new(Mutex::new(HashMap::new())),
+                scopes: Arc::new(Mutex::new(HashMap::new())),
+                removed_sessions: Arc::new(Mutex::new(HashSet::new())),
+                enabled: false,
+            },
+            rx,
+        )
+    }
+
     /// 功能：创建 Office 动作分发器并启动可选的 Gateway 后台发送 worker。
     /// 参数：`url` 为 Gateway `/actions` 地址；传入 `None` 时保留队列但丢弃网络投影。
     /// 返回：可在线程间共享的分发器。
@@ -82,11 +219,21 @@ impl OfficeDispatcher {
     /// 权限：URL 来自受控配置；动作请求不得携带 Basic Authentication 凭据。
     /// 关联：`REQ-B-OFFICE-008`、`CHG-2026-0003`。
     pub fn new(url: Option<String>) -> Self {
+        let enabled = url.is_some();
         let (tx, mut rx) = mpsc::channel::<OfficeAction>(128);
+        let removed_sessions = Arc::new(Mutex::new(HashSet::new()));
         if let Some(url) = url {
+            let worker_removed_sessions = removed_sessions.clone();
             let worker = async move {
                 let client = Client::new();
                 while let Some(action) = rx.recv().await {
+                    if worker_removed_sessions
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .contains(action.session_id())
+                    {
+                        continue;
+                    }
                     let result = tokio::time::timeout(
                         Duration::from_millis(500),
                         client.post(&url).json(&action).send(),
@@ -115,13 +262,76 @@ impl OfficeDispatcher {
         Self {
             tx,
             owners: Arc::new(Mutex::new(HashMap::new())),
+            scopes: Arc::new(Mutex::new(HashMap::new())),
+            removed_sessions,
+            enabled,
         }
     }
 
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// 仅在 attached Office 模式中追加可视化指导，独立 Host/CLI 不改变默认提示词。
+    pub(crate) fn system_prompt(&self) -> Option<String> {
+        self.enabled
+            .then(|| OFFICE_VISUAL_SYSTEM_PROMPT.to_string())
+    }
+
     fn send(&self, action: OfficeAction) {
+        if self
+            .removed_sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(action.session_id())
+        {
+            return;
+        }
         if let Err(error) = self.tx.try_send(action) {
             tracing::warn!(%error, "办公室动作队列已满或已关闭，已忽略本次动作");
         }
+    }
+
+    fn scope(&self, owner: &str) -> OfficeScope {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(owner)
+            .cloned()
+            .unwrap_or_else(|| OfficeScope::main(owner))
+    }
+
+    fn register_scope(&self, owner: &str, scope: OfficeScope) {
+        self.scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(owner.to_string(), scope);
+    }
+
+    fn send_state(&self, owner: &str, role: u8, state: &str, task: Option<String>) {
+        let scope = self.scope(owner);
+        self.send(OfficeAction::SetState {
+            workspace_id: scope.workspace_id,
+            workspace_name: scope.workspace_name,
+            session_id: scope.session_id,
+            parent_workspace_id: scope.parent_workspace_id,
+            roster_no: role,
+            state: state.into(),
+            task,
+        });
+    }
+
+    fn send_visit(&self, owner: &str, visitor: u8, host: u8, message: &str) {
+        let scope = self.scope(owner);
+        self.send(OfficeAction::DeskVisit {
+            workspace_id: scope.workspace_id,
+            workspace_name: scope.workspace_name,
+            session_id: scope.session_id,
+            parent_workspace_id: scope.parent_workspace_id,
+            visitor,
+            host,
+            message: message.into(),
+        });
     }
 
     fn set_working(
@@ -138,16 +348,12 @@ impl OfficeDispatcher {
             .entry(role)
             .or_default()
             .insert(owner.to_string());
-        self.send(OfficeAction::SetState {
-            roster_no: role,
-            state: state.into(),
-            task,
-        });
+        self.send_state(owner, role, state, task);
         working.insert(role);
     }
 
     fn release(&self, owner: &str, role: u8) {
-        let should_idle = {
+        let released = {
             let mut owners = self
                 .owners
                 .lock()
@@ -155,48 +361,56 @@ impl OfficeDispatcher {
             let Some(role_owners) = owners.get_mut(&role) else {
                 return;
             };
-            role_owners.remove(owner);
+            let released = role_owners.remove(owner);
             let empty = role_owners.is_empty();
             if empty {
                 owners.remove(&role);
             }
-            empty
+            released
         };
-        if should_idle {
-            self.send(OfficeAction::SetState {
-                roster_no: role,
-                state: "idle".into(),
-                task: None,
-            });
+        if released {
+            self.send_state(owner, role, "idle", None);
         }
     }
 
     /// 清理指定 session 仍持有的全部角色；用于 abort、panic 或任务被外部终止后的兜底路径。
     pub fn clear_owner(&self, owner: &str) {
-        let roles = {
+        let released_roles = {
             let mut owners = self
                 .owners
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let mut roles = Vec::new();
+            let mut released_roles = Vec::new();
+            let mut empty_roles = Vec::new();
             for (role, role_owners) in owners.iter_mut() {
-                role_owners.remove(owner);
+                if role_owners.remove(owner) {
+                    released_roles.push(*role);
+                }
                 if role_owners.is_empty() {
-                    roles.push(*role);
+                    empty_roles.push(*role);
                 }
             }
-            for role in &roles {
-                owners.remove(role);
+            for role in empty_roles {
+                owners.remove(&role);
             }
-            roles
+            released_roles
         };
-        for role in roles {
-            self.send(OfficeAction::SetState {
-                roster_no: role,
-                state: "idle".into(),
-                task: None,
-            });
+        for role in released_roles {
+            self.send_state(owner, role, "idle", None);
         }
+    }
+
+    /// 删除已结束会话的 Office scope，避免长期创建和删除会话造成内存累积。
+    pub(crate) fn remove_scope(&self, owner: &str) {
+        self.removed_sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(owner.to_string());
+        self.clear_owner(owner);
+        self.scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(owner);
     }
 
     /// 功能：开始一个 session 回合，清理该 owner 上一回合的角色并让 1 号角色进入思考状态。
@@ -208,6 +422,14 @@ impl OfficeDispatcher {
     /// 权限：不改变工具权限或审批状态。
     /// 关联：`REQ-B-OFFICE-003`、`EVT-HOST-SESSION-001`。
     pub fn turn_started(&self, owner: &str, working: &mut HashSet<u8>) {
+        if !self
+            .scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(owner)
+        {
+            self.register_scope(owner, OfficeScope::main(owner));
+        }
         for role in working.drain() {
             self.release(owner, role);
         }
@@ -310,11 +532,7 @@ impl OfficeDispatcher {
     ) {
         let previous = last_tool_role.unwrap_or(1);
         if previous != role {
-            self.send(OfficeAction::DeskVisit {
-                visitor: previous,
-                host: role,
-                message: handoff_message(role).to_string(),
-            });
+            self.send_visit(owner, previous, role, handoff_message(role));
         }
         self.set_working(owner, role, "working", Some(task.to_string()), working);
         *last_tool_role = Some(role);
@@ -342,21 +560,253 @@ impl OfficeDispatcher {
         owner: &str,
         working: &mut HashSet<u8>,
         last_tool_role: Option<u8>,
+        artifact_count: usize,
         completed: bool,
     ) {
         if completed {
-            if let Some(role) = last_tool_role.filter(|role| *role != 1) {
-                self.send(OfficeAction::DeskVisit {
-                    visitor: role,
-                    host: 1,
-                    message: "任务已完成，请查收".into(),
-                });
+            if artifact_count > 0 {
+                let previous = last_tool_role.unwrap_or(1);
+                if previous != 5 {
+                    self.send_visit(owner, previous, 5, "请整理产物");
+                }
+                self.set_working(
+                    owner,
+                    5,
+                    "working",
+                    Some(format!("整理 {artifact_count} 项产物")),
+                    working,
+                );
+                self.send_visit(owner, 5, 1, "产物已整理，请查收");
+            } else if let Some(role) = last_tool_role.filter(|role| *role != 1) {
+                self.send_visit(owner, role, 1, "任务已完成，请查收");
             }
         }
         for role in working.drain() {
             self.release(owner, role);
         }
     }
+
+    /// 创建一个真实子 Agent 空间，并让主空间向该空间交接任务。
+    pub(crate) fn subagent_started(
+        &self,
+        parent_session_id: &str,
+        workspace_id: &str,
+        workspace_name: &str,
+        workspace: &Path,
+    ) -> SubagentOfficeTurn {
+        self.register_scope(
+            workspace_id,
+            OfficeScope {
+                workspace_id: workspace_id.to_string(),
+                workspace_name: workspace_name.to_string(),
+                session_id: parent_session_id.to_string(),
+                parent_workspace_id: Some(parent_session_id.to_string()),
+            },
+        );
+        self.send(OfficeAction::WorkspaceHandoff {
+            from_workspace_id: parent_session_id.to_string(),
+            to_workspace_id: workspace_id.to_string(),
+            from_workspace_name: "我的空间".into(),
+            to_workspace_name: workspace_name.to_string(),
+            session_id: parent_session_id.to_string(),
+            phase: "going".into(),
+            roster_no: Some(5),
+            message: Some("正在分配子任务".into()),
+        });
+        let mut turn = SubagentOfficeTurn {
+            working: HashSet::new(),
+            last_tool_role: None,
+            tool_failed: false,
+            artifact_count: 0,
+            active_tools: HashMap::new(),
+            workspace: workspace.to_path_buf(),
+            pending_artifacts: HashMap::new(),
+            model_output: String::new(),
+            model_pending: String::new(),
+            model_output_chars: 0,
+        };
+        self.turn_started(workspace_id, &mut turn.working);
+        turn
+    }
+
+    /// 把子 Agent 的真实 AgentEvent 投影到其独立办公室空间。
+    pub(crate) fn observe_subagent(
+        &self,
+        workspace_id: &str,
+        event: &AgentEvent,
+        turn: &mut SubagentOfficeTurn,
+    ) {
+        match event {
+            AgentEvent::TextDelta { text } => {
+                let remaining = MAX_SUBAGENT_OUTPUT_CHARS.saturating_sub(turn.model_output_chars);
+                if remaining > 0 {
+                    let accepted = text.chars().take(remaining).collect::<String>();
+                    turn.model_output_chars += accepted.chars().count();
+                    turn.model_output.push_str(&accepted);
+                    turn.model_pending.push_str(&accepted);
+                    if turn.model_pending.chars().count() >= SUBAGENT_OUTPUT_CHUNK_CHARS {
+                        let scope = self.scope(workspace_id);
+                        self.send(OfficeAction::WorkspaceOutput {
+                            session_id: scope.session_id,
+                            workspace_id: scope.workspace_id,
+                            workspace_name: scope.workspace_name,
+                            parent_workspace_id: scope.parent_workspace_id,
+                            kind: "model_delta".into(),
+                            text: std::mem::take(&mut turn.model_pending),
+                        });
+                    }
+                }
+            }
+            AgentEvent::ToolExecutionStart {
+                tool_use_id,
+                name,
+                input,
+            } if matches!(name.as_str(), "write_file" | "edit_file" | "notebook_edit") => {
+                if let Some(path) = input
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .and_then(|path| workspace_relative_path(&turn.workspace, path))
+                {
+                    turn.pending_artifacts.insert(tool_use_id.clone(), path);
+                }
+            }
+            AgentEvent::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                let artifact = turn.pending_artifacts.remove(tool_use_id);
+                if !*is_error {
+                    if let Some(path) = artifact {
+                        let scope = self.scope(workspace_id);
+                        self.send(OfficeAction::RegisterArtifact {
+                            session_id: scope.session_id,
+                            workspace_id: scope.workspace_id,
+                            path,
+                        });
+                        turn.artifact_count = turn.artifact_count.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.observe(
+            workspace_id,
+            event,
+            &mut turn.working,
+            &mut turn.last_tool_role,
+            &mut turn.tool_failed,
+            &mut turn.active_tools,
+        );
+    }
+
+    /// 结束子 Agent 回合，释放角色并把结果交回父空间。
+    pub(crate) fn subagent_ended(
+        &self,
+        parent_session_id: &str,
+        workspace_id: &str,
+        workspace_name: &str,
+        mut turn: SubagentOfficeTurn,
+        completed: bool,
+    ) {
+        if !turn.model_output.is_empty() {
+            let scope = self.scope(workspace_id);
+            self.send(OfficeAction::WorkspaceOutput {
+                session_id: scope.session_id,
+                workspace_id: scope.workspace_id,
+                workspace_name: scope.workspace_name,
+                parent_workspace_id: scope.parent_workspace_id,
+                kind: "model_final".into(),
+                text: turn.model_output.clone(),
+            });
+        }
+        self.turn_ended(
+            workspace_id,
+            &mut turn.working,
+            turn.last_tool_role,
+            turn.artifact_count,
+            completed && !turn.tool_failed,
+        );
+        self.send(OfficeAction::WorkspaceHandoff {
+            from_workspace_id: workspace_id.to_string(),
+            to_workspace_id: parent_session_id.to_string(),
+            from_workspace_name: workspace_name.to_string(),
+            to_workspace_name: "我的空间".into(),
+            session_id: parent_session_id.to_string(),
+            phase: "returning".into(),
+            roster_no: Some(5),
+            message: Some(if completed {
+                "子任务已完成，正在交回结果".into()
+            } else {
+                "子任务已结束，正在返回状态".into()
+            }),
+        });
+        self.scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(workspace_id);
+        let dispatcher = self.clone();
+        let parent_session_id = parent_session_id.to_string();
+        let workspace_id = workspace_id.to_string();
+        let workspace_name = workspace_name.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                dispatcher.send(OfficeAction::WorkspaceHandoff {
+                    from_workspace_id: workspace_id,
+                    to_workspace_id: parent_session_id.clone(),
+                    from_workspace_name: workspace_name,
+                    to_workspace_name: "我的空间".into(),
+                    session_id: parent_session_id,
+                    phase: "complete".into(),
+                    roster_no: Some(5),
+                    message: None,
+                });
+            });
+        }
+    }
+}
+
+fn workspace_relative_path(workspace: &Path, value: &str) -> Option<String> {
+    let workspace = normalized_path(workspace)?;
+    let input = Path::new(value);
+    let absolute = if input.is_absolute() {
+        normalized_path(input)?
+    } else {
+        normalized_path(&workspace.join(input))?
+    };
+    let relative = absolute.strip_prefix(&workspace).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    Some(
+        relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(value) => Some(value.to_string_lossy()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+fn normalized_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    Some(normalized)
 }
 
 fn tool_role(name: &str) -> Option<u8> {
@@ -503,14 +953,301 @@ mod tests {
     use openpaw_engine::AgentEvent;
 
     fn recording_dispatcher() -> (OfficeDispatcher, mpsc::Receiver<OfficeAction>) {
-        let (tx, rx) = mpsc::channel(32);
-        (
-            OfficeDispatcher {
-                tx,
-                owners: Arc::new(Mutex::new(HashMap::new())),
+        OfficeDispatcher::recording()
+    }
+
+    #[tokio::test]
+    async fn subagent_actions_keep_parent_session_and_child_workspace_scope() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut turn = dispatcher.subagent_started(
+            "parent-session",
+            "parent-session:agent:1",
+            "研究 Agent",
+            workspace.path(),
+        );
+        dispatcher.observe_subagent(
+            "parent-session:agent:1",
+            &AgentEvent::ToolExecutionStart {
+                tool_use_id: "tool-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path":"README.md"}),
             },
-            rx,
-        )
+            &mut turn,
+        );
+        dispatcher.subagent_ended(
+            "parent-session",
+            "parent-session:agent:1",
+            "研究 Agent",
+            turn,
+            true,
+        );
+        assert!(!dispatcher
+            .scopes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key("parent-session:agent:1"));
+
+        let emitted: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
+        assert!(emitted.iter().any(|action| matches!(
+            action,
+            OfficeAction::WorkspaceHandoff {
+                from_workspace_id,
+                to_workspace_id,
+                session_id,
+                phase,
+                ..
+            } if from_workspace_id == "parent-session"
+                && to_workspace_id == "parent-session:agent:1"
+                && session_id == "parent-session"
+                && phase == "going"
+        )));
+        assert!(emitted.iter().any(|action| matches!(
+            action,
+            OfficeAction::SetState {
+                workspace_id,
+                workspace_name,
+                session_id,
+                parent_workspace_id: Some(parent_workspace_id),
+                roster_no: 1,
+                state,
+                ..
+            } if workspace_id == "parent-session:agent:1"
+                && workspace_name == "研究 Agent"
+                && session_id == "parent-session"
+                && parent_workspace_id == "parent-session"
+                && state == "thinking"
+        )));
+        assert!(emitted.iter().any(|action| matches!(
+            action,
+            OfficeAction::DeskVisit {
+                workspace_id,
+                session_id,
+                parent_workspace_id: Some(parent_workspace_id),
+                visitor: 1,
+                host: 3,
+                ..
+            } if workspace_id == "parent-session:agent:1"
+                && session_id == "parent-session"
+                && parent_workspace_id == "parent-session"
+        )));
+        assert!(emitted.iter().any(|action| matches!(
+            action,
+            OfficeAction::WorkspaceHandoff {
+                from_workspace_id,
+                to_workspace_id,
+                phase,
+                ..
+            } if from_workspace_id == "parent-session:agent:1"
+                && to_workspace_id == "parent-session"
+                && phase == "returning"
+        )));
+
+        tokio::time::sleep(Duration::from_millis(950)).await;
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(OfficeAction::WorkspaceHandoff { phase, .. }) if phase == "complete"
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleted_session_drops_delayed_workspace_handoff_completion() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let workspace = tempfile::tempdir().unwrap();
+        let turn = dispatcher.subagent_started(
+            "deleted-session",
+            "deleted-session:agent:1",
+            "研究 Agent",
+            workspace.path(),
+        );
+        dispatcher.subagent_ended(
+            "deleted-session",
+            "deleted-session:agent:1",
+            "研究 Agent",
+            turn,
+            true,
+        );
+        while actions.try_recv().is_ok() {}
+        dispatcher.remove_scope("deleted-session");
+
+        tokio::time::sleep(Duration::from_millis(950)).await;
+        assert!(actions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn subagent_registers_only_successful_workspace_relative_artifacts() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut turn = dispatcher.subagent_started(
+            "parent-session",
+            "parent-session:agent:1",
+            "实现 Agent",
+            workspace.path(),
+        );
+        while actions.try_recv().is_ok() {}
+
+        let cases = [
+            (
+                "write",
+                "write_file",
+                serde_json::json!({"path":"reports/result.md","content":"private body"}),
+                "reports/result.md",
+            ),
+            (
+                "edit",
+                "edit_file",
+                serde_json::json!({
+                    "path": workspace.path().join("notes/plan.md"),
+                    "old_string":"private old",
+                    "new_string":"private new"
+                }),
+                "notes/plan.md",
+            ),
+            (
+                "notebook",
+                "notebook_edit",
+                serde_json::json!({
+                    "path":"charts/demo.ipynb",
+                    "operation":"insert",
+                    "cell_index":0,
+                    "source":"private source"
+                }),
+                "charts/demo.ipynb",
+            ),
+        ];
+        for (tool_use_id, name, input, _) in &cases {
+            dispatcher.observe_subagent(
+                "parent-session:agent:1",
+                &AgentEvent::ToolExecutionStart {
+                    tool_use_id: (*tool_use_id).into(),
+                    name: (*name).into(),
+                    input: input.clone(),
+                },
+                &mut turn,
+            );
+            dispatcher.observe_subagent(
+                "parent-session:agent:1",
+                &AgentEvent::ToolResult {
+                    tool_use_id: (*tool_use_id).into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    name: Some((*name).into()),
+                    duration_ms: Some(1),
+                },
+                &mut turn,
+            );
+        }
+        dispatcher.observe_subagent(
+            "parent-session:agent:1",
+            &AgentEvent::ToolExecutionStart {
+                tool_use_id: "failed".into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path":"failed.md","content":"must not register"}),
+            },
+            &mut turn,
+        );
+        dispatcher.observe_subagent(
+            "parent-session:agent:1",
+            &AgentEvent::ToolResult {
+                tool_use_id: "failed".into(),
+                content: "denied".into(),
+                is_error: true,
+                name: Some("write_file".into()),
+                duration_ms: Some(1),
+            },
+            &mut turn,
+        );
+
+        let artifacts: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok())
+            .filter_map(|action| match action {
+                OfficeAction::RegisterArtifact {
+                    session_id,
+                    workspace_id,
+                    path,
+                } => Some((session_id, workspace_id, path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            artifacts,
+            cases
+                .iter()
+                .map(|(_, _, _, path)| {
+                    (
+                        "parent-session".to_string(),
+                        "parent-session:agent:1".to_string(),
+                        (*path).to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        let wire = serde_json::to_string(&OfficeAction::RegisterArtifact {
+            session_id: "parent-session".into(),
+            workspace_id: "parent-session:agent:1".into(),
+            path: "reports/result.md".into(),
+        })
+        .unwrap();
+        assert!(!wire.contains("private"));
+        assert!(!wire.contains(&workspace.path().display().to_string()));
+        assert!(!wire.contains("command"));
+    }
+
+    #[tokio::test]
+    async fn subagent_projects_incremental_and_final_model_text_without_reasoning() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut turn = dispatcher.subagent_started(
+            "parent-session",
+            "parent-session:agent:1",
+            "研究 Agent",
+            workspace.path(),
+        );
+        while actions.try_recv().is_ok() {}
+
+        dispatcher.observe_subagent(
+            "parent-session:agent:1",
+            &AgentEvent::ThinkingDelta {
+                text: "不得投影的内部推理".into(),
+            },
+            &mut turn,
+        );
+        let first = "研究结果".repeat(30);
+        let second = "，这是最终结论。";
+        dispatcher.observe_subagent(
+            "parent-session:agent:1",
+            &AgentEvent::TextDelta {
+                text: first.clone(),
+            },
+            &mut turn,
+        );
+        dispatcher.observe_subagent(
+            "parent-session:agent:1",
+            &AgentEvent::TextDelta {
+                text: second.into(),
+            },
+            &mut turn,
+        );
+        dispatcher.subagent_ended(
+            "parent-session",
+            "parent-session:agent:1",
+            "研究 Agent",
+            turn,
+            true,
+        );
+
+        let outputs = std::iter::from_fn(|| actions.try_recv().ok())
+            .filter_map(|action| match action {
+                OfficeAction::WorkspaceOutput { kind, text, .. } => Some((kind, text)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(outputs.iter().any(|(kind, text)| kind == "model_delta"
+            && text.contains("研究结果")
+            && !text.contains("内部推理")));
+        assert_eq!(
+            outputs.last(),
+            Some(&("model_final".into(), format!("{first}{second}")))
+        );
     }
 
     #[tokio::test]
@@ -597,6 +1334,7 @@ mod tests {
                     visitor,
                     host,
                     message,
+                    ..
                 } => Some((visitor, host, message)),
                 _ => None,
             })
@@ -812,6 +1550,10 @@ mod tests {
     #[test]
     fn action_wire_uses_gateway_names() {
         let state = serde_json::to_value(OfficeAction::SetState {
+            workspace_id: "session-a".into(),
+            workspace_name: "我的空间".into(),
+            session_id: "session-a".into(),
+            parent_workspace_id: None,
             roster_no: 1,
             state: "thinking".into(),
             task: None,
@@ -819,7 +1561,13 @@ mod tests {
         .unwrap();
         assert_eq!(state["type"], "set_state");
         assert_eq!(state["rosterNo"], 1);
+        assert_eq!(state["workspaceId"], "session-a");
+        assert_eq!(state["sessionId"], "session-a");
         let visit = serde_json::to_value(OfficeAction::DeskVisit {
+            workspace_id: "session-a".into(),
+            workspace_name: "我的空间".into(),
+            session_id: "session-a".into(),
+            parent_workspace_id: None,
             visitor: 1,
             host: 3,
             message: "read_file".into(),
@@ -860,7 +1608,7 @@ mod tests {
         );
         while actions.try_recv().is_ok() {}
 
-        dispatcher.turn_ended("session-a", &mut working, last_tool_role, false);
+        dispatcher.turn_ended("session-a", &mut working, last_tool_role, 0, false);
 
         assert!(working.is_empty());
         let emitted: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
@@ -878,33 +1626,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_session_cannot_idle_another_sessions_role() {
+    async fn parallel_sessions_release_only_their_own_workspace_role() {
         let (dispatcher, mut actions) = recording_dispatcher();
         let mut first = HashSet::new();
         let mut second = HashSet::new();
         dispatcher.turn_started("session-a", &mut first);
         dispatcher.turn_started("session-b", &mut second);
-        dispatcher.turn_ended("session-a", &mut first, None, false);
+        dispatcher.turn_ended("session-a", &mut first, None, 0, false);
 
         let first_batch: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
-        assert!(!first_batch.iter().any(|action| matches!(
+        assert!(first_batch.iter().any(|action| matches!(
             action,
             OfficeAction::SetState {
+                session_id,
                 roster_no: 1,
                 state,
                 ..
-            } if state == "idle"
+            } if session_id == "session-a" && state == "idle"
         )));
 
-        dispatcher.turn_ended("session-b", &mut second, None, false);
+        dispatcher.turn_ended("session-b", &mut second, None, 0, false);
         let second_batch: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
         assert!(second_batch.iter().any(|action| matches!(
             action,
             OfficeAction::SetState {
+                session_id,
                 roster_no: 1,
                 state,
                 ..
-            } if state == "idle"
+            } if session_id == "session-b" && state == "idle"
         )));
     }
 
@@ -915,7 +1665,7 @@ mod tests {
         dispatcher.turn_started("session-a", &mut working);
         while actions.try_recv().is_ok() {}
 
-        dispatcher.turn_ended("session-a", &mut working, Some(4), true);
+        dispatcher.turn_ended("session-a", &mut working, Some(4), 0, true);
 
         assert!(matches!(
             actions.try_recv(),
@@ -923,7 +1673,84 @@ mod tests {
                 visitor: 4,
                 host: 1,
                 message,
+                ..
             }) if message == "任务已完成，请查收"
+        ));
+    }
+
+    #[tokio::test]
+    async fn clear_owner_idles_only_the_aborted_session_workspace() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let mut first = HashSet::new();
+        let mut second = HashSet::new();
+        dispatcher.turn_started("session-a", &mut first);
+        dispatcher.turn_started("session-b", &mut second);
+        while actions.try_recv().is_ok() {}
+
+        dispatcher.clear_owner("session-a");
+
+        let emitted: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
+        assert!(emitted.iter().any(|action| matches!(
+            action,
+            OfficeAction::SetState {
+                session_id,
+                roster_no: 1,
+                state,
+                ..
+            } if session_id == "session-a" && state == "idle"
+        )));
+        assert!(!emitted.iter().any(|action| matches!(
+            action,
+            OfficeAction::SetState { session_id, .. } if session_id == "session-b"
+        )));
+
+        dispatcher.clear_owner("session-b");
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(OfficeAction::SetState {
+                session_id,
+                roster_no: 1,
+                state,
+                ..
+            }) if session_id == "session-b" && state == "idle"
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_artifact_turn_is_delivered_through_liu_shi() {
+        let (dispatcher, mut actions) = recording_dispatcher();
+        let mut working = HashSet::new();
+        dispatcher.turn_started("session-a", &mut working);
+        while actions.try_recv().is_ok() {}
+
+        dispatcher.turn_ended("session-a", &mut working, Some(4), 2, true);
+
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(OfficeAction::DeskVisit {
+                visitor: 4,
+                host: 5,
+                message,
+                ..
+            }) if message == "请整理产物"
+        ));
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(OfficeAction::SetState {
+                roster_no: 5,
+                state,
+                task: Some(task),
+                ..
+            }) if state == "working" && task == "整理 2 项产物"
+        ));
+        assert!(matches!(
+            actions.try_recv(),
+            Ok(OfficeAction::DeskVisit {
+                visitor: 5,
+                host: 1,
+                message,
+                ..
+            }) if message == "产物已整理，请查收"
         ));
     }
 
@@ -1103,7 +1930,7 @@ mod tests {
             &mut active_tools,
         );
         while actions.try_recv().is_ok() {}
-        dispatcher.turn_ended("session-a", &mut roles, last_tool_role, !tool_failed);
+        dispatcher.turn_ended("session-a", &mut roles, last_tool_role, 0, !tool_failed);
         assert!(!std::iter::from_fn(|| actions.try_recv().ok())
             .any(|action| matches!(action, OfficeAction::DeskVisit { host: 1, .. })));
     }

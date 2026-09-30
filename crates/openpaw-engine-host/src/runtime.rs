@@ -4,6 +4,9 @@
 //! 禁止承担：不定义 OpenCode 路由，不让 Office 失败改变 AgentLoop 结果。
 //! 关联：`REQ-B-HOST-002`、`REQ-B-HOST-006`、`REQ-B-HOST-007`。
 use crate::approval::HostApprovalManager;
+use crate::delegation::{
+    remove_persisted_delegation_state, DelegatingToolHost, DelegationContext, DelegationShared,
+};
 use crate::events;
 use crate::office::OfficeDispatcher;
 use crate::protocol::{
@@ -267,6 +270,7 @@ pub struct SessionHandle {
     session_path: PathBuf,
     pub agent: AgentLoop,
     pub approvals: Arc<HostApprovalManager>,
+    pub(crate) delegation: Arc<DelegationContext>,
     pub active: AtomicBool,
     pub workspace: PathBuf,
     session_provider: String,
@@ -586,6 +590,7 @@ pub struct AppState {
     pub office: OfficeDispatcher,
     pub global_events: broadcast::Sender<OpenCodeEvent>,
     pub(crate) scheduler: Arc<TurnScheduler>,
+    delegation_shared: Arc<DelegationShared>,
     session_slots: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     lifecycle: std::sync::Mutex<HostLifecycleState>,
     shutdown: CancellationToken,
@@ -598,6 +603,7 @@ struct SessionHandleInit {
     session_path: PathBuf,
     agent: AgentLoop,
     approvals: Arc<HostApprovalManager>,
+    delegation: Arc<DelegationContext>,
     workspace: PathBuf,
     tools: Vec<openpaw_core::ToolSpec>,
     title: String,
@@ -636,6 +642,7 @@ impl AppState {
         scheduler_config: TurnSchedulerConfig,
     ) -> Arc<Self> {
         let office = OfficeDispatcher::new(config.office_url.clone());
+        let delegation_shared = DelegationShared::from_env();
         let (global_events, _) = broadcast::channel(512);
         Arc::new(Self {
             config,
@@ -643,6 +650,7 @@ impl AppState {
             office,
             global_events,
             scheduler: TurnScheduler::new(scheduler_config),
+            delegation_shared,
             session_slots: Mutex::new(HashMap::new()),
             lifecycle: std::sync::Mutex::new(HostLifecycleState {
                 accepting_turns: true,
@@ -954,10 +962,16 @@ impl AppState {
             .join(format!("{id}.jsonl"));
         match std::fs::remove_file(&path) {
             Ok(()) => {
+                self.remove_delegation_state(id, handle.as_ref());
+                self.office.remove_scope(id);
                 self.remove_session_slot(id, &slot).await;
                 Ok(true)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if handle.is_some() {
+                    self.remove_delegation_state(id, handle.as_ref());
+                    self.office.remove_scope(id);
+                }
                 self.remove_session_slot(id, &slot).await;
                 Ok(handle.is_some())
             }
@@ -970,6 +984,18 @@ impl AppState {
                     self.sessions.write().await.insert(id.to_string(), handle);
                 }
                 Err(format!("删除会话文件失败：{error}"))
+            }
+        }
+    }
+
+    fn remove_delegation_state(&self, id: &str, handle: Option<&Arc<SessionHandle>>) {
+        let mut workspaces = HashSet::from([self.config.workspace.clone()]);
+        if let Some(handle) = handle {
+            workspaces.insert(handle.workspace.clone());
+        }
+        for workspace in workspaces {
+            if let Err(error) = remove_persisted_delegation_state(&workspace, id) {
+                tracing::warn!(%error, session_id = id, "无法删除子 Agent 委派状态");
             }
         }
     }
@@ -992,11 +1018,6 @@ impl AppState {
         });
         let workspace = absolute_workspace(session_workspace(&read.events, &self.config.workspace))
             .map_err(|_| SessionLoadError::Unavailable)?;
-        let tool_host = openpaw_tools::arc_registry(&workspace);
-        let tools = tool_host
-            .list_tools()
-            .await
-            .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
         let projection = restored_session_projection(&read.events)?;
         let messages = projection.messages;
@@ -1011,6 +1032,23 @@ impl AppState {
             self.global_events.clone(),
             CancellationToken::new(),
         );
+        let delegation = DelegationContext::new(
+            id.to_string(),
+            workspace.clone(),
+            self.office.clone(),
+            approvals.clone(),
+            provider.clone(),
+            session.meta.model.clone(),
+            self.delegation_shared.clone(),
+        );
+        let tool_host: Arc<dyn openpaw_core::ToolHost> = Arc::new(DelegatingToolHost::new(
+            workspace.clone(),
+            delegation.clone(),
+        ));
+        let tools = tool_host
+            .list_tools()
+            .await
+            .map_err(|_| SessionLoadError::Unavailable)?;
         let agent = configured_agent(
             provider,
             session.meta.model.clone(),
@@ -1026,6 +1064,7 @@ impl AppState {
             session_path: path,
             agent,
             approvals,
+            delegation,
             workspace,
             tools,
             title,
@@ -1055,7 +1094,19 @@ impl AppState {
         session.meta.id = id.clone();
         let cancel = CancellationToken::new();
         let approvals = HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel);
-        let tool_host = openpaw_tools::arc_registry(&workspace);
+        let delegation = DelegationContext::new(
+            id.clone(),
+            workspace.clone(),
+            self.office.clone(),
+            approvals.clone(),
+            provider.clone(),
+            model_name.clone(),
+            self.delegation_shared.clone(),
+        );
+        let tool_host: Arc<dyn openpaw_core::ToolHost> = Arc::new(DelegatingToolHost::new(
+            workspace.clone(),
+            delegation.clone(),
+        ));
         let tools = tool_host.list_tools().await.map_err(|e| e.to_string())?;
         let agent = configured_agent(provider, model_name, tool_host, approvals.clone())?;
         let home = self.config.home.clone();
@@ -1087,6 +1138,7 @@ impl AppState {
             session_path: path,
             agent,
             approvals,
+            delegation,
             workspace,
             tools,
             title: title.unwrap_or("New session").to_string(),
@@ -1104,6 +1156,7 @@ impl AppState {
             session_path,
             agent,
             approvals,
+            delegation,
             workspace,
             tools,
             title,
@@ -1123,6 +1176,7 @@ impl AppState {
             session_path,
             agent,
             approvals,
+            delegation,
             active: AtomicBool::new(false),
             workspace,
             created_at,
@@ -1297,7 +1351,8 @@ fn configured_agent(
 ) -> Result<AgentLoop, String> {
     let mut agent = AgentLoop::new(provider)
         .with_model(model)
-        .with_tool_host(tool_host);
+        .with_tool_host(tool_host)
+        .with_stream_timeout(engine_stream_timeout());
     if let Ok(value) = std::env::var("OPENPAW_MAX_OUTPUT_TOKENS") {
         let parsed = value.trim().parse::<std::num::NonZeroU32>();
         let max_tokens = parsed
@@ -1309,6 +1364,15 @@ fn configured_agent(
         agent = agent.with_guardrail(Arc::new(ManualGuardrail));
     }
     Ok(agent.with_approval_manager(approvals))
+}
+
+pub(crate) fn engine_stream_timeout() -> std::time::Duration {
+    let seconds = std::env::var("OPENPAW_ENGINE_STREAM_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| (30..=900).contains(seconds))
+        .unwrap_or(300);
+    std::time::Duration::from_secs(seconds)
 }
 /// Anthropic provider 的缺省模型，未设置 `OPENPAW_ANTHROPIC_MODEL` 时使用。
 /// 单一来源：`build_provider`、`default_model` 与 `/provider` 列表都引用它，避免多处漂移。
@@ -1331,6 +1395,56 @@ pub fn build_provider(name: &str) -> Result<Arc<dyn LlmProvider>, String> {
                         text: "reading".into(),
                     },
                     openpaw_llm::MockMode::Fixed("读取完成".into()),
+                ]),
+                "delegate" => openpaw_llm::MockProvider::scripted(vec![
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "delegate_task".into(),
+                        input: serde_json::json!({
+                            "name": "研究 Agent",
+                            "task": "整理子 Agent 端到端验证结果"
+                        }),
+                        text: "正在委派".into(),
+                    },
+                    openpaw_llm::MockMode::Fixed("子 Agent 验证结果".into()),
+                    openpaw_llm::MockMode::Fixed("主 Agent 已整合子 Agent 结果".into()),
+                ]),
+                "delegate_multi" => openpaw_llm::MockProvider::scripted(vec![
+                    openpaw_llm::MockMode::ParallelToolUse {
+                        tools: vec![
+                            (
+                                "delegate_task".into(),
+                                serde_json::json!({"name":"研究 Agent","task":"收集并整理研究结论"}),
+                            ),
+                            (
+                                "delegate_task".into(),
+                                serde_json::json!({"name":"设计 Agent","task":"形成方案结构和流程"}),
+                            ),
+                            (
+                                "delegate_task".into(),
+                                serde_json::json!({"name":"审核 Agent","task":"检查结果并给出验收结论"}),
+                            ),
+                        ],
+                        text: "正在并行委派三个子 Agent".into(),
+                    },
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "write_file".into(),
+                        input: serde_json::json!({"path":"reports/research.md","content":"研究产物"}),
+                        text: "正在写入研究产物".into(),
+                    },
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "write_file".into(),
+                        input: serde_json::json!({"path":"reports/design.md","content":"设计产物"}),
+                        text: "正在写入设计产物".into(),
+                    },
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "write_file".into(),
+                        input: serde_json::json!({"path":"reports/review.md","content":"审核产物"}),
+                        text: "正在写入审核产物".into(),
+                    },
+                    openpaw_llm::MockMode::Fixed("子 Agent 已完成产物".into()),
+                    openpaw_llm::MockMode::Fixed("子 Agent 已完成产物".into()),
+                    openpaw_llm::MockMode::Fixed("子 Agent 已完成产物".into()),
+                    openpaw_llm::MockMode::Fixed("主 Agent 已整合三个子 Agent 结果".into()),
                 ]),
                 "stream" => {
                     openpaw_llm::MockProvider::stream_text_delayed("streamed response", 8, 40)
@@ -2078,15 +2192,30 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     };
     let mut last_tool_role = None;
     let mut tool_failed = false;
+    let mut successful_artifact_count = 0usize;
     let mut active_tools = HashMap::new();
     let mut text_parts_started = HashSet::new();
     let mut reasoning_parts_started = HashSet::new();
     let mut completed_responses = HashSet::new();
     let mut response_index = 0usize;
     let mut active_response_index = 0usize;
+    let provider = handle.delegation.limit_provider(provider);
+    handle
+        .delegation
+        .begin_turn(provider.clone(), model.clone(), turn_cancel.clone());
     handle.office.turn_started(&handle.id, &mut roles);
     handle.set_activity("thinking", None, "正在思考");
     handle.emit(events::session_status(&handle.id, "busy"));
+    let system_prompt = {
+        let prompts = [
+            handle.office.system_prompt(),
+            handle.delegation.context_prompt(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        (!prompts.is_empty()).then(|| prompts.join("\n\n"))
+    };
     let (before, result) = {
         let mut session = handle.session.lock().await;
         let before = session.messages.len();
@@ -2137,6 +2266,14 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                         handle.set_activity("tool", safe_activity_tool(name), &task);
                     }
                     openpaw_engine::AgentEvent::ToolResult { name, is_error, .. } => {
+                        if !*is_error
+                            && matches!(
+                                name.as_deref(),
+                                Some("write_file" | "edit_file" | "notebook_edit")
+                            )
+                        {
+                            successful_artifact_count = successful_artifact_count.saturating_add(1);
+                        }
                         let task = crate::office::tool_result_activity(name.as_deref(), *is_error);
                         handle.set_activity(
                             if *is_error { "tool" } else { "thinking" },
@@ -2223,7 +2360,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             let execution =
                 std::panic::AssertUnwindSafe(handle.agent.run_turn_with_provider_and_cancel_token(
                     &mut session,
-                    None,
+                    system_prompt,
                     &provider_tools,
                     &mut sink,
                     turn_cancel.clone(),
@@ -2334,9 +2471,13 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             }
         };
         let office_completed = terminal.state == TurnState::Completed && !tool_failed;
-        handle
-            .office
-            .turn_ended(&handle.id, &mut roles, last_tool_role, office_completed);
+        handle.office.turn_ended(
+            &handle.id,
+            &mut roles,
+            last_tool_role,
+            successful_artifact_count,
+            office_completed,
+        );
         let snapshot = session.messages.clone();
         handle.publish_terminal_snapshot(snapshot.clone(), terminal);
         finish_turn_projection(&handle);
@@ -2925,8 +3066,10 @@ mod tests {
     #[tokio::test]
     async fn deleted_session_cannot_be_reserved_through_a_stale_handle() {
         let home = tempfile::tempdir().expect("home");
+        let workspace = tempfile::tempdir().expect("workspace");
         let state = AppState::new(HostConfig {
             home: home.path().into(),
+            workspace: workspace.path().into(),
             office_url: None,
             ..HostConfig::default()
         });
@@ -2935,6 +3078,15 @@ mod tests {
             .await
             .expect("session");
         let id = handle.id.clone();
+        let delegation_file = workspace
+            .path()
+            .join(".openpaw")
+            .join("engine-host-delegations")
+            .join(format!("{id}.json"));
+        std::fs::create_dir_all(delegation_file.parent().expect("delegation parent"))
+            .expect("delegation directory");
+        std::fs::write(&delegation_file, r#"{"version":1,"records":[]}"#)
+            .expect("delegation fixture");
 
         assert!(state.delete_session(&id).await.expect("delete"));
         assert!(handle.is_deleting());
@@ -2945,6 +3097,7 @@ mod tests {
             .join("sessions")
             .join(format!("{id}.jsonl"))
             .exists());
+        assert!(!delegation_file.exists());
     }
 
     #[tokio::test]

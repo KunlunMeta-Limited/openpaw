@@ -1,12 +1,12 @@
 //! 功能：管理 Host 侧的人工审批请求，并把审批结果回传给 AgentLoop。
 //! 输入输出边界：输入来自引擎的 `ApprovalManager::request`，输出为
 //! `permission.asked`/`permission.replied` 事件和单次审批响应。
-//! 设计约束：待审批项只保存在当前 session 和当前回合内；`always` 只在
-//! 当前 session 内记住对应工具，重启或新 session 不继承该授权。
+//! 设计约束：待审批项只保存在当前 session 和当前回合内；`once` 与
+//! `always` 都只批准当前请求，不持久化或扩大后续工具权限。
 //! 关联：`API-HOST-PERMISSION-001`、`EVT-HOST-PERMISSION-001`、
 //! `REQ-B-HOST-007`。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use openpaw_core::{ApprovalManager, ApprovalRequest, ApprovalResponse};
@@ -33,7 +33,6 @@ struct Pending {
 pub struct HostApprovalManager {
     session_id: String,
     lifecycle: Mutex<ApprovalLifecycle>,
-    session_allowed: Mutex<HashSet<String>>,
     global_events: broadcast::Sender<OpenCodeEvent>,
 }
 
@@ -79,7 +78,6 @@ impl HostApprovalManager {
                 cancelled,
                 aborted: false,
             }),
-            session_allowed: Mutex::new(HashSet::new()),
             global_events,
         })
     }
@@ -138,14 +136,12 @@ impl HostApprovalManager {
         self.reply_with_scope(id, approved, false, reason).await
     }
 
-    /// 回复审批，并可把本次批准的工具记为当前 session 的授权。
-    /// `remember_for_session` 对应 OpenWork 的 `always`；授权不跨回合、session
-    /// 或 Host 重启传播。
+    /// 回复审批；兼容层接收 OpenWork 的 `always` 参数，但按协议只批准当前请求。
     pub async fn reply_with_scope(
         &self,
         id: &str,
         approved: bool,
-        remember_for_session: bool,
+        _remember_for_session: bool,
         reason: String,
     ) -> bool {
         let mut lifecycle = self
@@ -157,12 +153,6 @@ impl HostApprovalManager {
         }
         let pending = lifecycle.pending.remove(id);
         let Some(pending) = pending else { return false };
-        if approved && remember_for_session {
-            self.session_allowed
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(pending.info.permission.clone());
-        }
         let response = if approved {
             ApprovalResponse::Approved
         } else {
@@ -230,14 +220,6 @@ impl ApprovalManager for HostApprovalManager {
                 return ApprovalResponse::Denied {
                     reason: "回合已取消".into(),
                 };
-            }
-            if self
-                .session_allowed
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .contains(&req.tool_name)
-            {
-                return ApprovalResponse::Approved;
             }
             let cancelled = lifecycle.cancelled.clone();
             lifecycle.pending.insert(
@@ -420,7 +402,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn always_remembers_tool_for_current_session_only() {
+    async fn always_approves_only_the_current_request() {
         let (global, mut rx) = broadcast::channel(16);
         let manager = HostApprovalManager::new("session-1", global, CancellationToken::new());
         manager.begin_turn();
@@ -444,14 +426,23 @@ mod tests {
         let _ = rx.recv().await.expect("first permission replied");
 
         manager.begin_turn();
-        let second = manager
-            .request(ApprovalRequest::new("read_file", json!({}), "read again"))
-            .await;
-        assert!(second.is_approved());
+        let second = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .request(ApprovalRequest::new("read_file", json!({}), "read again"))
+                    .await
+            })
+        };
+        let asked_again = rx.recv().await.expect("always must ask again");
+        assert_eq!(asked_again.event_type, "permission.asked");
+        let second_id = asked_again.properties["id"].as_str().unwrap().to_string();
+        assert!(manager.reply(&second_id, false, "本次拒绝".into()).await);
         assert!(matches!(
-            rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
+            second.await.unwrap(),
+            ApprovalResponse::Denied { .. }
         ));
+        let _ = rx.recv().await.expect("second permission replied");
 
         let third = {
             let manager = manager.clone();

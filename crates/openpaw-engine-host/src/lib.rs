@@ -7,6 +7,8 @@
 #[cfg(feature = "engine-host")]
 mod approval;
 #[cfg(feature = "engine-host")]
+mod delegation;
+#[cfg(feature = "engine-host")]
 mod events;
 #[cfg(feature = "engine-host")]
 mod http;
