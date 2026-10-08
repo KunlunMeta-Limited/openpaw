@@ -21,3 +21,4 @@
 | CHG-2026-0019 | 会话分支、回退与归档 | approved | high | OpenPaw Host 运行时负责人（待确认） | 9 | 22 |
 | CHG-2026-0020 | 工具结果历史投影一致性 | approved | medium | OpenPaw Host 接口负责人（待确认） | 1 | 8 |
 | CHG-2026-0021 | 按回合回退会话 | approved | medium | OpenPaw Host 接口与运行时负责人（待确认） | 1 | 9 |
+| CHG-2026-0022 | 回退替换与 API 错误透传 | approved | medium | OpenPaw Host 接口与运行时负责人（待确认） | 4 | 20 |

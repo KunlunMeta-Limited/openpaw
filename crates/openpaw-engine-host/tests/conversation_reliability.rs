@@ -24,12 +24,14 @@ struct FakeProviderState {
     release: Arc<Semaphore>,
     entered_tx: mpsc::UnboundedSender<String>,
     calls: Arc<AtomicUsize>,
+    requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 struct FakeProvider {
     address: std::net::SocketAddr,
     release: Arc<Semaphore>,
     entered_rx: mpsc::UnboundedReceiver<String>,
     calls: Arc<AtomicUsize>,
+    requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     server: tokio::task::JoinHandle<Result<(), std::io::Error>>,
 }
 impl FakeProvider {
@@ -39,6 +41,7 @@ impl FakeProvider {
             Json(body): Json<serde_json::Value>,
         ) -> Response {
             state.calls.fetch_add(1, Ordering::AcqRel);
+            state.requests.lock().unwrap().push(body.clone());
             let prompt = body["messages"]
                 .as_array()
                 .and_then(|messages| messages.last())
@@ -46,6 +49,25 @@ impl FakeProvider {
                 .unwrap_or_default()
                 .to_string();
             let _ = state.entered_tx.send(prompt.clone());
+            if prompt.contains("unsafe-error") {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error":{
+                    "message":"Bearer UPSTREAM_SENTINEL test-key /tmp/private", "request":"PRIVATE_BODY_SENTINEL"
+                }}))).into_response();
+            }
+            if prompt.contains("rate-limit") {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(serde_json::json!({"error":{"message":"quota exceeded"}})),
+                )
+                    .into_response();
+            }
+            if prompt.contains("stream-fault") {
+                return (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                )
+                    .into_response();
+            }
             if prompt.contains("blocked-auth-fail") {
                 let permit = state.release.acquire().await.expect("release semaphore");
                 permit.forget();
@@ -68,12 +90,14 @@ impl FakeProvider {
         let (entered_tx, entered_rx) = mpsc::unbounded_channel();
         let release = Arc::new(Semaphore::new(0));
         let calls = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/v1/chat/completions", post(completion))
             .with_state(FakeProviderState {
                 release: release.clone(),
                 entered_tx,
                 calls: calls.clone(),
+                requests: requests.clone(),
             });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -85,6 +109,7 @@ impl FakeProvider {
             release,
             entered_rx,
             calls,
+            requests,
             server,
         }
     }
@@ -243,8 +268,9 @@ async fn failed_turn_is_sanitized_persisted_and_does_not_block_the_next_turn() {
         .expect("safe message")
         .contains("secret"));
     let messages = get_json(&app, format!("/session/{id}/message")).await;
-    assert_eq!(messages.as_array().expect("messages").len(), 1);
+    assert_eq!(messages.as_array().expect("messages").len(), 2);
     assert_eq!(messages[0]["info"]["role"], "user");
+    assert_eq!(messages[1]["info"]["error"]["data"]["statusCode"], 401);
     provider.release.add_permits(1);
     assert_eq!(
         prompt(&app, &id, "next succeeds").await.status(),
@@ -265,6 +291,197 @@ async fn failed_turn_is_sanitized_persisted_and_does_not_block_the_next_turn() {
     let restored = get_json(&restarted, format!("/session/{id}/turns")).await;
     assert_eq!(restored, turns);
 }
+#[tokio::test]
+async fn accepted_input_and_api_failures_have_ordered_durable_opencode_projections() {
+    let _env_guard = lock_provider_environment().await;
+    let home = TempDir::new().expect("home");
+    let (mut provider, _environment, state, app) = provider_app(&home, None).await;
+    let id = create_session(&app).await;
+    let mut events = state.global_events.subscribe();
+    assert_eq!(
+        prompt(&app, &id, "held first input").await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(provider.next_prompt().await, "held first input");
+    let admitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    let part = admitted
+        .iter()
+        .find(|event| {
+            event.event_type == "message.part.updated"
+                && event.properties["part"]["text"] == "held first input"
+        })
+        .expect("input before provider release");
+    let busy = get_json(&app, format!("/session/{id}/message")).await;
+    assert_eq!(part.properties["part"], busy[0]["parts"][0]);
+    assert!(!admitted
+        .iter()
+        .any(|event| event.properties["info"]["role"] == "assistant"));
+    provider.release.add_permits(1);
+    wait_for_terminal(&app, &id).await;
+    while events.try_recv().is_ok() {}
+
+    for (input, status, description) in [
+        ("second overload", Some(503), "service unavailable"),
+        ("rate-limit", Some(429), "quota exceeded"),
+        ("auth-fail", Some(401), "invalid upstream credential"),
+        ("stream-fault", None, "不完整"),
+        ("unsafe-error", Some(503), "HTTP 503"),
+    ] {
+        assert_eq!(
+            prompt(&app, &id, input).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        let turns = wait_for_terminal(&app, &id).await;
+        assert_eq!(turns.as_array().unwrap().last().unwrap()["state"], "failed");
+        let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let error_index = emitted
+            .iter()
+            .position(|event| event.event_type == "session.error")
+            .expect("explicit execution error");
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| event.event_type == "session.error")
+                .count(),
+            1
+        );
+        let error = &emitted[error_index].properties["error"];
+        assert_eq!(error["data"]["providerID"], "openai");
+        assert_eq!(
+            error["data"]["statusCode"].as_u64(),
+            status.map(|value| value as u64)
+        );
+        assert!(
+            error["data"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(description),
+            "{error}"
+        );
+        assert!(emitted[..error_index]
+            .last()
+            .is_some_and(|event| event.event_type == "message.updated"
+                && event.properties["info"]["error"] == *error));
+        assert!(
+            emitted
+                .iter()
+                .position(|event| event.event_type == "session.idle")
+                .unwrap()
+                > error_index
+        );
+        let history = get_json(&app, format!("/session/{id}/message")).await;
+        let last = history.as_array().unwrap().last().unwrap();
+        assert_eq!(last["info"]["error"], *error);
+        let restored = build_router(AppState::new(HostConfig {
+            home: home.path().into(),
+            office_url: None,
+            ..Default::default()
+        }));
+        assert_eq!(
+            get_json(&restored, format!("/session/{id}/message")).await,
+            history
+        );
+        let projected = serde_json::to_string(&history).unwrap();
+        let journal =
+            std::fs::read_to_string(home.path().join("sessions").join(format!("{id}.jsonl")))
+                .unwrap();
+        for forbidden in [
+            "UPSTREAM_SENTINEL",
+            "PRIVATE_BODY_SENTINEL",
+            "test-key",
+            "/tmp/private",
+        ] {
+            assert!(!projected.contains(forbidden) && !journal.contains(forbidden));
+            assert!(!serde_json::to_string(
+                &emitted
+                    .iter()
+                    .map(|event| &event.properties)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+            .contains(forbidden));
+        }
+        // 占位仅用于 wire：下一次 provider 的请求不得携带错误说明。
+        while provider.entered_rx.try_recv().is_ok() {}
+    }
+    let history = get_json(&app, format!("/session/{id}/message")).await;
+    let failed_id = history.as_array().unwrap().last().unwrap()["info"]["id"]
+        .as_str()
+        .unwrap();
+    let fork = support::request(
+        &app,
+        "POST",
+        format!("/session/{id}/fork"),
+        serde_json::json!({"messageID":failed_id}).to_string(),
+    )
+    .await;
+    assert_eq!(fork.status(), StatusCode::OK);
+    let fork_id = response_json(fork).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let fork_history = get_json(&app, format!("/session/{fork_id}/message")).await;
+    assert!(fork_history.as_array().unwrap().iter().all(|message| {
+        message["info"]["error"].is_null() && message["info"]["id"] != failed_id
+    }));
+    assert!(fork_history.to_string().contains("unsafe-error"));
+    let nonexistent = support::request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":format!("{failed_id}_999")}).to_string(),
+    )
+    .await;
+    assert_eq!(nonexistent.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        history
+    );
+    let revert = support::request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":failed_id}).to_string(),
+    )
+    .await;
+    assert_eq!(revert.status(), StatusCode::OK);
+    provider.release.add_permits(1);
+    assert_eq!(
+        prompt(&app, &id, "replacement succeeds").await.status(),
+        StatusCode::NO_CONTENT
+    );
+    wait_for_terminal(&app, &id).await;
+    let replacement_events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(replacement_events
+        .iter()
+        .any(|event| event.event_type == "message.removed"
+            && event.properties["messageID"] == failed_id));
+    let replaced = get_json(&app, format!("/session/{id}/message")).await;
+    assert!(!replaced
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["info"]["id"] == failed_id));
+    let restored = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    }));
+    assert_eq!(
+        get_json(&restored, format!("/session/{id}/message")).await,
+        replaced
+    );
+    for request in provider.requests.lock().unwrap().iter() {
+        let context = request["messages"].to_string();
+        assert!(
+            !context.contains("HTTP 503")
+                && !context.contains("service unavailable")
+                && !context.contains("quota exceeded"),
+            "display errors must not enter model context"
+        );
+    }
+}
+
 #[tokio::test]
 async fn second_turn_overload_is_bounded_and_third_turn_recovers() {
     let _env_guard = lock_provider_environment().await;
@@ -404,6 +621,7 @@ async fn graceful_shutdown_stops_admission_and_harvests_registered_turns() {
     let _env_guard = lock_provider_environment().await;
     let home = TempDir::new().expect("home");
     let (mut provider, _environment, state, app) = provider_app(&home, None).await;
+    let mut events = state.global_events.subscribe();
     let running_id = create_session(&app).await;
     let rejected_id = create_session(&app).await;
     assert_eq!(
@@ -428,6 +646,15 @@ async fn graceful_shutdown_stops_admission_and_harvests_registered_turns() {
     assert!(shutdown.await.expect("shutdown task"));
     let turns = wait_for_terminal(&app, &running_id).await;
     assert_eq!(turns[0]["state"], "cancelled");
+    assert!(!std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+        event.event_type == "session.error" && event.properties["sessionID"] == running_id
+    }));
+    let history = get_json(&app, format!("/session/{running_id}/message")).await;
+    assert!(history
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| message["info"]["error"].is_null()));
 }
 
 #[tokio::test]
@@ -570,9 +797,18 @@ async fn restart_ignores_uncommitted_generated_messages() {
     drop(file);
     let restarted = build_router(AppState::new(config));
     let messages = get_json(&restarted, format!("/session/{id}/message")).await;
-    assert_eq!(messages.as_array().expect("messages").len(), 1);
+    assert_eq!(messages.as_array().expect("messages").len(), 2);
     assert_eq!(messages[0]["info"]["role"], "user");
     assert_eq!(messages[0]["parts"][0]["text"], "atomic user");
+    assert_eq!(messages[1]["parts"], serde_json::json!([]));
+    assert_eq!(
+        messages[1]["info"]["error"]["data"]["code"],
+        "host_restarted"
+    );
+    assert!(
+        !messages.to_string().contains("must stay invisible"),
+        "uncommitted assistant remains excluded"
+    );
     let turns = get_json(&restarted, format!("/session/{id}/turns")).await;
     assert_eq!(turns[0]["state"], "failed");
     assert_eq!(turns[0]["error"]["code"], "host_restarted");
