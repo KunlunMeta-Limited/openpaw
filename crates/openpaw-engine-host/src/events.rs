@@ -6,7 +6,22 @@ use std::path::Path;
 
 use openpaw_engine::AgentEvent;
 
-use crate::protocol::OpenCodeEvent;
+use crate::protocol::{OpenCodeEvent, SessionWire};
+
+/// 功能：生成 OpenWork 可消费的会话创建或更新事件。
+/// 参数：`event_type` 为 `session.created` 或 `session.updated`，`session` 为完整公共投影。
+/// 返回：`properties={sessionID,info}` 的 OpenCode 事件。
+/// 错误：无；序列化失败由 `OpenCodeEvent::new` 退化为 null。
+/// 状态：纯投影，不修改 session 或 JSONL。
+/// 并发与取消：同步无锁，不可取消。
+/// 权限：只发送公共 Session 字段，不包含私有 fork 来源。
+/// 关联：`EVT-HOST-SESSION-001`、`EVT-HOST-SESSION-004`。
+pub(crate) fn session_changed(event_type: &'static str, session: &SessionWire) -> OpenCodeEvent {
+    OpenCodeEvent::new(
+        event_type,
+        serde_json::json!({"sessionID":session.id,"info":session}),
+    )
+}
 
 /// 功能：将单个 AgentEvent 转换为 OpenCode 事件。
 /// 参数：`session_id` 为会话编号，`event` 为引擎事件。
@@ -293,6 +308,30 @@ pub fn todo_updated(session_id: &str, workspace: &Path) -> OpenCodeEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{SessionTime, SessionWire};
+
+    #[test]
+    fn session_events_use_info_envelope() {
+        let session = SessionWire {
+            id: "s1".into(),
+            title: "Session".into(),
+            slug: "s1".into(),
+            directory: "/workspace".into(),
+            time: SessionTime {
+                created: 1,
+                updated: 2,
+                archived: None,
+            },
+            revert: None,
+        };
+        for kind in ["session.created", "session.updated"] {
+            let event = session_changed(kind, &session);
+            assert_eq!(event.event_type, kind);
+            assert_eq!(event.properties["sessionID"], "s1");
+            assert_eq!(event.properties["info"]["id"], "s1");
+            assert!(event.properties.get("title").is_none());
+        }
+    }
 
     #[test]
     fn text_and_tool_events_use_v1_property_names() {

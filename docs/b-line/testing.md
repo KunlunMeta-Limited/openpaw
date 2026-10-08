@@ -56,8 +56,48 @@ npx playwright test
 并发、SSE 顺序、manual approval 清理、stream abort、动作队列顺序，以及全部五个
 `/office/*` 数组接口。
 
-需要外部 API key 或 OpenWork 的测试明确不在本次范围内，必须列为未执行，不得
-标记为通过。
+需要外部 API key 的测试明确列为未执行，不得标记为通过。OpenWork attached 的
+Session mutation journey 属于 CHG-2026-0019 的跨仓验收范围，必须同时经过直接 Host
+和 `bootAttachedWorld` 代理，且结果为零 skip。
+
+## CHG-2026-0019 会话变更矩阵
+
+| 能力 | Host 可观察条件 | OpenWork 可观察条件 |
+| --- | --- | --- |
+| Rename / Archive | PATCH 同时或独立更新 title/archived；空 patch、空标题、负数为 400；未知为 404；活动归档为 409 且无部分更新 | archive/unarchive 经代理可见；owned Host 重启后保持归档状态 |
+| Branch | full/boundary fork 返回新 ID，复制当前可见前缀，重排消息和工具 ID，不修改源会话，不返回 `parentID` | 完整和边界分支均显示为根会话；源 transcript 不变 |
+| Revert / Unrevert | revert 返回隐藏边界游标且 message snapshot 保留完整历史；`partID` 为 400 `unsupported_part_revert`；unrevert 清除游标且无游标时幂等 | staged revert/unrevert 可观察；Restore 无需刷新即恢复；替换 prompt 后 committed 尾部不可恢复 |
+| SSE / Auth | 四条写路由均要求 Basic Auth；Session 事件固定 `{sessionID,info}` | direct Host 与代理缓存都能消费完整 Session |
+| 持久化 / 并发 | JSONL 只追加；archive/fork/revert 与 prompt/delete 竞争只产生一个线性化结果；追加失败时文件与内存不变 | journey 不依赖内部函数或产品测试替身 |
+
+Host 定向 HTTP 矩阵已通过 32/32；OpenWork `openpaw-engine-attach.test.ts` 已通过 8/8、
+零 skip。`pnpm typecheck` 退出 0；`pnpm evals:typecheck` 因缓存镜像中既有的 Bun、企业 schema、
+NodeNext import 和 Node 22 typings 环境问题退出 2，输出没有指向本次修改的测试文件，仍按阻断记录。
+
+## CHG-2026-0020 工具结果历史投影矩阵
+
+| 场景 | Host 可观察条件 | OpenWork 可观察条件 |
+| --- | --- | --- |
+| completed ToolResult | REST 省略内部 user ToolResult，并将原 assistant tool part 更新为 completed 和实际 output | 刷新前后的工具状态一致，不产生新的 user admission |
+| Revert 最终 assistant | Core 游标仍严格隐藏边界及尾部；可见 REST 历史以 completed assistant tool part 结束 | 不显示 `The task was accepted, but no result arrived` 恢复卡 |
+| fork / restart | fork 后 callID 成对重排；重启前后 wire 完全一致 | Branch 与重新进入会话均显示相同工具结果 |
+| 无法完整匹配 | 普通用户文本、混合内容或 orphan ToolResult 保持原逐条投影 | 不因部分折叠丢失旧数据 |
+
+Docker Linux 环境的定向回归 1/1 和 Host 全量回归 92/92 通过；最终页面复验和治理门禁
+结果记录在 CHG-2026-0020 与 verification report。
+
+## CHG-2026-0021 按回合回退矩阵
+
+| 场景 | Host 可观察条件 | OpenWork 可观察条件 |
+| --- | --- | --- |
+| user 边界 | 返回请求 user ID，并严格隐藏该边界及尾部 | 既有行为不变 |
+| assistant / `assistant_n` 边界 | 通过 `TurnOutcome` 返回同回合 user ID，持久化后重启仍使用该权威游标 | 点击 assistant Revert 后该轮输入、输出和后续消息一起隐藏 |
+| 旧 assistant 无可靠 outcome | 保留原 assistant 游标，不猜测或误删此前 user | 兼容旧会话与外部写入 |
+| Unrevert / replacement prompt | staged REST/snapshot 保留完整尾部；Unrevert 清除游标；下一条 prompt 继续沿用既有 committed 语义 | Restore 无需刷新即恢复输入、输出和后续消息 |
+
+Linux Docker 定向 Revert 回归 3/3、Host HTTP 33/33、Host 全包 93/93 通过；格式检查退出 0。
+OpenWork `main` 保持无源码 diff，从主线镜像与当前 Host 镜像重建后两个容器均健康。容器内
+REST 验证 assistant 请求返回 user 游标，页面验证目标 user/assistant 同时隐藏且 Restore 恢复。
 
 ## 当前发布阻断矩阵
 
@@ -245,7 +285,7 @@ LLM/Host/Engine 不能判定发布通过。
 | `cargo test -p openpaw-cli --features engine-host --test help_snapshot` | 4/4 通过 |
 | `cargo test -p openpaw-cli --features sidecar` | 26/26 通过，独立 chat/sidecar 未回归 |
 | `CARGO_TARGET_DIR=target-windows cargo build -p openpaw-cli --features engine-host --locked` | 退出码 0 |
-| `cargo run -p xtask -- lines` | Host 4999/5000、Host tests 1479/1500、aux 9991/10000，退出码 0 |
+| `cargo run -p xtask -- lines` | 退出 1；Host 6156/5700、Host tests 2707/1900 超限，aux 10008/10100 通过；不得以压缩测试或提高未批准预算伪造通过 |
 | `governance validate` / `contracts` | 14 个 CHG、2 个 Schema 通过 |
 
 Windows 候选二进制：`target-windows/debug/openpaw.exe`，SHA-256
@@ -269,7 +309,7 @@ Windows 候选二进制：`target-windows/debug/openpaw.exe`，SHA-256
 ### 当前仍未闭环
 
 1. 尚未执行用户要求的 100/200 次真实 Provider 连续对话；不能把少量真实成功写成 200/200。
-2. 行数门禁已通过但余量很小：Host 0 行、aux 9 行、Host tests 21 行；后续新增必须同步精简。
+2. CHG-2026-0019 行数门禁未通过：Host 超 456 行、Host tests 超 807 行；aux 仍有 92 行余量。修复需精简实现/测试，或先由人工重新批准预算。
 3. 工具副作用不能由 session checkpoint 回滚，写文件/外部调用仍需业务幂等证据。
 4. Gateway terminal 与 assistant 正文的有界对账、turns/messages 单路降级、跨标签活动 turn 接管仍需系统测试。
 5. 完整 4 running + 32 queued + 第 37 个拒绝、30 分钟 soak、真实断流/限流/重启矩阵尚未在本候选执行。

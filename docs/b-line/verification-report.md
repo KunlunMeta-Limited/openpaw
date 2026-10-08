@@ -40,6 +40,29 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
 - 旧记录中的前端 Vitest 29 项、Playwright 2 项和四组联调只覆盖早期范围，不能替代当前多会话、长回复、恢复、压力和动画因果测试。
 - 所有新增验证报告、演示日志和错误提示均使用中文；仅保留 HTTP 路径、命令、包名和
   provider/model 标识等必要技术原文。
+- CHG-2026-0019 的 Session mutation 增量使用隔离容器验证，未替换或重启现有服务。
+  Host HTTP 合同矩阵为 32/32；OpenWork direct Host 与 `bootAttachedWorld` 代理 journey
+  为 8/8、零 skip。`pnpm typecheck` 退出 0；`pnpm evals:typecheck` 因缓存镜像中的既有
+  Bun/enterprise schema/NodeNext/Node 22 类型环境问题退出 2，且没有错误指向本次测试文件。
+- Rust 格式、默认依赖树和 engine-host CLI 构建退出 0；Host 全量 92/92。`xtask lines`
+  退出 1：Host 6156/5700、Host tests 2707/1900，aux 10008/10100。严格 Clippy
+  退出 101，原因是 `openpaw-sandbox` 11 条既有 warning。五项治理命令均因缺少固定版本
+  `AI_GOVERNANCE_FRAMEWORK` 退出 1。
+- CHG-2026-0020 将 REST 历史中的纯 ToolResult user 消息折叠回 assistant tool part，
+  修复 Revert 最终 assistant 后 OpenWork 误报无结果。Windows 定向测试因缺少 MSVC `link.exe`
+  未执行；Docker Linux 定向测试 1/1、Host 全量 92/92 通过，格式检查退出 0。
+- CHG-2026-0021 将可由 `TurnOutcome` 可靠关联的 assistant Revert 边界规范化为同回合 user
+  游标，使输入、输出和尾部按完整回合隐藏。Windows 测试仍因缺少 MSVC `link.exe` 未执行；
+  Docker Linux 定向测试 3/3、HTTP 33/33、Host 全包 93/93 通过，格式检查退出 0。
+  OpenWork 使用干净 `main` `3e58d95`，与 `origin/main` 为 0/0；从两仓源码重建并强制重建后，
+  `engine-host` 和 `openwork` 均健康。容器内 REST 实测 assistant 请求返回 user 游标，页面点击
+  Revert 后该轮输入与输出同时隐藏，Restore 无需刷新即恢复。最终边界复核确认 staged REST
+  snapshot 始终保留原始消息、已隐藏消息再次 Revert 仍返回 400，Restore 只清除游标；最新
+  `engine-host` 镜像已再次构建并健康启动，隔离 smoke 会话已删除。后续低风险去重统一了
+  staged 可见前缀和 committed turn 状态裁剪，并移除冷启动第三份临时消息克隆；同源 Linux
+  Docker 全量仍为 93/93。`xtask lines` 显示 Host 从 6278 降至 6267、Host tests 从 2862
+  降至 2859；门禁仍因 6267/5700 与 2859/1900 退出 1，本轮未调整预算。五项治理命令
+  在 `general-tools:latest` 中复跑仍全部退出 1，镜像内缺少 `/workspace/tools/pipeline.py`。
 
 ## 当前强证据与失败证据
 
@@ -48,6 +71,7 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
 | LLM mock contract | `mock_server_contract` 为 `8/8` | 局部通过；不覆盖 UTF-8 字节边界、截断流、终止 sentinel 和缓冲上限 |
 | LLM SSE 单元 | `sse::tests` 为 `3/3` | 局部通过；ASCII 拆分不能替代中文/emoji 和畸形流矩阵 |
 | Host reliability/runtime/HTTP | `7/7`、`10/10`、`15/15` | 局部通过；不覆盖冷加载隔离、全部孤儿恢复和真实 listener shutdown |
+| Session archive/fork/revert | PATCH/fork/revert/unrevert、Basic Auth、SSE 包络、并发、ToolResult 折叠、assistant 回合规范化、完整 staged snapshot、已隐藏边界 400 和重启 HTTP 33/33；Host 全包 93/93；OpenWork 既有 8/8 | Host 自动化通过；CHG-0021 使用未修改 OpenWork 主线完成 REST 与页面 Revert/Restore 无刷新复验；全仓 `evals:typecheck` 仍受既有环境基线阻断 |
 | 50K 助手正文 | provider 长度 50000；Host/JSONL 长度 50004，哈希不同并出现 `U+FFFD` | 失败 |
 | 180K 助手正文 | JSONL assistant 长度 180004，替换字符 7 个 | 失败 |
 | 动画可靠性 | v1 动作无 session/turn/eventId/sequence，MPSC `try_send` 和 HTTP POST 可丢 | 失败/未实现 |
@@ -81,7 +105,7 @@ G01/G02 可能新增公共请求字段、响应头、JSONL 幂等事实和 SSE �
 - CHG-2026-0015 的主合同及 G03/G04/G05/G06 关闭边界/G08 session 历史预算附录均未获人工批准和实施。
 - 协调动画变更 `XCHG-2026-ANIMATION-001` 已收敛为 OpenPaw CHG-2026-0014 单一主合同，但仍是 draft；没有 v2 Schema、outbox、journal、ACK、cursor、snapshot 或自动化证据。
 - 固定 fixtures、Host help 旗标、永不返回 future 取消、并行工具最终输入校验、fsync 临界故障和 1000 次竞态压力未执行。
-- OpenWork attached/evals/三方联调、受保护分支、真实 CODEOWNER、PR/Required Checks 和回滚演练未完成。
+- OpenWork attached Session mutation journey 已完成；完整三方联调、受保护分支、真实 CODEOWNER、PR/Required Checks 和回滚演练仍未完成。
 - 全仓公共中文注释迁移未完成；B10 修改 `sse.rs` 时必须按框架栏目补齐其公共声明 Rustdoc。
 
 最终裁决：**未通过，不建议发布。** 任何历史“所有命令退出 0”只适用于当时列出的命令和代码范围，不能覆盖当前确认缺陷，也不能把 T10-T12/M5 或整个 master-plan 标记完成。

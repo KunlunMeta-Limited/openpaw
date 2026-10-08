@@ -5,7 +5,9 @@
 #![cfg(feature = "engine-host")]
 use axum::body::Body;
 use axum::http::StatusCode;
-use openpaw_engine_host::{build_router, run_with_shutdown, AppState, HostConfig};
+use openpaw_core::{ContentBlock, Message, SessionEvent};
+use openpaw_engine_host::{build_router, run_with_shutdown, AppState, HostConfig, OpenCodeEvent};
+use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -14,9 +16,37 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 mod support;
 use support::{
-    create_session, get_json, prompt_with_request_id, request, request_with_headers,
-    response_bytes, response_json,
+    create_session, create_session_with, get_json, prompt_with_request_id, request,
+    request_with_headers, response_bytes, response_json,
 };
+
+fn append_session_events(home: &std::path::Path, id: &str, events: &[SessionEvent]) {
+    let path = home.join("sessions").join(format!("{id}.jsonl"));
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open session fixture");
+    for event in events {
+        serde_json::to_writer(&mut file, event).expect("serialize session fixture");
+        file.write_all(b"\n").expect("append session fixture");
+    }
+    file.sync_all().expect("sync session fixture");
+}
+
+async fn sync_prompt_with_request_id(
+    app: &axum::Router,
+    id: &str,
+    request_id: &str,
+    text: &str,
+) -> axum::response::Response {
+    request(
+        app,
+        "POST",
+        format!("/session/{id}/message"),
+        serde_json::json!({"requestID":request_id,"text":text}).to_string(),
+    )
+    .await
+}
 fn unused_loopback_port() -> u16 {
     std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("bind temporary listener")
@@ -36,6 +66,34 @@ async fn wait_until_listening(address: SocketAddr) {
     .await
     .expect("Host should start listening");
 }
+
+async fn next_session_event(
+    events: &mut tokio::sync::broadcast::Receiver<OpenCodeEvent>,
+    event_type: &str,
+) -> OpenCodeEvent {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let event = events.recv().await.expect("session event");
+            if event.event_type == event_type {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("session event timeout")
+}
+
+fn assert_session_event(event: &OpenCodeEvent, event_type: &str, session_id: &str) {
+    assert_eq!(event.event_type, event_type);
+    let properties = event
+        .properties
+        .as_object()
+        .expect("session event properties");
+    assert_eq!(properties.len(), 2);
+    assert_eq!(properties["sessionID"], session_id);
+    assert_eq!(properties["info"]["id"], session_id);
+}
+
 #[tokio::test]
 async fn health_and_session_wire_contract() {
     let home = tempdir().expect("home");
@@ -82,6 +140,1183 @@ async fn health_and_session_wire_contract() {
     let response = request(&app, "GET", format!("/session/{id}"), Body::empty()).await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn session_created_and_updated_events_use_the_info_envelope() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let mut events = state.global_events.subscribe();
+
+    let id = create_session(&app).await;
+    let event = next_session_event(&mut events, "session.created").await;
+    assert_session_event(&event, "session.created", &id);
+
+    let response = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Envelope"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = next_session_event(&mut events, "session.updated").await;
+    assert_session_event(&event, "session.updated", &id);
+    assert_eq!(event.properties["info"]["title"], "Envelope");
+
+    let fork = request(&app, "POST", format!("/session/{id}/fork"), "{}").await;
+    assert_eq!(fork.status(), StatusCode::OK);
+    let fork_id = response_json(fork).await["id"]
+        .as_str()
+        .expect("fork id")
+        .to_string();
+    let event = next_session_event(&mut events, "session.created").await;
+    assert_session_event(&event, "session.created", &fork_id);
+
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/message"),
+        r#"{"text":"event boundary"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    while events.try_recv().is_ok() {}
+    let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let user_id = messages[0]["info"]["id"]
+        .as_str()
+        .expect("user revert boundary")
+        .to_string();
+    let boundary_id = messages[1]["info"]["id"]
+        .as_str()
+        .expect("assistant revert request")
+        .to_string();
+
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = next_session_event(&mut events, "session.updated").await;
+    assert_session_event(&event, "session.updated", &id);
+    assert_eq!(event.properties["info"]["revert"]["messageID"], user_id);
+
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let event = next_session_event(&mut events, "session.updated").await;
+    assert_session_event(&event, "session.updated", &id);
+    assert!(event.properties["info"].get("revert").is_none());
+}
+
+#[tokio::test]
+async fn session_mutations_linearize_with_prompt_acceptance() {
+    let home = tempdir().expect("home");
+    let app = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    }));
+
+    let archive_id = create_session(&app).await;
+    let archive = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{archive_id}"),
+        &[("content-type", "application/json")],
+        r#"{"time":{"archived":111}}"#,
+    );
+    let prompt = sync_prompt_with_request_id(&app, &archive_id, "archive-race", "archive race");
+    let (archive, prompt) = tokio::join!(archive, prompt);
+    assert_eq!(prompt.status(), StatusCode::OK);
+    assert!(matches!(
+        archive.status(),
+        StatusCode::OK | StatusCode::CONFLICT
+    ));
+    let archived = get_json(&app, format!("/session/{archive_id}")).await;
+    if archive.status() == StatusCode::OK {
+        assert_eq!(archived["time"]["archived"], 111);
+    } else {
+        assert!(archived["time"].get("archived").is_none());
+    }
+
+    let fork_source_id = create_session(&app).await;
+    let fork = request(
+        &app,
+        "POST",
+        format!("/session/{fork_source_id}/fork"),
+        "{}",
+    );
+    let prompt = sync_prompt_with_request_id(&app, &fork_source_id, "fork-race", "fork race");
+    let (fork, prompt) = tokio::join!(fork, prompt);
+    assert_eq!(prompt.status(), StatusCode::OK);
+    assert!(matches!(
+        fork.status(),
+        StatusCode::OK | StatusCode::CONFLICT
+    ));
+    if fork.status() == StatusCode::OK {
+        let fork_id = response_json(fork).await["id"]
+            .as_str()
+            .expect("fork id")
+            .to_string();
+        let copied = get_json(&app, format!("/session/{fork_id}/message")).await;
+        assert!(matches!(copied.as_array().unwrap().len(), 0 | 2));
+    }
+
+    let revert_id = create_session(&app).await;
+    for (request_id, text) in [("revert-seed-1", "kept"), ("revert-seed-2", "removed")] {
+        let response = sync_prompt_with_request_id(&app, &revert_id, request_id, text).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let before = get_json(&app, format!("/session/{revert_id}/message")).await;
+    let boundary_id = before[2]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+    let revert = request(
+        &app,
+        "POST",
+        format!("/session/{revert_id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    );
+    let prompt = sync_prompt_with_request_id(&app, &revert_id, "revert-race", "replacement race");
+    let (revert, prompt) = tokio::join!(revert, prompt);
+    assert_eq!(prompt.status(), StatusCode::OK);
+    assert!(matches!(
+        revert.status(),
+        StatusCode::OK | StatusCode::CONFLICT
+    ));
+    let session = get_json(&app, format!("/session/{revert_id}")).await;
+    let messages = get_json(&app, format!("/session/{revert_id}/message")).await;
+    match (revert.status(), session.get("revert")) {
+        (StatusCode::CONFLICT, None) => assert_eq!(messages.as_array().unwrap().len(), 6),
+        (StatusCode::OK, None) => assert_eq!(messages.as_array().unwrap().len(), 4),
+        (StatusCode::OK, Some(cursor)) => {
+            assert_eq!(cursor["messageID"], boundary_id);
+            assert_eq!(messages.as_array().unwrap().len(), 2);
+        }
+        outcome => panic!("non-linearized revert/prompt outcome: {outcome:?}"),
+    }
+}
+
+#[tokio::test]
+async fn session_mutations_linearize_with_delete() {
+    let home = tempdir().expect("home");
+    let app = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    }));
+
+    let archive_id = create_session(&app).await;
+    let archive = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{archive_id}"),
+        &[("content-type", "application/json")],
+        r#"{"time":{"archived":222}}"#,
+    );
+    let delete = request(
+        &app,
+        "DELETE",
+        format!("/session/{archive_id}"),
+        Body::empty(),
+    );
+    let (archive, delete) = tokio::join!(archive, delete);
+    assert!(matches!(
+        archive.status(),
+        StatusCode::OK | StatusCode::NOT_FOUND
+    ));
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        request(&app, "GET", format!("/session/{archive_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let fork_source_id = create_session(&app).await;
+    let fork = request(
+        &app,
+        "POST",
+        format!("/session/{fork_source_id}/fork"),
+        "{}",
+    );
+    let delete = request(
+        &app,
+        "DELETE",
+        format!("/session/{fork_source_id}"),
+        Body::empty(),
+    );
+    let (fork, delete) = tokio::join!(fork, delete);
+    assert!(matches!(
+        fork.status(),
+        StatusCode::OK | StatusCode::NOT_FOUND
+    ));
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    if fork.status() == StatusCode::OK {
+        let fork_id = response_json(fork).await["id"]
+            .as_str()
+            .expect("fork id")
+            .to_string();
+        assert_eq!(
+            request(&app, "GET", format!("/session/{fork_id}"), Body::empty())
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    let revert_id = create_session(&app).await;
+    let response = sync_prompt_with_request_id(&app, &revert_id, "delete-seed", "seed").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let messages = get_json(&app, format!("/session/{revert_id}/message")).await;
+    let boundary_id = messages[1]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+    let revert = request(
+        &app,
+        "POST",
+        format!("/session/{revert_id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    );
+    let delete = request(
+        &app,
+        "DELETE",
+        format!("/session/{revert_id}"),
+        Body::empty(),
+    );
+    let (revert, delete) = tokio::join!(revert, delete);
+    assert!(matches!(
+        revert.status(),
+        StatusCode::OK | StatusCode::NOT_FOUND
+    ));
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        request(&app, "GET", format!("/session/{revert_id}"), Body::empty())
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn patch_session_persists_title_archive_and_unarchive_across_restart() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let config = HostConfig {
+        home: home.path().into(),
+        workspace: workspace.path().into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let mut events = state.global_events.subscribe();
+    let response = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Renamed","time":{"archived":123}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let session = response_json(response).await;
+    assert_eq!(session["title"], "Renamed");
+    assert_eq!(session["time"]["archived"], 123);
+    let event = events.recv().await.expect("session.updated event");
+    assert_eq!(event.event_type, "session.updated");
+    assert_eq!(event.properties["sessionID"], id);
+    assert_eq!(event.properties["info"]["title"], "Renamed");
+    assert_eq!(event.properties["info"]["time"]["archived"], 123);
+    drop(app);
+    drop(state);
+
+    let restarted = build_router(AppState::new(config.clone()));
+    let restored = get_json(&restarted, format!("/session/{id}")).await;
+    assert_eq!(restored["title"], "Renamed");
+    assert_eq!(restored["time"]["archived"], 123);
+    let response = request_with_headers(
+        &restarted,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"time":{"archived":0}}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_json(response).await["time"]
+        .get("archived")
+        .is_none());
+    let listed = get_json(&restarted, "/session").await;
+    let listed = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == id)
+        .expect("listed session");
+    assert_eq!(listed["title"], "Renamed");
+    assert!(listed["time"].get("archived").is_none());
+}
+
+#[tokio::test]
+async fn patch_session_validates_input_and_rejects_active_archive_atomically() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    for body in [r#"{}"#, r#"{"title":"  "}"#, r#"{"time":{"archived":-1}}"#] {
+        let response = request_with_headers(
+            &app,
+            "PATCH",
+            format!("/session/{id}"),
+            &[("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+    }
+    let missing = request_with_headers(
+        &app,
+        "PATCH",
+        "/session/missing",
+        &[("content-type", "application/json")],
+        r#"{"title":"Missing"}"#,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let handle = state.get(&id).await.expect("session");
+    assert!(handle.reserve_turn());
+    let conflict = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Must not apply","time":{"archived":456}}"#,
+    )
+    .await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let title_only = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[("content-type", "application/json")],
+        r#"{"title":"Allowed while active"}"#,
+    )
+    .await;
+    assert_eq!(title_only.status(), StatusCode::OK);
+    handle.release_turn();
+    let session = get_json(&app, format!("/session/{id}")).await;
+    assert_eq!(session["title"], "Allowed while active");
+    assert!(session["time"].get("archived").is_none());
+}
+
+#[tokio::test]
+async fn fork_session_copies_boundaries_numbers_titles_and_survives_restart() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_id = create_session_with(&app, serde_json::json!({"title":"Plan"})).await;
+    for text in ["first", "second"] {
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{source_id}/message"),
+            serde_json::json!({"text":text}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let source_messages = get_json(&app, format!("/session/{source_id}/message")).await;
+    assert_eq!(source_messages.as_array().unwrap().len(), 4);
+    let boundary_id = source_messages[2]["info"]["id"]
+        .as_str()
+        .expect("boundary message id")
+        .to_string();
+    let mut events = state.global_events.subscribe();
+
+    let full = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(full.status(), StatusCode::OK);
+    let full = response_json(full).await;
+    let full_id = full["id"].as_str().expect("full fork id").to_string();
+    assert_ne!(full_id, source_id);
+    assert_eq!(full["title"], "Plan (1)");
+    assert!(full.get("parentID").is_none());
+    let event = events.recv().await.expect("session.created event");
+    assert_eq!(event.event_type, "session.created");
+    assert_eq!(event.properties["sessionID"], full_id);
+    assert_eq!(event.properties["info"]["title"], "Plan (1)");
+    let full_messages = get_json(&app, format!("/session/{full_id}/message")).await;
+    assert_eq!(full_messages.as_array().unwrap().len(), 4);
+    for (source, forked) in source_messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(full_messages.as_array().unwrap())
+    {
+        assert_eq!(forked["info"]["role"], source["info"]["role"]);
+        assert_eq!(forked["parts"][0]["text"], source["parts"][0]["text"]);
+        assert_ne!(forked["info"]["id"], source["info"]["id"]);
+    }
+
+    let boundary = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/fork"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(boundary.status(), StatusCode::OK);
+    let boundary = response_json(boundary).await;
+    let boundary_fork_id = boundary["id"]
+        .as_str()
+        .expect("boundary fork id")
+        .to_string();
+    assert_eq!(boundary["title"], "Plan (2)");
+    assert_eq!(
+        get_json(&app, format!("/session/{boundary_fork_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let nested = request(&app, "POST", format!("/session/{full_id}/fork"), "{}").await;
+    assert_eq!(nested.status(), StatusCode::OK);
+    assert_eq!(response_json(nested).await["title"], "Plan (1) (1)");
+    assert_eq!(
+        get_json(&app, format!("/session/{source_id}/message")).await,
+        source_messages
+    );
+
+    drop(app);
+    drop(state);
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{full_id}")).await["title"],
+        "Plan (1)"
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{full_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn tool_results_coalesce_across_fork_revert_and_restart() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_id = create_session_with(&app, serde_json::json!({"title":"Tools"})).await;
+    drop(app);
+    drop(state);
+    append_session_events(
+        home.path(),
+        &source_id,
+        &[
+            SessionEvent::Message(Message {
+                role: openpaw_core::Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "call-source".into(),
+                    name: "read_file".into(),
+                    input: serde_json::json!({"path":"README.md"}),
+                }],
+                uuid: Some("message-tool-source".into()),
+                ..Default::default()
+            }),
+            SessionEvent::Message(Message {
+                role: openpaw_core::Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-source".into(),
+                    content: "done".into(),
+                    is_error: false,
+                    name: Some("read_file".into()),
+                    protected: false,
+                }],
+                uuid: Some("message-result-source".into()),
+                ..Default::default()
+            }),
+            SessionEvent::Message(Message {
+                role: openpaw_core::Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "final answer".into(),
+                }],
+                uuid: Some("message-final-source".into()),
+                ..Default::default()
+            }),
+        ],
+    );
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_messages = get_json(&app, format!("/session/{source_id}/message")).await;
+    assert_eq!(source_messages.as_array().unwrap().len(), 2);
+    assert_eq!(source_messages[0]["info"]["role"], "assistant");
+    assert_eq!(
+        source_messages[0]["parts"][0]["state"]["status"],
+        "completed"
+    );
+    assert_eq!(source_messages[0]["parts"][0]["state"]["output"], "done");
+    assert_eq!(source_messages[1]["parts"][0]["text"], "final answer");
+    assert_eq!(
+        get_json(
+            &app,
+            format!("/session/{source_id}/message/message-tool-source")
+        )
+        .await["parts"][0]["state"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            format!("/session/{source_id}/message/message-result-source"),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    let response = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fork_id = response_json(response).await["id"]
+        .as_str()
+        .expect("fork id")
+        .to_string();
+    let fork_messages = get_json(&app, format!("/session/{fork_id}/message")).await;
+    assert_eq!(fork_messages.as_array().unwrap().len(), 2);
+    assert_ne!(
+        fork_messages[0]["info"]["id"],
+        source_messages[0]["info"]["id"]
+    );
+    assert_ne!(fork_messages[0]["parts"][0]["callID"], "call-source");
+    assert_eq!(fork_messages[0]["parts"][0]["state"]["status"], "completed");
+    assert_eq!(fork_messages[0]["parts"][0]["state"]["output"], "done");
+
+    let unknown = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/fork"),
+        r#"{"messageID":"missing"}"#,
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+    let missing = request(&app, "POST", "/session/missing/fork", "{}").await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let handle = state.get(&source_id).await.expect("source session");
+    assert!(handle.reserve_turn());
+    let active = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(active.status(), StatusCode::CONFLICT);
+    handle.release_turn();
+
+    let final_message_id = source_messages[1]["info"]["id"]
+        .as_str()
+        .expect("final assistant message id")
+        .to_string();
+    let reverted = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/revert"),
+        serde_json::json!({"messageID":final_message_id}).to_string(),
+    )
+    .await;
+    assert_eq!(reverted.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(reverted).await["revert"]["messageID"],
+        final_message_id
+    );
+    let staged_history = get_json(&app, format!("/session/{source_id}/message")).await;
+    assert_eq!(staged_history, source_messages);
+    drop(app);
+    drop(state);
+
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{source_id}/message")).await,
+        staged_history
+    );
+}
+
+#[tokio::test]
+async fn fork_session_uses_staged_revert_visible_prefix() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_id = create_session(&app).await;
+    for text in ["kept", "hidden"] {
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{source_id}/message"),
+            serde_json::json!({"text":text}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let messages = get_json(&app, format!("/session/{source_id}/message")).await;
+    let hidden_id = messages[2]["info"]["id"]
+        .as_str()
+        .expect("hidden boundary")
+        .to_string();
+    drop(app);
+    drop(state);
+    append_session_events(
+        home.path(),
+        &source_id,
+        &[SessionEvent::Unknown(Box::new(serde_json::json!({
+            "type":"session_revert_staged_v1",
+            "messageID":hidden_id,
+        })))],
+    );
+
+    let app = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&app, format!("/session/{source_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let response = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fork_id = response_json(response).await["id"]
+        .as_str()
+        .expect("fork id")
+        .to_string();
+    assert_eq!(
+        get_json(&app, format!("/session/{fork_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let hidden = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/fork"),
+        serde_json::json!({"messageID":hidden_id}).to_string(),
+    )
+    .await;
+    assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn revert_session_keeps_history_and_unrevert_clears_cursor_across_restart() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    for text in ["kept", "reverted"] {
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{id}/message"),
+            serde_json::json!({"text":text}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let original = get_json(&app, format!("/session/{id}/message")).await;
+    let boundary_id = original[2]["info"]["id"]
+        .as_str()
+        .expect("user revert boundary")
+        .to_string();
+    let requested_id = original[3]["info"]["id"]
+        .as_str()
+        .expect("assistant revert request")
+        .to_string();
+    let mut events = state.global_events.subscribe();
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":requested_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reverted = response_json(response).await;
+    assert_eq!(reverted["revert"]["messageID"], boundary_id);
+    let event = events.recv().await.expect("session.updated event");
+    assert_eq!(event.event_type, "session.updated");
+    assert_eq!(event.properties["sessionID"], id);
+    assert_eq!(event.properties["info"]["revert"]["messageID"], boundary_id);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        original
+    );
+    let hidden = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":requested_id}).to_string(),
+    )
+    .await;
+    assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
+    drop(app);
+    drop(state);
+
+    let restarted_state = AppState::new(config.clone());
+    let restarted = build_router(restarted_state.clone());
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}")).await["revert"]["messageID"],
+        boundary_id
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        original
+    );
+    let mut events = restarted_state.global_events.subscribe();
+    let response = request(
+        &restarted,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response_json(response).await.get("revert").is_none());
+    let event = events.recv().await.expect("session.updated event");
+    assert_eq!(event.event_type, "session.updated");
+    assert!(event.properties["info"].get("revert").is_none());
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        original
+    );
+    drop(restarted);
+    drop(restarted_state);
+
+    let restored = build_router(AppState::new(config));
+    assert!(get_json(&restored, format!("/session/{id}"))
+        .await
+        .get("revert")
+        .is_none());
+    assert_eq!(
+        get_json(&restored, format!("/session/{id}/message")).await,
+        original
+    );
+    let idempotent = request(
+        &restored,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(idempotent.status(), StatusCode::OK);
+    assert!(response_json(idempotent).await.get("revert").is_none());
+}
+
+#[tokio::test]
+async fn revert_session_normalizes_later_assistant_response_to_turn_user() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    drop(app);
+    drop(state);
+
+    let turn_id = "1_deadbeef";
+    let user_id = format!("msg_{id}_{turn_id}_user");
+    let first_assistant_id = format!("msg_{id}_{turn_id}_assistant");
+    let later_assistant_id = format!("msg_{id}_{turn_id}_assistant_1");
+    append_session_events(
+        home.path(),
+        &id,
+        &[
+            SessionEvent::Message(Message::user_text("whole turn").with_uuid(user_id.clone())),
+            SessionEvent::Message(
+                Message::assistant_text("tool response").with_uuid(first_assistant_id.clone()),
+            ),
+            SessionEvent::Message(
+                Message::assistant_text("final response").with_uuid(later_assistant_id.clone()),
+            ),
+            SessionEvent::Unknown(Box::new(serde_json::json!({
+                "type":"turn_outcome",
+                "turnID":turn_id,
+                "userMessageID":user_id,
+                "state":"completed",
+                "startedAt":1,
+                "completedAt":2
+            }))),
+        ],
+    );
+
+    let state = AppState::new(config.clone());
+    let app = build_router(state);
+    let original = get_json(&app, format!("/session/{id}/message")).await;
+    assert_eq!(original.as_array().unwrap().len(), 3);
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":later_assistant_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["revert"]["messageID"],
+        user_id
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        original
+    );
+    drop(app);
+
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}")).await["revert"]["messageID"],
+        user_id
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        original
+    );
+    let response = request(
+        &restarted,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored = get_json(&restarted, format!("/session/{id}/message")).await;
+    assert_eq!(restored, original);
+}
+
+#[tokio::test]
+async fn revert_session_validates_boundaries_part_ids_and_active_state() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let missing_message = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        r#"{"messageID":"missing"}"#,
+    )
+    .await;
+    assert_eq!(missing_message.status(), StatusCode::BAD_REQUEST);
+    let part = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        r#"{"messageID":"missing","partID":"part-1"}"#,
+    )
+    .await;
+    assert_eq!(part.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response_json(part).await["code"], "unsupported_part_revert");
+    let missing = request(
+        &app,
+        "POST",
+        "/session/missing/revert",
+        r#"{"messageID":"missing"}"#,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing = request(&app, "POST", "/session/missing/unrevert", Body::empty()).await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let handle = state.get(&id).await.expect("session");
+    handle
+        .message_cache
+        .write()
+        .unwrap()
+        .push(Message::user_text("active").with_uuid("active-message"));
+    assert!(handle.reserve_turn());
+    let active = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        r#"{"messageID":"active-message"}"#,
+    )
+    .await;
+    assert_eq!(active.status(), StatusCode::CONFLICT);
+    handle.release_turn();
+}
+
+#[tokio::test]
+async fn revert_commit_replaces_tail_atomically_and_survives_restart() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let first = sync_prompt_with_request_id(&app, &id, "first-key", "first").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_turn = first.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let second = sync_prompt_with_request_id(&app, &id, "second-key", "second").await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_turn = second.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let boundary_id = messages[2]["info"]["id"]
+        .as_str()
+        .expect("second user id")
+        .to_string();
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let replay = prompt_with_request_id(&app, &id, "second-key", "second").await;
+    assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+    assert_eq!(replay.headers()["openpaw-turn-id"], second_turn);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
+        boundary_id
+    );
+    let conflict = prompt_with_request_id(&app, &id, "second-key", "different").await;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response_json(conflict).await["code"],
+        "idempotency_conflict"
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
+        boundary_id
+    );
+
+    let mut events = state.global_events.subscribe();
+    let replacement =
+        sync_prompt_with_request_id(&app, &id, "replacement-key", "replacement").await;
+    assert_eq!(replacement.status(), StatusCode::OK);
+    let replacement_turn = replacement.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(replacement_turn.starts_with("3_"));
+    let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    assert!(emitted.iter().any(|event| {
+        event.event_type == "session.updated"
+            && event.properties["sessionID"] == id
+            && event.properties["info"].get("revert").is_none()
+    }));
+    let session = get_json(&app, format!("/session/{id}")).await;
+    assert!(session.get("revert").is_none());
+    let committed_messages = get_json(&app, format!("/session/{id}/message")).await;
+    let texts: Vec<_> = committed_messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["parts"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        ["first", "Echo: first", "replacement", "Echo: replacement"]
+    );
+    let turns = get_json(&app, format!("/session/{id}/turns")).await;
+    assert_eq!(turns.as_array().unwrap().len(), 2);
+    assert_eq!(turns[0]["turnID"], first_turn);
+    assert_eq!(turns[1]["turnID"], replacement_turn);
+    assert!(!turns
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|turn| turn["turnID"] == second_turn));
+
+    let file = std::fs::read_to_string(home.path().join("sessions").join(format!("{id}.jsonl")))
+        .expect("session jsonl");
+    let event_types: Vec<_> = file
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("jsonl event"))
+        .filter_map(|event| event["type"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "session_revert_committed_v1")
+            .count(),
+        1
+    );
+    assert_eq!(
+        event_types
+            .iter()
+            .filter(|event_type| event_type.as_str() == "turn_accept_v1")
+            .count(),
+        2,
+        "replacement prompt must not append a second standalone accept"
+    );
+    let unrevert = request(
+        &app,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(unrevert.status(), StatusCode::OK);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        committed_messages
+    );
+    drop(app);
+    drop(state);
+
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        committed_messages
+    );
+    let restored_turns = get_json(&restarted, format!("/session/{id}/turns")).await;
+    assert_eq!(restored_turns.as_array().unwrap().len(), 2);
+    let reused = sync_prompt_with_request_id(&restarted, &id, "second-key", "after restart").await;
+    assert_eq!(reused.status(), StatusCode::OK);
+    assert!(reused.headers()["openpaw-turn-id"]
+        .to_str()
+        .unwrap()
+        .starts_with("4_"));
+    let final_messages = get_json(&restarted, format!("/session/{id}/message")).await;
+    assert!(!final_messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["parts"][0]["text"] == "second"));
+    assert_eq!(
+        final_messages.as_array().unwrap().last().unwrap()["parts"][0]["text"],
+        "Echo: after restart"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn revert_commit_persistence_failure_keeps_file_and_memory_unchanged() {
+    let home = tempdir().expect("home");
+    let state = AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        ..Default::default()
+    });
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    let response = sync_prompt_with_request_id(&app, &id, "first-key", "first").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let user_id = messages[0]["info"]["id"]
+        .as_str()
+        .expect("user revert boundary")
+        .to_string();
+    let boundary_id = messages[1]["info"]["id"]
+        .as_str()
+        .expect("assistant revert request")
+        .to_string();
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let visible_before = get_json(&app, format!("/session/{id}/message")).await;
+    let session_path = home.path().join("sessions").join(format!("{id}.jsonl"));
+    let file_before = std::fs::read(&session_path).expect("session before failure");
+    let handle = state.get(&id).await.expect("session");
+    let original_writer = handle
+        .writer
+        .lock()
+        .unwrap()
+        .take()
+        .expect("session writer");
+    *handle.writer.lock().unwrap() =
+        Some(openpaw_store::SessionWriter::open_append("/dev/full").expect("/dev/full writer"));
+
+    let failed = sync_prompt_with_request_id(&app, &id, "replacement-failure", "replacement").await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    *handle.writer.lock().unwrap() = Some(original_writer);
+    assert_eq!(
+        std::fs::read(&session_path).expect("session after failure"),
+        file_before
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        visible_before
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
+        user_id
+    );
+    assert_eq!(handle.session.lock().await.messages.len(), 2);
+    assert!(!handle.is_active());
+
+    let retry = sync_prompt_with_request_id(&app, &id, "replacement-failure", "replacement").await;
+    assert_eq!(retry.status(), StatusCode::OK);
+}
 #[tokio::test]
 async fn malformed_json_is_a_bad_request() {
     let home = tempdir().expect("home");
@@ -108,6 +1343,125 @@ async fn basic_auth_is_required_when_configured() {
         "GET",
         "/global/health",
         &[("authorization", "Basic YWxpY2U6c2VjcmV0")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_mutation_routes_require_basic_auth() {
+    const AUTH: (&str, &str) = ("authorization", "Basic YWxpY2U6c2VjcmV0");
+    let home = tempdir().expect("home");
+    let app = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        provider: "echo".into(),
+        office_url: None,
+        username: Some("alice".into()),
+        password: Some("secret".into()),
+        ..Default::default()
+    }));
+    let response = request_with_headers(
+        &app,
+        "POST",
+        "/session",
+        &[AUTH],
+        r#"{"title":"Protected"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = response_json(response).await["id"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    let response = request_with_headers(
+        &app,
+        "POST",
+        format!("/session/{id}/message"),
+        &[AUTH],
+        r#"{"text":"protected history"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = request_with_headers(
+        &app,
+        "GET",
+        format!("/session/{id}/message"),
+        &[AUTH],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let boundary_id = response_json(response).await[1]["info"]["id"]
+        .as_str()
+        .expect("revert boundary")
+        .to_string();
+
+    for (method, uri, body) in [
+        (
+            "PATCH",
+            format!("/session/{id}"),
+            r#"{"title":"Unauthorized"}"#.to_string(),
+        ),
+        ("POST", format!("/session/{id}/fork"), "{}".to_string()),
+        (
+            "POST",
+            format!("/session/{id}/revert"),
+            serde_json::json!({"messageID":boundary_id}).to_string(),
+        ),
+        ("POST", format!("/session/{id}/unrevert"), String::new()),
+    ] {
+        let response = request_with_headers(
+            &app,
+            method,
+            uri,
+            &[("content-type", "application/json")],
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method}");
+    }
+
+    let response = request_with_headers(
+        &app,
+        "GET",
+        format!("/session/{id}"),
+        &[AUTH],
+        Body::empty(),
+    )
+    .await;
+    let unchanged = response_json(response).await;
+    assert_eq!(unchanged["title"], "Protected");
+    assert!(unchanged.get("revert").is_none());
+    let response = request_with_headers(&app, "GET", "/session", &[AUTH], Body::empty()).await;
+    assert_eq!(response_json(response).await.as_array().unwrap().len(), 1);
+
+    let response = request_with_headers(
+        &app,
+        "PATCH",
+        format!("/session/{id}"),
+        &[AUTH, ("content-type", "application/json")],
+        r#"{"title":"Authorized"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response =
+        request_with_headers(&app, "POST", format!("/session/{id}/fork"), &[AUTH], "{}").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = request_with_headers(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        &[AUTH],
+        serde_json::json!({"messageID":boundary_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = request_with_headers(
+        &app,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        &[AUTH],
         Body::empty(),
     )
     .await;

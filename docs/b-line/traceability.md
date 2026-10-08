@@ -14,7 +14,8 @@
 | §2.3 模块结构与行数 | protocol/http/runtime/events/approval/office 已拆分 | 历史 lines 预算有记录 | 局部验证 |
 | §2.4 CLI 与 Host flags | 参数和启动代码存在 | help snapshot 未覆盖三个 Host 全局旗标 | 阻断 |
 | §3.2 回环、鉴权和工作区优先级 | HostConfig、middleware、create_session 已编码 | HTTP 定向测试 15/15 | 局部验证 |
-| §3.2 Session REST/JSONL | create/list/get/message/status/turns/prompt/abort/delete 已编码 | Host reliability 7/7、runtime 10/10；生命周期缺口未覆盖 | 局部验证 |
+| §3.2 Session REST/JSONL | create/list/get/message/status/turns/prompt/abort/delete 已编码；纯 ToolResult 历史折叠到 assistant tool part | CHG-0020 Docker Host 92/92；生命周期缺口未覆盖 | 局部验证 |
+| §3.2 Session 归档/分支/回退 | PATCH/fork/revert/unrevert、追加式私有事件、Session SSE 包络、ToolResult REST 投影和 assistant 到 user 回合边界规范化已编码 | CHG-0021 Docker Host 93/93；完整 staged snapshot、已隐藏边界 400、assistant REST 游标与未修改 OpenWork 主线页面 Revert/Restore 无刷新实机通过；OpenWork direct/proxy 既有 8/8、0 skip | 局部验证 |
 | §3.2 多 session 并行与队列 | 默认 4 running/32 queued、同 session 1 | 基础并发/FIFO/409 有证据；冷加载全局锁和关闭所有权未修 | 阻断 |
 | §3.2 provider/model | per-turn provider/model 已编码 | fake OpenAI 和 mock contract 局部通过 | 局部验证 |
 | §2.5/§3.2 SSE | 路由、events 和 Provider decoder 已编码 | SSE 单元 3/3、mock 8/8；跨 UTF-8 chunk、截断和终止矩阵失败/缺失 | 失败 |
@@ -25,7 +26,7 @@
 | T3 生命周期恢复 | lazy load、delete、restart 代码存在 | 只恢复最后一个未终态 turn；冷加载可阻塞其它 session | 阻断 |
 | T4 长回复 | Provider/Host/JSONL 链路存在 | 50K/180K 中文和 emoji 已确认损坏 | 失败 |
 | T10 因果动画 | v1 可产生动作 | v2 唯一主合同 CHG-2026-0014 仍为 draft | 待实施 |
-| T13/M6 三方联调 | OpenPaw + AI Office 有基础联调 | OpenWork attached/evals 与完整三方候选缺失 | 范围外 |
+| T13/M6 三方联调 | OpenPaw + AI Office 有基础联调；OpenWork attached Session mutation 已验证 | direct Host 与 `bootAttachedWorld` 代理 journey 8/8、0 skip；完整三方候选仍缺失 | 局部验证 |
 
 ## 主阻断与变更单
 

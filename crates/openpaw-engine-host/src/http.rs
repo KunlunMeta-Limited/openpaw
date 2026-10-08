@@ -27,10 +27,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::protocol::wire::SseEnvelope;
 use crate::protocol::{
-    CreateSessionRequest, HostConfig, MessageRequest, OpenCodeEvent, PermissionReply,
-    RequestAdmission, TurnState,
+    CreateSessionRequest, ForkSessionRequest, HostConfig, MessageRequest, OpenCodeEvent,
+    PermissionReply, RequestAdmission, RevertSessionRequest, TurnState, UpdateSessionRequest,
 };
-use crate::runtime::{self, AcceptTurnResult, AppState, SessionHandle, SessionLoadError};
+use crate::runtime::{
+    self, AcceptTurnResult, AppState, SessionHandle, SessionLoadError, SessionMutationError,
+};
 
 const OPENPAW_TURN_ID: &str = "openpaw-turn-id";
 const HOST_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,15 +48,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let router = Router::new()
         .route("/global/health", get(health))
         .route("/session", get(list_sessions).post(create_session))
-        .route("/session/{id}", get(get_session).delete(delete_session))
+        .route(
+            "/session/{id}",
+            get(get_session)
+                .patch(update_session)
+                .delete(delete_session),
+        )
         .route("/session/{id}/message", get(messages).post(message))
         .route("/session/{id}/message/{message_id}", get(messages))
         .route("/session/{id}/turns", get(turns))
         .route("/session/{id}/command", post(no_content))
-        // 显式降级：fork/revert 返回原会话 no-op，避免 SDK 空对象导航。
         .route("/session/{id}/shell", post(no_content))
-        .route("/session/{id}/fork", post(get_session))
-        .route("/session/{id}/revert", post(get_session))
+        .route("/session/{id}/fork", post(fork_session))
+        .route("/session/{id}/revert", post(revert_session))
+        .route("/session/{id}/unrevert", post(unrevert_session))
         .route("/session/{id}/summarize", post(no_content))
         .route("/session/{id}/prompt_async", post(prompt_async))
         .route("/session/{id}/abort", post(abort))
@@ -267,15 +274,7 @@ async fn create_session(
     {
         Ok(handle) => {
             let wire = state.wire_session(&handle).await;
-            let mut properties =
-                serde_json::to_value(&wire).unwrap_or_else(|_| serde_json::json!({}));
-            if let Some(object) = properties.as_object_mut() {
-                object.insert("sessionID".into(), serde_json::json!(handle.id));
-            }
-            handle.emit(crate::protocol::OpenCodeEvent::new(
-                "session.created",
-                properties,
-            ));
+            handle.emit(crate::events::session_changed("session.created", &wire));
             // openwork 代理端到端验收断言 200（OpenCode v1 服务端亦为 200）。
             (StatusCode::OK, Json(wire)).into_response()
         }
@@ -295,6 +294,63 @@ async fn get_session(State(state): State<Arc<AppState>>, Path(id): Path<String>)
         Err(error) => return session_load_error(error),
     };
     Json(state.wire_session(&handle).await).into_response()
+}
+
+async fn update_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateSessionRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    match state.update_session(&id, body).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+async fn fork_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<ForkSessionRequest>>,
+) -> Response {
+    let message_id = body.and_then(|Json(body)| body.message_id);
+    match state.fork_session(&id, message_id.as_deref()).await {
+        Ok(handle) => Json(state.wire_session(&handle).await).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+async fn revert_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<RevertSessionRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    if body.part_id.is_some() {
+        return bad_with_code(
+            StatusCode::BAD_REQUEST,
+            "暂不支持按 partID 回退",
+            "unsupported_part_revert",
+            false,
+        );
+    }
+    match state.revert_session(&id, &body.message_id).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
+}
+
+async fn unrevert_session(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match state.unrevert_session(&id).await {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => session_mutation_error(error),
+    }
 }
 
 async fn delete_session(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
@@ -318,11 +374,7 @@ async fn messages(
     };
     // 读取独立快照，避免模型/工具回合持有 Session 写锁时让前端轮询等待。
     let messages = state.message_snapshot(&handle);
-    let result: Vec<serde_json::Value> = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| message_wire(&handle, index, message))
-        .collect();
+    let result = messages_wire(&handle, &messages);
     match path.get("message_id") {
         Some(id) => match result
             .into_iter()
@@ -706,6 +758,15 @@ fn bad(status: StatusCode, error: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({"error":error.into()}))).into_response()
 }
 
+fn session_mutation_error(error: SessionMutationError) -> Response {
+    match error {
+        SessionMutationError::BadRequest(error) => bad(StatusCode::BAD_REQUEST, error),
+        SessionMutationError::NotFound => bad(StatusCode::NOT_FOUND, "会话不存在"),
+        SessionMutationError::Conflict(error) => bad(StatusCode::CONFLICT, error),
+        SessionMutationError::Persistence(error) => bad(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
 fn bad_with_code(
     status: StatusCode,
     error: impl Into<String>,
@@ -929,6 +990,71 @@ fn message_wire(
         .unwrap_or(handle.created_at);
     let completed = turn.as_ref().and_then(|turn| turn.completed_at);
     serde_json::json!({"info":{"id":message_id,"sessionID":session_id,"role":role,"time":{"created":created,"completed":completed}},"parts":parts})
+}
+
+fn messages_wire(
+    handle: &SessionHandle,
+    messages: &[openpaw_core::Message],
+) -> Vec<serde_json::Value> {
+    let mut result = Vec::<serde_json::Value>::with_capacity(messages.len());
+    let mut tool_parts = std::collections::HashMap::<String, (usize, usize)>::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let tool_results = (!message.content.is_empty()
+            && message.role == openpaw_core::Role::User)
+            .then(|| {
+                message
+                    .content
+                    .iter()
+                    .map(|block| match block {
+                        openpaw_core::ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                            ..
+                        } => Some((tool_use_id, content, *is_error)),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .flatten();
+        if let Some(tool_results) = tool_results {
+            let targets = tool_results
+                .iter()
+                .map(|(tool_use_id, _, _)| tool_parts.get(*tool_use_id).copied())
+                .collect::<Option<Vec<_>>>();
+            if let Some(targets) = targets {
+                for ((wire_message_index, part_index), (_, content, is_error)) in
+                    targets.into_iter().zip(tool_results)
+                {
+                    let state = &mut result[wire_message_index]["parts"][part_index]["state"];
+                    state["status"] =
+                        serde_json::json!(if is_error { "error" } else { "completed" });
+                    state["output"] = serde_json::json!(if is_error { "" } else { content });
+                    state["error"] = serde_json::json!(if is_error { content } else { "" });
+                }
+                continue;
+            }
+        }
+
+        let wire_message_index = result.len();
+        result.push(message_wire(handle, message_index, message));
+        if message.role != openpaw_core::Role::Assistant {
+            continue;
+        }
+        for (part_index, part) in result[wire_message_index]["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            if part["type"] == "tool" {
+                if let Some(call_id) = part["callID"].as_str() {
+                    tool_parts.insert(call_id.to_string(), (wire_message_index, part_index));
+                }
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -1202,12 +1328,11 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "GET {route}");
         }
-        // 降级路由只在 session 作用域；fork/revert 只读返回原会话。
+        // 降级路由只在 session 作用域；fork 已升级为真实分支。
         for route in [
             format!("/session/{id}/command"),
             format!("/session/{id}/shell"),
             format!("/session/{id}/fork"),
-            format!("/session/{id}/revert"),
             format!("/session/{id}/summarize"),
         ] {
             let response = app
@@ -1221,17 +1346,43 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            if route.ends_with("/fork") || route.ends_with("/revert") {
+            if route.ends_with("/fork") {
                 assert_eq!(response.status(), StatusCode::OK, "POST {route}");
                 let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
                 let session: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(session["id"], id);
-                assert!(session.get("revert").is_none());
+                assert_ne!(session["id"], id);
+                assert!(session.get("parentID").is_none());
             } else {
                 assert_eq!(response.status(), StatusCode::NO_CONTENT, "POST {route}");
             }
         }
-        // §3.2 的 `/command` 只有 GET → []；根路径不存在 shell/fork/revert/summarize。
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/session/{id}/revert"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/session/{id}/unrevert"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // §3.2 的 `/command` 只有 GET → []；根路径不存在会话作用域操作。
         let response = app
             .clone()
             .oneshot(
@@ -1248,7 +1399,7 @@ mod tests {
             StatusCode::METHOD_NOT_ALLOWED,
             "POST /command"
         );
-        for route in ["/shell", "/fork", "/revert", "/summarize"] {
+        for route in ["/shell", "/fork", "/revert", "/unrevert", "/summarize"] {
             let response = app
                 .clone()
                 .oneshot(

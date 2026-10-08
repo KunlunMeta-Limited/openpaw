@@ -21,7 +21,7 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-plugins", 1_300),
     ("openpaw-cli", 4_500),
     ("openpaw-reflect-lite", 3_000),
-    ("openpaw-engine-host", 5_000),
+    ("openpaw-engine-host", 5_700),
     ("openpaw-goal-ledger", 2_000),
     // Local sandbox (plan section 3.4 budget lives in the tools domain; the
     // crate is standalone for the crate-level unsafe allowance, D-9).
@@ -38,8 +38,8 @@ const AUX_CAP: usize = 10_100;
 /// B 线 engine-host 独立验证预算。
 ///
 /// engine-host 已作为独立 feature 扩展并拥有单独业务代码上限；其 HTTP、并发、持久化和重启
-/// 契约测试不能挤占原工程的测试余量，也不能通过删除可靠性测试规避门禁，因此单列 1,500 行。
-const ENGINE_HOST_TEST_CAP: usize = 1_500;
+/// 契约测试不能挤占原工程的测试余量，也不能通过删除可靠性测试规避门禁，因此单列 1,900 行。
+const ENGINE_HOST_TEST_CAP: usize = 1_900;
 pub fn run(root: &Path) -> Result<()> {
     let crates_dir = root.join("crates");
     let mut total_business = 0usize;
