@@ -1031,7 +1031,7 @@ impl AppState {
         let request_admissions = projection.request_admissions;
         let mutation = projection.mutation;
         let turn_sequence = projection.turn_sequence_high_water;
-        let visible_messages = restored_visible_messages(id, &messages, &mutation)?;
+        let published_messages = restored_message_snapshot(id, &messages, &mutation)?;
         let mut session = Session::new(read.meta.model.clone(), read.meta.provider.clone());
         session.meta = read.meta;
         session.messages = messages.clone();
@@ -1050,7 +1050,7 @@ impl AppState {
         let title = session_title(&mutation, &messages);
         Ok(self.build_session_handle(SessionHandleInit {
             session,
-            messages: visible_messages,
+            messages: published_messages,
             writer,
             session_path: path,
             agent,
@@ -1320,7 +1320,7 @@ impl AppState {
                     "会话正在执行，无法创建分支".into(),
                 ));
             }
-            let (source_messages, source_title) = {
+            let (source_messages, source_title, revert_message_id) = {
                 let _snapshot = source
                     .snapshot_gate
                     .read()
@@ -1336,16 +1336,32 @@ impl AppState {
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .clone(),
+                    source
+                        .mutation
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .revert_message_id
+                        .clone(),
                 )
             };
+            let visible_len = revert_message_id
+                .as_deref()
+                .map(|message_id| {
+                    visible_prefix_len(source_id, &source_messages, message_id).ok_or_else(|| {
+                        SessionMutationError::Persistence("会话回退游标无法匹配完整消息历史".into())
+                    })
+                })
+                .transpose()?
+                .unwrap_or(source_messages.len());
+            let visible_messages = &source_messages[..visible_len];
             let fork_len = match message_id {
-                Some(message_id) => visible_prefix_len(source_id, &source_messages, message_id)
+                Some(message_id) => visible_prefix_len(source_id, visible_messages, message_id)
                     .ok_or_else(|| {
                         SessionMutationError::BadRequest("messageID 不存在或已被回退隐藏".into())
                     })?,
-                None => source_messages.len(),
+                None => visible_messages.len(),
             };
-            let messages = clone_messages_for_fork(&source_messages[..fork_len]);
+            let messages = clone_messages_for_fork(&visible_messages[..fork_len]);
             let ordinal = next_fork_ordinal(&self.config.home, source_id)?;
             let title = format!("{source_title} ({ordinal})");
             let origin = SessionForkOriginV1 {
@@ -1458,7 +1474,7 @@ impl AppState {
     /// 参数：`id` 为目标会话；`message_id` 为第一条需要隐藏的消息编号。
     /// 返回：成功时返回包含 `revert.messageID` 的公共 Session 投影。
     /// 错误：会话缺失、边界不可见、活动回合冲突或 JSONL 写入失败时返回稳定分类。
-    /// 状态：完整历史留在 `Session`；只有 `message_cache` 被裁剪为边界之前的前缀。
+    /// 状态：完整历史保留在 `Session` 和 `message_cache`；客户端根据返回游标隐藏尾部。
     /// 并发与取消：`turn_gate` 与 prompt、fork、delete 线性化；同步持久化临界区不可取消。
     /// 权限：只追加目标 session JSONL，不恢复或修改工作区文件。
     /// 关联：`API-HOST-SESSION-REVERT-001`、`DAT-HOST-SESSION-MUTATION-003`。
@@ -1489,10 +1505,25 @@ impl AppState {
                     "会话正在执行，无法回退".into(),
                 ));
             }
-            let visible_messages = self.message_snapshot(&handle);
+            let messages = self.message_snapshot(&handle);
             let turn_outcomes = handle.turn_outcomes();
-            let (revert_message_id, prefix_len) =
-                normalize_revert_boundary(id, &visible_messages, &turn_outcomes, message_id)
+            let current_revert_message_id = handle
+                .mutation
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .revert_message_id
+                .clone();
+            let visible_len = current_revert_message_id
+                .as_deref()
+                .map(|message_id| {
+                    visible_prefix_len(id, &messages, message_id).ok_or_else(|| {
+                        SessionMutationError::Persistence("会话回退游标无法匹配完整消息历史".into())
+                    })
+                })
+                .transpose()?
+                .unwrap_or(messages.len());
+            let (revert_message_id, _) =
+                normalize_revert_boundary(id, &messages[..visible_len], &turn_outcomes, message_id)
                     .ok_or_else(|| {
                         SessionMutationError::BadRequest("messageID 不存在或已被回退隐藏".into())
                     })?;
@@ -1513,11 +1544,6 @@ impl AppState {
                 .snapshot_gate
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
-            *handle
-                .message_cache
-                .write()
-                .unwrap_or_else(|error| error.into_inner()) =
-                visible_messages[..prefix_len].to_vec();
             handle
                 .mutation
                 .write()
@@ -1535,7 +1561,7 @@ impl AppState {
     /// 参数：`id` 为目标会话编号。
     /// 返回：成功或本来没有游标时都返回当前公共 Session 投影。
     /// 错误：会话缺失、状态冲突或 JSONL 写入失败时返回稳定分类。
-    /// 状态：存在游标时追加 `session_revert_cleared_v1`，随后从完整 `Session` 恢复缓存。
+    /// 状态：存在游标时追加 `session_revert_cleared_v1` 并清除游标；完整消息缓存保持不变。
     /// 并发与取消：`turn_gate` 与 prompt 接收线性化；同步持久化临界区不可取消。
     /// 权限：只追加目标 session JSONL，不恢复或修改工作区文件。
     /// 关联：`API-HOST-SESSION-UNREVERT-001`、`DAT-HOST-SESSION-MUTATION-003`。
@@ -1569,12 +1595,6 @@ impl AppState {
                         "会话正在执行，无法取消回退".into(),
                     ));
                 }
-                let full_messages = handle
-                    .session
-                    .try_lock()
-                    .map_err(|_| SessionMutationError::Conflict("会话状态暂时繁忙".into()))?
-                    .messages
-                    .clone();
                 let event = SessionMutationEvent::RevertCleared;
                 let (path, length) =
                     writer_snapshot(&handle).map_err(SessionMutationError::Persistence)?;
@@ -1590,10 +1610,6 @@ impl AppState {
                     .snapshot_gate
                     .write()
                     .unwrap_or_else(|error| error.into_inner());
-                *handle
-                    .message_cache
-                    .write()
-                    .unwrap_or_else(|error| error.into_inner()) = full_messages;
                 handle
                     .mutation
                     .write()
@@ -1902,17 +1918,15 @@ fn session_title(
         .take(80)
         .collect()
 }
-fn restored_visible_messages(
+fn restored_message_snapshot(
     session_id: &str,
     messages: &[openpaw_core::Message],
     mutation: &SessionMutationProjection,
 ) -> Result<Vec<openpaw_core::Message>, SessionLoadError> {
-    let Some(message_id) = mutation.revert_message_id.as_deref() else {
-        return Ok(messages.to_vec());
-    };
-    let prefix_len =
+    if let Some(message_id) = mutation.revert_message_id.as_deref() {
         visible_prefix_len(session_id, messages, message_id).ok_or(SessionLoadError::Corrupt)?;
-    Ok(messages[..prefix_len].to_vec())
+    }
+    Ok(messages.to_vec())
 }
 fn session_mutation_load_error(error: SessionLoadError) -> SessionMutationError {
     match error {

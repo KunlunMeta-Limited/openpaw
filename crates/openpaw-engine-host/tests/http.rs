@@ -763,18 +763,15 @@ async fn tool_results_coalesce_across_fork_revert_and_restart() {
         response_json(reverted).await["revert"]["messageID"],
         final_message_id
     );
-    let visible = get_json(&app, format!("/session/{source_id}/message")).await;
-    assert_eq!(visible.as_array().unwrap().len(), 1);
-    assert_eq!(visible[0]["info"]["role"], "assistant");
-    assert_eq!(visible[0]["parts"][0]["state"]["status"], "completed");
-    assert_eq!(visible[0]["parts"][0]["state"]["output"], "done");
+    let staged_history = get_json(&app, format!("/session/{source_id}/message")).await;
+    assert_eq!(staged_history, source_messages);
     drop(app);
     drop(state);
 
     let restarted = build_router(AppState::new(config));
     assert_eq!(
         get_json(&restarted, format!("/session/{source_id}/message")).await,
-        visible
+        staged_history
     );
 }
 
@@ -817,6 +814,14 @@ async fn fork_session_uses_staged_revert_visible_prefix() {
     );
 
     let app = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&app, format!("/session/{source_id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
     let response = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
     assert_eq!(response.status(), StatusCode::OK);
     let fork_id = response_json(response).await["id"]
@@ -842,7 +847,7 @@ async fn fork_session_uses_staged_revert_visible_prefix() {
 }
 
 #[tokio::test]
-async fn revert_session_hides_tail_and_unrevert_restores_it_across_restart() {
+async fn revert_session_keeps_history_and_unrevert_clears_cursor_across_restart() {
     let home = tempdir().expect("home");
     let config = HostConfig {
         home: home.path().into(),
@@ -888,12 +893,8 @@ async fn revert_session_hides_tail_and_unrevert_restores_it_across_restart() {
     assert_eq!(event.properties["sessionID"], id);
     assert_eq!(event.properties["info"]["revert"]["messageID"], boundary_id);
     assert_eq!(
-        get_json(&app, format!("/session/{id}/message"))
-            .await
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+        get_json(&app, format!("/session/{id}/message")).await,
+        original
     );
     let hidden = request(
         &app,
@@ -913,12 +914,8 @@ async fn revert_session_hides_tail_and_unrevert_restores_it_across_restart() {
         boundary_id
     );
     assert_eq!(
-        get_json(&restarted, format!("/session/{id}/message"))
-            .await
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        original
     );
     let mut events = restarted_state.global_events.subscribe();
     let response = request(
@@ -1002,14 +999,8 @@ async fn revert_session_normalizes_later_assistant_response_to_turn_user() {
 
     let state = AppState::new(config.clone());
     let app = build_router(state);
-    assert_eq!(
-        get_json(&app, format!("/session/{id}/message"))
-            .await
-            .as_array()
-            .unwrap()
-            .len(),
-        3
-    );
+    let original = get_json(&app, format!("/session/{id}/message")).await;
+    assert_eq!(original.as_array().unwrap().len(), 3);
     let response = request(
         &app,
         "POST",
@@ -1024,7 +1015,7 @@ async fn revert_session_normalizes_later_assistant_response_to_turn_user() {
     );
     assert_eq!(
         get_json(&app, format!("/session/{id}/message")).await,
-        serde_json::json!([])
+        original
     );
     drop(app);
 
@@ -1032,6 +1023,10 @@ async fn revert_session_normalizes_later_assistant_response_to_turn_user() {
     assert_eq!(
         get_json(&restarted, format!("/session/{id}")).await["revert"]["messageID"],
         user_id
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        original
     );
     let response = request(
         &restarted,

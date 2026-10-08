@@ -56,7 +56,9 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
   Docker Linux 定向测试 3/3、HTTP 33/33、Host 全包 93/93 通过，格式检查退出 0。
   OpenWork 使用干净 `main` `3e58d95`，与 `origin/main` 为 0/0；从两仓源码重建并强制重建后，
   `engine-host` 和 `openwork` 均健康。容器内 REST 实测 assistant 请求返回 user 游标，页面点击
-  Revert 后该轮输入与输出同时隐藏，Restore 后恢复。
+  Revert 后该轮输入与输出同时隐藏，Restore 无需刷新即恢复。最终边界复核确认 staged REST
+  snapshot 始终保留原始消息、已隐藏消息再次 Revert 仍返回 400，Restore 只清除游标；最新
+  `engine-host` 镜像已再次构建并健康启动，隔离 smoke 会话已删除。
 
 ## 当前强证据与失败证据
 
@@ -65,7 +67,7 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
 | LLM mock contract | `mock_server_contract` 为 `8/8` | 局部通过；不覆盖 UTF-8 字节边界、截断流、终止 sentinel 和缓冲上限 |
 | LLM SSE 单元 | `sse::tests` 为 `3/3` | 局部通过；ASCII 拆分不能替代中文/emoji 和畸形流矩阵 |
 | Host reliability/runtime/HTTP | `7/7`、`10/10`、`15/15` | 局部通过；不覆盖冷加载隔离、全部孤儿恢复和真实 listener shutdown |
-| Session archive/fork/revert | PATCH/fork/revert/unrevert、Basic Auth、SSE 包络、并发、ToolResult 折叠、assistant 回合规范化和重启 HTTP 33/33；Host 全包 93/93；OpenWork 既有 8/8 | Host 自动化通过；CHG-0021 使用未修改 OpenWork 主线完成 REST 与页面 Revert/Restore 复验；全仓 `evals:typecheck` 仍受既有环境基线阻断 |
+| Session archive/fork/revert | PATCH/fork/revert/unrevert、Basic Auth、SSE 包络、并发、ToolResult 折叠、assistant 回合规范化、完整 staged snapshot、已隐藏边界 400 和重启 HTTP 33/33；Host 全包 93/93；OpenWork 既有 8/8 | Host 自动化通过；CHG-0021 使用未修改 OpenWork 主线完成 REST 与页面 Revert/Restore 无刷新复验；全仓 `evals:typecheck` 仍受既有环境基线阻断 |
 | 50K 助手正文 | provider 长度 50000；Host/JSONL 长度 50004，哈希不同并出现 `U+FFFD` | 失败 |
 | 180K 助手正文 | JSONL assistant 长度 180004，替换字符 7 个 | 失败 |
 | 动画可靠性 | v1 动作无 session/turn/eventId/sequence，MPSC `try_send` 和 HTTP POST 可丢 | 失败/未实现 |

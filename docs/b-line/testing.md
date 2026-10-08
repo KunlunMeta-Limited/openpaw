@@ -66,7 +66,7 @@ Session mutation journey 属于 CHG-2026-0019 的跨仓验收范围，必须同�
 | --- | --- | --- |
 | Rename / Archive | PATCH 同时或独立更新 title/archived；空 patch、空标题、负数为 400；未知为 404；活动归档为 409 且无部分更新 | archive/unarchive 经代理可见；owned Host 重启后保持归档状态 |
 | Branch | full/boundary fork 返回新 ID，复制当前可见前缀，重排消息和工具 ID，不修改源会话，不返回 `parentID` | 完整和边界分支均显示为根会话；源 transcript 不变 |
-| Revert / Unrevert | revert 隐藏边界及尾部并返回游标；`partID` 为 400 `unsupported_part_revert`；unrevert 恢复且无游标时幂等 | staged revert/unrevert 可观察；替换 prompt 后 committed 尾部不可恢复 |
+| Revert / Unrevert | revert 返回隐藏边界游标且 message snapshot 保留完整历史；`partID` 为 400 `unsupported_part_revert`；unrevert 清除游标且无游标时幂等 | staged revert/unrevert 可观察；Restore 无需刷新即恢复；替换 prompt 后 committed 尾部不可恢复 |
 | SSE / Auth | 四条写路由均要求 Basic Auth；Session 事件固定 `{sessionID,info}` | direct Host 与代理缓存都能消费完整 Session |
 | 持久化 / 并发 | JSONL 只追加；archive/fork/revert 与 prompt/delete 竞争只产生一个线性化结果；追加失败时文件与内存不变 | journey 不依赖内部函数或产品测试替身 |
 
@@ -93,7 +93,7 @@ Docker Linux 环境的定向回归 1/1 和 Host 全量回归 92/92 通过；最�
 | user 边界 | 返回请求 user ID，并严格隐藏该边界及尾部 | 既有行为不变 |
 | assistant / `assistant_n` 边界 | 通过 `TurnOutcome` 返回同回合 user ID，持久化后重启仍使用该权威游标 | 点击 assistant Revert 后该轮输入、输出和后续消息一起隐藏 |
 | 旧 assistant 无可靠 outcome | 保留原 assistant 游标，不猜测或误删此前 user | 兼容旧会话与外部写入 |
-| Unrevert / replacement prompt | Unrevert 恢复完整尾部；下一条 prompt 继续沿用既有 committed 语义 | Restore 恢复输入、输出和后续消息 |
+| Unrevert / replacement prompt | staged REST/snapshot 保留完整尾部；Unrevert 清除游标；下一条 prompt 继续沿用既有 committed 语义 | Restore 无需刷新即恢复输入、输出和后续消息 |
 
 Linux Docker 定向 Revert 回归 3/3、Host HTTP 33/33、Host 全包 93/93 通过；格式检查退出 0。
 OpenWork `main` 保持无源码 diff，从主线镜像与当前 Host 镜像重建后两个容器均健康。容器内
