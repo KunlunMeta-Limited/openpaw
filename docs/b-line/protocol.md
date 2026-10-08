@@ -32,7 +32,10 @@ host 实现 `master-plan.md` 第 3.2 节规定的 OpenCode v1 子集。所有 SS
 
 - Session 的 `time.created` 和 `time.updated` 使用 Unix 毫秒。
 - 已归档 Session 额外返回正数 Unix 毫秒 `time.archived`；unarchive 请求写 `0`，响应省略该字段。
-- staged revert 返回 `revert.messageID`；Branch 是新根会话，不返回 `parentID`。
+- staged revert 返回 `revert.messageID`；请求 user 边界时保持原游标，请求可由
+  `TurnOutcome` 可靠关联的 `assistant` / `assistant_n` 边界时返回同回合 user 游标，
+  从而隐藏完整回合及尾部。无法可靠关联的旧 assistant 边界保持原游标。
+  Branch 是新根会话，不返回 `parentID`。
 - `GET /session/:id/message` 将可完整匹配此前 assistant tool part 的纯 ToolResult
   user 消息折叠到该 part 的 `state`；普通用户文本、混合内容和无法匹配的旧数据保持逐条投影。
   因此 REST 历史与实时 SSE 均以 assistant tool part 表示 `running/completed/error`。
@@ -79,8 +82,9 @@ Anthropic/OpenAI 缺少 API key 或 base URL 无效时，请求在预留 active 
 旧 session 没有 `metadata.cwd` 时回退 host CLI workspace。列表摘要直接只读这些
 字段和文件 mtime，不装载运行时对象。
 
-所有会话变更继续使用追加写 JSONL。staged revert 只在 REST、SSE、模型上下文和 message cache
-隐藏边界及尾部；unrevert 在下一条 prompt 被接收前可以恢复。下一条 prompt 将回退和 turn accept
+所有会话变更继续使用追加写 JSONL。staged revert 只持久化服务端规范化后的权威游标，并在
+REST、SSE、模型上下文和 message cache 隐藏边界及尾部；unrevert 在下一条 prompt 被接收前
+可以恢复。下一条 prompt 将回退和 turn accept
 写入同一条 committed 记录，之后 unrevert 为幂等 no-op。包含 committed 记录的数据不能直接交给
 不识别 `session_revert_committed_v1` 的旧 Host，否则旧 reader 会重新显示逻辑删除的尾部。
 

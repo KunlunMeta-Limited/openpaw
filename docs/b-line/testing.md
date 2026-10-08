@@ -86,6 +86,19 @@ NodeNext import 和 Node 22 typings 环境问题退出 2，输出没有指向本
 Docker Linux 环境的定向回归 1/1 和 Host 全量回归 92/92 通过；最终页面复验和治理门禁
 结果记录在 CHG-2026-0020 与 verification report。
 
+## CHG-2026-0021 按回合回退矩阵
+
+| 场景 | Host 可观察条件 | OpenWork 可观察条件 |
+| --- | --- | --- |
+| user 边界 | 返回请求 user ID，并严格隐藏该边界及尾部 | 既有行为不变 |
+| assistant / `assistant_n` 边界 | 通过 `TurnOutcome` 返回同回合 user ID，持久化后重启仍使用该权威游标 | 点击 assistant Revert 后该轮输入、输出和后续消息一起隐藏 |
+| 旧 assistant 无可靠 outcome | 保留原 assistant 游标，不猜测或误删此前 user | 兼容旧会话与外部写入 |
+| Unrevert / replacement prompt | Unrevert 恢复完整尾部；下一条 prompt 继续沿用既有 committed 语义 | Restore 恢复输入、输出和后续消息 |
+
+Linux Docker 定向 Revert 回归 3/3、Host HTTP 33/33、Host 全包 93/93 通过；格式检查退出 0。
+OpenWork `main` 保持无源码 diff，从主线镜像与当前 Host 镜像重建后两个容器均健康。容器内
+REST 验证 assistant 请求返回 user 游标，页面验证目标 user/assistant 同时隐藏且 Restore 恢复。
+
 ## 当前发布阻断矩阵
 
 | 编号 | 风险 | 当前证据 | 必须新增的门禁 |

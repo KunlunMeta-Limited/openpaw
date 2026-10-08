@@ -189,9 +189,13 @@ async fn session_created_and_updated_events_use_the_info_envelope() {
     assert_eq!(response.status(), StatusCode::OK);
     while events.try_recv().is_ok() {}
     let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let user_id = messages[0]["info"]["id"]
+        .as_str()
+        .expect("user revert boundary")
+        .to_string();
     let boundary_id = messages[1]["info"]["id"]
         .as_str()
-        .expect("revert boundary")
+        .expect("assistant revert request")
         .to_string();
 
     let response = request(
@@ -204,7 +208,7 @@ async fn session_created_and_updated_events_use_the_info_envelope() {
     assert_eq!(response.status(), StatusCode::OK);
     let event = next_session_event(&mut events, "session.updated").await;
     assert_session_event(&event, "session.updated", &id);
-    assert_eq!(event.properties["info"]["revert"]["messageID"], boundary_id);
+    assert_eq!(event.properties["info"]["revert"]["messageID"], user_id);
 
     let response = request(
         &app,
@@ -755,6 +759,10 @@ async fn tool_results_coalesce_across_fork_revert_and_restart() {
     )
     .await;
     assert_eq!(reverted.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(reverted).await["revert"]["messageID"],
+        final_message_id
+    );
     let visible = get_json(&app, format!("/session/{source_id}/message")).await;
     assert_eq!(visible.as_array().unwrap().len(), 1);
     assert_eq!(visible[0]["info"]["role"], "assistant");
@@ -858,18 +866,18 @@ async fn revert_session_hides_tail_and_unrevert_restores_it_across_restart() {
     let original = get_json(&app, format!("/session/{id}/message")).await;
     let boundary_id = original[2]["info"]["id"]
         .as_str()
-        .expect("revert boundary")
+        .expect("user revert boundary")
         .to_string();
-    let hidden_id = original[3]["info"]["id"]
+    let requested_id = original[3]["info"]["id"]
         .as_str()
-        .expect("hidden message")
+        .expect("assistant revert request")
         .to_string();
     let mut events = state.global_events.subscribe();
     let response = request(
         &app,
         "POST",
         format!("/session/{id}/revert"),
-        serde_json::json!({"messageID":boundary_id}).to_string(),
+        serde_json::json!({"messageID":requested_id}).to_string(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -891,7 +899,7 @@ async fn revert_session_hides_tail_and_unrevert_restores_it_across_restart() {
         &app,
         "POST",
         format!("/session/{id}/revert"),
-        serde_json::json!({"messageID":hidden_id}).to_string(),
+        serde_json::json!({"messageID":requested_id}).to_string(),
     )
     .await;
     assert_eq!(hidden.status(), StatusCode::BAD_REQUEST);
@@ -950,6 +958,94 @@ async fn revert_session_hides_tail_and_unrevert_restores_it_across_restart() {
     .await;
     assert_eq!(idempotent.status(), StatusCode::OK);
     assert!(response_json(idempotent).await.get("revert").is_none());
+}
+
+#[tokio::test]
+async fn revert_session_normalizes_later_assistant_response_to_turn_user() {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session(&app).await;
+    drop(app);
+    drop(state);
+
+    let turn_id = "1_deadbeef";
+    let user_id = format!("msg_{id}_{turn_id}_user");
+    let first_assistant_id = format!("msg_{id}_{turn_id}_assistant");
+    let later_assistant_id = format!("msg_{id}_{turn_id}_assistant_1");
+    append_session_events(
+        home.path(),
+        &id,
+        &[
+            SessionEvent::Message(Message::user_text("whole turn").with_uuid(user_id.clone())),
+            SessionEvent::Message(
+                Message::assistant_text("tool response").with_uuid(first_assistant_id.clone()),
+            ),
+            SessionEvent::Message(
+                Message::assistant_text("final response").with_uuid(later_assistant_id.clone()),
+            ),
+            SessionEvent::Unknown(Box::new(serde_json::json!({
+                "type":"turn_outcome",
+                "turnID":turn_id,
+                "userMessageID":user_id,
+                "state":"completed",
+                "startedAt":1,
+                "completedAt":2
+            }))),
+        ],
+    );
+
+    let state = AppState::new(config.clone());
+    let app = build_router(state);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":later_assistant_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["revert"]["messageID"],
+        user_id
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        serde_json::json!([])
+    );
+    drop(app);
+
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}")).await["revert"]["messageID"],
+        user_id
+    );
+    let response = request(
+        &restarted,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored = get_json(&restarted, format!("/session/{id}/message")).await;
+    assert_eq!(restored.as_array().unwrap().len(), 3);
+    assert_eq!(restored[0]["info"]["id"], user_id);
+    assert_eq!(restored[1]["info"]["id"], first_assistant_id);
+    assert_eq!(restored[2]["info"]["id"], later_assistant_id);
 }
 
 #[tokio::test]
@@ -1179,9 +1275,13 @@ async fn revert_commit_persistence_failure_keeps_file_and_memory_unchanged() {
     let response = sync_prompt_with_request_id(&app, &id, "first-key", "first").await;
     assert_eq!(response.status(), StatusCode::OK);
     let messages = get_json(&app, format!("/session/{id}/message")).await;
+    let user_id = messages[0]["info"]["id"]
+        .as_str()
+        .expect("user revert boundary")
+        .to_string();
     let boundary_id = messages[1]["info"]["id"]
         .as_str()
-        .expect("assistant boundary")
+        .expect("assistant revert request")
         .to_string();
     let response = request(
         &app,
@@ -1217,7 +1317,7 @@ async fn revert_commit_persistence_failure_keeps_file_and_memory_unchanged() {
     );
     assert_eq!(
         get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
-        boundary_id
+        user_id
     );
     assert_eq!(handle.session.lock().await.messages.len(), 2);
     assert!(!handle.is_active());

@@ -12,8 +12,8 @@ use crate::protocol::{
     TurnSchedulerConfig, TurnState, UpdateSessionRequest,
 };
 use crate::session_mutation::{
-    clone_messages_for_fork, visible_prefix_len, SessionForkOriginV1, SessionMetadataV1,
-    SessionMutationEvent, SessionMutationProjection, SessionRevertCommittedV1,
+    clone_messages_for_fork, normalize_revert_boundary, visible_prefix_len, SessionForkOriginV1,
+    SessionMetadataV1, SessionMutationEvent, SessionMutationProjection, SessionRevertCommittedV1,
     SessionRevertStagedV1,
 };
 use futures::FutureExt;
@@ -1490,12 +1490,14 @@ impl AppState {
                 ));
             }
             let visible_messages = self.message_snapshot(&handle);
-            let prefix_len =
-                visible_prefix_len(id, &visible_messages, message_id).ok_or_else(|| {
-                    SessionMutationError::BadRequest("messageID 不存在或已被回退隐藏".into())
-                })?;
+            let turn_outcomes = handle.turn_outcomes();
+            let (revert_message_id, prefix_len) =
+                normalize_revert_boundary(id, &visible_messages, &turn_outcomes, message_id)
+                    .ok_or_else(|| {
+                        SessionMutationError::BadRequest("messageID 不存在或已被回退隐藏".into())
+                    })?;
             let event = SessionMutationEvent::RevertStaged(SessionRevertStagedV1 {
-                message_id: message_id.to_string(),
+                message_id: revert_message_id,
             });
             let (path, length) =
                 writer_snapshot(&handle).map_err(SessionMutationError::Persistence)?;

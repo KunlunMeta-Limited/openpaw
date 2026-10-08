@@ -5,11 +5,11 @@
 
 use std::collections::HashMap;
 
-use openpaw_core::{ContentBlock, Message, SessionEvent};
+use openpaw_core::{ContentBlock, Message, Role, SessionEvent};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::protocol::TurnAcceptV1;
+use crate::protocol::{TurnAcceptV1, TurnOutcome};
 
 /// 功能：保存一次 PATCH 提供的会话标题与归档字段。
 /// 数据边界：缺省字段保持旧投影；`archived=0` 表示取消归档。
@@ -204,6 +204,51 @@ pub(crate) fn visible_prefix_len(
         .iter()
         .enumerate()
         .position(|(index, message)| wire_message_id(session_id, index, message) == message_id)
+}
+
+/// 功能：把可见 assistant 回退边界规范化为触发同一回合的 user 消息边界。
+/// 参数：session、可见消息、回合结果和客户端请求的消息编号。
+/// 返回：命中可见消息时返回权威游标及其前缀长度；未知边界返回 None。
+/// 错误：无；无法可靠关联的 assistant 保留原边界。
+/// 状态：纯读取，不修改消息、回合结果或持久化投影。
+/// 并发与取消：调用方提供稳定快照，同步无锁，不可取消。
+/// 权限：不读取消息正文、文件或网络。
+/// 关联：`API-HOST-SESSION-REVERT-001`、`CHG-2026-0021`。
+pub(crate) fn normalize_revert_boundary(
+    session_id: &str,
+    messages: &[Message],
+    turn_outcomes: &[TurnOutcome],
+    message_id: &str,
+) -> Option<(String, usize)> {
+    let requested_prefix = visible_prefix_len(session_id, messages, message_id)?;
+    let original = (message_id.to_string(), requested_prefix);
+    if messages[requested_prefix].role != Role::Assistant {
+        return Some(original);
+    }
+    turn_outcomes
+        .iter()
+        .find(|outcome| is_turn_assistant_message_id(session_id, &outcome.turn_id, message_id))
+        .and_then(|outcome| {
+            visible_prefix_len(session_id, messages, &outcome.user_message_id)
+                .map(|prefix| (outcome.user_message_id.clone(), prefix))
+        })
+        .or(Some(original))
+}
+
+fn is_turn_assistant_message_id(session_id: &str, turn_id: &str, message_id: &str) -> bool {
+    let base = format!("msg_{session_id}_{turn_id}_assistant");
+    let Some(suffix) = message_id.strip_prefix(&base) else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(index) = suffix.strip_prefix('_') else {
+        return false;
+    };
+    index
+        .parse::<usize>()
+        .is_ok_and(|value| value > 0 && value.to_string() == index)
 }
 
 /// 功能：复制会话消息并重新生成消息、工具调用和内部引用编号。

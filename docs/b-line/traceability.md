@@ -15,7 +15,7 @@
 | §2.4 CLI 与 Host flags | 参数和启动代码存在 | help snapshot 未覆盖三个 Host 全局旗标 | 阻断 |
 | §3.2 回环、鉴权和工作区优先级 | HostConfig、middleware、create_session 已编码 | HTTP 定向测试 15/15 | 局部验证 |
 | §3.2 Session REST/JSONL | create/list/get/message/status/turns/prompt/abort/delete 已编码；纯 ToolResult 历史折叠到 assistant tool part | CHG-0020 Docker Host 92/92；生命周期缺口未覆盖 | 局部验证 |
-| §3.2 Session 归档/分支/回退 | PATCH/fork/revert/unrevert、追加式私有事件、Session SSE 包络和 ToolResult REST 投影已编码 | Host HTTP 32/32；CHG-0020 覆盖 fork/revert/restart；OpenWork direct/proxy 8/8、0 skip | 局部验证 |
+| §3.2 Session 归档/分支/回退 | PATCH/fork/revert/unrevert、追加式私有事件、Session SSE 包络、ToolResult REST 投影和 assistant 到 user 回合边界规范化已编码 | CHG-0021 Docker Host 93/93；assistant REST 游标与未修改 OpenWork 主线页面 Revert/Restore 实机通过；OpenWork direct/proxy 既有 8/8、0 skip | 局部验证 |
 | §3.2 多 session 并行与队列 | 默认 4 running/32 queued、同 session 1 | 基础并发/FIFO/409 有证据；冷加载全局锁和关闭所有权未修 | 阻断 |
 | §3.2 provider/model | per-turn provider/model 已编码 | fake OpenAI 和 mock contract 局部通过 | 局部验证 |
 | §2.5/§3.2 SSE | 路由、events 和 Provider decoder 已编码 | SSE 单元 3/3、mock 8/8；跨 UTF-8 chunk、截断和终止矩阵失败/缺失 | 失败 |
