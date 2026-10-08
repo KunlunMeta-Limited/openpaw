@@ -74,6 +74,18 @@ Host 定向 HTTP 矩阵已通过 32/32；OpenWork `openpaw-engine-attach.test.ts
 零 skip。`pnpm typecheck` 退出 0；`pnpm evals:typecheck` 因缓存镜像中既有的 Bun、企业 schema、
 NodeNext import 和 Node 22 typings 环境问题退出 2，输出没有指向本次修改的测试文件，仍按阻断记录。
 
+## CHG-2026-0020 工具结果历史投影矩阵
+
+| 场景 | Host 可观察条件 | OpenWork 可观察条件 |
+| --- | --- | --- |
+| completed ToolResult | REST 省略内部 user ToolResult，并将原 assistant tool part 更新为 completed 和实际 output | 刷新前后的工具状态一致，不产生新的 user admission |
+| Revert 最终 assistant | Core 游标仍严格隐藏边界及尾部；可见 REST 历史以 completed assistant tool part 结束 | 不显示 `The task was accepted, but no result arrived` 恢复卡 |
+| fork / restart | fork 后 callID 成对重排；重启前后 wire 完全一致 | Branch 与重新进入会话均显示相同工具结果 |
+| 无法完整匹配 | 普通用户文本、混合内容或 orphan ToolResult 保持原逐条投影 | 不因部分折叠丢失旧数据 |
+
+Docker Linux 环境的定向回归 1/1 和 Host 全量回归 92/92 通过；最终页面复验和治理门禁
+结果记录在 CHG-2026-0020 与 verification report。
+
 ## 当前发布阻断矩阵
 
 | 编号 | 风险 | 当前证据 | 必须新增的门禁 |

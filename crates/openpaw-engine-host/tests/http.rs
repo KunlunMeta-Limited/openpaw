@@ -633,7 +633,7 @@ async fn fork_session_copies_boundaries_numbers_titles_and_survives_restart() {
 }
 
 #[tokio::test]
-async fn fork_session_rekeys_tool_links_and_validates_source_state() {
+async fn tool_results_coalesce_across_fork_revert_and_restart() {
     let home = tempdir().expect("home");
     let config = HostConfig {
         home: home.path().into(),
@@ -671,11 +671,46 @@ async fn fork_session_rekeys_tool_links_and_validates_source_state() {
                 uuid: Some("message-result-source".into()),
                 ..Default::default()
             }),
+            SessionEvent::Message(Message {
+                role: openpaw_core::Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "final answer".into(),
+                }],
+                uuid: Some("message-final-source".into()),
+                ..Default::default()
+            }),
         ],
     );
-    let state = AppState::new(config);
+    let state = AppState::new(config.clone());
     let app = build_router(state.clone());
     let source_messages = get_json(&app, format!("/session/{source_id}/message")).await;
+    assert_eq!(source_messages.as_array().unwrap().len(), 2);
+    assert_eq!(source_messages[0]["info"]["role"], "assistant");
+    assert_eq!(
+        source_messages[0]["parts"][0]["state"]["status"],
+        "completed"
+    );
+    assert_eq!(source_messages[0]["parts"][0]["state"]["output"], "done");
+    assert_eq!(source_messages[1]["parts"][0]["text"], "final answer");
+    assert_eq!(
+        get_json(
+            &app,
+            format!("/session/{source_id}/message/message-tool-source")
+        )
+        .await["parts"][0]["state"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "GET",
+            format!("/session/{source_id}/message/message-result-source"),
+            Body::empty(),
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
     let response = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
     assert_eq!(response.status(), StatusCode::OK);
     let fork_id = response_json(response).await["id"]
@@ -683,15 +718,14 @@ async fn fork_session_rekeys_tool_links_and_validates_source_state() {
         .expect("fork id")
         .to_string();
     let fork_messages = get_json(&app, format!("/session/{fork_id}/message")).await;
+    assert_eq!(fork_messages.as_array().unwrap().len(), 2);
     assert_ne!(
         fork_messages[0]["info"]["id"],
         source_messages[0]["info"]["id"]
     );
     assert_ne!(fork_messages[0]["parts"][0]["callID"], "call-source");
-    assert_eq!(
-        fork_messages[1]["parts"][0]["callID"],
-        fork_messages[0]["parts"][0]["callID"]
-    );
+    assert_eq!(fork_messages[0]["parts"][0]["state"]["status"], "completed");
+    assert_eq!(fork_messages[0]["parts"][0]["state"]["output"], "done");
 
     let unknown = request(
         &app,
@@ -708,6 +742,32 @@ async fn fork_session_rekeys_tool_links_and_validates_source_state() {
     let active = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
     assert_eq!(active.status(), StatusCode::CONFLICT);
     handle.release_turn();
+
+    let final_message_id = source_messages[1]["info"]["id"]
+        .as_str()
+        .expect("final assistant message id")
+        .to_string();
+    let reverted = request(
+        &app,
+        "POST",
+        format!("/session/{source_id}/revert"),
+        serde_json::json!({"messageID":final_message_id}).to_string(),
+    )
+    .await;
+    assert_eq!(reverted.status(), StatusCode::OK);
+    let visible = get_json(&app, format!("/session/{source_id}/message")).await;
+    assert_eq!(visible.as_array().unwrap().len(), 1);
+    assert_eq!(visible[0]["info"]["role"], "assistant");
+    assert_eq!(visible[0]["parts"][0]["state"]["status"], "completed");
+    assert_eq!(visible[0]["parts"][0]["state"]["output"], "done");
+    drop(app);
+    drop(state);
+
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{source_id}/message")).await,
+        visible
+    );
 }
 
 #[tokio::test]

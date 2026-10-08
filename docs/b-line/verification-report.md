@@ -48,6 +48,9 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
   退出 1：Host 6156/5700、Host tests 2707/1900，aux 10008/10100。严格 Clippy
   退出 101，原因是 `openpaw-sandbox` 11 条既有 warning。五项治理命令均因缺少固定版本
   `AI_GOVERNANCE_FRAMEWORK` 退出 1。
+- CHG-2026-0020 将 REST 历史中的纯 ToolResult user 消息折叠回 assistant tool part，
+  修复 Revert 最终 assistant 后 OpenWork 误报无结果。Windows 定向测试因缺少 MSVC `link.exe`
+  未执行；Docker Linux 定向测试 1/1、Host 全量 92/92 通过，格式检查退出 0。
 
 ## 当前强证据与失败证据
 
@@ -56,7 +59,7 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
 | LLM mock contract | `mock_server_contract` 为 `8/8` | 局部通过；不覆盖 UTF-8 字节边界、截断流、终止 sentinel 和缓冲上限 |
 | LLM SSE 单元 | `sse::tests` 为 `3/3` | 局部通过；ASCII 拆分不能替代中文/emoji 和畸形流矩阵 |
 | Host reliability/runtime/HTTP | `7/7`、`10/10`、`15/15` | 局部通过；不覆盖冷加载隔离、全部孤儿恢复和真实 listener shutdown |
-| Session archive/fork/revert | PATCH/fork/revert/unrevert、Basic Auth、SSE 包络、并发和重启 HTTP 32/32；OpenWork 8/8 | 本次能力范围通过；全仓 `evals:typecheck` 仍受既有环境基线阻断 |
+| Session archive/fork/revert | PATCH/fork/revert/unrevert、Basic Auth、SSE 包络、并发、ToolResult 折叠和重启 HTTP 32/32；OpenWork 8/8 | Host 自动化通过；页面容器复验见 CHG-0020；全仓 `evals:typecheck` 仍受既有环境基线阻断 |
 | 50K 助手正文 | provider 长度 50000；Host/JSONL 长度 50004，哈希不同并出现 `U+FFFD` | 失败 |
 | 180K 助手正文 | JSONL assistant 长度 180004，替换字符 7 个 | 失败 |
 | 动画可靠性 | v1 动作无 session/turn/eventId/sequence，MPSC `try_send` 和 HTTP POST 可丢 | 失败/未实现 |

@@ -33,6 +33,9 @@ host 实现 `master-plan.md` 第 3.2 节规定的 OpenCode v1 子集。所有 SS
 - Session 的 `time.created` 和 `time.updated` 使用 Unix 毫秒。
 - 已归档 Session 额外返回正数 Unix 毫秒 `time.archived`；unarchive 请求写 `0`，响应省略该字段。
 - staged revert 返回 `revert.messageID`；Branch 是新根会话，不返回 `parentID`。
+- `GET /session/:id/message` 将可完整匹配此前 assistant tool part 的纯 ToolResult
+  user 消息折叠到该 part 的 `state`；普通用户文本、混合内容和无法匹配的旧数据保持逐条投影。
+  因此 REST 历史与实时 SSE 均以 assistant tool part 表示 `running/completed/error`。
 - Text part 按输入顺序直接拼接，不插入分隔符；非文本 part 被忽略。
 - `message.part.delta` 使用 `partID`、`sessionID`、`messageID`、`field` 和
   `delta`；tool state 为 `running`、`completed` 或 `error`。

@@ -19,3 +19,4 @@
 | CHG-2026-0015 | 会话懒加载隔离与受控关闭 | approved | high | OpenPaw Host 运行时负责人（待确认） | 8 | 18 |
 | CHG-2026-0016 | 运行配置回退与 sidecar 顺序收敛 | approved | medium | OpenPaw CLI 负责人（待确认） | 1 | 24 |
 | CHG-2026-0019 | 会话分支、回退与归档 | approved | high | OpenPaw Host 运行时负责人（待确认） | 9 | 22 |
+| CHG-2026-0020 | 工具结果历史投影一致性 | approved | medium | OpenPaw Host 接口负责人（待确认） | 1 | 8 |
