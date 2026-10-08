@@ -58,7 +58,11 @@ T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过
   `engine-host` 和 `openwork` 均健康。容器内 REST 实测 assistant 请求返回 user 游标，页面点击
   Revert 后该轮输入与输出同时隐藏，Restore 无需刷新即恢复。最终边界复核确认 staged REST
   snapshot 始终保留原始消息、已隐藏消息再次 Revert 仍返回 400，Restore 只清除游标；最新
-  `engine-host` 镜像已再次构建并健康启动，隔离 smoke 会话已删除。
+  `engine-host` 镜像已再次构建并健康启动，隔离 smoke 会话已删除。后续低风险去重统一了
+  staged 可见前缀和 committed turn 状态裁剪，并移除冷启动第三份临时消息克隆；同源 Linux
+  Docker 全量仍为 93/93。`xtask lines` 显示 Host 从 6278 降至 6267、Host tests 从 2862
+  降至 2859；门禁仍因 6267/5700 与 2859/1900 退出 1，本轮未调整预算。五项治理命令
+  在 `general-tools:latest` 中复跑仍全部退出 1，镜像内缺少 `/workspace/tools/pipeline.py`。
 
 ## 当前强证据与失败证据
 

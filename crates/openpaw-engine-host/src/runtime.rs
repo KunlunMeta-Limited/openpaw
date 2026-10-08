@@ -1031,10 +1031,10 @@ impl AppState {
         let request_admissions = projection.request_admissions;
         let mutation = projection.mutation;
         let turn_sequence = projection.turn_sequence_high_water;
-        let published_messages = restored_message_snapshot(id, &messages, &mutation)?;
+        staged_visible_len(id, &messages, mutation.revert_message_id.as_deref())
+            .ok_or(SessionLoadError::Corrupt)?;
         let mut session = Session::new(read.meta.model.clone(), read.meta.provider.clone());
         session.meta = read.meta;
-        session.messages = messages.clone();
         let approvals = HostApprovalManager::new(
             id.to_string(),
             self.global_events.clone(),
@@ -1048,6 +1048,8 @@ impl AppState {
         )
         .map_err(|_| SessionLoadError::Unavailable)?;
         let title = session_title(&mutation, &messages);
+        let published_messages = messages.clone();
+        session.messages = messages;
         Ok(self.build_session_handle(SessionHandleInit {
             session,
             messages: published_messages,
@@ -1344,15 +1346,11 @@ impl AppState {
                         .clone(),
                 )
             };
-            let visible_len = revert_message_id
-                .as_deref()
-                .map(|message_id| {
-                    visible_prefix_len(source_id, &source_messages, message_id).ok_or_else(|| {
+            let visible_len =
+                staged_visible_len(source_id, &source_messages, revert_message_id.as_deref())
+                    .ok_or_else(|| {
                         SessionMutationError::Persistence("会话回退游标无法匹配完整消息历史".into())
-                    })
-                })
-                .transpose()?
-                .unwrap_or(source_messages.len());
+                    })?;
             let visible_messages = &source_messages[..visible_len];
             let fork_len = match message_id {
                 Some(message_id) => visible_prefix_len(source_id, visible_messages, message_id)
@@ -1513,15 +1511,11 @@ impl AppState {
                 .unwrap_or_else(|error| error.into_inner())
                 .revert_message_id
                 .clone();
-            let visible_len = current_revert_message_id
-                .as_deref()
-                .map(|message_id| {
-                    visible_prefix_len(id, &messages, message_id).ok_or_else(|| {
+            let visible_len =
+                staged_visible_len(id, &messages, current_revert_message_id.as_deref())
+                    .ok_or_else(|| {
                         SessionMutationError::Persistence("会话回退游标无法匹配完整消息历史".into())
-                    })
-                })
-                .transpose()?
-                .unwrap_or(messages.len());
+                    })?;
             let (revert_message_id, _) =
                 normalize_revert_boundary(id, &messages[..visible_len], &turn_outcomes, message_id)
                     .ok_or_else(|| {
@@ -1918,15 +1912,15 @@ fn session_title(
         .take(80)
         .collect()
 }
-fn restored_message_snapshot(
+fn staged_visible_len(
     session_id: &str,
     messages: &[openpaw_core::Message],
-    mutation: &SessionMutationProjection,
-) -> Result<Vec<openpaw_core::Message>, SessionLoadError> {
-    if let Some(message_id) = mutation.revert_message_id.as_deref() {
-        visible_prefix_len(session_id, messages, message_id).ok_or(SessionLoadError::Corrupt)?;
+    revert_message_id: Option<&str>,
+) -> Option<usize> {
+    match revert_message_id {
+        Some(message_id) => visible_prefix_len(session_id, messages, message_id),
+        None => Some(messages.len()),
     }
-    Ok(messages.to_vec())
 }
 fn session_mutation_load_error(error: SessionLoadError) -> SessionMutationError {
     match error {
@@ -2076,19 +2070,11 @@ fn apply_revert_commit(
         .iter()
         .filter_map(|message| message.uuid.clone())
         .collect();
-    let retained_user_ids = retained_user_message_ids(&projection.messages);
-    projection
-        .turn_outcomes
-        .retain(|outcome| retained_user_ids.contains(&outcome.user_message_id));
-    let retained_turn_ids: HashSet<_> = projection
-        .turn_outcomes
-        .iter()
-        .map(|outcome| outcome.turn_id.clone())
-        .collect();
-    projection.request_admissions.retain(|_, admission| {
-        retained_user_ids.contains(&admission.user_message_id)
-            && retained_turn_ids.contains(&admission.turn_id)
-    });
+    retain_turn_state_for_messages(
+        &projection.messages,
+        &mut projection.turn_outcomes,
+        &mut projection.request_admissions,
+    );
     apply_turn_accept(projection, message_ids, commit.accept)
 }
 fn apply_finish_commit(
@@ -2131,6 +2117,22 @@ fn retained_user_message_ids(messages: &[openpaw_core::Message]) -> HashSet<Stri
         .filter(|message| message.role == openpaw_core::Role::User)
         .filter_map(|message| message.uuid.clone())
         .collect()
+}
+fn retain_turn_state_for_messages(
+    messages: &[openpaw_core::Message],
+    outcomes: &mut Vec<TurnOutcome>,
+    admissions: &mut HashMap<String, RequestAdmission>,
+) {
+    let retained_user_ids = retained_user_message_ids(messages);
+    outcomes.retain(|outcome| retained_user_ids.contains(&outcome.user_message_id));
+    let retained_turn_ids: HashSet<_> = outcomes
+        .iter()
+        .map(|outcome| outcome.turn_id.clone())
+        .collect();
+    admissions.retain(|_, admission| {
+        retained_user_ids.contains(&admission.user_message_id)
+            && retained_turn_ids.contains(&admission.turn_id)
+    });
 }
 fn push_restored_message(
     messages: &mut Vec<openpaw_core::Message>,
@@ -2501,13 +2503,9 @@ pub(crate) fn append_user_and_turn(
         .unwrap_or_else(|error| error.into_inner())
         .revert_message_id
         .clone();
-    let revert_prefix_len = staged_message_id
-        .as_deref()
-        .map(|message_id| {
-            visible_prefix_len(&handle.id, &session.messages, message_id)
-                .ok_or_else(|| "会话回退游标无法匹配完整消息历史".to_string())
-        })
-        .transpose()?;
+    let visible_len =
+        staged_visible_len(&handle.id, &session.messages, staged_message_id.as_deref())
+            .ok_or_else(|| "会话回退游标无法匹配完整消息历史".to_string())?;
     let mutation_event = staged_message_id.map(|message_id| {
         SessionMutationEvent::RevertCommitted(SessionRevertCommittedV1 {
             message_id,
@@ -2523,8 +2521,8 @@ pub(crate) fn append_user_and_turn(
             .map_err(|rollback_error| format!("{error}；接收事务回滚失败：{rollback_error}"))?;
         return Err(error);
     }
-    if let Some(prefix_len) = revert_prefix_len {
-        session.messages.truncate(prefix_len);
+    if mutation_event.is_some() {
+        session.messages.truncate(visible_len);
     }
     session.messages.push(message.clone());
     let published_messages = session.messages.clone();
@@ -2538,24 +2536,15 @@ pub(crate) fn append_user_and_turn(
             .write()
             .unwrap_or_else(|error| error.into_inner()) = published_messages.clone();
         if let Some(event) = mutation_event.as_ref() {
-            let retained_user_ids = retained_user_message_ids(&published_messages);
             let mut outcomes = handle
                 .turn_outcomes
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
-            outcomes.retain(|outcome| retained_user_ids.contains(&outcome.user_message_id));
-            let retained_turn_ids: HashSet<_> = outcomes
-                .iter()
-                .map(|outcome| outcome.turn_id.clone())
-                .collect();
-            handle
+            let mut admissions = handle
                 .request_admissions
                 .write()
-                .unwrap_or_else(|error| error.into_inner())
-                .retain(|_, admission| {
-                    retained_user_ids.contains(&admission.user_message_id)
-                        && retained_turn_ids.contains(&admission.turn_id)
-                });
+                .unwrap_or_else(|error| error.into_inner());
+            retain_turn_state_for_messages(&published_messages, &mut outcomes, &mut admissions);
             handle
                 .mutation
                 .write()

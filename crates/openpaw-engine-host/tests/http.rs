@@ -1037,10 +1037,7 @@ async fn revert_session_normalizes_later_assistant_response_to_turn_user() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let restored = get_json(&restarted, format!("/session/{id}/message")).await;
-    assert_eq!(restored.as_array().unwrap().len(), 3);
-    assert_eq!(restored[0]["info"]["id"], user_id);
-    assert_eq!(restored[1]["info"]["id"], first_assistant_id);
-    assert_eq!(restored[2]["info"]["id"], later_assistant_id);
+    assert_eq!(restored, original);
 }
 
 #[tokio::test]
