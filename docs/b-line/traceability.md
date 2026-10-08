@@ -63,3 +63,13 @@ tracked 与未忽略 untracked 的 10,044 个条目，其中 10,043 个现存文
 `ca62b47296a736244d5a92b0b9d9ccc45d30980b479fbcd741e3317a17f35d74`。
 该值标识审计输入快照；随后仅修改审计文档，因此最终发布候选必须重新生成独立清单，
 不能用本值冒充发布制品哈希。
+
+## CHG-2026-0022 三项用户缺陷
+
+| 缺陷 | 实现 | 验收证据 | 状态 |
+| --- | --- | --- | --- |
+| 回退替换后缓存复活 | runtime 提交后按共享投影发 message.removed，随后清游标 | HTTP 完整 ID 与顺序、幂等负例；真实 OpenWork revert/resend 页面 1/1 | 局部验证；新旅程 Passed，发布门禁仍阻断 |
+| accepted/no-result 隐藏 503 | 安全 provider 摘要、私有 finish metadata、assistant error + session.error、REST/restart 投影 | reliability 故障矩阵与上下文隔离；真实 SSE/REST attached 7/7；真实 503 页面三步 Passed | 局部验证；旧错误测试与完整门禁结果见 verification-report |
+| 输入直到输出结束才可见 | HTTP 接收后在执行前发布完整 user text part | 阻塞 provider 断言；真实 OpenWork 首输出前唯一正文可见，刷新一致 | 局部验证；新旅程 Passed，发布门禁仍阻断 |
+
+此追踪只针对已批准 CHG-0022；不改变上文完整 master-plan、压力和发布验收状态。

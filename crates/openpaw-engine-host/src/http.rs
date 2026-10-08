@@ -373,8 +373,7 @@ async fn messages(
         Err(error) => return session_load_error(error),
     };
     // 读取独立快照，避免模型/工具回合持有 Session 写锁时让前端轮询等待。
-    let messages = state.message_snapshot(&handle);
-    let result = messages_wire(&handle, &messages);
+    let result = handle.wire_messages();
     match path.get("message_id") {
         Some(id) => match result
             .into_iter()
@@ -572,6 +571,11 @@ async fn schedule_turn(
     handle.emit(crate::events::user_message_updated(
         &id,
         &accepted.user_message_id,
+    ));
+    handle.emit(crate::events::user_text_part(
+        &id,
+        &accepted.user_message_id,
+        &text,
     ));
     let response_turn_id = accepted.turn_id.clone();
     let task = state.spawn_turn(
@@ -948,113 +952,6 @@ fn sse_stream(
             }
         }
     })
-}
-
-fn message_wire(
-    handle: &SessionHandle,
-    index: usize,
-    message: &openpaw_core::Message,
-) -> serde_json::Value {
-    let session_id = &handle.id;
-    let message_id = message
-        .uuid
-        .clone()
-        .unwrap_or_else(|| format!("msg_{session_id}_{index}"));
-    let role = match message.role {
-        openpaw_core::Role::User => "user",
-        openpaw_core::Role::Assistant => "assistant",
-    };
-    let parts = message.content.iter().enumerate().filter_map(|(part_index, block)| {
-        let part_id = format!("prt_{message_id}_{part_index}");
-        match block {
-            openpaw_core::ContentBlock::Text { text } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"text","text":text})),
-            openpaw_core::ContentBlock::Thinking { thinking, .. } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"reasoning","text":thinking})),
-            openpaw_core::ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"tool","callID":id,"tool":name,"state":{"status":"running","input":input,"output":"","error":""}})),
-            openpaw_core::ContentBlock::ToolResult { tool_use_id, content, is_error, name, .. } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"tool","callID":tool_use_id,"tool":name,"state":{"status":if *is_error {"error"} else {"completed"},"input":{},"output":if *is_error {""} else {content},"error":if *is_error {content} else {""}}})),
-            _ => None,
-        }
-    }).collect::<Vec<_>>();
-    let turn = handle.turn_outcomes().into_iter().find(|turn| {
-        turn.user_message_id == message_id
-            || message_id.starts_with(&format!("msg_{session_id}_{}_", turn.turn_id))
-    });
-    let created = message
-        .timestamp
-        .as_deref()
-        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-        .map(|time| time.timestamp_millis())
-        .or_else(|| {
-            turn.as_ref()
-                .and_then(|turn| turn.started_at.or(turn.queued_at))
-        })
-        .unwrap_or(handle.created_at);
-    let completed = turn.as_ref().and_then(|turn| turn.completed_at);
-    serde_json::json!({"info":{"id":message_id,"sessionID":session_id,"role":role,"time":{"created":created,"completed":completed}},"parts":parts})
-}
-
-fn messages_wire(
-    handle: &SessionHandle,
-    messages: &[openpaw_core::Message],
-) -> Vec<serde_json::Value> {
-    let mut result = Vec::<serde_json::Value>::with_capacity(messages.len());
-    let mut tool_parts = std::collections::HashMap::<String, (usize, usize)>::new();
-    for (message_index, message) in messages.iter().enumerate() {
-        let tool_results = (!message.content.is_empty()
-            && message.role == openpaw_core::Role::User)
-            .then(|| {
-                message
-                    .content
-                    .iter()
-                    .map(|block| match block {
-                        openpaw_core::ContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error,
-                            ..
-                        } => Some((tool_use_id, content, *is_error)),
-                        _ => None,
-                    })
-                    .collect::<Option<Vec<_>>>()
-            })
-            .flatten();
-        if let Some(tool_results) = tool_results {
-            let targets = tool_results
-                .iter()
-                .map(|(tool_use_id, _, _)| tool_parts.get(*tool_use_id).copied())
-                .collect::<Option<Vec<_>>>();
-            if let Some(targets) = targets {
-                for ((wire_message_index, part_index), (_, content, is_error)) in
-                    targets.into_iter().zip(tool_results)
-                {
-                    let state = &mut result[wire_message_index]["parts"][part_index]["state"];
-                    state["status"] =
-                        serde_json::json!(if is_error { "error" } else { "completed" });
-                    state["output"] = serde_json::json!(if is_error { "" } else { content });
-                    state["error"] = serde_json::json!(if is_error { content } else { "" });
-                }
-                continue;
-            }
-        }
-
-        let wire_message_index = result.len();
-        result.push(message_wire(handle, message_index, message));
-        if message.role != openpaw_core::Role::Assistant {
-            continue;
-        }
-        for (part_index, part) in result[wire_message_index]["parts"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .enumerate()
-        {
-            if part["type"] == "tool" {
-                if let Some(call_id) = part["callID"].as_str() {
-                    tool_parts.insert(call_id.to_string(), (wire_message_index, part_index));
-                }
-            }
-        }
-    }
-    result
 }
 
 #[cfg(test)]

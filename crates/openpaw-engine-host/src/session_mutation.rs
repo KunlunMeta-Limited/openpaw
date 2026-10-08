@@ -9,7 +9,7 @@ use openpaw_core::{ContentBlock, Message, Role, SessionEvent};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::protocol::{TurnAcceptV1, TurnOutcome};
+use crate::protocol::{TurnAcceptV1, TurnOutcome, TurnState};
 
 /// 功能：保存一次 PATCH 提供的会话标题与归档字段。
 /// 数据边界：缺省字段保持旧投影；`archived=0` 表示取消归档。
@@ -208,19 +208,31 @@ pub(crate) fn visible_prefix_len(
 
 /// 功能：把可见 assistant 回退边界规范化为触发同一回合的 user 消息边界。
 /// 参数：session、可见消息、回合结果和客户端请求的消息编号。
-/// 返回：命中可见消息时返回权威游标及其前缀长度；未知边界返回 None。
+/// 返回：权威游标及前缀；已验证失败占位归到真实 user，未知边界返回 None。
 /// 错误：无；无法可靠关联的 assistant 保留原边界。
 /// 状态：纯读取，不修改消息、回合结果或持久化投影。
 /// 并发与取消：调用方提供稳定快照，同步无锁，不可取消。
 /// 权限：不读取消息正文、文件或网络。
-/// 关联：`API-HOST-SESSION-REVERT-001`、`CHG-2026-0021`。
+/// 关联：`API-HOST-SESSION-REVERT-001`、`CHG-2026-0021`、`CHG-2026-0022`。
 pub(crate) fn normalize_revert_boundary(
     session_id: &str,
     messages: &[Message],
     turn_outcomes: &[TurnOutcome],
     message_id: &str,
 ) -> Option<(String, usize)> {
-    let requested_prefix = visible_prefix_len(session_id, messages, message_id)?;
+    let Some(requested_prefix) = visible_prefix_len(session_id, messages, message_id) else {
+        // runtime 已验证该 ID 存在于公共错误投影；这里仅还原其真实 user 边界。
+        return turn_outcomes
+            .iter()
+            .find(|turn| {
+                turn.state == TurnState::Failed
+                    && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
+            })
+            .and_then(|turn| {
+                visible_prefix_len(session_id, messages, &turn.user_message_id)
+                    .map(|prefix| (turn.user_message_id.clone(), prefix))
+            });
+    };
     let original = (message_id.to_string(), requested_prefix);
     if messages[requested_prefix].role != Role::Assistant {
         return Some(original);
@@ -235,7 +247,19 @@ pub(crate) fn normalize_revert_boundary(
         .or(Some(original))
 }
 
-fn is_turn_assistant_message_id(session_id: &str, turn_id: &str, message_id: &str) -> bool {
+/// 功能：验证 assistant ID 是否精确属于指定会话与回合。
+/// 参数：session_id、turn_id 为权威归属，message_id 为待验证编号。
+/// 返回：稳定 assistant 或规范的正整数响应后缀匹配时返回 true。
+/// 错误：无。
+/// 状态：纯计算。
+/// 并发与取消：同步无锁，不可取消。
+/// 权限：不读取正文或外部资源。
+/// 关联：`CHG-2026-0021`、`CHG-2026-0022`。
+pub(crate) fn is_turn_assistant_message_id(
+    session_id: &str,
+    turn_id: &str,
+    message_id: &str,
+) -> bool {
     let base = format!("msg_{session_id}_{turn_id}_assistant");
     let Some(suffix) = message_id.strip_prefix(&base) else {
         return false;
@@ -249,6 +273,41 @@ fn is_turn_assistant_message_id(session_id: &str, turn_id: &str, message_id: &st
     index
         .parse::<usize>()
         .is_ok_and(|value| value > 0 && value.to_string() == index)
+}
+
+/// 功能：将已经验证存在的失败占位边界映射为真实历史前缀。
+/// 参数：session_id、messages、outcomes 为稳定快照，message_id 为公共错误消息编号。
+/// 返回：该失败回合真实消息之后、下一用户回合之前的位置；不可验证时返回 None。
+/// 错误：无。
+/// 状态：纯计算，不将占位或错误复制到分支模型历史。
+/// 并发与取消：调用方持有会话变更闸门，同步不可取消。
+/// 权限：只读取不透明 ID，不访问文件或网络。
+/// 关联：`CHG-2026-0022`。
+pub(crate) fn failed_message_prefix_len(
+    session_id: &str,
+    messages: &[Message],
+    outcomes: &[TurnOutcome],
+    message_id: &str,
+) -> Option<usize> {
+    let turn = outcomes.iter().find(|turn| {
+        turn.state == TurnState::Failed
+            && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
+    })?;
+    let start = visible_prefix_len(session_id, messages, &turn.user_message_id)?;
+    Some(
+        messages
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, message)| {
+                message
+                    .uuid
+                    .as_ref()
+                    .is_some_and(|id| outcomes.iter().any(|other| &other.user_message_id == id))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(messages.len()),
+    )
 }
 
 /// 功能：复制会话消息并重新生成消息、工具调用和内部引用编号。

@@ -316,3 +316,19 @@ Windows 候选二进制：`target-windows/debug/openpaw.exe`，SHA-256
 6. CHG-0013 是覆盖多阶段计划的宽范围 CHG；治理 `diff` 要求实际 diff 与全部声明文件完全相等，当前只实施其中 6 个文件，因此边界命令按“声明文件缺失”失败，不能记为治理 diff 通过。
 
 因此本节只关闭用户当前“不完整响应、第二轮失败”的已复现主缺陷，不把整个发布矩阵标记为完成。
+
+## CHG-2026-0022 回退、错误与输入显示回归
+
+本变更使用隔离 Host、home/workspace、假 provider 和未改业务代码的 OpenWork 消费者。
+不操作正式服务、不请求真实模型，诊断探针不作为修复验收。
+
+| 验收 | 证据入口与关键断言 |
+| --- | --- |
+| 回退提交替换 | HTTP：全部旧公共 ID 删除、删除先于游标清除；重放/冲突无重复；REST/重启一致 |
+| 即时输入 | reliability：provider 阻塞时有完整 user part；OpenWork 新 journey 在第一 token 前显示唯一输入 |
+| API 错误 | reliability：503/429/401、截断流、不安全摘要；SSE/REST/重启同值；展示 metadata 不入模型上下文 |
+| 真实消费者 | attached spec 读取真实 SSE；错误 E2E 接入真实 503；新 revert/resend E2E 检查刷新前后一致 |
+| 隐私/边界 | 敏感哨兵不出现在公开错误或私有诊断；OpenWork diff 只含登记的四个测试文件；无默认 Axum |
+
+当前候选命令、计数、环境阻断和干净基线对照见 verification-report 的 CHG-0022 记录。
+Clippy、行数预算、治理或 UI 环境失败分别登记，不能以功能测试通过替代发布门禁。

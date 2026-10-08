@@ -5,15 +5,17 @@
 //! 关联：`REQ-B-HOST-002`、`REQ-B-HOST-006`、`REQ-B-HOST-007`。
 use crate::approval::HostApprovalManager;
 use crate::events;
+use crate::message_projection;
 use crate::office::OfficeDispatcher;
 use crate::protocol::{
-    unix_millis, HostConfig, OpenCodeEvent, RequestAdmission, SessionSummary, SessionTime,
-    SessionWire, TurnAcceptV1, TurnError, TurnFinishCommitV1, TurnFinishPrepareV1, TurnOutcome,
-    TurnSchedulerConfig, TurnState, UpdateSessionRequest,
+    unix_millis, HostConfig, OpenCodeEvent, OpenCodeTurnErrorV1, RequestAdmission, SessionSummary,
+    SessionTime, SessionWire, TurnAcceptV1, TurnError, TurnFinishCommitV1, TurnFinishPrepareV1,
+    TurnOutcome, TurnSchedulerConfig, TurnState, UpdateSessionRequest,
 };
 use crate::session_mutation::{
-    clone_messages_for_fork, normalize_revert_boundary, visible_prefix_len, SessionForkOriginV1,
-    SessionMetadataV1, SessionMutationEvent, SessionMutationProjection, SessionRevertCommittedV1,
+    clone_messages_for_fork, failed_message_prefix_len, is_turn_assistant_message_id,
+    normalize_revert_boundary, visible_prefix_len, SessionForkOriginV1, SessionMetadataV1,
+    SessionMutationEvent, SessionMutationProjection, SessionRevertCommittedV1,
     SessionRevertStagedV1,
 };
 use futures::FutureExt;
@@ -306,6 +308,7 @@ pub struct SessionHandle {
     // 消息快照与回合结果必须通过同一发布闸门对 HTTP 读者可见。
     snapshot_gate: std::sync::RwLock<()>,
     turn_outcomes: std::sync::RwLock<Vec<TurnOutcome>>,
+    turn_errors: std::sync::RwLock<HashMap<String, OpenCodeTurnErrorV1>>,
     request_admissions: std::sync::RwLock<HashMap<String, RequestAdmission>>,
     turn_gate: std::sync::Mutex<()>,
     turn_cancel: std::sync::Mutex<CancellationToken>,
@@ -482,6 +485,33 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner())
             .clone()
     }
+    /// 功能：读取消息、终态与安全错误的同一原子快照并生成 REST 展示。
+    /// 参数：无，读取当前会话。
+    /// 返回：OpenCode 公共消息列表，失败占位不进入模型上下文。
+    /// 错误：无；锁中毒时沿用已恢复的投影。
+    /// 状态：只读。
+    /// 并发与取消：持有 snapshot_gate 读锁，避免终态先于消息或详情可见。
+    /// 权限：仅投影当前会话已经过滤的错误。
+    /// 关联：`CHG-2026-0022`。
+    pub(crate) fn wire_messages(&self) -> Vec<serde_json::Value> {
+        let _snapshot = self
+            .snapshot_gate
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let messages = self
+            .message_cache
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let outcomes = self
+            .turn_outcomes
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let errors = self
+            .turn_errors
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        message_projection::messages_wire(&self.id, self.created_at, &outcomes, &messages, &errors)
+    }
     /// 功能：设置当前回合状态并追加 `turn_outcome` 未知事件。
     /// 并发与取消：同 session 单回合保证状态转换串行；writer 锁保护追加。
     pub(crate) fn persist_turn_outcome(
@@ -543,6 +573,7 @@ impl SessionHandle {
         &self,
         messages: Vec<openpaw_core::Message>,
         outcome: TurnOutcome,
+        failure: Option<OpenCodeTurnErrorV1>,
     ) {
         let _snapshot = self
             .snapshot_gate
@@ -554,6 +585,12 @@ impl SessionHandle {
             .unwrap_or_else(|error| error.into_inner()) = messages;
         self.updated_at
             .store(chrono::Utc::now().timestamp_millis(), Ordering::Release);
+        if let Some(failure) = failure {
+            self.turn_errors
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(outcome.turn_id.clone(), failure);
+        }
         self.project_turn_outcome_locked(outcome, None);
     }
     /// 功能：生成并尝试补写持久化失败终态，但暂不发布内存投影。
@@ -628,6 +665,7 @@ struct SessionHandleInit {
     mutation: SessionMutationProjection,
     turn_sequence: u64,
     turn_outcomes: Vec<TurnOutcome>,
+    turn_errors: HashMap<String, OpenCodeTurnErrorV1>,
     request_admissions: HashMap<String, RequestAdmission>,
 }
 impl AppState {
@@ -1027,6 +1065,7 @@ impl AppState {
         let projection = restored_session_projection(id, &read.events)?;
         let messages = projection.messages;
         let mut turn_outcomes = projection.turn_outcomes;
+        let turn_errors = projection.turn_errors;
         recover_hanging_outcomes(&mut turn_outcomes, &mut writer)?;
         let request_admissions = projection.request_admissions;
         let mutation = projection.mutation;
@@ -1063,11 +1102,18 @@ impl AppState {
             mutation,
             turn_sequence,
             turn_outcomes,
+            turn_errors,
             request_admissions,
         }))
     }
     /// 功能：创建 session、JSONL meta 和 AgentLoop 运行资源。
+    /// 参数：provider_name、model 覆盖默认模型配置，workspace、title 指定工作区与标题。
+    /// 返回：已登记且无历史消息或错误的新会话句柄。
+    /// 错误：provider 构建、模型配置或会话文件创建失败时返回说明。
+    /// 状态：创建独立消息、回合和错误缓存，不启动模型执行。
     /// 并发与取消：创建本身不启动回合；后续 prompt 由 reserve_turn 控制。
+    /// 权限：仅写入 Host 配置的 session 目录，不调用 Office 或模型服务。
+    /// 关联：`REQ-B-HOST-002`、`CHG-2026-0022`。
     pub async fn create_session(
         self: &Arc<Self>,
         provider_name: Option<&str>,
@@ -1129,6 +1175,7 @@ impl AppState {
             },
             turn_sequence: 0,
             turn_outcomes: Vec::new(),
+            turn_errors: HashMap::new(),
             request_admissions: HashMap::new(),
         });
         self.sessions.write().await.insert(id, handle.clone());
@@ -1148,6 +1195,7 @@ impl AppState {
             mutation,
             turn_sequence,
             turn_outcomes,
+            turn_errors,
             request_admissions,
         } = init;
         let id = session.meta.id.clone();
@@ -1180,6 +1228,7 @@ impl AppState {
             current_turn: std::sync::Mutex::new(None),
             snapshot_gate: std::sync::RwLock::new(()),
             turn_outcomes: std::sync::RwLock::new(turn_outcomes),
+            turn_errors: std::sync::RwLock::new(turn_errors),
             request_admissions: std::sync::RwLock::new(request_admissions),
             turn_gate: std::sync::Mutex::new(()),
             turn_cancel: std::sync::Mutex::new(CancellationToken::new()),
@@ -1282,7 +1331,7 @@ impl AppState {
     /// 参数：`source_id` 为直接源会话；`message_id` 可选，存在时复制严格早于该消息的前缀。
     /// 返回：成功时返回已加入运行时表的新会话句柄。
     /// 错误：源会话缺失、边界非法、源会话活动或分支文件事务失败时返回稳定分类。
-    /// 状态：消息、工具调用和内部引用全部换新编号；不复制归档、回退、回合或幂等状态。
+    /// 状态：消息、工具调用和内部引用全部换新编号；不复制归档、回退、回合、错误或幂等状态。
     /// 并发与取消：源 `turn_gate` 线性化活动检查、序号分配和文件发布；文件事务同步不可取消。
     /// 权限：只在 Host session 目录创建新 JSONL，不读取或修改工作区文件。
     /// 关联：`API-HOST-SESSION-FORK-001`、`DAT-HOST-SESSION-MUTATION-002`。
@@ -1354,6 +1403,24 @@ impl AppState {
             let visible_messages = &source_messages[..visible_len];
             let fork_len = match message_id {
                 Some(message_id) => visible_prefix_len(source_id, visible_messages, message_id)
+                    .or_else(|| {
+                        source
+                            .wire_messages()
+                            .iter()
+                            .any(|message| {
+                                message["info"]["id"] == message_id
+                                    && message["info"]["error"].is_object()
+                            })
+                            .then(|| {
+                                failed_message_prefix_len(
+                                    source_id,
+                                    visible_messages,
+                                    &source.turn_outcomes(),
+                                    message_id,
+                                )
+                            })
+                            .flatten()
+                    })
                     .ok_or_else(|| {
                         SessionMutationError::BadRequest("messageID 不存在或已被回退隐藏".into())
                     })?,
@@ -1457,6 +1524,7 @@ impl AppState {
                 },
                 turn_sequence: 0,
                 turn_outcomes: Vec::new(),
+                turn_errors: HashMap::new(),
                 request_admissions: HashMap::new(),
             })
         };
@@ -1516,6 +1584,15 @@ impl AppState {
                     .ok_or_else(|| {
                         SessionMutationError::Persistence("会话回退游标无法匹配完整消息历史".into())
                     })?;
+            if visible_prefix_len(id, &messages[..visible_len], message_id).is_none()
+                && !handle.wire_messages().iter().any(|message| {
+                    message["info"]["id"] == message_id && message["info"]["error"].is_object()
+                })
+            {
+                return Err(SessionMutationError::BadRequest(
+                    "messageID 不存在或已被回退隐藏".into(),
+                ));
+            }
             let (revert_message_id, _) =
                 normalize_revert_boundary(id, &messages[..visible_len], &turn_outcomes, message_id)
                     .ok_or_else(|| {
@@ -1935,6 +2012,7 @@ fn session_mutation_load_error(error: SessionLoadError) -> SessionMutationError 
 struct RestoredSessionProjection {
     messages: Vec<openpaw_core::Message>,
     turn_outcomes: Vec<TurnOutcome>,
+    turn_errors: HashMap<String, OpenCodeTurnErrorV1>,
     request_admissions: HashMap<String, RequestAdmission>,
     mutation: SessionMutationProjection,
     turn_sequence_high_water: u64,
@@ -1951,6 +2029,7 @@ fn restored_session_projection(
     let mut projection = RestoredSessionProjection {
         messages: Vec::new(),
         turn_outcomes: Vec::new(),
+        turn_errors: HashMap::new(),
         request_admissions: HashMap::new(),
         mutation: SessionMutationProjection::default(),
         turn_sequence_high_water: 0,
@@ -1999,7 +2078,13 @@ fn restored_session_projection(
             }
             if let Some(commit) = TurnFinishCommitV1::from_session_event(event) {
                 let pending = pending_finish.take().ok_or(SessionLoadError::Corrupt)?;
-                apply_finish_commit(&mut projection, &mut message_ids, pending, commit)?;
+                apply_finish_commit(
+                    session_id,
+                    &mut projection,
+                    &mut message_ids,
+                    pending,
+                    commit,
+                )?;
                 continue;
             }
             // prepare 后未出现合法 commit 即视为崩溃残留；忽略整批生成消息，
@@ -2074,10 +2159,12 @@ fn apply_revert_commit(
         &projection.messages,
         &mut projection.turn_outcomes,
         &mut projection.request_admissions,
+        &mut projection.turn_errors,
     );
     apply_turn_accept(projection, message_ids, commit.accept)
 }
 fn apply_finish_commit(
+    session_id: &str,
     projection: &mut RestoredSessionProjection,
     message_ids: &mut HashSet<String>,
     pending: PendingFinishTransaction,
@@ -2103,6 +2190,23 @@ fn apply_finish_commit(
     {
         return Err(SessionLoadError::Corrupt);
     }
+    if let Some(failure) = commit.open_code_error {
+        let Some(classification) = commit.terminal.error.as_ref() else {
+            return Err(SessionLoadError::Corrupt);
+        };
+        if commit.terminal.state != TurnState::Failed
+            || !is_turn_assistant_message_id(session_id, &commit.turn_id, &failure.message_id)
+            || failure.error.data.code != classification.code
+            || failure.error.data.is_retryable != classification.retryable
+            || failure.error.data.message.chars().count() > 512
+            || !matches!(failure.error.name.as_str(), "APIError" | "UnknownError")
+        {
+            return Err(SessionLoadError::Corrupt);
+        }
+        projection
+            .turn_errors
+            .insert(commit.turn_id.clone(), failure);
+    }
     for message in pending.messages {
         push_restored_message(&mut projection.messages, message_ids, message);
     }
@@ -2122,6 +2226,7 @@ fn retain_turn_state_for_messages(
     messages: &[openpaw_core::Message],
     outcomes: &mut Vec<TurnOutcome>,
     admissions: &mut HashMap<String, RequestAdmission>,
+    errors: &mut HashMap<String, OpenCodeTurnErrorV1>,
 ) {
     let retained_user_ids = retained_user_message_ids(messages);
     outcomes.retain(|outcome| retained_user_ids.contains(&outcome.user_message_id));
@@ -2129,6 +2234,7 @@ fn retain_turn_state_for_messages(
         .iter()
         .map(|outcome| outcome.turn_id.clone())
         .collect();
+    errors.retain(|turn_id, _| retained_turn_ids.contains(turn_id));
     admissions.retain(|_, admission| {
         retained_user_ids.contains(&admission.user_message_id)
             && retained_turn_ids.contains(&admission.turn_id)
@@ -2482,7 +2588,13 @@ pub(crate) fn accept_turn(
     })
 }
 /// 功能：把用户消息与首个 queued/running outcome 原子追加到 session JSONL 和内存快照。
+/// 参数：handle、session 为已预留会话，message 为输入，outcome、queue_ticket、request_admission 为接收状态。
+/// 返回：消息与接收状态提交成功时返回 Ok。
+/// 错误：JSONL 追加失败时返回持久化错误，不发布删除或新输入。
+/// 状态：有 staged revert 时原子裁剪旧尾部与错误，并先发布公共消息删除。
 /// 并发与取消：要求同 session reserve_turn 已成功；同步临界区内不可取消。
+/// 权限：只修改当前 session 历史；正文不写额外日志。
+/// 关联：`CHG-2026-0019`、`CHG-2026-0022`。
 pub(crate) fn append_user_and_turn(
     handle: &SessionHandle,
     session: &mut Session,
@@ -2512,6 +2624,7 @@ pub(crate) fn append_user_and_turn(
             accept: accept.clone(),
         })
     });
+    let previous_wire = mutation_event.is_some().then(|| handle.wire_messages());
     let persisted_event = mutation_event
         .as_ref()
         .map(SessionMutationEvent::to_session_event)
@@ -2544,7 +2657,15 @@ pub(crate) fn append_user_and_turn(
                 .request_admissions
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
-            retain_turn_state_for_messages(&published_messages, &mut outcomes, &mut admissions);
+            retain_turn_state_for_messages(
+                &published_messages,
+                &mut outcomes,
+                &mut admissions,
+                &mut handle
+                    .turn_errors
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner()),
+            );
             handle
                 .mutation
                 .write()
@@ -2576,7 +2697,20 @@ pub(crate) fn append_user_and_turn(
         outcome,
         queue_ticket,
     });
-    if mutation_event.is_some() {
+    if let Some(previous_wire) = previous_wire {
+        let retained_ids: HashSet<_> = handle
+            .wire_messages()
+            .iter()
+            .filter_map(|message| message["info"]["id"].as_str().map(str::to_string))
+            .collect();
+        for message in previous_wire {
+            if let Some(id) = message["info"]["id"]
+                .as_str()
+                .filter(|id| !retained_ids.contains(*id))
+            {
+                handle.emit(events::message_removed(&handle.id, id));
+            }
+        }
         handle.emit(events::session_changed(
             "session.updated",
             &wire_session_snapshot(handle),
@@ -2638,7 +2772,13 @@ pub(crate) struct ScheduledTurn {
     pub(crate) admission: TurnAdmission,
 }
 /// 功能：在后台任务中执行一个完整 AgentLoop 回合。
+/// 参数：handle 为会话句柄，turn 为已持久化输入及调度凭据。
+/// 返回：无；通过终态快照和 SSE 报告执行结果。
+/// 错误：执行失败安全分类后持久化；持久化失败按 persistence_failed 闭合。
+/// 状态：失败详情与终态原子提交，展示占位不进入模型上下文；完成后释放活动状态。
 /// 并发与取消：由 `SessionHandle` 的 cancel token 和 AgentLoop cancel 控制。
+/// 权限：沿用回合工具权限；上游错误仅公开经过过滤的摘要和可靠元数据。
+/// 关联：`REQ-B-HOST-006`、`CHG-2026-0022`。
 pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     let ScheduledTurn {
         turn_id,
@@ -2658,6 +2798,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         }
         return;
     }
+    let provider_name = provider.name().to_string();
     let message_count_before = handle
         .message_cache
         .read()
@@ -2961,6 +3102,30 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 ),
             }
         };
+        let mut failure = if intended_terminal.state == TurnState::Failed {
+            result
+                .as_ref()
+                .err()
+                .zip(intended_terminal.error.as_ref())
+                .map(|(source, classification)| OpenCodeTurnErrorV1 {
+                    message_id: if active_response_index == 0 {
+                        format!("msg_{}_{}_assistant", handle.id, turn_id)
+                    } else {
+                        format!(
+                            "msg_{}_{}_assistant_{}",
+                            handle.id, turn_id, active_response_index
+                        )
+                    },
+                    error: message_projection::provider_error(
+                        source,
+                        classification,
+                        &provider_name,
+                        &text,
+                    ),
+                })
+        } else {
+            None
+        };
         let terminal = if cancelled {
             if let Err(error) = handle.persist_turn_outcome_event(&intended_terminal) {
                 tracing::error!(session_id = %handle.id, %error, "无法持久化回合终态");
@@ -2970,11 +3135,16 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             }
         } else {
             let generated = session.messages[before..].to_vec();
-            if let Err(error) =
-                persist_finish_transaction(&handle, &turn_id, &generated, intended_terminal.clone())
-            {
+            if let Err(error) = persist_finish_transaction(
+                &handle,
+                &turn_id,
+                &generated,
+                intended_terminal.clone(),
+                failure.clone(),
+            ) {
                 tracing::error!(session_id = %handle.id, %error, "无法提交回合消息事务");
                 session.messages.truncate(before);
+                failure = None;
                 let failed = terminal_outcome(
                     &running,
                     TurnState::Failed,
@@ -2995,7 +3165,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             }
         };
         let snapshot = session.messages.clone();
-        handle.publish_terminal_snapshot(snapshot.clone(), terminal);
+        handle.publish_terminal_snapshot(snapshot.clone(), terminal, failure);
         finish_turn_projection(&handle);
         handle.active.store(false, Ordering::Release);
         snapshot
@@ -3045,6 +3215,39 @@ fn cleanup_unpublished_session_file(path: &std::path::Path) {
     }
 }
 fn finish_turn_projection(handle: &SessionHandle) {
+    if let Some(outcome) = handle
+        .turn_outcomes()
+        .last()
+        .filter(|turn| turn.state == TurnState::Failed)
+    {
+        if let Some(message) = handle
+            .wire_messages()
+            .iter()
+            .rev()
+            .find(|message| message["info"]["error"].is_object())
+        {
+            if let (Some(id), Ok(error)) = (
+                message["info"]["id"].as_str(),
+                serde_json::from_value(message["info"]["error"].clone()),
+            ) {
+                let failure = OpenCodeTurnErrorV1 {
+                    message_id: id.to_string(),
+                    error,
+                };
+                for event in events::turn_failed(
+                    &handle.id,
+                    outcome
+                        .started_at
+                        .or(outcome.queued_at)
+                        .unwrap_or(handle.created_at),
+                    outcome.completed_at.unwrap_or(handle.created_at),
+                    &failure,
+                ) {
+                    handle.emit(event);
+                }
+            }
+        }
+    }
     handle.clear_activity();
     handle.office.clear_owner(&handle.id);
     if let Ok(mut working) = handle.office_working.try_lock() {
@@ -3114,6 +3317,7 @@ fn persist_finish_transaction(
     turn_id: &str,
     messages: &[openpaw_core::Message],
     terminal: TurnOutcome,
+    open_code_error: Option<OpenCodeTurnErrorV1>,
 ) -> Result<(), String> {
     if messages.len() > MAX_FINISH_TRANSACTION_MESSAGES
         || terminal.turn_id != turn_id
@@ -3148,6 +3352,7 @@ fn persist_finish_transaction(
                 turn_id: turn_id.to_string(),
                 generated_message_ids,
                 terminal: terminal.clone(),
+                open_code_error,
             }
             .to_session_event(),
         )
@@ -3881,6 +4086,7 @@ mod tests {
             &turn_id,
             std::slice::from_ref(&assistant),
             terminal.clone(),
+            None,
         )
         .expect("finish transaction");
 

@@ -110,6 +110,7 @@ revert commit 都发布完整的 `session.updated`。
 
 ```text
 message.updated(user)
+message.part.updated(user text)  # 接收已持久化，先于后台执行
 session.status(busy)
 message.updated(assistant created)
 message.part.updated(empty text/reasoning)
@@ -137,6 +138,25 @@ response 都在对应 `TurnUsage` 边界发送 completed 时间。
 | user JSONL append 失败 | 500 | 不加入内存，不启动 AgentLoop |
 | Office gateway 超时/拒绝/断开 | 原请求不变 | 仅日志，回合继续 |
 | v2 路由 | 404 | 否 |
+
+### CHG-2026-0022 消息替换与执行错误
+
+下一条 prompt 提交 staged revert 后，Host 使用同一公共消息投影计算删除 ID，
+依次发出 `message.removed`，再发清除游标的 `session.updated`，最后发布新 user 消息和正文。
+删除事件包含 `{sessionID,messageID}`，覆盖被裁剪的 user、assistant 与仅用于错误展示的消息。
+幂等重放、冲突或持久化失败不重复发出删除或正文事件；staged REST 仍保留完整历史。
+
+已接收回合执行失败仍保持 prompt 的 204，稳定 Gateway `TurnError/TurnOutcome` 不增加字段。
+OpenCode 兼容层先发布归属失败回合的 assistant `message.updated`，再发
+`session.error {sessionID,error}`，最后进入 idle。REST 对同一 assistant 返回 `info.error`。
+零输出失败可生成 `parts=[]` 的展示消息，绝不写入模型 `Session.messages`；其 Revert 边界
+可靠关联到同回合 user。fork 继续不复制 turn/admission/error 诊断状态。
+
+安全错误形状为 `{name,data:{message,code,isRetryable,statusCode?,providerID?}}`，约束见
+`contracts/host-message-events-v1.schema.json`。可靠 HTTP 状态保留；网络和流协议错误不猜测状态。
+摘要有界，过滤凭据、URL、路径及输入回显；不公开 responseBody、responseHeaders 或原始错误。
+取消沿用 cancelled，不发 API 失败。finish commit 的可选私有 `openCodeError` 与 terminal
+原子保存；旧记录缺字段时使用稳定分类，回退提交同步裁剪 metadata。旧 reader 可忽略新增字段。
 
 ## 认证与就绪标记
 

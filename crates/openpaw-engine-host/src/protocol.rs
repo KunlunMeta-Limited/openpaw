@@ -606,6 +606,70 @@ pub(crate) struct TurnFinishCommitV1 {
     pub generated_message_ids: Vec<String>,
     /// 功能：保存与消息批次同时生效的 completed 或 failed 终态。
     pub terminal: TurnOutcome,
+    /// 功能：保存与 failed 终态原子提交的安全 OpenCode 错误；旧记录缺省为空。
+    #[serde(
+        rename = "openCodeError",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) open_code_error: Option<OpenCodeTurnErrorV1>,
+}
+
+/// 功能：记录失败回合的展示消息身份及安全错误，不作为模型消息。
+/// 字段语义：messageID 与实时 assistant header 一致，error 仅含已过滤的公开详情。
+/// 数据来源：Host 最终失败投影；数据去向：私有 finish commit、SSE 与 REST。
+/// 约束：只能随同一回合 failed 终态提交，禁止携带原始 Provider 响应。
+/// 稳定性：Host 私有可选字段，旧 reader 可忽略。
+/// 关联：`CHG-2026-0022`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCodeTurnErrorV1 {
+    /// 功能：保存该回合稳定的 assistant 展示消息编号。
+    #[serde(rename = "messageID")]
+    pub(crate) message_id: String,
+    /// 功能：保存实时事件与历史查询共用的安全错误。
+    pub(crate) error: OpenCodeErrorV1,
+}
+
+/// 功能：表示已有 OpenCode 消费者支持的错误 envelope。
+/// 字段语义：name 为 APIError 或 UnknownError，data 为安全详情。
+/// 数据来源：Host 错误分类；数据去向：session.error 与 assistant info.error。
+/// 约束：不包含响应头、原始响应体、凭据或请求文本。
+/// 稳定性：OpenCode v1 兼容子集，不改变公共 turns 合同。
+/// 关联：`CHG-2026-0022`、`host-message-events-v1.schema.json`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCodeErrorV1 {
+    /// 功能：保存消费者识别的错误名称。
+    pub(crate) name: String,
+    /// 功能：保存有界且过滤后的错误详情。
+    pub(crate) data: OpenCodeErrorDataV1,
+}
+
+/// 功能：保存可公开的失败说明及可靠可知的 API 元数据。
+/// 字段语义：message/code/isRetryable 必填，状态码与 provider 无事实依据时省略。
+/// 数据来源：稳定 TurnError 与过滤后的 HTTP 错误摘要。
+/// 数据去向：Host 私有 JSONL、OpenCode SSE/REST；不进入模型上下文。
+/// 约束：上游说明最多 300 字符，禁止 raw body、headers 或 URL。
+/// 稳定性：OpenCode v1 可选详情，不修改 TurnError。
+/// 关联：`CHG-2026-0022`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OpenCodeErrorDataV1 {
+    /// 功能：保存安全分类说明与允许公开的上游摘要。
+    pub(crate) message: String,
+    /// 功能：保存稳定的 Host 错误分类码。
+    pub(crate) code: String,
+    /// 功能：保留是否可能重试成功的原有判断。
+    pub(crate) is_retryable: bool,
+    /// 功能：保存确知的上游 HTTP 状态码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) status_code: Option<u16>,
+    /// 功能：保存实际执行 provider 的稳定名称。
+    #[serde(
+        rename = "providerID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) provider_id: Option<String>,
 }
 
 impl TurnFinishCommitV1 {

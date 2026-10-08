@@ -109,3 +109,60 @@ G01/G02 可能新增公共请求字段、响应头、JSONL 幂等事实和 SSE �
 - 全仓公共中文注释迁移未完成；B10 修改 `sse.rs` 时必须按框架栏目补齐其公共声明 Rustdoc。
 
 最终裁决：**未通过，不建议发布。** 任何历史“所有命令退出 0”只适用于当时列出的命令和代码范围，不能覆盖当前确认缺陷，也不能把 T10-T12/M5 或整个 master-plan 标记完成。
+
+## 2026-10-08 CHG-2026-0022 修复候选
+
+OpenPaw 分支 `bugfix/revert-api-error-propagation`，基线 `0f7c2fa`。
+OpenWork 测试分支 `bugfix/openpaw-revert-api-regression`，业务源码基线 `3e58d95`。
+正式 Compose 四个服务保持原运行状态；所有验证在 CHG-0022 专用容器和隔离 home/workspace 中进行。
+日志与真实 wire 样本保存在工作区 `../artifacts/chg0022-fix-evidence/`。
+
+| 命令或检查 | 实际结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo test --offline --locked -p openpaw-engine-host --features engine-host` | exit 0；49 单元 + 14 reliability + 33 HTTP，96/96，零 ignored |
+| `cargo build --offline --locked -p openpaw-cli --features engine-host` | exit 0，隔离 UI 使用该 debug 二进制 |
+| `cargo tree --offline --locked -p openpaw-cli -e normal` | exit 0，默认依赖树无 Axum |
+| 严格 Host Clippy（含依赖） | Docker 命令 exit 1、Cargo 101；sandbox 11 条失败；干净 `0f7c2fa` 同命令同签名失败 |
+| 严格 Host Clippy `--no-deps` | Docker exit 1、Cargo 101；office collapsible_else_if、SessionMutationEvent large_enum_variant；同环境干净基线两项同签名失败 |
+| `cargo run --offline --locked -p xtask -- lines` | Cargo exit 1；基线 Host 6318/5700、测试 2859/1900；最终候选 6917/5700、3140/1900，本次增加 599/281 行；预算未修改 |
+| 五项 `governance/check.py` 命令 | Codex 捆绑 Python process exit 2；缺固定版本 AI_GOVERNANCE_FRAMEWORK，未进入规则检查；不能判定治理或注释机器合规 |
+| `pnpm evals:pr specs/openpaw-engine-attach.test.ts` | exit 0；PR lane，7/7、零 skip；实际订阅 SSE 并验证删除、正文、503 与 REST 一致 |
+| 实际输出的 Schema 2020-12 / Ajv 8 验证 | exit 0；16 个事件、10 条 REST 消息；禁止 responseBody 的负例被拒绝 |
+| `pnpm evals:typecheck` | pnpm exit 2，Docker exit 1；当前与干净 OpenWork 基线均为 362 条，去除路径/行号后签名完全相同；本次新增类型错误已修正 |
+
+Rust 测试使用 1.88.0 工具链、同一缓存和空 `OPENPAW_ENGINE_PERMISSIONS`。
+镜像默认 manual 会使需要工具授权的旧测试挂起；修正测试环境后完整运行通过。
+`cargo xtask lines` 在干净归档中没有 alias，实际使用上表 canonical 命令，不虚构 alias 检查通过。
+
+页面 journey 的首次启动失败分别为 Node 22 缺 AsyncDisposableStack、root Chromium 缺容器启动参数，
+以及没有 init 的专用容器无法回收子进程。这些运行未进入页面断言，不作为业务修复的反例或通过。
+补齐 Node 24、真实 Chromium 154 和容器 init 后的最终页面结果记录在下方及 CHG 审批验证记录。
+
+| 页面验证 | 实际结果与原始证据 |
+| --- | --- |
+| `pnpm evals:e2e openpaw-revert-resend` | exit 0；placement: local (daytona CLI missing or not authenticated)；1 passed、0 failed、0 skipped；`revert-browser/test-run.json` 三步与所有 trace 均通过 |
+| 真实 OpenPaw 503 的定向 `vitest --project=e2e --testNamePattern=OpenPaw` | exit 0；1 passed、2 未选择；只判定新旅程 Passed；`error-focused-final.json`。完整 CLI 中的新旅程三步也 Passed，见 `error-browser/test-run.json` |
+| `pnpm evals:e2e session-error-technical-details` | exit 1；placement: local (daytona CLI missing or not authenticated)；2 passed、1 failed、0 skipped；新真实 503 与既有 seeded diagnostics 都通过；旧 submit ownership 在 setup 因缺 `127.0.0.1:3306` MySQL 失败，未进入页面断言；原始 CLI Verdict Failed，验收覆盖判定 Incomplete |
+| 最终 `conversation_reliability` | exit 0；14/14，增加虚拟失败 assistant Fork 不复制错误、伪造 ID 拒绝、取消不发 API 错误断言；`chg0022-reliability-final.log` |
+
+503 页面明确显示 `Status: 503`、`Provider: openai`、`Code: provider_overloaded`，
+默认模式只展示安全错误；Developer mode 面板不包含测试 key 或请求正文；刷新恢复相同错误。
+回退页面通过真实菜单完成两轮后替换，provider 在首输出前挂起时输入恰好一条，旧第二轮
+user/assistant 均不可见，provider 请求不包含旧尾部；结束与刷新后的用户消息一致。
+
+首次 503 页面断言误写成 provider_server_error；观察页面和既有分类后改为 provider_overloaded，
+没有更改产品错误码。多个 world 扩展共享 fixture 名称导致错误世界绑定，在各自 describe 中
+创建与注册后解决；改动仅位于登记测试文件。严格类型与原有 Electron 测试另行记录，
+未选择、环境失败与核心功能通过不混为整个测试文件通过。
+
+旧 Electron 的首次干净基线控制（3e58d95）复现 headless-threads/dist 缺失；
+重建测试容器的离线 node_modules 与该包 dist 后，候选原有 diagnostics 旅程通过。
+此时另一个旧 Den submit ownership 旅程才进入其正确 world，并报告缺 MySQL。
+这是本次环境阻断，不能把不同首个错误称为基线同签名失败，也不能称该旧旅程通过。
+原始记录见 `seeded-error-browser/`、`submit-error-environment-red/`、`error-cli-result.json`。
+
+xtask 的根目录通过编译时 CARGO_MANIFEST_DIR 固定；共享缓存曾误用干净基线二进制。
+仅清理 xtask 构建缓存并在 `/src/xtask` 重编译后取得最终 6917/3140 计数。
+原始浏览器记录的 gitSha 是 OpenWork HEAD 3e58d95，测试含未提交变更；最终源码与文档
+指纹保存在 `candidate-manifest.json`，不能把该 HEAD 当作包含修复的已发布提交。

@@ -277,6 +277,68 @@ pub fn user_message_updated(session_id: &str, message_id: &str) -> OpenCodeEvent
     )
 }
 
+/// 功能：发布已经持久化的用户输入正文。
+/// 参数：session_id、message_id 为权威身份，text 为接收后的完整正文。
+/// 返回：与 REST part ID 一致的 message.part.updated。
+/// 错误：无。
+/// 状态：纯投影，不写入会话或日志。
+/// 并发与取消：接收提交后、后台执行前同步发布。
+/// 权限：沿用 prompt 鉴权，不访问其他会话。
+/// 关联：`CHG-2026-0022`、`EVT-HOST-MESSAGE-002`。
+pub(crate) fn user_text_part(session_id: &str, message_id: &str, text: &str) -> OpenCodeEvent {
+    OpenCodeEvent::new(
+        "message.part.updated",
+        serde_json::json!({"part":{
+            "id":format!("prt_{message_id}_0"),"messageID":message_id,
+            "sessionID":session_id,"type":"text","text":text
+        }}),
+    )
+}
+
+/// 功能：通知消费者移除已经提交删除的公共消息。
+/// 参数：session_id 为会话编号，message_id 为提交前 REST 投影中的消息编号。
+/// 返回：message.removed 事件。
+/// 错误：无。
+/// 状态：不修改持久化，调用方必须先完成删除事务。
+/// 并发与取消：在回退提交闸门内、清除游标前发布。
+/// 权限：仅携带不透明 ID。
+/// 关联：`CHG-2026-0022`。
+pub(crate) fn message_removed(session_id: &str, message_id: &str) -> OpenCodeEvent {
+    OpenCodeEvent::new(
+        "message.removed",
+        serde_json::json!({"sessionID":session_id,"messageID":message_id}),
+    )
+}
+
+/// 功能：将最终失败绑定到本回合 assistant，再通知消费者结束运行。
+/// 参数：session_id、created、completed 为身份与时间，failure 为已过滤的错误。
+/// 返回：依序为 assistant message.updated 与 session.error。
+/// 错误：无。
+/// 状态：调用方须先发布终态 snapshot；不修改模型消息。
+/// 并发与取消：回合结束闸门内、idle 前同步发布；取消不调用本函数。
+/// 权限：只包含已经过滤的公开错误。
+/// 关联：`CHG-2026-0022`。
+pub(crate) fn turn_failed(
+    session_id: &str,
+    created: i64,
+    completed: i64,
+    failure: &crate::protocol::OpenCodeTurnErrorV1,
+) -> [OpenCodeEvent; 2] {
+    [
+        OpenCodeEvent::new(
+            "message.updated",
+            serde_json::json!({"info":{
+                "id":failure.message_id,"sessionID":session_id,"role":"assistant",
+                "time":{"created":created,"completed":completed},"error":failure.error
+            }}),
+        ),
+        OpenCodeEvent::new(
+            "session.error",
+            serde_json::json!({"sessionID":session_id,"error":failure.error}),
+        ),
+    ]
+}
+
 /// 功能：读取 workspace todo JSONL 并生成 `todo.updated` 事件。
 /// 参数：`workspace` 为工作区根目录。
 /// 返回：格式正确的 todo 摘要；坏行被忽略。

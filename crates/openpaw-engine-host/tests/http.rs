@@ -1134,6 +1134,7 @@ async fn revert_commit_replaces_tail_atomically_and_survives_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 
+    let mut events = state.global_events.subscribe();
     let replay = prompt_with_request_id(&app, &id, "second-key", "second").await;
     assert_eq!(replay.status(), StatusCode::NO_CONTENT);
     assert_eq!(replay.headers()["openpaw-turn-id"], second_turn);
@@ -1152,7 +1153,10 @@ async fn revert_commit_replaces_tail_atomically_and_survives_restart() {
         boundary_id
     );
 
-    let mut events = state.global_events.subscribe();
+    assert!(
+        events.try_recv().is_err(),
+        "replay and conflict must not delete or republish input"
+    );
     let replacement =
         sync_prompt_with_request_id(&app, &id, "replacement-key", "replacement").await;
     assert_eq!(replacement.status(), StatusCode::OK);
@@ -1162,6 +1166,47 @@ async fn revert_commit_replaces_tail_atomically_and_survives_restart() {
         .to_string();
     assert!(replacement_turn.starts_with("3_"));
     let emitted: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+    let removed: Vec<_> = emitted
+        .iter()
+        .filter(|event| event.event_type == "message.removed")
+        .map(|event| event.properties["messageID"].clone())
+        .collect();
+    assert_eq!(
+        removed,
+        vec![
+            messages[2]["info"]["id"].clone(),
+            messages[3]["info"]["id"].clone()
+        ]
+    );
+    let cleared = emitted
+        .iter()
+        .position(|event| {
+            event.event_type == "session.updated"
+                && event.properties["info"].get("revert").is_none()
+        })
+        .unwrap();
+    assert!(
+        emitted
+            .iter()
+            .take(cleared)
+            .filter(|event| event.event_type == "message.removed")
+            .count()
+            == 2
+    );
+    let user_part = emitted
+        .iter()
+        .position(|event| {
+            event.event_type == "message.part.updated"
+                && event.properties["part"]["text"] == "replacement"
+        })
+        .unwrap();
+    let output = emitted
+        .iter()
+        .position(|event| {
+            event.event_type == "message.updated" && event.properties["info"]["role"] == "assistant"
+        })
+        .unwrap();
+    assert!(cleared < user_part && user_part < output);
     assert!(emitted.iter().any(|event| {
         event.event_type == "session.updated"
             && event.properties["sessionID"] == id
