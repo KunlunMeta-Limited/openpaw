@@ -88,6 +88,8 @@ jobs:
       # Q3 zero telemetry (Cargo.lock dependency names + source call-site symbols)
       - run: cargo run -p xtask -- telemetry
       # Q2 dependency whitelist
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      # v1 内置 cargo-deny 0.14，无法解析当前 advisory 数据库的 CVSS 4.0。
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --workspace
+          rust-version: stable
