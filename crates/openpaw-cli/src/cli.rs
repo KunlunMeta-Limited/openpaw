@@ -48,16 +48,46 @@ pub struct Cli {
     pub engine_host_port: u16,
     /// Provider used by `--engine-host`；未给定时回退 `OPENPAW_ENGINE_PROVIDER`，再回退 `mock`。
     #[cfg(feature = "engine-host")]
-    #[arg(long)]
+    #[arg(long, help = "Provider protocol: mock, echo, openai, anthropic")]
     pub provider: Option<String>,
     /// `--engine-host` 使用的 OpenPaw home，会保存 session 等运行数据。
     #[cfg(feature = "engine-host")]
-    #[arg(long)]
+    #[arg(long, help = "OpenPaw home for session storage")]
     pub home: Option<PathBuf>,
     /// `--engine-host` 使用的工作区根目录，工具访问不得越界。
     #[cfg(feature = "engine-host")]
-    #[arg(long)]
+    #[arg(long, help = "Workspace for tools")]
     pub workspace: Option<PathBuf>,
+}
+
+/// 功能：定义唯一 chat 参数。
+#[derive(Debug, clap::Args)]
+pub struct ChatArgs {
+    /// 功能：支持 mock、echo、openai、anthropic。
+    #[arg(
+        long,
+        default_value = "mock",
+        help = "Provider protocol: mock, echo, openai, anthropic"
+    )]
+    pub provider: String,
+    /// 功能：工具工作区。
+    #[arg(long, help = "Workspace for tools")]
+    pub workspace: Option<PathBuf>,
+    /// 功能：会话存储目录。
+    #[arg(long, help = "OpenPaw home for session storage")]
+    pub home: Option<PathBuf>,
+    /// 功能：第三方服务基础地址。
+    #[arg(long, help = "Base URL for an OpenAI or Anthropic compatible API")]
+    pub base_url: Option<String>,
+    /// 功能：第三方模型名称。
+    #[arg(long, help = "Model name (overrides provider environment)")]
+    pub model: Option<String>,
+    /// 功能：输出 token 正整数上限。
+    #[arg(long, help = "Positive output token limit")]
+    pub max_output_tokens: Option<String>,
+    /// 功能：工具审批模式。
+    #[arg(long, default_value = "auto", value_parser = ["auto", "manual"], help = "Tool approval mode: auto or manual")]
+    pub permissions: String,
 }
 
 /// All top-level subcommands (the M5 selection).
@@ -69,18 +99,7 @@ pub enum Command {
     /// Start the agent loop conversation with tools and session
     /// persistence (offline providers; real providers plug into the same
     /// seam).
-    Chat {
-        /// Offline provider: `mock` (counter replies) or `echo`.
-        #[arg(long, default_value = "mock")]
-        provider: String,
-        /// Workspace the tool host operates in (default: current directory).
-        #[arg(long)]
-        workspace: Option<PathBuf>,
-        /// OpenPaw home for session storage (default: OPENPAW_HOME or
-        /// ~/.openpaw).
-        #[arg(long)]
-        home: Option<PathBuf>,
-    },
+    Chat(ChatArgs),
     /// List, show, and search persisted chat sessions.
     Session {
         #[command(subcommand)]

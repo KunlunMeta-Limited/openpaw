@@ -117,3 +117,10 @@ URL 并移除末尾 `/`。OpenAI base URL 应包含版本路径（默认 `/v1`�
 `run_turn` 和 `run_turn_with_cancel_token` 保持兼容。
 CLI 仅在显式 feature 下构造 HostConfig。关闭 feature 后默认命令、sidecar 行为和
 依赖树不变。回滚 B 线只需停用 feature，既有 JSONL 仍由 openpaw-store 读取。
+
+## CHG-2026-0023 共享能力边界
+
+CLI 与 Host 都调用 openpaw-llm::config 的配置/工厂和生成设置、openpaw-store::transcript/catalog 的中立 codec/历史重放/目录快照、openpaw-engine::approval 的审批 gate/manual 策略。
+Host 保留 REST/OpenCode 类型及字段转换，CLI 保留终端输入/提示。runtime 继续持有 session、锁、回合调度、恢复和 writer，只对选定共享能力组装和调用。
+共享模块不包含 HTTP、Office 或终端依赖；Core trait、AgentLoop、Tools 策略及默认 feature 的依赖边界保持不变。
+Anthropic endpoint 对服务根路径或已有 /v1 前缀规范化；OpenAI 保留自定义父路径。

@@ -13,14 +13,14 @@ use crate::protocol::{
     TurnOutcome, TurnSchedulerConfig, TurnState, UpdateSessionRequest,
 };
 use crate::session_mutation::{
-    clone_messages_for_fork, failed_message_prefix_len, is_turn_assistant_message_id,
-    normalize_revert_boundary, visible_prefix_len, SessionForkOriginV1, SessionMetadataV1,
-    SessionMutationEvent, SessionMutationProjection, SessionRevertCommittedV1,
-    SessionRevertStagedV1,
+    clone_messages_for_fork, failed_message_prefix_len, normalize_revert_boundary,
+    visible_prefix_len, SessionForkOriginV1, SessionMetadataV1, SessionMutationEvent,
+    SessionMutationProjection, SessionRevertCommittedV1, SessionRevertStagedV1,
 };
 use futures::FutureExt;
 use openpaw_core::{LlmProvider, Session, SessionEvent};
 use openpaw_engine::AgentLoop;
+use openpaw_store::transcript::MAX_FINISH_TRANSACTION_MESSAGES;
 use openpaw_store::{SessionError, SessionReader, SessionWriter};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1051,9 +1051,10 @@ impl AppState {
             repair_torn_session_tail(&path)?;
             read = SessionReader::read(&path).map_err(classify_session_error)?;
         }
-        let provider = build_provider(&read.meta.provider).unwrap_or_else(|error| {
-            Arc::new(openpaw_core::NullProvider::new(error)) as Arc<dyn LlmProvider>
-        });
+        let provider = build_provider_for_model(&read.meta.provider, Some(&read.meta.model))
+            .unwrap_or_else(|error| {
+                Arc::new(openpaw_core::NullProvider::new(error)) as Arc<dyn LlmProvider>
+            });
         let workspace = absolute_workspace(session_workspace(&read.events, &self.config.workspace))
             .map_err(|_| SessionLoadError::Unavailable)?;
         let tool_host = openpaw_tools::arc_registry(&workspace);
@@ -1122,8 +1123,8 @@ impl AppState {
         title: Option<&str>,
     ) -> Result<Arc<SessionHandle>, String> {
         let provider_tag = provider_name.unwrap_or(&self.config.provider);
-        let provider = build_provider(provider_tag)?;
-        let model_name = model.unwrap_or(provider.default_model()).to_string();
+        let provider = build_provider_for_model(provider_tag, model)?;
+        let model_name = model.unwrap_or(provider.default_model()).trim().to_string();
         if model_name.trim().is_empty() {
             return Err("model 不能为空".into());
         }
@@ -1434,9 +1435,10 @@ impl AppState {
                 ordinal,
             };
             let (provider_name, model_name) = source.provider_model();
-            let provider = build_provider(&provider_name).unwrap_or_else(|error| {
-                Arc::new(openpaw_core::NullProvider::new(error)) as Arc<dyn LlmProvider>
-            });
+            let provider = build_provider_for_model(&provider_name, Some(&model_name))
+                .unwrap_or_else(|error| {
+                    Arc::new(openpaw_core::NullProvider::new(error)) as Arc<dyn LlmProvider>
+                });
             let approvals = HostApprovalManager::new(
                 new_id.clone(),
                 self.global_events.clone(),
@@ -1725,8 +1727,15 @@ impl AppState {
             .unwrap_or_else(|error| error.into_inner()) = messages;
     }
     /// 功能：扫描 home 下 JSONL 并生成会话摘要列表。
+    /// 参数：见签名；入口路径/名称或显式配置。
+    /// 返回：见签名的退出码、Provider 或摘要。
+    /// 错误：配置和读取失败脱敏处理；doctor WARN 不失败。
+    /// 状态：诊断不连接模型；摘要不写 JSONL。
+    /// 并发与取消：使用已有运行时和锁，未新增调度或恢复决策。
+    /// 权限：密钥不进入输出或摘要。
+    /// 关联：CHG-2026-0023 共享配置/目录。
     pub async fn summaries(&self) -> Vec<SessionSummary> {
-        let dir = self.config.home.join("sessions");
+        let home = self.config.home.clone();
         let default_workspace = self.config.workspace.clone();
         let active_ids: HashSet<String> = self
             .sessions
@@ -1738,22 +1747,16 @@ impl AppState {
             .collect();
         tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
-            let Ok(entries) = std::fs::read_dir(dir) else {
+            let Ok(ids) = openpaw_store::catalog::discover(&home) else {
                 return out;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let Ok(read) = SessionReader::read(&path) else {
+            for id in ids {
+                let Ok(read) = openpaw_store::catalog::read(&home, &id) else {
                     continue;
                 };
-                let Ok(projection) = restored_session_projection(&read.meta.id, &read.events)
-                else {
-                    continue;
-                };
-                let title = session_title(&projection.mutation, &projection.messages);
+                let path = read.path.clone();
+                let projection = read.transcript;
+                let title = projection.title();
                 let directory =
                     absolute_workspace(session_workspace(&read.events, &default_workspace))
                         .unwrap_or_else(|_| default_workspace.clone())
@@ -1822,18 +1825,6 @@ fn valid_session_id(id: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
-/// 功能：对所有工具调用要求人工确认的 Host guardrail。
-pub struct ManualGuardrail;
-#[async_trait::async_trait]
-impl openpaw_core::ToolGuardrail for ManualGuardrail {
-    async fn check(
-        &self,
-        name: &str,
-        _args: &serde_json::Value,
-    ) -> openpaw_core::GuardrailDecision {
-        openpaw_core::GuardrailDecision::Confirm(format!("manual approval required for `{name}`"))
-    }
-}
 fn configured_agent(
     provider: Arc<dyn LlmProvider>,
     model: String,
@@ -1843,29 +1834,46 @@ fn configured_agent(
     let mut agent = AgentLoop::new(provider)
         .with_model(model)
         .with_tool_host(tool_host);
-    if let Ok(value) = std::env::var("OPENPAW_MAX_OUTPUT_TOKENS") {
-        let parsed = value.trim().parse::<std::num::NonZeroU32>();
-        let max_tokens = parsed
-            .map_err(|_| "OPENPAW_MAX_OUTPUT_TOKENS 必须是正整数".to_string())?
-            .get();
-        agent = agent.with_max_tokens(max_tokens)
-    }
-    if std::env::var("OPENPAW_ENGINE_PERMISSIONS").as_deref() == Ok("manual") {
-        agent = agent.with_guardrail(Arc::new(ManualGuardrail));
-    }
-    Ok(agent.with_approval_manager(approvals))
+    agent = agent
+        .with_max_tokens(openpaw_llm::config::ConfigSnapshot::from_env().max_output_tokens(None)?);
+    Ok(openpaw_engine::approval::configure(
+        agent,
+        std::env::var("OPENPAW_ENGINE_PERMISSIONS").as_deref() == Ok("manual"),
+        approvals,
+    ))
 }
-/// Anthropic provider 的缺省模型，未设置 `OPENPAW_ANTHROPIC_MODEL` 时使用。
-/// 单一来源：`build_provider`、`default_model` 与 `/provider` 列表都引用它，避免多处漂移。
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-sonnet-4";
-/// OpenAI 兼容 provider 的缺省模型，未设置 `OPENPAW_OPENAI_MODEL` 时使用。
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4o";
-
-/// 功能：按 provider 标识创建 Host 使用的 LLM provider。
-/// 并发与取消：provider 可被多个 session 独占使用，回合取消由 AgentLoop 负责。
+/// 功能：按协议名称构造 Host Provider。
+/// 参数：协议名称。
+/// 返回：共享 LlmProvider。
+/// 错误：脱敏配置错误。
+/// 状态：保留 Host mock 测试选择。
+/// 并发与取消：请求由 AgentLoop 管理。
+/// 权限：构造不连接网络。
+/// 关联：共享 LLM 工厂。
+#[cfg(test)]
 pub fn build_provider(name: &str) -> Result<Arc<dyn LlmProvider>, String> {
+    build_provider_for_model(name, None)
+}
+/// 功能：用显式模型覆盖环境后调用共享 Provider 工厂，保留 Host mock 模式。
+/// 参数：见签名；入口路径/名称或显式配置。
+/// 返回：见签名的退出码、Provider 或摘要。
+/// 错误：配置和读取失败脱敏处理；doctor WARN 不失败。
+/// 状态：诊断不连接模型；摘要不写 JSONL。
+/// 并发与取消：使用已有运行时和锁，未新增调度或恢复决策。
+/// 权限：密钥不进入输出或摘要。
+/// 关联：CHG-2026-0023 共享配置/目录。
+pub(crate) fn build_provider_for_model(
+    name: &str,
+    model: Option<&str>,
+) -> Result<Arc<dyn LlmProvider>, String> {
+    let config = openpaw_llm::config::ConfigSnapshot::from_env().resolve(
+        name,
+        openpaw_llm::config::Overrides {
+            model: model.map(str::to_string),
+            ..Default::default()
+        },
+    )?;
     match name {
-        "echo" => Ok(Arc::new(openpaw_llm::EchoProvider::new())),
         "mock" => {
             let mode = std::env::var("OPENPAW_ENGINE_MOCK").unwrap_or_default();
             let p = match mode.as_str() {
@@ -1884,63 +1892,19 @@ pub fn build_provider(name: &str) -> Result<Arc<dyn LlmProvider>, String> {
             };
             Ok(Arc::new(p))
         }
-        "anthropic" => {
-            let key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| "未设置 ANTHROPIC_API_KEY".to_string())?;
-            let model = std::env::var("OPENPAW_ANTHROPIC_MODEL")
-                .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.into());
-            let mut provider = openpaw_llm::AnthropicProvider::new(key, model);
-            if let Some(base_url) = provider_base_url("OPENPAW_ANTHROPIC_BASE_URL")? {
-                provider = provider.with_base_url(base_url);
-            }
-            Ok(Arc::new(provider))
-        }
-        "openai" => {
-            let key =
-                std::env::var("OPENAI_API_KEY").map_err(|_| "未设置 OPENAI_API_KEY".to_string())?;
-            let model = std::env::var("OPENPAW_OPENAI_MODEL")
-                .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into());
-            let mut provider = openpaw_llm::OpenAiProvider::new(key, model);
-            if let Some(base_url) = provider_base_url("OPENPAW_OPENAI_BASE_URL")? {
-                provider = provider.with_base_url(base_url);
-            }
-            Ok(Arc::new(provider))
-        }
-        other => Err(format!("不支持的 provider：`{other}`")),
+        _ => Ok(config.build()),
     }
 }
-/// 功能：解析指定 provider 的默认模型，不触发凭据读取或网络连接。
-/// 用途：HTTP 幂等重放必须在 Provider 构造前确定请求指纹。
+/// 功能：解析用于请求指纹的有效模型。
+/// 参数：协议名称。
+/// 返回：有效模型。
+/// 错误：未知协议或无效模型。
+/// 状态：不修改环境。
+/// 并发与取消：同步只读。
+/// 权限：不读取密钥或请求网络。
+/// 关联：共享配置和 HTTP 幂等接收。
 pub fn default_model(name: &str) -> Result<String, String> {
-    match name {
-        "echo" => Ok("echo-1".into()),
-        "mock" => Ok("mock-1".into()),
-        "anthropic" => Ok(std::env::var("OPENPAW_ANTHROPIC_MODEL")
-            .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.into())),
-        "openai" => {
-            Ok(std::env::var("OPENPAW_OPENAI_MODEL")
-                .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into()))
-        }
-        other => Err(format!("不支持的 provider：`{other}`")),
-    }
-}
-fn provider_base_url(variable: &str) -> Result<Option<String>, String> {
-    let Ok(value) = std::env::var(variable) else {
-        return Ok(None);
-    };
-    let value = value.trim().trim_end_matches('/');
-    let parsed =
-        reqwest::Url::parse(value).map_err(|error| format!("{variable} 不是有效 URL：{error}"))?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(format!(
-            "{variable} 必须是无 query/fragment 的 http(s) 基础 URL"
-        ));
-    }
-    Ok(Some(value.to_string()))
+    openpaw_llm::config::ConfigSnapshot::from_env().model(name, None)
 }
 fn wire_session_snapshot(handle: &SessionHandle) -> SessionWire {
     let _snapshot = handle
@@ -1975,19 +1939,7 @@ fn session_title(
     mutation: &SessionMutationProjection,
     messages: &[openpaw_core::Message],
 ) -> String {
-    mutation
-        .title
-        .clone()
-        .or_else(|| {
-            messages
-                .iter()
-                .find(|message| message.role == openpaw_core::Role::User)
-                .map(openpaw_core::Message::text)
-        })
-        .unwrap_or_else(|| "New session".into())
-        .chars()
-        .take(80)
-        .collect()
+    openpaw_store::transcript::session_title(mutation.title.as_deref(), messages)
 }
 fn staged_visible_len(
     session_id: &str,
@@ -2017,203 +1969,35 @@ struct RestoredSessionProjection {
     mutation: SessionMutationProjection,
     turn_sequence_high_water: u64,
 }
-struct PendingFinishTransaction {
-    turn_id: String,
-    messages: Vec<openpaw_core::Message>,
-}
-const MAX_FINISH_TRANSACTION_MESSAGES: usize = 4096;
 fn restored_session_projection(
     session_id: &str,
     events: &[SessionEvent],
 ) -> Result<RestoredSessionProjection, SessionLoadError> {
-    let mut projection = RestoredSessionProjection {
-        messages: Vec::new(),
-        turn_outcomes: Vec::new(),
-        turn_errors: HashMap::new(),
-        request_admissions: HashMap::new(),
-        mutation: SessionMutationProjection::default(),
-        turn_sequence_high_water: 0,
-    };
-    let mut message_ids = HashSet::new();
-    let mut pending_finish: Option<PendingFinishTransaction> = None;
-    for event in events {
-        if let SessionEvent::Metadata {
-            title: Some(title), ..
-        } = event
-        {
-            projection.mutation.title = Some(title.clone());
-        }
-        if let Some(mutation) = SessionMutationEvent::from_session_event(event) {
-            pending_finish = None;
-            match mutation {
-                SessionMutationEvent::RevertCommitted(commit) => {
-                    apply_revert_commit(
-                        session_id,
-                        &mut projection,
-                        &mut message_ids,
-                        commit.clone(),
-                    )?;
-                    projection
-                        .mutation
-                        .apply(SessionMutationEvent::RevertCommitted(commit));
-                }
-                mutation => projection.mutation.apply(mutation),
-            }
-            continue;
-        }
-        if let Some(prepare) = TurnFinishPrepareV1::from_session_event(event) {
-            pending_finish = Some(PendingFinishTransaction {
-                turn_id: prepare.turn_id,
-                messages: Vec::new(),
-            });
-            continue;
-        }
-        if let Some(pending) = pending_finish.as_mut() {
-            if let SessionEvent::Message(message) = event {
-                if pending.messages.len() >= MAX_FINISH_TRANSACTION_MESSAGES {
-                    return Err(SessionLoadError::Corrupt);
-                }
-                pending.messages.push(message.clone());
-                continue;
-            }
-            if let Some(commit) = TurnFinishCommitV1::from_session_event(event) {
-                let pending = pending_finish.take().ok_or(SessionLoadError::Corrupt)?;
-                apply_finish_commit(
-                    session_id,
-                    &mut projection,
-                    &mut message_ids,
-                    pending,
-                    commit,
-                )?;
-                continue;
-            }
-            // prepare 后未出现合法 commit 即视为崩溃残留；忽略整批生成消息，
-            // 当前事件仍按旧格式或下一事务继续恢复。
-            pending_finish = None;
-        }
-        if let Some(accept) = TurnAcceptV1::from_session_event(event) {
-            apply_turn_accept(&mut projection, &mut message_ids, accept)?;
-        } else if let Some(outcome) = TurnOutcome::from_session_event(event) {
-            projection.turn_sequence_high_water = projection
-                .turn_sequence_high_water
-                .max(turn_sequence_number(&outcome.turn_id));
-            apply_restored_outcome(&mut projection.turn_outcomes, outcome)?;
-        } else if let Some(admission) = RequestAdmission::from_session_event(event) {
-            apply_restored_admission(&mut projection.request_admissions, admission)?;
-        } else if TurnFinishCommitV1::from_session_event(event).is_some() {
-            return Err(SessionLoadError::Corrupt);
-        } else if let SessionEvent::Message(message) = event {
-            push_restored_message(&mut projection.messages, &mut message_ids, message.clone());
-        } else if is_transaction_event(event) {
-            return Err(SessionLoadError::Corrupt);
-        }
+    let p = openpaw_store::transcript::replay(session_id, events)
+        .map_err(|_| SessionLoadError::Corrupt)?;
+    fn convert<T: serde::Serialize, U: serde::de::DeserializeOwned>(
+        value: T,
+    ) -> Result<U, SessionLoadError> {
+        serde_json::to_value(value)
+            .and_then(serde_json::from_value)
+            .map_err(|_| SessionLoadError::Corrupt)
     }
-    Ok(projection)
-}
-fn apply_turn_accept(
-    projection: &mut RestoredSessionProjection,
-    message_ids: &mut HashSet<String>,
-    accept: TurnAcceptV1,
-) -> Result<(), SessionLoadError> {
-    if accept.message.role != openpaw_core::Role::User
-        || accept.message.uuid.as_deref() != Some(accept.outcome.user_message_id.as_str())
-        || accept.outcome.state.is_terminal()
-    {
-        return Err(SessionLoadError::Corrupt);
-    }
-    if let Some(admission) = accept.request_admission.as_ref() {
-        if admission.turn_id != accept.outcome.turn_id
-            || admission.user_message_id != accept.outcome.user_message_id
-        {
-            return Err(SessionLoadError::Corrupt);
-        }
-    }
-    projection.turn_sequence_high_water = projection
-        .turn_sequence_high_water
-        .max(turn_sequence_number(&accept.outcome.turn_id));
-    push_restored_message(&mut projection.messages, message_ids, accept.message);
-    apply_restored_outcome(&mut projection.turn_outcomes, accept.outcome)?;
-    if let Some(admission) = accept.request_admission {
-        apply_restored_admission(&mut projection.request_admissions, admission)?;
-    }
-    Ok(())
-}
-fn apply_revert_commit(
-    session_id: &str,
-    projection: &mut RestoredSessionProjection,
-    message_ids: &mut HashSet<String>,
-    commit: SessionRevertCommittedV1,
-) -> Result<(), SessionLoadError> {
-    if projection.mutation.revert_message_id.as_deref() != Some(commit.message_id.as_str()) {
-        return Err(SessionLoadError::Corrupt);
-    }
-    let prefix_len = visible_prefix_len(session_id, &projection.messages, &commit.message_id)
-        .ok_or(SessionLoadError::Corrupt)?;
-    projection.messages.truncate(prefix_len);
-    *message_ids = projection
-        .messages
-        .iter()
-        .filter_map(|message| message.uuid.clone())
-        .collect();
-    retain_turn_state_for_messages(
-        &projection.messages,
-        &mut projection.turn_outcomes,
-        &mut projection.request_admissions,
-        &mut projection.turn_errors,
-    );
-    apply_turn_accept(projection, message_ids, commit.accept)
-}
-fn apply_finish_commit(
-    session_id: &str,
-    projection: &mut RestoredSessionProjection,
-    message_ids: &mut HashSet<String>,
-    pending: PendingFinishTransaction,
-    commit: TurnFinishCommitV1,
-) -> Result<(), SessionLoadError> {
-    if pending.turn_id != commit.turn_id
-        || commit.terminal.turn_id != commit.turn_id
-        || !commit.terminal.state.is_terminal()
-        || pending.messages.len() != commit.generated_message_ids.len()
-    {
-        return Err(SessionLoadError::Corrupt);
-    }
-    let actual_ids: Option<Vec<_>> = pending
-        .messages
-        .iter()
-        .map(|message| message.uuid.clone())
-        .collect();
-    let Some(actual_ids) = actual_ids else {
-        return Err(SessionLoadError::Corrupt);
-    };
-    if actual_ids != commit.generated_message_ids
-        || actual_ids.iter().collect::<HashSet<_>>().len() != actual_ids.len()
-    {
-        return Err(SessionLoadError::Corrupt);
-    }
-    if let Some(failure) = commit.open_code_error {
-        let Some(classification) = commit.terminal.error.as_ref() else {
-            return Err(SessionLoadError::Corrupt);
-        };
-        if commit.terminal.state != TurnState::Failed
-            || !is_turn_assistant_message_id(session_id, &commit.turn_id, &failure.message_id)
-            || failure.error.data.code != classification.code
-            || failure.error.data.is_retryable != classification.retryable
-            || failure.error.data.message.chars().count() > 512
-            || !matches!(failure.error.name.as_str(), "APIError" | "UnknownError")
-        {
-            return Err(SessionLoadError::Corrupt);
-        }
-        projection
-            .turn_errors
-            .insert(commit.turn_id.clone(), failure);
-    }
-    for message in pending.messages {
-        push_restored_message(&mut projection.messages, message_ids, message);
-    }
-    projection.turn_sequence_high_water = projection
-        .turn_sequence_high_water
-        .max(turn_sequence_number(&commit.terminal.turn_id));
-    apply_restored_outcome(&mut projection.turn_outcomes, commit.terminal)
+    Ok(RestoredSessionProjection {
+        messages: p.messages,
+        turn_outcomes: convert(p.turn_outcomes)?,
+        turn_errors: convert(p.turn_errors)?,
+        request_admissions: convert(p.request_admissions)?,
+        mutation: SessionMutationProjection {
+            title: p.mutation.title,
+            archived: p.mutation.archived,
+            revert_message_id: p.mutation.revert_message_id,
+            fork_origin: p.mutation.fork_origin.map(|v| SessionForkOriginV1 {
+                source_session_id: v.source_session_id,
+                ordinal: v.ordinal,
+            }),
+        },
+        turn_sequence_high_water: p.turn_sequence_high_water,
+    })
 }
 fn retained_user_message_ids(messages: &[openpaw_core::Message]) -> HashSet<String> {
     messages
@@ -2239,63 +2023,6 @@ fn retain_turn_state_for_messages(
         retained_user_ids.contains(&admission.user_message_id)
             && retained_turn_ids.contains(&admission.turn_id)
     });
-}
-fn push_restored_message(
-    messages: &mut Vec<openpaw_core::Message>,
-    message_ids: &mut HashSet<String>,
-    message: openpaw_core::Message,
-) {
-    if let Some(id) = message.uuid.as_ref() {
-        if !message_ids.insert(id.clone()) {
-            return;
-        }
-    }
-    messages.push(message);
-}
-fn apply_restored_outcome(
-    outcomes: &mut Vec<TurnOutcome>,
-    outcome: TurnOutcome,
-) -> Result<(), SessionLoadError> {
-    if let Some(existing) = outcomes
-        .iter_mut()
-        .find(|existing| existing.turn_id == outcome.turn_id)
-    {
-        if existing.user_message_id != outcome.user_message_id {
-            return Err(SessionLoadError::Corrupt);
-        }
-        if existing.state.is_terminal() {
-            if outcome.state.is_terminal() && existing != &outcome {
-                return Err(SessionLoadError::Corrupt);
-            }
-            return Ok(());
-        }
-        *existing = outcome;
-    } else {
-        outcomes.push(outcome);
-    }
-    Ok(())
-}
-fn apply_restored_admission(
-    admissions: &mut HashMap<String, RequestAdmission>,
-    admission: RequestAdmission,
-) -> Result<(), SessionLoadError> {
-    if let Some(existing) = admissions.get(&admission.request_id) {
-        if existing != &admission {
-            return Err(SessionLoadError::Corrupt);
-        }
-        return Ok(());
-    }
-    admissions.insert(admission.request_id.clone(), admission);
-    Ok(())
-}
-fn is_transaction_event(event: &SessionEvent) -> bool {
-    let SessionEvent::Unknown(value) = event else {
-        return false;
-    };
-    matches!(
-        value.get("type").and_then(serde_json::Value::as_str),
-        Some("turn_accept_v1" | "turn_finish_prepare_v1" | "turn_finish_commit_v1")
-    )
 }
 fn classify_session_error(error: SessionError) -> SessionLoadError {
     match error {
@@ -2363,13 +2090,6 @@ fn upsert_turn_outcome(outcomes: &mut Vec<TurnOutcome>, outcome: TurnOutcome) {
     } else {
         outcomes.push(outcome);
     }
-}
-fn turn_sequence_number(turn_id: &str) -> u64 {
-    turn_id
-        .split('_')
-        .next()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0)
 }
 fn turn_error(code: &str, message: &str, retryable: bool) -> TurnError {
     TurnError {

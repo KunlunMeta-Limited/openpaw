@@ -42,35 +42,41 @@ AgentLoop，只代理已登记的会话 API；OpenPaw 是 session、工具调用
 工具输入、模型思考正文和 API key 不进入 `/actions`。人物只显示“正在搜索、读取文件、撰写文件”等
 脱敏活动摘要。Office 动作失败不会改变 AgentLoop 的模型结果。
 
-## 3. 配置加载与优先级
+## 3. 程序配置来源与优先级
 
-CLI 在解析 provider 前加载 dotenv。查找顺序如下：
+OpenPaw 程序只读取当前进程环境，不自动寻找 `.env`、不读取 `OPENPAW_ENV_FILE`，也不通过密钥存在性自动切换 provider。
+若启动脚本加载 `.env`，那属于脚本行为；直接运行 `openpaw` 时须先将变量导入进程。
 
-1. `OPENPAW_ENV_FILE` 指定的文件；指定但不存在会启动失败。
-2. 从当前工作目录向上寻找可识别的 OpenPaw 工程根，只读取该根的 `.env`。
-3. 当前目录不在 OpenPaw 工程内时，从可执行文件目录向上寻找可识别的 OpenPaw 工程根。
+chat 默认 `mock`；Host 使用显式 `--provider`，其次 `OPENPAW_ENGINE_PROVIDER`，最后 `mock`。
+网络字段优先级是显式 chat 参数 > 对应 `OPENPAW_*` 进程环境 > 协议默认值。
+Host session/per-turn 的 provider/model 覆盖保持原优先级，幂等指纹使用同一有效模型。
 
-工程根必须同时存在工作区 `Cargo.toml` 和 `crates/openpaw-cli/Cargo.toml`。程序不会读取任意
-工作目录或任意祖先目录的 `.env`，防止在不可信目录启动时导入无关服务地址和凭据。
+```powershell
+$env:OPENAI_API_KEY = '<your-key>'
+openpaw chat --provider openai --base-url https://example.invalid/v1 --model third-party-model --max-output-tokens 4096
+```
 
-单个字段的优先级固定为：命令行 > 已存在进程环境变量 > `.env` > 自动推断 > 默认值。
-dotenv 不覆盖进程中已有的同名变量。
+OpenAI 地址是 `/chat/completions` 的父路径，自定义服务前缀保留；Anthropic 可给根地址或已带 `/v1` 的地址，尾斜杠会规范化，只生成一层 `/v1/messages`。
+地址必须为 HTTP(S)，有 host 且不含内嵌凭据、query 或 fragment。Key/model 必须非空，token 上限须为正 u32。
+配置错误在请求前失败，chat 退出 2；运行或持久化错误退出 1。错误只标明字段，密钥不进入诊断。
+离线协议忽略网络字段，但仍校验通用生成上限。
 
-provider 决策：
+`model list` 展示默认和有效配置模型；`config show`、`doctor` 使用相同解析规则，显示本地配置状态并隐藏 Key。
+目录诊断不请求上游；doctor 的 WARN 仍退出 0。
 
-| 条件 | 结果 |
-| --- | --- |
-| 显式 `--provider`/`-Provider` | 使用显式值；真实 provider 缺密钥时中文报错 |
-| `OPENPAW_PROVIDER` 有效且有对应密钥 | 使用配置值 |
-| 未配置 provider，但存在 `OPENAI_API_KEY` | 自动选择 `openai` |
-| 未配置 provider，但存在 `ANTHROPIC_API_KEY` | 自动选择 `anthropic` |
-| 不存在可用模型密钥 | 中文提示并选择 `echo`，不会伪装为模型回答 |
+chat 的 `--permissions auto|manual` 默认 `auto`。manual 下终端显示工具名，输入 `once` 批准本次，`session` 授权本 session 同工具的后续回合，`reject` 拒绝。
+空白、无效输入和 EOF 都拒绝；非 TTY 直接拒绝需审批工具且不读取下一条聊天作为审批。授权不跨 session 或进程重启，不绕过工具自己的工作区或 bash 限制。
+Host 的 manual 仍由 `OPENPAW_ENGINE_PERMISSIONS=manual` 开启，并通过既有 permission REST/SSE 交互。
 
-## 4. `.env` 字段字典
+CLI 与 Host 使用同一个 home 时，`session list/show/search --home <home>` 可直接发现 Host JSONL，无需先运行 chat 或启动 Host。
+JSONL 是事实源；show/list 只读取快照，search 和 chat 按单会话原子刷新 SQLite 次级索引，遵守 finish commit 与回退可见性。
+CLI 查询不追加 interrupted、不截断 JSONL，不删除整个 index.db；索引修复必须保留审计和其他数据。
+
+## 4. 进程环境字段字典
 
 | 字段 | 必填 | 默认值 | 消费者 | 说明 |
 | --- | --- | --- | --- | --- |
-| `OPENPAW_PROVIDER` | 建议 | 自动推断 | CLI、Host、Gateway | `openai/anthropic/echo/mock` |
+| `OPENPAW_ENGINE_PROVIDER` | 否 | `mock` | Host 启动入口 | 显式 --provider 优先；chat 只使用自己的 --provider |
 | `OPENAI_API_KEY` | OpenAI 必填 | 无 | OpenPaw、Gateway OCR | 只进入进程内存，不得进入日志/报告 |
 | `OPENPAW_OPENAI_BASE_URL` | 兼容服务必填 | OpenAI 官方地址 | OpenPaw、OCR | 应包含服务版本路径，例如 `/v1`，不得带 query/fragment |
 | `OPENPAW_OPENAI_MODEL` | 建议 | `gpt-4o` | OpenPaw、Gateway、页面诊断 | 必须是兼容服务实际支持的模型编号 |
@@ -80,7 +86,8 @@ provider 决策：
 | `OPENPAW_ENGINE_PERMISSIONS` | 否 | 空 | OpenPaw | `manual` 开启人工工具审批 |
 | `OPENPAW_SOURCE_ROOT` | 否 | Kunlun 相邻工程 | 启动脚本 | OpenPaw 源码绝对路径 |
 | `AI_OFFICE_SOURCE_ROOT` | 否 | Kunlun 相邻工程 | 启动脚本 | AI Office 源码绝对路径 |
-| `OPENPAW_ENV_FILE` | 否 | `<OpenPaw根>/.env` | CLI、启动脚本 | 显式配置文件路径；应通过参数或进程环境传入，不能靠写入自身来定位 |
+| `OPENPAW_ENV_FILE` | 否 | 由脚本确定 | 启动脚本 | OpenPaw 程序自身不消费 |
+| `OPENPAW_MAX_OUTPUT_TOKENS` | 否 | `4096` | CLI chat、Host | 正 u32，共用生成配置 |
 
 以下变量由启动脚本自动生成，一般不应写入 `.env`：`OPENPAW_HOME`、
 `OPENPAW_OFFICE_WORKSPACE`、`OPENPAW_ENGINE_HOST_URL`、`OPENPAW_OFFICE_ACTIONS_URL`、
@@ -102,10 +109,10 @@ provider 决策：
 - `.env` 已由 `.gitignore` 排除；`.env.example` 只能保留空密钥。
 - `openpaw config show` 只显示“已配置（值已隐藏）”，不会输出密钥。
 - 启动状态日志允许记录 provider、model、配置文件路径和密钥存在性，不记录密钥值。
-- 显式真实 provider 缺密钥时退出码为 2；默认启动缺密钥时允许 `echo`，且必须显示中文提示。
+- chat 显式网络 provider 缺密钥时退出 2；默认 mock 不访问网络；Host 接收缺配置的模型请求返回 400。
 - 基础地址解析失败时 Host 返回中文配置错误；不会悄悄把请求发往未知目标。
 - `openpaw chat` 任一 JSONL 追加失败时立即返回非零，不再继续运行或显示“会话已保存”。
-- dotenv 只允许在 CLI 创建线程前加载；运行期间不支持热切换配置文件。
+- 程序不自动加载 dotenv；入口配置不支持文件热切换。
 - Gateway 和 Host 继续绑定回环地址，`.env` 不能改变该安全边界。
 
 ## 7. 兼容性和迁移

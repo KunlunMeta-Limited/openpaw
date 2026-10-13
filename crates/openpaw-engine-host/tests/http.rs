@@ -134,7 +134,15 @@ async fn health_and_session_wire_contract() {
         serde_json::json!([])
     );
     let providers = get_json(&app, "/provider").await;
-    assert_eq!(providers["connected"].as_array().unwrap().len(), 4);
+    assert!(providers["connected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|id| providers["all"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == *id)));
     let response = request(&app, "DELETE", format!("/session/{id}"), Body::empty()).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = request(&app, "GET", format!("/session/{id}"), Body::empty()).await;
@@ -1038,6 +1046,234 @@ async fn revert_session_normalizes_later_assistant_response_to_turn_user() {
     assert_eq!(response.status(), StatusCode::OK);
     let restored = get_json(&restarted, format!("/session/{id}/message")).await;
     assert_eq!(restored, original);
+}
+
+#[tokio::test]
+async fn revert_legacy_assistant_skips_tool_results_and_replaces_whole_turn() {
+    for has_uuid in [false, true] {
+        assert_untracked_assistant_revert(has_uuid, false).await;
+    }
+}
+
+#[tokio::test]
+async fn revert_fork_assistant_skips_tool_results_and_preserves_source() {
+    for has_uuid in [false, true] {
+        assert_untracked_assistant_revert(has_uuid, true).await;
+    }
+}
+
+async fn assert_untracked_assistant_revert(has_uuid: bool, fork: bool) {
+    let home = tempdir().expect("home");
+    let config = HostConfig {
+        home: home.path().into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let source_id = create_session_with(&app, serde_json::json!({"provider":"echo"})).await;
+    drop(app);
+    drop(state);
+    let messages = [
+        Message::user_text("kept request"),
+        Message::assistant_text("kept answer"),
+        Message::user_text("removed request"),
+        Message {
+            role: openpaw_core::Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-removed".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path":"README.md"}),
+            }],
+            ..Default::default()
+        },
+        Message {
+            role: openpaw_core::Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-removed".into(),
+                content: "tool output".into(),
+                is_error: false,
+                name: Some("read_file".into()),
+                protected: false,
+            }],
+            ..Default::default()
+        },
+        Message::assistant_text("removed answer"),
+        Message::user_text("later request"),
+        Message::assistant_text("later answer"),
+    ];
+    let events: Vec<_> = messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            SessionEvent::Message(if has_uuid {
+                message.with_uuid(format!("legacy-message-{index}"))
+            } else {
+                message
+            })
+        })
+        .collect();
+    append_session_events(home.path(), &source_id, &events);
+    let app = build_router(AppState::new(config.clone()));
+    let source = get_json(&app, format!("/session/{source_id}/message")).await;
+    let id = if fork {
+        let response = request(&app, "POST", format!("/session/{source_id}/fork"), "{}").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    } else {
+        source_id.clone()
+    };
+    let original = get_json(&app, format!("/session/{id}/message")).await;
+    assert_eq!(original.as_array().unwrap().len(), 7);
+    assert_eq!(original[3]["parts"][0]["state"]["status"], "completed");
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/turns")).await,
+        serde_json::json!([])
+    );
+    let user_id = original[2]["info"]["id"].as_str().unwrap();
+    let assistant_id = original[4]["info"]["id"].as_str().unwrap();
+    for requested in [original[3]["info"]["id"].as_str().unwrap(), assistant_id] {
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{id}/revert"),
+            serde_json::json!({"messageID":requested}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["revert"]["messageID"],
+            user_id
+        );
+        assert_eq!(
+            get_json(&app, format!("/session/{id}/message")).await,
+            original
+        );
+        for hidden in [assistant_id, "missing"] {
+            let response = request(
+                &app,
+                "POST",
+                format!("/session/{id}/revert"),
+                serde_json::json!({"messageID":hidden}).to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = request(
+            &app,
+            "POST",
+            format!("/session/{id}/unrevert"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            get_json(&app, format!("/session/{id}/message")).await,
+            original
+        );
+    }
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":assistant_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let prefix_fork = request(&app, "POST", format!("/session/{id}/fork"), "{}").await;
+    assert_eq!(prefix_fork.status(), StatusCode::OK);
+    let prefix_id = response_json(prefix_fork).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let prefix = get_json(&app, format!("/session/{prefix_id}/message")).await;
+    assert_eq!(prefix.as_array().unwrap().len(), 2);
+    assert_eq!(prefix[0]["parts"][0]["text"], "kept request");
+    assert_eq!(prefix[1]["parts"][0]["text"], "kept answer");
+    drop(app);
+
+    let app = build_router(AppState::new(config.clone()));
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["revert"]["messageID"],
+        user_id
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        original
+    );
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        original
+    );
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/revert"),
+        serde_json::json!({"messageID":assistant_id}).to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = sync_prompt_with_request_id(&app, &id, "replace-untracked", "replacement").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let replaced = get_json(&app, format!("/session/{id}/message")).await;
+    let texts: Vec<_> = replaced
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["parts"][0]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "kept request",
+            "kept answer",
+            "replacement",
+            "Echo: replacement"
+        ]
+    );
+    assert!(get_json(&app, format!("/session/{id}"))
+        .await
+        .get("revert")
+        .is_none());
+    if fork {
+        assert_eq!(
+            get_json(&app, format!("/session/{source_id}/message")).await,
+            source
+        );
+        assert!(get_json(&app, format!("/session/{source_id}"))
+            .await
+            .get("revert")
+            .is_none());
+    }
+    drop(app);
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        replaced
+    );
+    let response = request(
+        &restarted,
+        "POST",
+        format!("/session/{id}/unrevert"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        replaced
+    );
 }
 
 #[tokio::test]

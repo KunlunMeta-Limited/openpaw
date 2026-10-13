@@ -160,11 +160,7 @@ impl TurnOutcome {
     /// 状态：不修改当前快照。
     /// 关联：`CHG-2026-0012`。
     pub fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_outcome"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
+        openpaw_store::transcript::encode(self, "turn_outcome")
     }
 
     /// 功能：从未知 JSONL 事件解析已登记的回合快照。
@@ -173,12 +169,10 @@ impl TurnOutcome {
     /// 错误：未知事件和旧版本附加事件被安全忽略。
     /// 状态：纯解析，不修改 JSONL。
     /// 关联：`CHG-2026-0012`。
+    #[cfg(test)]
     pub fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_outcome"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
+        openpaw_store::transcript::decode(event, "turn_outcome")
+            .ok()
             .flatten()
     }
 }
@@ -473,12 +467,10 @@ impl RequestAdmission {
     /// 并发与取消：纯同步解析，无锁且不可取消。
     /// 权限：不记录或返回事件之外的文件路径和正文。
     /// 关联：`CHG-2026-0013`、`DAT-HOST-IDEMPOTENCY-003`。
+    #[cfg(test)]
     pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("request_admission"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
+        openpaw_store::transcript::decode(event, "request_admission")
+            .ok()
             .flatten()
     }
 }
@@ -515,11 +507,7 @@ impl TurnAcceptV1 {
     /// 权限：只包含本轮用户消息和脱敏状态，不包含凭据、路径或 Provider 错误正文。
     /// 关联：`CHG-2026-0013`、`DAT-HOST-TURN-001`。
     pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_accept_v1"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
+        openpaw_store::transcript::encode(self, "turn_accept_v1")
     }
 
     /// 功能：从 session 未知事件解析崩溃原子的回合接收记录。
@@ -530,12 +518,10 @@ impl TurnAcceptV1 {
     /// 并发与取消：同步无锁，不可取消。
     /// 权限：只读取事件自身内容，不记录正文或文件路径。
     /// 关联：`CHG-2026-0013`、`DAT-HOST-TURN-001`。
+    #[cfg(test)]
     pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_accept_v1"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
+        openpaw_store::transcript::decode(event, "turn_accept_v1")
+            .ok()
             .flatten()
     }
 }
@@ -564,11 +550,7 @@ impl TurnFinishPrepareV1 {
     /// 权限：只包含不透明 turnID。
     /// 关联：`CHG-2026-0013`。
     pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_finish_prepare_v1"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
+        openpaw_store::transcript::encode(self, "turn_finish_prepare_v1")
     }
 
     /// 功能：解析生成消息事务的 prepare 事件。
@@ -579,12 +561,10 @@ impl TurnFinishPrepareV1 {
     /// 并发与取消：同步无锁，不可取消。
     /// 权限：不接触消息正文。
     /// 关联：`CHG-2026-0013`。
+    #[cfg(test)]
     pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_finish_prepare_v1"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
+        openpaw_store::transcript::decode(event, "turn_finish_prepare_v1")
+            .ok()
             .flatten()
     }
 }
@@ -682,11 +662,7 @@ impl TurnFinishCommitV1 {
     /// 权限：不包含生成消息正文、工具输出副本或 Provider 原始错误。
     /// 关联：`CHG-2026-0013`。
     pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_finish_commit_v1"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
+        openpaw_store::transcript::encode(self, "turn_finish_commit_v1")
     }
 
     /// 功能：解析生成消息事务的 commit 事件。
@@ -697,12 +673,10 @@ impl TurnFinishCommitV1 {
     /// 并发与取消：同步无锁，不可取消。
     /// 权限：不读取消息正文。
     /// 关联：`CHG-2026-0013`。
+    #[cfg(test)]
     pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_finish_commit_v1"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
+        openpaw_store::transcript::decode(event, "turn_finish_commit_v1")
+            .ok()
             .flatten()
     }
 }
@@ -949,7 +923,7 @@ mod tests {
         let provider: ProviderListWire = roundtrip(include_str!("../tests/fixtures/provider.json"));
         let ids: Vec<&str> = provider.all.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(ids, ["mock", "echo", "anthropic", "openai"]);
-        assert_eq!(provider.connected, ids);
+        assert_eq!(provider.connected, vec!["mock", "echo"]);
 
         let message_json = serde_json::to_value(&messages).expect("messages json");
         let tool_json = &message_json[1]["parts"][1];

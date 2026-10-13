@@ -73,3 +73,15 @@ tracked 与未忽略 untracked 的 10,044 个条目，其中 10,043 个现存文
 | 输入直到输出结束才可见 | HTTP 接收后在执行前发布完整 user text part | 阻塞 provider 断言；真实 OpenWork 首输出前唯一正文可见，刷新一致 | 局部验证；新旅程 Passed，发布门禁仍阻断 |
 
 此追踪只针对已批准 CHG-0022；不改变上文完整 master-plan、压力和发布验收状态。
+
+## CHG-2026-0023 修复追踪
+
+| 缺陷 | 共享实现 / 接线 | 回归 |
+| --- | --- | --- |
+| CLI 第三方配置与模型占位 | LLM config；唯一 ChatArgs；chat/config/model/doctor 与 Host 工厂 | CFG-001～008；chat_e2e/provider_config_e2e、Host provider/override |
+| Host 会话未被 CLI 发现，隐藏历史泄露风险 | Store transcript/catalog；SQLite 原子刷新；CLI 与 Host 形状 adapter | HIST-001～010；session_host_parity、Store 与既有 Host 恢复/回退 |
+| CLI 无人工审批与重复 pending | Engine gate/manual；CLI 输入所有者；Host permission adapter | APR-001～007；chat_approval_e2e 与 Host approval/HTTP |
+| 历史/分支回复 Revert 仅隐藏输出并出现 unresolved | Host normalize_revert_boundary 保留回合关联，缺记录时从已验证真实 assistant 定位最近输入并跳过纯工具结果 | HTTP 两项 red→green；Host 99/99、CLI 互通 3/3、OpenWork UI 2/2 零 skip；本机已部署、报告旧游标可撤销修复后 DOM 无残留输入/提示，其他会话游标保持不变；细节及既有门禁限制见 CHG 第 13 节 |
+
+初始红灯和修复候选的实际命令输出保存在仓库外 `../artifacts/chat-runtime-audit/`；当前验收结果在 CHG-0023 第 12 节。
+当前编码与功能验证完成，Rust 回归及 OpenWork attached 契约通过；行数门禁失败、外部治理框架缺失，正式验收仍受阻。

@@ -1,20 +1,18 @@
-//! `openpaw session ...` — list, show, and search persisted chat sessions.
+//! `openpaw session ...`：通过共享持久目录列出、显示和搜索会话。
 //!
-//! The SQLite index (`<home>/index.db`, FTS5-backed) is maintained
-//! best-effort by `openpaw chat` next to the JSONL transcripts. The
-//! transcripts remain the source of truth and are re-read on
-//! `session show`.
+//! JSONL 是事实源；list/show 无需预建 SQLite 索引。search 先按会话刷新
+//! `<home>/index.db` 的可见消息/FTS 缓存，chat 也尽力同步该缓存。
+//! 查询只读取已提交的可见历史，不恢复活动回合、不重写 JSONL；关联 CHG-2026-0023。
 
 use std::path::Path;
 
-use openpaw_core::{Role, SessionEvent};
+use openpaw_core::Role;
 use openpaw_store::sqlite::SessionDb;
-use openpaw_store::SessionReader;
 
-/// Subcommands of `openpaw session`.
+/// `openpaw session` 的持久会话查询子命令。
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
-    /// List recent sessions from the index.
+    /// 列出持久目录中的近期会话，无需预建索引。
     List {
         /// Maximum number of sessions to print.
         #[arg(long, default_value_t = 20)]
@@ -31,7 +29,7 @@ pub enum Command {
         #[arg(long)]
         home: Option<std::path::PathBuf>,
     },
-    /// Full-text search across indexed session messages.
+    /// 刷新逐会话索引后，全文搜索当前可见消息。
     Search {
         /// Search query (tokens are matched via FTS5).
         query: String,
@@ -68,205 +66,196 @@ fn truncate(s: &str, n: usize) -> String {
     out
 }
 
-/// `openpaw session list` — tabular summary of indexed sessions
-/// (id / title / updated / message count).
+/// 功能：从持久目录列出会话，不要求预建 SQLite 索引。
+/// 参数：home、结果上限。
+/// 返回：退出码。
+/// 错误：读取错误隔离并返回 1。
+/// 状态：不写 JSONL。
+/// 并发与取消：读取当次合法提交前缀。
+/// 权限：只访问 home/sessions。
+/// 关联：共享 catalog。
 pub fn run_list(home: &Path, limit: usize) -> i32 {
-    let db_path = home.join("index.db");
-    if !db_path.exists() {
-        println!("(no session index yet — start a conversation with `openpaw chat`)");
-        return 0;
+    let ids = match openpaw_store::catalog::discover(home) {
+        Ok(ids) => ids,
+        Err(e) => return catalog_error(e),
+    };
+    let mut snapshots = Vec::new();
+    let mut exit = 0;
+    for id in ids {
+        match openpaw_store::catalog::read(home, &id) {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => {
+                catalog_error(error);
+                exit = 1;
+            }
+        }
     }
-    let db = match SessionDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            report_error(
-                format!("cannot open session index {}: {e}", db_path.display()),
-                "the index file must be readable and a valid SQLite database.",
-                "check the home path permissions; remove the index to rebuild it on the next chat.",
-            );
-            return 1;
-        }
-    };
-    let sessions = match db.list_sessions() {
-        Ok(sessions) => sessions,
-        Err(e) => {
-            report_error(
-                format!("cannot list sessions: {e}"),
-                "the sessions table could not be read.",
-                "remove the index and re-run `openpaw chat` to rebuild it.",
-            );
-            return 1;
-        }
-    };
-    if sessions.is_empty() {
+    snapshots.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    if snapshots.is_empty() {
         println!("(no sessions)");
-        return 0;
-    }
-    println!(
-        "{:<34} {:<26} {:<20} {:>8}",
-        "id", "title", "updated", "turns"
-    );
-    for s in sessions.iter().take(limit) {
-        let title = if s.title.is_empty() {
-            "(untitled)"
-        } else {
-            s.title.as_str()
-        };
+    } else {
         println!(
             "{:<34} {:<26} {:<20} {:>8}",
-            truncate(&s.id, 32),
-            truncate(title, 24),
-            truncate(&s.updated_at, 19),
-            s.message_count
+            "id", "title", "updated", "turns"
         );
     }
-    0
+    for s in snapshots.iter().take(limit) {
+        let updated = s
+            .updated_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        println!(
+            "{:<34} {:<26} {:<20} {:>8}",
+            truncate(&s.meta.id, 32),
+            truncate(&s.transcript.title(), 24),
+            updated,
+            s.transcript
+                .visible_messages(&s.meta.id)
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .count()
+        );
+    }
+    exit
 }
 
-/// `openpaw session show <id>` — re-read the JSONL transcript behind the
-/// indexed session and print a role-prefixed message digest.
+/// 功能：显示当前已提交可见历史。
+/// 参数：home 和会话 ID。
+/// 返回：退出码。
+/// 错误：缺失或损坏返回 1，禁止降级遍历原始消息。
+/// 状态：不写 JSONL 或恢复活动回合。
+/// 并发与取消：当次快照。
+/// 权限：不采用 SQLite 中任意文件路径。
+/// 关联：共享 transcript。
 pub fn run_show(home: &Path, id: &str) -> i32 {
-    let db_path = home.join("index.db");
-    if !db_path.exists() {
-        report_error(
-            format!("no session index at {}", db_path.display()),
-            "`session show` resolves ids through the index built by `openpaw chat`.",
-            "start a conversation with `openpaw chat`, then re-run.",
-        );
-        return 1;
+    let s = match openpaw_store::catalog::read(home, id) {
+        Ok(s) => s,
+        Err(e) => return catalog_error(e),
+    };
+    println!(
+        "# {}\nmodel:    {}\nprovider: {}\ncreated:  {}\nfile:     {}\ntitle:    {}",
+        s.meta.id,
+        s.meta.model,
+        s.meta.provider,
+        s.meta.created_at.to_rfc3339(),
+        s.path.display(),
+        s.transcript.title()
+    );
+    if s.transcript.mutation.archived.is_some() {
+        println!("archived: true");
     }
-    let db = match SessionDb::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            report_error(
-                format!("cannot open session index {}: {e}", db_path.display()),
-                "the index file must be readable and a valid SQLite database.",
-                "check the home path permissions; remove the index to rebuild it on the next chat.",
-            );
-            return 1;
-        }
-    };
-    let transcript = match db.get_jsonl_path(id) {
-        Ok(Some(path)) => path,
-        Ok(None) => {
-            report_error(
-                format!("session `{id}` is not in the index"),
-                "ids come from `openpaw session list`; this transcript was never indexed.",
-                "run `openpaw session list` to see the indexed sessions.",
-            );
-            return 1;
-        }
-        Err(e) => {
-            report_error(
-                format!("cannot look up session `{id}`: {e}"),
-                "the index lookup failed.",
-                "remove the index and re-run `openpaw chat` to rebuild it.",
-            );
-            return 1;
-        }
-    };
-    if !transcript.exists() {
-        report_error(
-            format!("transcript {} is missing", transcript.display()),
-            "the JSONL file behind this session was moved or deleted.",
-            "the index row is stale; remove the index and re-run `openpaw chat`.",
-        );
-        return 1;
-    }
-    let outcome = match SessionReader::read(&transcript) {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            report_error(
-                format!("cannot parse transcript {}: {e}", transcript.display()),
-                "the JSONL file is corrupted beyond its tolerated torn tail.",
-                "sessions are plain JSONL; inspect the file manually to recover.",
-            );
-            return 1;
-        }
-    };
-    println!("# {}", outcome.meta.id);
-    println!("model:    {}", outcome.meta.model);
-    println!("provider: {}", outcome.meta.provider);
-    println!("created:  {}", outcome.meta.created_at.to_rfc3339());
-    println!("file:     {}", transcript.display());
-    if outcome.torn_tail_lines > 0 {
+    if s.torn_tail_lines > 0 {
         println!(
             "(warning: {} torn tail line(s) from an interrupted write)",
-            outcome.torn_tail_lines
+            s.torn_tail_lines
         );
     }
-    println!();
-    let mut line = 0usize;
-    for ev in &outcome.events {
-        match ev {
-            SessionEvent::Message(msg) => {
-                line += 1;
-                let role = match msg.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                };
-                println!("{:>3}. [{role:>9}] {}", line, truncate(&msg.text(), 100));
+    for (index, message) in s.transcript.visible_messages(id).iter().enumerate() {
+        let role = if message.role == Role::User {
+            "user"
+        } else {
+            "assistant"
+        };
+        println!(
+            "{:>3}. [{role:>9}] {}",
+            index + 1,
+            truncate(&message.text(), 100)
+        );
+        for block in &message.content {
+            if let openpaw_core::ContentBlock::ToolResult { name, is_error, .. } = block {
+                println!(
+                    "     [{}] {}",
+                    if *is_error { "tool err" } else { "tool" },
+                    name.as_deref().unwrap_or("tool")
+                );
             }
-            SessionEvent::ToolCallComplete {
-                tool_name, success, ..
-            } => {
-                line += 1;
-                let role = if *success { "tool" } else { "tool err" };
-                println!("{:>3}. [{role:>9}] {}", line, truncate(tool_name, 100));
-            }
-            _ => {}
         }
     }
     0
 }
 
-/// `openpaw session search <query>` — FTS5 search over indexed messages,
-/// printing session id, snippet, and relevance score per hit.
+/// 功能：刷新可见索引后全文搜索有效目录中的会话。
+/// 参数：home、查询和上限。
+/// 返回：退出码。
+/// 错误：损坏会话隔离并失效缓存，索引失败返回 1。
+/// 状态：只更新逐会话 SQLite 缓存。
+/// 并发与取消：刷新先取写事务再读快照。
+/// 权限：不显示外部或损坏会话的陈旧命中。
+/// 关联：SessionDb::refresh_transcript。
 pub fn run_search(home: &Path, query: &str, limit: usize) -> i32 {
-    let db_path = home.join("index.db");
-    if !db_path.exists() {
-        println!("(no session index yet — start a conversation with `openpaw chat`)");
+    let ids = match openpaw_store::catalog::discover(home) {
+        Ok(ids) => ids,
+        Err(e) => return catalog_error(e),
+    };
+    if ids.is_empty() {
+        println!("(no results)");
         return 0;
     }
-    let db = match SessionDb::open(&db_path) {
+    let db = match SessionDb::open(home.join("index.db")) {
         Ok(db) => db,
-        Err(e) => {
+        Err(_) => {
             report_error(
-                format!("cannot open session index {}: {e}", db_path.display()),
-                "the index file must be readable and a valid SQLite database.",
-                "check the home path permissions; remove the index to rebuild it on the next chat.",
+                "cannot open session index".into(),
+                "index.db must be writable SQLite",
+                "check permissions; preserve audit and other data when repairing",
             );
             return 1;
         }
     };
-    let results = match db.search(query, limit) {
-        Ok(results) => results,
-        Err(e) => {
+    let mut valid = std::collections::HashSet::new();
+    let mut exit = 0;
+    for id in ids {
+        match db.refresh_transcript(home, &id) {
+            Ok(_) => {
+                valid.insert(id);
+            }
+            Err(e) => {
+                catalog_error(e);
+                exit = 1;
+            }
+        }
+    }
+    let results = match db.search(query, i64::MAX as usize) {
+        Ok(results) => results
+            .into_iter()
+            .filter(|r| valid.contains(&r.session_id))
+            .take(limit)
+            .collect::<Vec<_>>(),
+        Err(_) => {
             report_error(
-                format!("search failed: {e}"),
-                "the full-text query could not be executed against the index.",
-                "simplify the query; punctuation-heavy queries are quoted automatically.",
+                "search failed".into(),
+                "full-text index query failed",
+                "inspect the index without deleting audit data",
             );
             return 1;
         }
     };
     if results.is_empty() {
         println!("(no results for \"{query}\")");
-        return 0;
     }
     for r in &results {
-        // FTS5 rank is negative; negate so a bigger score reads as a
-        // better match. Prefer the highlighted snippet when present.
-        let snippet = if r.snippet.is_empty() {
-            truncate(&r.text_preview, 120)
+        let text = if r.snippet.is_empty() {
+            &r.text_preview
         } else {
-            truncate(&r.snippet, 120)
+            &r.snippet
         };
         println!(
             "[{}:{}] score={:.3} {}",
-            r.session_id, r.seq, -r.rank, snippet
+            r.session_id,
+            r.seq,
+            -r.rank,
+            truncate(text, 120)
         );
     }
     println!("({} result(s))", results.len());
-    0
+    exit
+}
+fn catalog_error(error: openpaw_store::catalog::CatalogError) -> i32 {
+    report_error(
+        error.to_string(),
+        "session JSONL is the source of truth",
+        "check home/sessions permissions and records; preserve index.db audit data",
+    );
+    1
 }

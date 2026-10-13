@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpaw.local/contracts/host-provider-v1.schema.json",
+  "title": "OpenPaw Provider 目录 v1",
+  "description": "API-HOST-PROVIDER-001；connected 表示本地配置可用，不验证上游连通或认证；显式 default 不被静默替换。",
+  "type": "object",
+  "required": [
+    "all",
+    "connected",
+    "default"
+  ],
+  "properties": {
+    "all": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "models"
+        ],
+        "properties": {
+          "id": {
+            "enum": [
+              "mock",
+              "echo",
+              "anthropic",
+              "openai"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "models": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": [
+                "id",
+                "name"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "connected": {
+      "type": "array",
+      "uniqueItems": true,
+      "description": "all 的子集；离线要求生成配置合法，网络还要求合法 Key/URL/model。",
+      "items": {
+        "enum": [
+          "mock",
+          "echo",
+          "anthropic",
+          "openai"
+        ]
+      }
+    },
+    "default": {
+      "enum": [
+        "mock",
+        "echo",
+        "anthropic",
+        "openai"
+      ]
+    }
+  }
+}

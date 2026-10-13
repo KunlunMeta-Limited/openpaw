@@ -85,17 +85,14 @@ impl SessionMutationEvent {
     /// 权限：不添加事件值之外的正文、路径或凭据。
     /// 关联：`DAT-HOST-SESSION-MUTATION-*`。
     pub(crate) fn to_session_event(&self) -> SessionEvent {
-        let (kind, mut value) = match self {
-            Self::Metadata(value) => ("session_metadata_v1", json_value(value)),
-            Self::ForkOrigin(value) => ("session_fork_origin_v1", json_value(value)),
-            Self::RevertStaged(value) => ("session_revert_staged_v1", json_value(value)),
-            Self::RevertCleared => ("session_revert_cleared_v1", serde_json::json!({})),
-            Self::RevertCommitted(value) => ("session_revert_committed_v1", json_value(value)),
-        };
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!(kind));
+        use openpaw_store::transcript::encode;
+        match self {
+            Self::Metadata(v) => encode(v, "session_metadata_v1"),
+            Self::ForkOrigin(v) => encode(v, "session_fork_origin_v1"),
+            Self::RevertStaged(v) => encode(v, "session_revert_staged_v1"),
+            Self::RevertCleared => encode(&serde_json::json!({}), "session_revert_cleared_v1"),
+            Self::RevertCommitted(v) => encode(v, "session_revert_committed_v1"),
         }
-        SessionEvent::Unknown(Box::new(value))
     }
 
     /// 功能：从未知 JSONL 事件解析已登记的会话变更版本。
@@ -106,24 +103,29 @@ impl SessionMutationEvent {
     /// 并发与取消：同步无锁，不可取消。
     /// 权限：只读取事件自身，不访问工作区或凭据。
     /// 关联：`DAT-HOST-SESSION-MUTATION-*`。
+    #[cfg(test)]
     pub(crate) fn from_session_event(event: &SessionEvent) -> Option<Self> {
-        let SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        let kind = value.get("type")?.as_str()?;
-        let value = (**value).clone();
-        match kind {
-            "session_metadata_v1" => serde_json::from_value(value).ok().map(Self::Metadata),
-            "session_fork_origin_v1" => serde_json::from_value(value).ok().map(Self::ForkOrigin),
-            "session_revert_staged_v1" => {
-                serde_json::from_value(value).ok().map(Self::RevertStaged)
+        use openpaw_store::transcript as store;
+        let parsed = store::SessionMutationEvent::from_session_event(event)?;
+        Some(match parsed {
+            store::SessionMutationEvent::Metadata(v) => Self::Metadata(SessionMetadataV1 {
+                title: v.title,
+                archived: v.archived,
+            }),
+            store::SessionMutationEvent::ForkOrigin(v) => Self::ForkOrigin(SessionForkOriginV1 {
+                source_session_id: v.source_session_id,
+                ordinal: v.ordinal,
+            }),
+            store::SessionMutationEvent::RevertStaged(v) => {
+                Self::RevertStaged(SessionRevertStagedV1 {
+                    message_id: v.message_id,
+                })
             }
-            "session_revert_cleared_v1" => Some(Self::RevertCleared),
-            "session_revert_committed_v1" => serde_json::from_value(value)
-                .ok()
-                .map(Self::RevertCommitted),
-            _ => None,
-        }
+            store::SessionMutationEvent::RevertCleared => Self::RevertCleared,
+            store::SessionMutationEvent::RevertCommitted(v) => {
+                Self::RevertCommitted(serde_json::from_value(serde_json::to_value(v).ok()?).ok()?)
+            }
+        })
     }
 }
 
@@ -152,23 +154,31 @@ impl SessionMutationProjection {
     /// 权限：不读取事件外的资源。
     /// 关联：`DAT-HOST-SESSION-MUTATION-*`。
     pub(crate) fn apply(&mut self, event: SessionMutationEvent) {
-        match event {
-            SessionMutationEvent::Metadata(metadata) => {
-                if let Some(title) = metadata.title {
-                    self.title = Some(title);
-                }
-                if let Some(archived) = metadata.archived {
-                    self.archived = (archived > 0).then_some(archived);
-                }
-            }
-            SessionMutationEvent::ForkOrigin(origin) => self.fork_origin = Some(origin),
-            SessionMutationEvent::RevertStaged(revert) => {
-                self.revert_message_id = Some(revert.message_id)
-            }
-            SessionMutationEvent::RevertCleared | SessionMutationEvent::RevertCommitted(_) => {
-                self.revert_message_id = None
-            }
+        use openpaw_store::transcript as store;
+        let mut projection = store::SessionMutationProjection {
+            title: self.title.clone(),
+            archived: self.archived,
+            revert_message_id: self.revert_message_id.clone(),
+            fork_origin: self
+                .fork_origin
+                .as_ref()
+                .map(|v| store::SessionForkOriginV1 {
+                    source_session_id: v.source_session_id.clone(),
+                    ordinal: v.ordinal,
+                }),
+        };
+        if let Some(event) =
+            store::SessionMutationEvent::from_session_event(&event.to_session_event())
+        {
+            projection.apply(event);
         }
+        self.title = projection.title;
+        self.archived = projection.archived;
+        self.revert_message_id = projection.revert_message_id;
+        self.fork_origin = projection.fork_origin.map(|v| SessionForkOriginV1 {
+            source_session_id: v.source_session_id,
+            ordinal: v.ordinal,
+        });
     }
 }
 
@@ -181,10 +191,7 @@ impl SessionMutationProjection {
 /// 权限：不读取消息正文之外的资源。
 /// 关联：`API-HOST-SESSION-F03`。
 pub(crate) fn wire_message_id(session_id: &str, index: usize, message: &Message) -> String {
-    message
-        .uuid
-        .clone()
-        .unwrap_or_else(|| format!("msg_{session_id}_{index}"))
+    openpaw_store::transcript::wire_message_id(session_id, index, message)
 }
 
 /// 功能：解析严格早于指定消息边界的可见前缀长度。
@@ -200,20 +207,17 @@ pub(crate) fn visible_prefix_len(
     messages: &[Message],
     message_id: &str,
 ) -> Option<usize> {
-    messages
-        .iter()
-        .enumerate()
-        .position(|(index, message)| wire_message_id(session_id, index, message) == message_id)
+    openpaw_store::transcript::visible_prefix_len(session_id, messages, message_id)
 }
 
 /// 功能：把可见 assistant 回退边界规范化为触发同一回合的 user 消息边界。
 /// 参数：session、可见消息、回合结果和客户端请求的消息编号。
-/// 返回：权威游标及前缀；已验证失败占位归到真实 user，未知边界返回 None。
-/// 错误：无；无法可靠关联的 assistant 保留原边界。
+/// 返回：权威游标及前缀；真实或已验证失败 assistant 归到触发输入，未知边界返回 None。
+/// 错误：无；无有效回合关联且找不到此前真实用户输入时保留原 assistant 边界。
 /// 状态：纯读取，不修改消息、回合结果或持久化投影。
 /// 并发与取消：调用方提供稳定快照，同步无锁，不可取消。
-/// 权限：不读取消息正文、文件或网络。
-/// 关联：`API-HOST-SESSION-REVERT-001`、`CHG-2026-0021`、`CHG-2026-0022`。
+/// 权限：仅读取角色、内容块类型及不透明 ID，不读取正文值、文件或网络。
+/// 关联：`API-HOST-SESSION-REVERT-001`、`CHG-2026-0021`、`CHG-2026-0022`、`CHG-2026-0023`。
 pub(crate) fn normalize_revert_boundary(
     session_id: &str,
     messages: &[Message],
@@ -244,6 +248,25 @@ pub(crate) fn normalize_revert_boundary(
             visible_prefix_len(session_id, messages, &outcome.user_message_id)
                 .map(|prefix| (outcome.user_message_id.clone(), prefix))
         })
+        .or_else(|| {
+            // 分支和旧记录可能没有回合结果；纯工具结果不是触发本轮的用户输入。
+            messages[..requested_prefix]
+                .iter()
+                .rposition(|message| {
+                    message.role == Role::User
+                        && (message.content.is_empty()
+                            || !message
+                                .content
+                                .iter()
+                                .all(|block| matches!(block, ContentBlock::ToolResult { .. })))
+                })
+                .map(|prefix| {
+                    (
+                        wire_message_id(session_id, prefix, &messages[prefix]),
+                        prefix,
+                    )
+                })
+        })
         .or(Some(original))
 }
 
@@ -260,19 +283,7 @@ pub(crate) fn is_turn_assistant_message_id(
     turn_id: &str,
     message_id: &str,
 ) -> bool {
-    let base = format!("msg_{session_id}_{turn_id}_assistant");
-    let Some(suffix) = message_id.strip_prefix(&base) else {
-        return false;
-    };
-    if suffix.is_empty() {
-        return true;
-    }
-    let Some(index) = suffix.strip_prefix('_') else {
-        return false;
-    };
-    index
-        .parse::<usize>()
-        .is_ok_and(|value| value > 0 && value.to_string() == index)
+    openpaw_store::transcript::is_turn_assistant_message_id(session_id, turn_id, message_id)
 }
 
 /// 功能：将已经验证存在的失败占位边界映射为真实历史前缀。
@@ -376,10 +387,6 @@ pub(crate) fn clone_messages_for_fork(messages: &[Message]) -> Vec<Message> {
             message
         })
         .collect()
-}
-
-fn json_value(value: &impl Serialize) -> serde_json::Value {
-    serde_json::to_value(value).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 #[cfg(test)]

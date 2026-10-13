@@ -192,3 +192,12 @@ assistant completed 事件。
 对账。terminal 已出现但 assistant 正文尚未可见时，应在有界窗口继续读取，不能立即生成
 `completed_without_reply`。messages 与 turns 任一暂时失败时，另一路的可用正文不应被
 `Promise.all` 一并阻塞；该项仍列入发布前优化清单。
+
+## CHG-2026-0023 持久历史与索引
+
+CLI/Host 都写 JSONL，SQLite 是 CLI 的可重建 transcript 索引，也是 audit 等其他数据的宿主。
+目录快照 -> 版本化 codec -> 纯重放 -> 已提交完整消息 + staged 可见前缀 -> CLI digest / Host REST adapter。
+accept 展开内嵌 user，prepare 批次仅在合法 finish commit 后公开；commit revert 逻辑裁剪历史；未知版本保留兼容，已登记损坏版本拒绝读取。
+CLI 查询不进行 Host 恢复，不追加 interrupted。search/chat 先取得 SQLite IMMEDIATE 写事务，再读取快照并替换单会话可见消息/FTS；不把扫描时间当活动时间，不迁移 schema，不删除全 DB。
+索引刷新保留审计和非 transcript 标记。损坏会话的旧消息索引失效；搜索只输出当前合法目录/投影中的 ID。
+目录扫描/重放成本随历史规模增长，本轮不增加缓存 schema。

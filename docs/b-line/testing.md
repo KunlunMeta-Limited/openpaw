@@ -92,7 +92,7 @@ Docker Linux 环境的定向回归 1/1 和 Host 全量回归 92/92 通过；最�
 | --- | --- | --- |
 | user 边界 | 返回请求 user ID，并严格隐藏该边界及尾部 | 既有行为不变 |
 | assistant / `assistant_n` 边界 | 通过 `TurnOutcome` 返回同回合 user ID，持久化后重启仍使用该权威游标 | 点击 assistant Revert 后该轮输入、输出和后续消息一起隐藏 |
-| 旧 assistant 无可靠 outcome | 保留原 assistant 游标，不猜测或误删此前 user | 兼容旧会话与外部写入 |
+| 旧 assistant 无可靠 outcome | CHG-0023：已验证真实 assistant 返回最近真实 user 输入游标，跳过纯 ToolResult；没有此前输入才保留原游标 | 旧消息及完整分支均隐藏整轮，无 accepted/no-result 提示 |
 | Unrevert / replacement prompt | staged REST/snapshot 保留完整尾部；Unrevert 清除游标；下一条 prompt 继续沿用既有 committed 语义 | Restore 无需刷新即恢复输入、输出和后续消息 |
 
 Linux Docker 定向 Revert 回归 3/3、Host HTTP 33/33、Host 全包 93/93 通过；格式检查退出 0。
@@ -332,3 +332,28 @@ Windows 候选二进制：`target-windows/debug/openpaw.exe`，SHA-256
 
 当前候选命令、计数、环境阻断和干净基线对照见 verification-report 的 CHG-0022 记录。
 Clippy、行数预算、治理或 UI 环境失败分别登记，不能以功能测试通过替代发布门禁。
+
+## CHG-2026-0023 回归入口
+
+chat_e2e：实际二进制请求本地 OpenAI/Anthropic SSE，检查 endpoint、认证头、模型、token、回复和落盘模型。
+provider_config_e2e：实际 model/config/doctor 一致性、无效配置退出 2 和凭据脱敏。
+session_host_parity：真实 Host 写入 + 实际 CLI list/show/search，覆盖 staged/unrevert/committed 替换、rename/archive/fork，并检查查询不改 JSONL；用确定性 latch 验证查询不恢复/取消活动 Host 回合。
+Store：未提交批次、非法 commit/已登记 mutation、安全目录与逐会话并发刷新，验证 FTS 隐藏和 audit/flags/schema 保留。
+chat_approval_e2e：共享 AgentLoop + 可注入终端的真实工具副作用；实际 headless chat 拒绝且下一行 yes 保持聊天输入。
+Host approval：原 once/always/reject、SSE 顺序/取消，以及丢弃 future 后卡片清理；既有 HTTP/恢复/取消/Office 测试继续执行。
+当前修复功能回归通过；OpenWork 既有 attached 契约在隔离候选 Host 上 7/7、0 skip，未运行浏览器 UI。
+正式命令与限制记录在 CHG-0023 第 12 节，不能以局部测试替代治理和预算门禁。
+
+### CHG-2026-0023 历史与分支整轮回退补充
+
+`http.rs` 的两项新回归覆盖 UUID/兼容 ID、真实完整 fork、多个 assistant 和纯 ToolResult user。
+对工具回复和最终回复 Revert 均返回真实输入游标；未知/已隐藏 ID 拒绝；完整 REST 可恢复，
+默认 fork 只复制保留前缀，替换裁剪整轮与后续历史，重启保持结果，源会话不被分支修改。
+初始两项均失败，修复后通过；当前 Host 全包 99/99、CLI/Host 互通 3/3。
+浏览器补充在既有 `openpaw-revert-resend.e2e.test.ts` 中通过回复按钮操作真实分支，
+检查输入/输出同时隐藏、前轮保留、超过 admission grace 无错误卡、刷新和替换上下文一致。
+本补充的最终浏览器、部署与治理记录见 CHG 第 13 节及 `../artifacts/openwork-revert/`。
+最终命令 `pnpm evals:e2e openpaw-revert-resend`：placement local（Daytona 未配置），
+verdict passed，2/2、0 skip、退出 0。通过实际 DOM 与命中验证后的鼠标点击验收回退行为，
+不把验证镜像操作区的透明样式或像素可见性写成通过项。更新本机引擎后，独立 fork、普通两轮
+及报告旧会话的真实浏览器复测均通过；原会话输入/输出均隐藏且无 unresolved 卡，其他游标保持不变。

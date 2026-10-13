@@ -40,6 +40,15 @@ impl AnthropicProvider {
         self
     }
 
+    fn endpoint(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        }
+    }
+
     fn build_body(&self, req: &CompletionRequest, stream: bool) -> serde_json::Value {
         let model = if req.model.is_empty() {
             self.default_model.clone()
@@ -95,7 +104,7 @@ impl AnthropicProvider {
 impl LlmProvider for AnthropicProvider {
     async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
         let body = self.build_body(&req, false);
-        let url = format!("{}/v1/messages", self.base_url);
+        let url = self.endpoint();
         let resp = self
             .client
             .post(&url)
@@ -128,7 +137,7 @@ impl LlmProvider for AnthropicProvider {
         req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
         let body = self.build_body(&req, true);
-        let url = format!("{}/v1/messages", self.base_url);
+        let url = self.endpoint();
         let resp = self
             .stream_client
             .post(&url)
