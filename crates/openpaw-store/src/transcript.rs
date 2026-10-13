@@ -6,9 +6,10 @@
 //! 并发与取消：对稳定切片同步重放。
 //! 权限：不访问模型、工具或传输。
 //! 关联：Host 和 CLI 读取。
-use openpaw_core::{Message, SessionEvent};
+use openpaw_core::{ContentBlock, Message, Role, SessionEvent};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
 
 /// 功能：表示已登记持久记录的结构或提交一致性错误。
 #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -823,7 +824,15 @@ fn retained_user_message_ids(messages: &[openpaw_core::Message]) -> HashSet<Stri
         .filter_map(|message| message.uuid.clone())
         .collect()
 }
-fn retain_turn_state_for_messages(
+/// 功能：按保留的用户消息裁剪回合、幂等与失败投影。
+/// 参数：messages 为保留历史；outcomes、admissions、errors 为需要同步裁剪的附加状态。
+/// 返回：无。
+/// 错误：无。
+/// 状态：只保留仍有对应用户消息的回合及其幂等和失败记录，不修改消息。
+/// 并发与取消：调用方独占三个容器；同步处理，不跨 await。
+/// 权限：不访问文件、网络或工具，不改变保留消息的正文。
+/// 关联：CHG-2026-0025。
+pub fn retain_turn_state_for_messages(
     messages: &[openpaw_core::Message],
     outcomes: &mut Vec<TurnOutcome>,
     admissions: &mut HashMap<String, RequestAdmission>,
@@ -980,6 +989,169 @@ pub fn session_title(explicit: Option<&str>, messages: &[Message]) -> String {
         .unwrap_or_else(|| "New session".into())
         .chars()
         .take(80)
+        .collect()
+}
+
+/// 功能：把可见 assistant 回退边界规范化为触发同一回合的 user 消息边界。
+/// 参数：session、可见消息、回合结果和客户端请求的消息编号。
+/// 返回：权威游标及前缀；真实或已验证失败 assistant 归到触发输入，未知边界返回 None。
+/// 错误：无；无有效回合关联且找不到此前真实用户输入时保留原 assistant 边界。
+/// 状态：纯读取，不修改消息、回合结果或持久化投影。
+/// 并发与取消：调用方提供稳定快照，同步无锁，不可取消。
+/// 权限：仅读取角色、内容块类型及不透明 ID，不读取正文值、文件或网络。
+/// 关联：`API-HOST-SESSION-REVERT-001`、`CHG-2026-0021`、`CHG-2026-0022`、`CHG-2026-0023`。
+pub fn normalize_revert_boundary(
+    session_id: &str,
+    messages: &[Message],
+    turn_outcomes: &[TurnOutcome],
+    message_id: &str,
+) -> Option<(String, usize)> {
+    let Some(requested_prefix) = visible_prefix_len(session_id, messages, message_id) else {
+        // runtime 已验证该 ID 存在于公共错误投影；这里仅还原其真实 user 边界。
+        return turn_outcomes
+            .iter()
+            .find(|turn| {
+                turn.state == TurnState::Failed
+                    && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
+            })
+            .and_then(|turn| {
+                visible_prefix_len(session_id, messages, &turn.user_message_id)
+                    .map(|prefix| (turn.user_message_id.clone(), prefix))
+            });
+    };
+    let original = (message_id.to_string(), requested_prefix);
+    if messages[requested_prefix].role != Role::Assistant {
+        return Some(original);
+    }
+    turn_outcomes
+        .iter()
+        .find(|outcome| is_turn_assistant_message_id(session_id, &outcome.turn_id, message_id))
+        .and_then(|outcome| {
+            visible_prefix_len(session_id, messages, &outcome.user_message_id)
+                .map(|prefix| (outcome.user_message_id.clone(), prefix))
+        })
+        .or_else(|| {
+            // 分支和旧记录可能没有回合结果；纯工具结果不是触发本轮的用户输入。
+            messages[..requested_prefix]
+                .iter()
+                .rposition(|message| {
+                    message.role == Role::User
+                        && (message.content.is_empty()
+                            || !message
+                                .content
+                                .iter()
+                                .all(|block| matches!(block, ContentBlock::ToolResult { .. })))
+                })
+                .map(|prefix| {
+                    (
+                        wire_message_id(session_id, prefix, &messages[prefix]),
+                        prefix,
+                    )
+                })
+        })
+        .or(Some(original))
+}
+
+/// 功能：将已经验证存在的失败占位边界映射为真实历史前缀。
+/// 参数：session_id、messages、outcomes 为稳定快照，message_id 为公共错误消息编号。
+/// 返回：该失败回合真实消息之后、下一用户回合之前的位置；不可验证时返回 None。
+/// 错误：无。
+/// 状态：纯计算，不将占位或错误复制到分支模型历史。
+/// 并发与取消：调用方持有会话变更闸门，同步不可取消。
+/// 权限：只读取不透明 ID，不访问文件或网络。
+/// 关联：`CHG-2026-0022`。
+pub fn failed_message_prefix_len(
+    session_id: &str,
+    messages: &[Message],
+    outcomes: &[TurnOutcome],
+    message_id: &str,
+) -> Option<usize> {
+    let turn = outcomes.iter().find(|turn| {
+        turn.state == TurnState::Failed
+            && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
+    })?;
+    let start = visible_prefix_len(session_id, messages, &turn.user_message_id)?;
+    Some(
+        messages
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, message)| {
+                message
+                    .uuid
+                    .as_ref()
+                    .is_some_and(|id| outcomes.iter().any(|other| &other.user_message_id == id))
+            })
+            .map(|(index, _)| index)
+            .unwrap_or(messages.len()),
+    )
+}
+
+/// 功能：复制会话消息并重新生成消息、工具调用和内部引用编号。
+/// 参数：`messages` 为已经按 fork 边界裁剪的可见消息。
+/// 返回：正文和角色保持一致、身份与源会话隔离的新消息列表。
+/// 错误：无。
+/// 状态：不修改源消息；使用随机 UUID 生成新身份。
+/// 并发与取消：同步无共享锁，不可取消。
+/// 权限：只复制调用方提供的消息，不访问工作区。
+/// 关联：`API-HOST-SESSION-FORK-001`。
+pub fn clone_messages_for_fork(messages: &[Message]) -> Vec<Message> {
+    let message_ids: HashMap<String, String> = messages
+        .iter()
+        .filter_map(|message| {
+            message
+                .uuid
+                .as_ref()
+                .map(|id| (id.clone(), Uuid::new_v4().simple().to_string()))
+        })
+        .collect();
+    let tool_ids: HashMap<String, String> = messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolUse { id, .. } => {
+                Some((id.clone(), Uuid::new_v4().simple().to_string()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    messages
+        .iter()
+        .cloned()
+        .map(|mut message| {
+            message.uuid = Some(
+                message
+                    .uuid
+                    .as_ref()
+                    .and_then(|id| message_ids.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
+            );
+            for block in &mut message.content {
+                match block {
+                    ContentBlock::ToolUse { id, .. } => {
+                        if let Some(replacement) = tool_ids.get(id) {
+                            *id = replacement.clone();
+                        }
+                    }
+                    ContentBlock::ToolResult { tool_use_id, .. } => {
+                        if let Some(replacement) = tool_ids.get(tool_use_id) {
+                            *tool_use_id = replacement.clone();
+                        }
+                    }
+                    ContentBlock::CompactBoundary { metadata } => {
+                        if let Some(last_user) = metadata.last_user_message_uuid.as_mut() {
+                            if let Some(replacement) = message_ids.get(last_user) {
+                                *last_user = replacement.clone();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            message
+        })
         .collect()
 }
 

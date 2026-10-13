@@ -9,21 +9,23 @@ use crate::message_projection;
 use crate::office::OfficeDispatcher;
 use crate::protocol::{
     unix_millis, HostConfig, OpenCodeEvent, OpenCodeTurnErrorV1, RequestAdmission, SessionSummary,
-    SessionTime, SessionWire, TurnAcceptV1, TurnError, TurnFinishCommitV1, TurnFinishPrepareV1,
-    TurnOutcome, TurnSchedulerConfig, TurnState, UpdateSessionRequest,
+    SessionTime, SessionWire, TurnAcceptV1, TurnError, TurnOutcome, TurnSchedulerConfig, TurnState,
+    UpdateSessionRequest,
 };
 use crate::session_mutation::{
     clone_messages_for_fork, failed_message_prefix_len, normalize_revert_boundary,
     visible_prefix_len, SessionForkOriginV1, SessionMetadataV1, SessionMutationEvent,
     SessionMutationProjection, SessionRevertCommittedV1, SessionRevertStagedV1,
 };
-use futures::FutureExt;
 use openpaw_core::{LlmProvider, Session, SessionEvent};
+use openpaw_engine::scheduler::{ScheduleError, TurnAdmission, TurnScheduler};
+use openpaw_engine::turn_execution::{self, SessionCheckpoint, TurnOptions};
 use openpaw_engine::AgentLoop;
-use openpaw_store::transcript::MAX_FINISH_TRANSACTION_MESSAGES;
+use openpaw_store::journal;
+use openpaw_store::transcript::retain_turn_state_for_messages;
 use openpaw_store::{SessionError, SessionReader, SessionWriter};
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -94,98 +96,6 @@ impl RegisteredTurnTask {
         let _ = self.completed.await;
     }
 }
-struct SchedulerState {
-    running: usize,
-    next_ticket: u64,
-    queued: VecDeque<Arc<QueuedEntry>>,
-}
-struct QueuedEntry {
-    ticket: u64,
-    promoted: AtomicBool,
-    notify: Notify,
-}
-/// 为全部 session 提供有界 FIFO 调度；同步锁线性化接收、取消和 permit 交接。
-pub(crate) struct TurnScheduler {
-    config: TurnSchedulerConfig,
-    state: std::sync::Mutex<SchedulerState>,
-}
-impl TurnScheduler {
-    /// 使用已校验容量创建进程级调度器，后续操作通过内部锁线性化。
-    fn new(config: TurnSchedulerConfig) -> Arc<Self> {
-        Arc::new(Self {
-            config,
-            state: std::sync::Mutex::new(SchedulerState {
-                running: 0,
-                next_ticket: 0,
-                queued: VecDeque::new(),
-            }),
-        })
-    }
-    /// 在写入用户消息前原子接收回合，多个 session 按接收顺序获得队列票号。
-    pub(crate) fn admit(self: &Arc<Self>) -> Result<TurnAdmission, ScheduleError> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.running < self.config.max_concurrent_turns {
-            state.running += 1;
-            return Ok(TurnAdmission::Running(TurnPermit {
-                scheduler: self.clone(),
-                released: false,
-            }));
-        }
-        if state.queued.len() >= self.config.max_queued_turns {
-            return Err(ScheduleError::QueueFull);
-        }
-        state.next_ticket = state.next_ticket.saturating_add(1);
-        let entry = Arc::new(QueuedEntry {
-            ticket: state.next_ticket,
-            promoted: AtomicBool::new(false),
-            notify: Notify::new(),
-        });
-        state.queued.push_back(entry.clone());
-        Ok(TurnAdmission::Queued(QueuedTurn {
-            scheduler: self.clone(),
-            entry,
-            armed: true,
-        }))
-    }
-    /// 查询票号的 1 基队列位置，与接收、取消和 permit 释放共用同一锁。
-    pub(crate) fn queue_position(&self, ticket: u64) -> Option<usize> {
-        self.state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .queued
-            .iter()
-            .position(|entry| entry.ticket == ticket)
-            .map(|index| index + 1)
-    }
-    fn cancel_queued(&self, ticket: u64) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(index) = state.queued.iter().position(|entry| entry.ticket == ticket) else {
-            return false;
-        };
-        state.queued.remove(index);
-        true
-    }
-    fn release_running(&self) {
-        let next = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if let Some(next) = state.queued.pop_front() {
-                next.promoted.store(true, Ordering::Release);
-                Some(next)
-            } else {
-                state.running = state.running.saturating_sub(1);
-                None
-            }
-        };
-        if let Some(next) = next {
-            next.notify.notify_one();
-        }
-    }
-}
-/// 功能：表示 Host 调度接收失败的稳定原因。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScheduleError {
-    QueueFull,
-}
 /// session gate 的原子接收结果；仅 Accepted 可启动 AgentLoop，Replay 不得重复副作用。
 pub(crate) enum AcceptTurnResult {
     Accepted(AcceptedTurn),
@@ -202,81 +112,6 @@ pub(crate) struct AcceptedTurn {
     pub(crate) turn_id: String,
     pub(crate) user_message_id: String,
     pub(crate) admission: TurnAdmission,
-}
-/// 持有运行槽位或 FIFO 排队凭据；`wait` 同时监听晋升与 session CancellationToken。
-pub(crate) enum TurnAdmission {
-    Running(TurnPermit),
-    Queued(QueuedTurn),
-}
-impl TurnAdmission {
-    pub(crate) fn is_queued(&self) -> bool {
-        matches!(self, Self::Queued(_))
-    }
-    pub(crate) fn queue_ticket(&self) -> Option<u64> {
-        match self {
-            Self::Running(_) => None,
-            Self::Queued(queued) => Some(queued.entry.ticket),
-        }
-    }
-    /// 等待运行槽位或 session 取消；竞争结果以调度锁中的线性化顺序为准。
-    pub(crate) async fn wait(self, cancel: CancellationToken) -> Option<TurnPermit> {
-        match self {
-            Self::Running(permit) => Some(permit),
-            Self::Queued(queued) => queued.wait(cancel).await,
-        }
-    }
-}
-pub(crate) struct TurnPermit {
-    scheduler: Arc<TurnScheduler>,
-    released: bool,
-}
-impl Drop for TurnPermit {
-    fn drop(&mut self) {
-        if !self.released {
-            self.released = true;
-            self.scheduler.release_running();
-        }
-    }
-}
-pub(crate) struct QueuedTurn {
-    scheduler: Arc<TurnScheduler>,
-    entry: Arc<QueuedEntry>,
-    armed: bool,
-}
-impl QueuedTurn {
-    async fn wait(mut self, cancel: CancellationToken) -> Option<TurnPermit> {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                if self.scheduler.cancel_queued(self.entry.ticket) {
-                    self.armed = false;
-                    None
-                } else if self.entry.promoted.load(Ordering::Acquire) {
-                    self.armed = false;
-                    Some(TurnPermit { scheduler: self.scheduler.clone(), released: false })
-                } else {
-                    self.armed = false;
-                    None
-                }
-            }
-            _ = self.entry.notify.notified() => {
-                self.armed = false;
-                Some(TurnPermit { scheduler: self.scheduler.clone(), released: false })
-            }
-        }
-    }
-}
-impl Drop for QueuedTurn {
-    fn drop(&mut self) {
-        if self.armed
-            && !self.scheduler.cancel_queued(self.entry.ticket)
-            && self.entry.promoted.load(Ordering::Acquire)
-        {
-            // release_running 已把活动槽位交给本票据；若等待 future 此时被丢弃，
-            // 必须继续把槽位交给下一项或归还容量，不能让并发额度永久泄漏。
-            self.scheduler.release_running();
-        }
-    }
 }
 /// 功能：保存单个 session 的运行时资源和并发状态。
 /// 并发与取消：`turn_gate` 线性化 reserve/abort/delete；取消同时通知 AgentLoop 和审批管理器。
@@ -531,14 +366,7 @@ impl SessionHandle {
     /// 并发与取消：调用方必须在同一 session 的 `turn_gate` 内完成后续消息快照和终态投影。
     /// 约束：用于终态事务，避免 `turn_outcomes` 先于 `message_cache` 对 HTTP 读接口可见。
     fn persist_turn_outcome_event(&self, outcome: &TurnOutcome) -> Result<(), String> {
-        let (path, length) = writer_snapshot(self)?;
-        if let Err(error) = append_event(self, &outcome.to_session_event()) {
-            if let Err(rollback_error) = restore_writer_snapshot(self, &path, length) {
-                return Err(format!("{error}；回合状态写入回滚失败：{rollback_error}"));
-            }
-            return Err(error);
-        }
-        Ok(())
+        append_event(self, &outcome.to_session_event())
     }
     fn project_turn_outcome_locked(&self, outcome: TurnOutcome, queue_ticket: Option<u64>) {
         upsert_turn_outcome(
@@ -611,32 +439,11 @@ impl SessionHandle {
         failed
     }
     fn retry_persist_turn_outcome(&self, outcome: &TurnOutcome) -> Result<(), String> {
-        let event = outcome.to_session_event();
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| "会话写入器锁状态异常".to_string())?;
-        let rollback = writer.as_ref().and_then(|current| {
-            std::fs::metadata(current.path())
-                .ok()
-                .map(|metadata| (current.path().to_path_buf(), metadata.len()))
-        });
-        if let Some(current) = writer.as_mut() {
-            if current.append(&event).is_ok() {
-                return Ok(());
-            }
-        }
-        *writer = None;
-        if let Some((path, length)) = rollback {
-            truncate_session_file(&path, length)?;
-        }
-        let mut recovered = SessionWriter::open_append(&self.session_path)
-            .map_err(|error| format!("无法重建会话写入器：{error}"))?;
-        recovered
-            .append(&event)
-            .map_err(|error| format!("无法补写回合终态：{error}"))?;
-        *writer = Some(recovered);
-        Ok(())
+        journal::append_with_retry(&mut writer, &self.session_path, &outcome.to_session_event())
     }
 }
 /// 功能：保存 Host 进程级配置、session 表、Office 投影和全局事件。
@@ -706,7 +513,7 @@ impl AppState {
             sessions: RwLock::new(HashMap::new()),
             office,
             global_events,
-            scheduler: TurnScheduler::new(scheduler_config),
+            scheduler: TurnScheduler::new(scheduler_config.into()),
             session_slots: Mutex::new(HashMap::new()),
             lifecycle: std::sync::Mutex::new(HostLifecycleState {
                 accepting_turns: true,
@@ -1293,16 +1100,8 @@ impl AppState {
                 ));
             }
             let event = SessionMutationEvent::Metadata(metadata.clone());
-            let (path, length) =
-                writer_snapshot(&handle).map_err(SessionMutationError::Persistence)?;
-            if let Err(error) = append_event(&handle, &event.to_session_event()) {
-                restore_writer_snapshot(&handle, &path, length).map_err(|rollback_error| {
-                    SessionMutationError::Persistence(format!(
-                        "{error}；会话更新回滚失败：{rollback_error}"
-                    ))
-                })?;
-                return Err(SessionMutationError::Persistence(error));
-            }
+            append_event(&handle, &event.to_session_event())
+                .map_err(SessionMutationError::Persistence)?;
             {
                 let _snapshot = handle
                     .snapshot_gate
@@ -1462,53 +1261,14 @@ impl AppState {
                 workspace_name: None,
                 task_id: None,
             };
-            let write_result = (|| {
-                let mut writer = SessionWriter::create(&temporary_path).map_err(|_| {
-                    SessionMutationError::Persistence("无法创建会话分支临时文件".into())
-                })?;
-                writer
-                    .append(&SessionEvent::Meta(session.meta.clone()))
-                    .and_then(|_| writer.append(&metadata))
-                    .and_then(|_| {
-                        writer.append(
-                            &SessionMutationEvent::ForkOrigin(origin.clone()).to_session_event(),
-                        )
-                    })
-                    .map_err(|_| {
-                        SessionMutationError::Persistence("无法写入会话分支元数据".into())
-                    })?;
-                for message in &messages {
-                    writer
-                        .append(&SessionEvent::Message(message.clone()))
-                        .map_err(|_| {
-                            SessionMutationError::Persistence("无法写入会话分支消息".into())
-                        })?;
-                }
-                drop(writer);
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&temporary_path)
-                    .and_then(|file| file.sync_all())
-                    .map_err(|_| {
-                        SessionMutationError::Persistence("无法同步会话分支临时文件".into())
-                    })?;
-                std::fs::rename(&temporary_path, &final_path)
-                    .map_err(|_| SessionMutationError::Persistence("无法发布会话分支文件".into()))
-            })();
-            if let Err(error) = write_result {
-                cleanup_unpublished_session_file(&temporary_path);
-                return Err(error);
-            }
-            let writer = match SessionWriter::open_append(&final_path) {
-                Ok(writer) => writer,
-                Err(_) => {
-                    cleanup_unpublished_session_file(&final_path);
-                    return Err(SessionMutationError::Persistence(
-                        "无法打开已发布的会话分支".into(),
-                    ));
-                }
-            };
+            let mut records = vec![
+                SessionEvent::Meta(session.meta.clone()),
+                metadata,
+                SessionMutationEvent::ForkOrigin(origin.clone()).to_session_event(),
+            ];
+            records.extend(messages.iter().cloned().map(SessionEvent::Message));
+            let writer = journal::publish(&temporary_path, &final_path, &records)
+                .map_err(|_| SessionMutationError::Persistence("无法创建或发布会话分支".into()))?;
             self.build_session_handle(SessionHandleInit {
                 session,
                 messages,
@@ -1603,16 +1363,8 @@ impl AppState {
             let event = SessionMutationEvent::RevertStaged(SessionRevertStagedV1 {
                 message_id: revert_message_id,
             });
-            let (path, length) =
-                writer_snapshot(&handle).map_err(SessionMutationError::Persistence)?;
-            if let Err(error) = append_event(&handle, &event.to_session_event()) {
-                restore_writer_snapshot(&handle, &path, length).map_err(|rollback_error| {
-                    SessionMutationError::Persistence(format!(
-                        "{error}；会话回退暂存回滚失败：{rollback_error}"
-                    ))
-                })?;
-                return Err(SessionMutationError::Persistence(error));
-            }
+            append_event(&handle, &event.to_session_event())
+                .map_err(SessionMutationError::Persistence)?;
             let _snapshot = handle
                 .snapshot_gate
                 .write()
@@ -1669,16 +1421,8 @@ impl AppState {
                     ));
                 }
                 let event = SessionMutationEvent::RevertCleared;
-                let (path, length) =
-                    writer_snapshot(&handle).map_err(SessionMutationError::Persistence)?;
-                if let Err(error) = append_event(&handle, &event.to_session_event()) {
-                    restore_writer_snapshot(&handle, &path, length).map_err(|rollback_error| {
-                        SessionMutationError::Persistence(format!(
-                            "{error}；取消会话回退的回滚失败：{rollback_error}"
-                        ))
-                    })?;
-                    return Err(SessionMutationError::Persistence(error));
-                }
+                append_event(&handle, &event.to_session_event())
+                    .map_err(SessionMutationError::Persistence)?;
                 let _snapshot = handle
                     .snapshot_gate
                     .write()
@@ -1961,68 +1705,11 @@ fn session_mutation_load_error(error: SessionLoadError) -> SessionMutationError 
         }
     }
 }
-struct RestoredSessionProjection {
-    messages: Vec<openpaw_core::Message>,
-    turn_outcomes: Vec<TurnOutcome>,
-    turn_errors: HashMap<String, OpenCodeTurnErrorV1>,
-    request_admissions: HashMap<String, RequestAdmission>,
-    mutation: SessionMutationProjection,
-    turn_sequence_high_water: u64,
-}
 fn restored_session_projection(
     session_id: &str,
     events: &[SessionEvent],
-) -> Result<RestoredSessionProjection, SessionLoadError> {
-    let p = openpaw_store::transcript::replay(session_id, events)
-        .map_err(|_| SessionLoadError::Corrupt)?;
-    fn convert<T: serde::Serialize, U: serde::de::DeserializeOwned>(
-        value: T,
-    ) -> Result<U, SessionLoadError> {
-        serde_json::to_value(value)
-            .and_then(serde_json::from_value)
-            .map_err(|_| SessionLoadError::Corrupt)
-    }
-    Ok(RestoredSessionProjection {
-        messages: p.messages,
-        turn_outcomes: convert(p.turn_outcomes)?,
-        turn_errors: convert(p.turn_errors)?,
-        request_admissions: convert(p.request_admissions)?,
-        mutation: SessionMutationProjection {
-            title: p.mutation.title,
-            archived: p.mutation.archived,
-            revert_message_id: p.mutation.revert_message_id,
-            fork_origin: p.mutation.fork_origin.map(|v| SessionForkOriginV1 {
-                source_session_id: v.source_session_id,
-                ordinal: v.ordinal,
-            }),
-        },
-        turn_sequence_high_water: p.turn_sequence_high_water,
-    })
-}
-fn retained_user_message_ids(messages: &[openpaw_core::Message]) -> HashSet<String> {
-    messages
-        .iter()
-        .filter(|message| message.role == openpaw_core::Role::User)
-        .filter_map(|message| message.uuid.clone())
-        .collect()
-}
-fn retain_turn_state_for_messages(
-    messages: &[openpaw_core::Message],
-    outcomes: &mut Vec<TurnOutcome>,
-    admissions: &mut HashMap<String, RequestAdmission>,
-    errors: &mut HashMap<String, OpenCodeTurnErrorV1>,
-) {
-    let retained_user_ids = retained_user_message_ids(messages);
-    outcomes.retain(|outcome| retained_user_ids.contains(&outcome.user_message_id));
-    let retained_turn_ids: HashSet<_> = outcomes
-        .iter()
-        .map(|outcome| outcome.turn_id.clone())
-        .collect();
-    errors.retain(|turn_id, _| retained_turn_ids.contains(turn_id));
-    admissions.retain(|_, admission| {
-        retained_user_ids.contains(&admission.user_message_id)
-            && retained_turn_ids.contains(&admission.turn_id)
-    });
+) -> Result<openpaw_store::transcript::Transcript, SessionLoadError> {
+    openpaw_store::transcript::replay(session_id, events).map_err(|_| SessionLoadError::Corrupt)
 }
 fn classify_session_error(error: SessionError) -> SessionLoadError {
     match error {
@@ -2033,15 +1720,7 @@ fn classify_session_error(error: SessionError) -> SessionLoadError {
     }
 }
 fn recover_orphaned_turns_in_file(path: &std::path::Path) -> Result<usize, SessionLoadError> {
-    let mut read = SessionReader::read(path).map_err(classify_session_error)?;
-    let expected_id = path.file_stem().and_then(|value| value.to_str());
-    if Some(read.meta.id.as_str()) != expected_id {
-        return Err(SessionLoadError::Corrupt);
-    }
-    if read.torn_tail_lines > 0 {
-        repair_torn_session_tail(path)?;
-        read = SessionReader::read(path).map_err(classify_session_error)?;
-    }
+    let read = journal::read_repaired(path).map_err(classify_session_error)?;
     let mut outcomes = restored_session_projection(&read.meta.id, &read.events)?.turn_outcomes;
     let mut writer = SessionWriter::open_append(path).map_err(classify_session_error)?;
     recover_hanging_outcomes(&mut outcomes, &mut writer)
@@ -2323,7 +2002,6 @@ pub(crate) fn append_user_and_turn(
     queue_ticket: Option<u64>,
     request_admission: Option<RequestAdmission>,
 ) -> Result<(), String> {
-    let (path, length) = writer_snapshot(handle)?;
     let accept = TurnAcceptV1 {
         message: message.clone(),
         outcome: outcome.clone(),
@@ -2349,11 +2027,7 @@ pub(crate) fn append_user_and_turn(
         .as_ref()
         .map(SessionMutationEvent::to_session_event)
         .unwrap_or_else(|| accept.to_session_event());
-    if let Err(error) = append_event(handle, &persisted_event) {
-        restore_writer_snapshot(handle, &path, length)
-            .map_err(|rollback_error| format!("{error}；接收事务回滚失败：{rollback_error}"))?;
-        return Err(error);
-    }
+    append_event(handle, &persisted_event)?;
     if mutation_event.is_some() {
         session.messages.truncate(visible_len);
     }
@@ -2441,6 +2115,7 @@ pub(crate) fn append_user_and_turn(
 struct TurnCleanup {
     handle: Arc<SessionHandle>,
     message_count_before: usize,
+    checkpoint: Option<SessionCheckpoint>,
     finished: bool,
 }
 impl TurnCleanup {
@@ -2448,7 +2123,15 @@ impl TurnCleanup {
         Self {
             handle,
             message_count_before,
+            checkpoint: None,
             finished: false,
+        }
+    }
+    fn restore_session(&self, session: &mut Session) {
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.restore(session);
+        } else {
+            session.messages.truncate(self.message_count_before);
         }
     }
     fn finish(&mut self) {
@@ -2474,7 +2157,7 @@ impl Drop for TurnCleanup {
         self.handle.agent.cancel();
         self.handle.approvals.abort_all();
         if let Ok(mut session) = self.handle.session.try_lock() {
-            session.messages.truncate(self.message_count_before);
+            self.restore_session(&mut session);
         }
         finish_turn_projection(&self.handle);
         self.handle.active.store(false, Ordering::Release);
@@ -2600,7 +2283,6 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         // AgentLoop 会在 await 期间直接修改 messages、token 计数和压缩状态。
         // Provider、工具或事件投影若 panic，必须恢复整个回合前快照，避免半轮内存
         // 上下文进入下一次请求；生成消息尚未进入 JSONL，因此无需截断持久文件。
-        let checkpoint = session.clone();
         if handle.cancel_requested.load(Ordering::Acquire) {
             (before, Ok(openpaw_core::StopReason::EndTurn))
         } else {
@@ -2733,26 +2415,22 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     }
                 }
             };
-            let execution =
-                std::panic::AssertUnwindSafe(handle.agent.run_turn_with_provider_and_cancel_token(
-                    &mut session,
-                    None,
-                    &provider_tools,
-                    &mut sink,
-                    turn_cancel.clone(),
-                    (provider, model),
-                ))
-                .catch_unwind()
-                .await;
-            let result = execution.unwrap_or_else(|_| {
-                tracing::error!(session_id = %handle.id, turn_id = %turn_id, "AgentLoop 异常中止");
-                Err(openpaw_core::Error::session("agent loop panicked"))
-            });
-            if result.is_err() {
-                if let Err(error) = &result {
-                    tracing::warn!(session_id = %handle.id, turn_id = %turn_id, error = %error, "回合执行失败");
-                }
-                *session = checkpoint;
+            let execution = turn_execution::run_turn(
+                &handle.agent,
+                &mut session,
+                &provider_tools,
+                &mut sink,
+                TurnOptions {
+                    cancel: turn_cancel.clone(),
+                    provider_and_model: Some((provider, model)),
+                    ..Default::default()
+                },
+            )
+            .await;
+            cleanup.checkpoint = Some(execution.checkpoint);
+            let result = execution.result;
+            if let Err(error) = &result {
+                tracing::warn!(session_id = %handle.id, turn_id = %turn_id, error = %error, "回合执行失败");
             }
             (before, result)
         }
@@ -2797,7 +2475,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             }
         }
         if cancelled {
-            session.messages.truncate(before);
+            cleanup.restore_session(&mut session);
         }
         if response_index > 0 && completed_responses.insert(active_response_index) {
             handle.emit(events::assistant_completed_for_turn_response(
@@ -2863,7 +2541,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 failure.clone(),
             ) {
                 tracing::error!(session_id = %handle.id, %error, "无法提交回合消息事务");
-                session.messages.truncate(before);
+                cleanup.restore_session(&mut session);
                 failure = None;
                 let failed = terminal_outcome(
                     &running,
@@ -2884,6 +2562,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 intended_terminal
             }
         };
+        cleanup.checkpoint = None;
+        cleanup.message_count_before = session.messages.len();
         let snapshot = session.messages.clone();
         handle.publish_terminal_snapshot(snapshot.clone(), terminal, failure);
         finish_turn_projection(&handle);
@@ -2902,37 +2582,8 @@ fn session_file_updated_at(path: &std::path::Path, fallback: i64) -> i64 {
         .unwrap_or(fallback)
 }
 fn next_fork_ordinal(home: &std::path::Path, source_id: &str) -> Result<u64, SessionMutationError> {
-    let directory = home.join("sessions");
-    let entries = std::fs::read_dir(directory)
-        .map_err(|_| SessionMutationError::Persistence("无法扫描会话分支序号".into()))?;
-    let mut maximum = 0u64;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let Ok(read) = SessionReader::read(&path) else {
-            continue;
-        };
-        let Ok(projection) = restored_session_projection(&read.meta.id, &read.events) else {
-            continue;
-        };
-        if let Some(origin) = projection.mutation.fork_origin {
-            if origin.source_session_id == source_id {
-                maximum = maximum.max(origin.ordinal);
-            }
-        }
-    }
-    maximum
-        .checked_add(1)
-        .ok_or_else(|| SessionMutationError::Persistence("会话分支序号已耗尽".into()))
-}
-fn cleanup_unpublished_session_file(path: &std::path::Path) {
-    if let Err(error) = std::fs::remove_file(path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(%error, "无法清理未发布的会话分支文件");
-        }
-    }
+    openpaw_store::catalog::next_fork_ordinal(home, source_id)
+        .map_err(|_| SessionMutationError::Persistence("无法扫描会话分支序号".into()))
 }
 fn finish_turn_projection(handle: &SessionHandle) {
     if let Some(outcome) = handle
@@ -3026,11 +2677,7 @@ fn append_event(handle: &SessionHandle, event: &SessionEvent) -> Result<(), Stri
         .writer
         .lock()
         .map_err(|_| "会话写入器锁状态异常".to_string())?;
-    writer
-        .as_mut()
-        .ok_or_else(|| "会话正在删除".to_string())?
-        .append(event)
-        .map_err(|e| e.to_string())
+    journal::append(&mut writer, event)
 }
 fn persist_finish_transaction(
     handle: &SessionHandle,
@@ -3039,106 +2686,16 @@ fn persist_finish_transaction(
     terminal: TurnOutcome,
     open_code_error: Option<OpenCodeTurnErrorV1>,
 ) -> Result<(), String> {
-    if messages.len() > MAX_FINISH_TRANSACTION_MESSAGES
-        || terminal.turn_id != turn_id
-        || !terminal.state.is_terminal()
-    {
-        return Err("回合消息事务不符合持久化约束".into());
-    }
-    let generated_message_ids: Option<Vec<_>> = messages
-        .iter()
-        .map(|message| message.uuid.clone())
-        .collect();
-    let generated_message_ids =
-        generated_message_ids.ok_or_else(|| "回合生成消息缺少稳定 UUID".to_string())?;
-    if generated_message_ids.iter().collect::<HashSet<_>>().len() != generated_message_ids.len() {
-        return Err("回合生成消息 UUID 重复".into());
-    }
-    let (path, length) = writer_snapshot(handle)?;
-    let result = (|| {
-        append_event(
-            handle,
-            &TurnFinishPrepareV1 {
-                turn_id: turn_id.to_string(),
-            }
-            .to_session_event(),
-        )?;
-        for message in messages {
-            append_event(handle, &SessionEvent::Message(message.clone()))?;
-        }
-        append_event(
-            handle,
-            &TurnFinishCommitV1 {
-                turn_id: turn_id.to_string(),
-                generated_message_ids,
-                terminal: terminal.clone(),
-                open_code_error,
-            }
-            .to_session_event(),
-        )
-    })();
-    if let Err(error) = result {
-        restore_writer_snapshot(handle, &path, length)
-            .map_err(|rollback_error| format!("{error}；回合消息事务回滚失败：{rollback_error}"))?;
-        return Err(error);
-    }
-    Ok(())
-}
-/// 读取当前 JSONL 文件长度，作为回合消息批量追加的强制回滚点。
-fn writer_snapshot(handle: &SessionHandle) -> Result<(std::path::PathBuf, u64), String> {
-    let writer = handle
-        .writer
-        .lock()
-        .map_err(|_| "会话写入器锁状态异常".to_string())?;
-    let writer = writer.as_ref().ok_or_else(|| "会话正在删除".to_string())?;
-    let path = writer.path().to_path_buf();
-    let length = std::fs::metadata(&path)
-        .map_err(|error| format!("无法读取会话文件长度：{error}"))?
-        .len();
-    Ok((path, length))
-}
-/// 将 JSONL 文件截回指定长度；用于回合消息追加失败后的事务回滚。
-fn truncate_session_file(path: &std::path::Path, length: u64) -> Result<(), String> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|error| format!("打开会话文件失败：{error}"))?;
-    file.set_len(length)
-        .map_err(|error| format!("截断会话文件失败：{error}"))?;
-    file.sync_data()
-        .map_err(|error| format!("同步截断后的会话文件失败：{error}"))
-}
-/// 将 session 文件截回事务快照并重建 append writer，避免旧句柄继续持有错误尾部。
-fn restore_writer_snapshot(
-    handle: &SessionHandle,
-    path: &std::path::Path,
-    length: u64,
-) -> Result<(), String> {
     let mut writer = handle
         .writer
         .lock()
         .map_err(|_| "会话写入器锁状态异常".to_string())?;
-    *writer = None;
-    truncate_session_file(path, length)?;
-    let recovered =
-        SessionWriter::open_append(path).map_err(|error| format!("无法重建会话写入器：{error}"))?;
-    *writer = Some(recovered);
-    Ok(())
+    journal::finish(&mut writer, turn_id, messages, terminal, open_code_error)
 }
-/// 删除 SessionReader 已确认的最后一条 torn JSONL 行；必须在重新打开 writer 前执行。
 fn repair_torn_session_tail(path: &std::path::Path) -> Result<(), SessionLoadError> {
-    let bytes = std::fs::read(path).map_err(|error| classify_io_kind(error.kind()))?;
-    let end = bytes
-        .iter()
-        .rposition(|byte| !matches!(byte, b'\r' | b'\n' | b' ' | b'\t'))
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    let start = bytes[..end]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    truncate_session_file(path, start as u64).map_err(|_| SessionLoadError::Unavailable)
+    journal::read_repaired(path)
+        .map(|_| ())
+        .map_err(classify_session_error)
 }
 #[cfg(test)]
 mod tests {
@@ -3302,10 +2859,13 @@ mod tests {
 
     #[test]
     fn dropping_promoted_queue_entry_returns_running_capacity() {
-        let scheduler = TurnScheduler::new(TurnSchedulerConfig {
-            max_concurrent_turns: 1,
-            max_queued_turns: 1,
-        });
+        let scheduler = TurnScheduler::new(
+            TurnSchedulerConfig {
+                max_concurrent_turns: 1,
+                max_queued_turns: 1,
+            }
+            .into(),
+        );
         let running = scheduler.admit().expect("running admission");
         let queued = scheduler.admit().expect("queued admission");
 
@@ -3834,8 +3394,11 @@ mod tests {
     #[tokio::test]
     async fn delayed_stream_abort_emits_no_delta_after_idle() {
         let home = tempfile::tempdir().expect("home");
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("fixture.txt"), "tool output").unwrap();
         let state = AppState::new(HostConfig {
             home: home.path().into(),
+            workspace: workspace.path().into(),
             office_url: None,
             ..HostConfig::default()
         });
@@ -3843,6 +3406,16 @@ mod tests {
             .create_session(None, None, None, None)
             .await
             .expect("session");
+        let baseline = {
+            let mut session = handle.session.lock().await;
+            session.messages.push(
+                openpaw_core::Message::user_text("accepted stream input").with_uuid("test-user"),
+            );
+            session.total_input_tokens = 31;
+            session.total_output_tokens = 7;
+            *handle.message_cache.write().unwrap() = session.messages.clone();
+            serde_json::to_value(&*session).unwrap()
+        };
         let mut events = handle.global_events.subscribe();
         assert!(handle.reserve_turn());
         let turn = tokio::spawn(run_turn(
@@ -3853,9 +3426,18 @@ mod tests {
                 handle.next_turn_id(),
                 "test-user",
                 "stream",
-                Arc::new(openpaw_llm::MockProvider::stream_text_delayed(
-                    "abcdefgh", 8, 30,
-                )),
+                Arc::new(openpaw_llm::MockProvider::scripted(vec![
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "read_file".into(),
+                        input: serde_json::json!({"path":"fixture.txt"}),
+                        text: "read first".into(),
+                    },
+                    openpaw_llm::MockMode::DelayedStreamText {
+                        text: "abcdefgh".into(),
+                        chunks: 8,
+                        delay_ms: 30,
+                    },
+                ])),
             ),
         ));
         loop {
@@ -3869,6 +3451,11 @@ mod tests {
         }
         handle.abort().await;
         turn.await.expect("turn task");
+        assert_eq!(
+            serde_json::to_value(&*handle.session.lock().await).unwrap(),
+            baseline,
+            "cancel after a completed tool must restore usage and accepted input"
+        );
         let remaining: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
         let idle_index = remaining
             .iter()
@@ -3884,5 +3471,94 @@ mod tests {
                     .all(|event| event.event_type != "message.part.delta")
                 && !handle.is_active()
         );
+    }
+
+    struct FinishFailureProvider(std::sync::Weak<SessionHandle>);
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FinishFailureProvider {
+        async fn complete(
+            &self,
+            _: openpaw_core::CompletionRequest,
+        ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+            unreachable!("fixture uses streaming")
+        }
+        async fn stream(
+            &self,
+            _: openpaw_core::CompletionRequest,
+        ) -> openpaw_core::Result<
+            futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>,
+        > {
+            self.0.upgrade().unwrap().writer.lock().unwrap().take();
+            let response = openpaw_core::CompletionResponse {
+                content: vec![openpaw_core::ContentBlock::Text {
+                    text: "uncommitted reply".into(),
+                }],
+                stop_reason: openpaw_core::StopReason::EndTurn,
+                usage: openpaw_core::Usage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    ..Default::default()
+                },
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Final(
+                Box::new(response),
+            ))])))
+        }
+        fn capabilities(&self) -> openpaw_core::Capabilities {
+            Default::default()
+        }
+        fn name(&self) -> &str {
+            "finish-failure"
+        }
+        fn default_model(&self) -> &str {
+            "fixture"
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_failure_restores_full_session_after_successful_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let state = AppState::new(HostConfig {
+            home: home.path().into(),
+            office_url: None,
+            ..HostConfig::default()
+        });
+        let handle = state.create_session(None, None, None, None).await.unwrap();
+        let baseline = {
+            let mut session = handle.session.lock().await;
+            session
+                .messages
+                .push(openpaw_core::Message::user_text("accepted input").with_uuid("test-user"));
+            session.total_input_tokens = 31;
+            session.total_output_tokens = 7;
+            *handle.message_cache.write().unwrap() = session.messages.clone();
+            serde_json::to_value(&*session).unwrap()
+        };
+        assert!(handle.reserve_turn());
+        run_turn(
+            handle.clone(),
+            scheduled_turn(
+                &state,
+                &handle,
+                handle.next_turn_id(),
+                "test-user",
+                "accepted input",
+                Arc::new(FinishFailureProvider(Arc::downgrade(&handle))),
+            ),
+        )
+        .await;
+        assert_eq!(
+            serde_json::to_value(&*handle.session.lock().await).unwrap(),
+            baseline
+        );
+        assert_eq!(
+            serde_json::to_value(&*handle.message_cache.read().unwrap()).unwrap(),
+            baseline["messages"]
+        );
+        let outcome = handle.turn_outcomes().pop().unwrap();
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert_eq!(outcome.error.unwrap().code, "persistence_failed");
+        assert!(!handle.is_active());
     }
 }

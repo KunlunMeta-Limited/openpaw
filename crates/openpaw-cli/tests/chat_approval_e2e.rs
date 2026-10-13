@@ -106,6 +106,29 @@ fn manual_headless_denies_tool_and_keeps_next_chat_prompt() {
             .count(),
         2
     );
+    // 拒绝执行同样会产生供模型使用的工具结果，落盘后必须保持完整调用链。
+    let ids = openpaw_store::catalog::discover(home.path()).unwrap();
+    let persisted = openpaw_store::catalog::read(home.path(), &ids[0]).unwrap();
+    let results: Vec<_> = persisted
+        .transcript
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| {
+            if let openpaw_core::ContentBlock::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } = block
+            {
+                Some((tool_use_id.as_str(), *is_error))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(results, vec![("write-call", true)]);
+    assert_eq!(persisted.transcript.messages.len(), 6);
 }
 
 #[tokio::test]

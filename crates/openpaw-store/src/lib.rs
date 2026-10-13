@@ -35,3 +35,6 @@ pub use frontmatter::{read_doc, write_doc_atomic, FrontmatterDoc, FrontmatterErr
 pub use global_db::{ensure_global_db, global_db, init_global_db, is_global_db_initialized};
 pub use session::{SessionError, SessionReader, SessionWriter};
 pub use sqlite::{DbError, MessageRecord, OpenPawDb, SearchResult, SessionDb, SessionSummary};
+
+/// 功能：提供共享 journal 能力；边界及错误见模块说明。
+pub mod journal;

@@ -1,5 +1,17 @@
 # OpenPaw B 线追踪矩阵
 
+## CHG-2026-0025 当前重构追踪
+
+| 本轮要求 | 最终职责与实现 | 验收入口 |
+| --- | --- | --- |
+| runtime 通用职责下沉 | Engine scheduler/turn_execution；Store journal/transcript/catalog；Host 留协调及协议适配 | Engine/Store 单元与既有 Host HTTP/reliability |
+| CLI 实际复用 | CLI chat 调用相同 Engine 执行包装及 Store 消息事务 | chat_e2e/chat_approval_e2e；session_host_parity |
+| ToolResult 不漏存 | 只排除已保存输入，保留 User 角色的工具结果 | 真实 CLI 保存 6 条消息；基线探针 0 个结果、当前 1 个结果 |
+| 完整状态恢复 | 完整 Session checkpoint；异常、取消、future drop 或提交失败时恢复 | Engine usage/压缩/丢弃测试；Host 取消与提交失败的完整状态断言 |
+| 保留严格行数门禁 | Store 按实测由 3000 调至 3500；其他上限和计数规则不变 | xtask lines 及 CHG 实测表 |
+
+本节只追踪当前已批准范围，历史审计、跨平台 CI、真实服务与完整发布裁决分别记录。
+
 > 历史审计快照：本文件保留 2026-09-17 早期反向审计结论，不能作为当前候选事实源。当前实现状态和未关闭发布项以 `../../ai-office-react-main/docs/01-需求基线.md`、`03-测试大纲.md`、`04-验收记录.md` 为准。
 
 审计日期：2026-09-17

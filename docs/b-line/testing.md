@@ -1,5 +1,20 @@
 # B 线测试策略
 
+## CHG-2026-0025 共享运行能力回归入口
+
+| 能力 | 回归入口与观察条件 |
+| --- | --- |
+| 中立 FIFO | Engine scheduler 单元测试与 Host reliability：有界接收、取消、晋升后丢弃不泄漏容量 |
+| 完整会话恢复 | Engine turn_execution：usage 后取消/回调 panic、压缩重写后 panic、部分工具回合 future drop，比较完整 Session |
+| 提交失败恢复 | Host runtime：模型成功并累加用量后令 writer 失效，Session 和缓存恢复、终态 persistence_failed |
+| 文件事务与失效 | Store journal：部分写入回滚后下一次可写；回滚失败 writer=None；不合法 finish 拒绝且文件不变 |
+| 历史与发布 | Store journal 和现有 Host mutation：工具结果顺序、仅损坏尾行修复、身份/中段损坏拒绝、Fork 清理/不覆盖 |
+| 实际 CLI 漏存修复 | chat_approval_e2e：真实 CLI 拒绝工具后保存 6 条完整消息、ToolResult 匹配 write-call、下一条输入不被审批消费 |
+| 外部合同兼容 | 既有 Host HTTP/reliability 和 CLI session_host_parity：接收/终态竞争、Revert/Fork、重启、跨入口只读查询 |
+
+Linux 实际命令、退出码、版本和限制记录在 CHG-2026-0025；旧候选绿测不替代本次验证。
+测试使用隔离临时 home/workspace 和本地 Provider fixture，不访问真实模型或用户历史。
+
 > 当前审计日期：2026-09-20
 > 当前裁决：**核心真实对话缺陷已修复并通过本轮回归，但完整发布门禁仍未通过。** 历史绿测不能替代当前候选的真实 Provider、故障注入、压力与资源门禁。
 

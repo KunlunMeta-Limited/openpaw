@@ -31,3 +31,9 @@ pub use token_budget::{TokenBudgetConfig, TokenBudgetTracker};
 /// 权限：保持既有边界。
 /// 关联：CHG-2026-0023。
 pub mod approval;
+
+/// 功能：提供共享 scheduler 能力；边界及错误见模块说明。
+pub mod scheduler;
+
+/// 功能：提供共享 turn_execution 能力；边界及错误见模块说明。
+pub mod turn_execution;

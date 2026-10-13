@@ -2,14 +2,17 @@
 //!
 //! 默认 mock 离线运行；OpenAI/Anthropic 兼容服务支持自定义地址和模型，密钥
 //! 从环境读取。终端输入由单一所有者路由，人工审批沿用共享 gate 和工具限制。
-//! 本入口不承担 Host HTTP/Office 适配或会话恢复；关联 CHG-2026-0023。
+//! 执行及故障回滚复用 Engine，消息事务复用 Store；本入口每次创建新会话。
+//! Host HTTP/Office 适配不进入终端交互；关联 CHG-2026-0023、CHG-2026-0025。
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use openpaw_core::{Session, SessionEvent};
+use openpaw_engine::turn_execution::{self, TurnOptions};
 use openpaw_engine::{AgentEvent, AgentLoop};
+use openpaw_store::journal;
 
 const EXIT_WORDS: [&str; 4] = ["exit", "quit", "/exit", "/quit"];
 
@@ -87,14 +90,16 @@ pub fn run(args: ChatArgs) -> i32 {
     let home = args.home.clone().unwrap_or_else(openpaw_core::openpaw_home);
     let sessions_dir = home.join("sessions");
     let transcript_path = sessions_dir.join(format!("{}.jsonl", session.meta.id));
-    let mut writer = match openpaw_store::SessionWriter::create(&transcript_path) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("error: cannot create session file: {e}\nwhy: the sessions directory must be writable.\nnext: check OPENPAW_HOME permissions.");
-            return 1;
-        }
-    };
-    if let Err(e) = writer.append(&SessionEvent::Meta(session.meta.clone())) {
+    let mut writer = Some(
+        match openpaw_store::SessionWriter::create(&transcript_path) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("error: cannot create session file: {e}\nwhy: the sessions directory must be writable.\nnext: check OPENPAW_HOME permissions.");
+                return 1;
+            }
+        },
+    );
+    if let Err(e) = journal::append(&mut writer, &SessionEvent::Meta(session.meta.clone())) {
         eprintln!("error: cannot write session meta: {e}");
         return 1;
     }
@@ -136,13 +141,13 @@ pub fn run(args: ChatArgs) -> i32 {
 
         let user_msg = openpaw_core::Message::user_text(trimmed.to_string());
         let pre_len = session.messages.len();
-        session.messages.push(user_msg.clone());
         // The transcript is the durable conversation record: a failed append
         // means the session on disk no longer matches this run, so the
         // command must fail loudly instead of returning 0.
-        if let Err(error) = writer.append(&SessionEvent::Message(user_msg.clone())) {
+        if let Err(error) = journal::append(&mut writer, &SessionEvent::Message(user_msg.clone())) {
             return report_persistence_error("persist the user message", &transcript_path, &error);
         }
+        session.messages.push(user_msg);
         let log: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
         let mut sink = move |ev: AgentEvent| {
@@ -150,8 +155,8 @@ pub fn run(args: ChatArgs) -> i32 {
         };
 
         approvals.begin_turn();
-        let result = rt.block_on(async {
-            let turn = agent.run_turn(&mut session, None, &specs, &mut sink);
+        let execution = rt.block_on(async {
+            let turn = turn_execution::run_turn(&agent, &mut session, &specs, &mut sink, TurnOptions::default());
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -167,7 +172,8 @@ pub fn run(args: ChatArgs) -> i32 {
             }
         });
         approvals.abort_all();
-        let stop = match result {
+        let checkpoint = execution.checkpoint;
+        let stop = match execution.result {
             Ok(stop) => stop,
             Err(e) => {
                 // Three-segment error shape: what / why / next step.
@@ -178,49 +184,50 @@ pub fn run(args: ChatArgs) -> i32 {
             }
         };
 
-        // Persist the new messages and print a compact turn summary.
-        // The user message was already appended (and indexed) when it was
-        // entered above — appending it again here would duplicate the event
-        // in the transcript. Only this turn's produced messages land here.
-        for msg in &session.messages[pre_len..] {
-            if matches!(msg.role, openpaw_core::Role::User) {
-                continue;
-            }
-            if let Err(error) = writer.append(&SessionEvent::Message(msg.clone())) {
-                return report_persistence_error(
-                    "persist the assistant message",
-                    &transcript_path,
-                    &error,
-                );
-            }
+        // 原始输入已提交；产出可以包含 User 角色的工具结果，必须完整保存。
+        let events = log.lock().unwrap_or_else(|e| e.into_inner());
+        let completions: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                if let AgentEvent::ToolResult { name, is_error, .. } = event {
+                    Some(SessionEvent::ToolCallComplete {
+                        call_id: String::new(),
+                        tool_name: name.clone().unwrap_or_default(),
+                        success: !*is_error,
+                        duration_ms: None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let persisted = session
+            .messages
+            .get(pre_len + 1..)
+            .ok_or_else(|| "会话历史的持久化边界不一致".to_string())
+            .and_then(|messages| journal::append_messages(&mut writer, messages, &completions));
+        if let Err(error) = persisted {
+            checkpoint.restore(&mut session);
+            return report_persistence_error(
+                "persist the generated messages",
+                &transcript_path,
+                &error,
+            );
         }
         if let Some(db) = &session_db {
             if let Err(error) = db.refresh_transcript(&home, &session.meta.id) {
                 eprintln!("warn: {error}");
             }
         }
-        let events = log.lock().unwrap_or_else(|e| e.into_inner());
-        for ev in events.iter() {
-            if let AgentEvent::ToolResult {
-                name,
-                is_error,
-                content,
-                ..
-            } = ev
-            {
-                if let Err(error) = writer.append(&SessionEvent::ToolCallComplete {
-                    call_id: String::new(),
-                    tool_name: name.clone().unwrap_or_default(),
-                    success: !*is_error,
-                    duration_ms: None,
-                }) {
-                    return report_persistence_error(
-                        "persist the tool result",
-                        &transcript_path,
-                        &error,
-                    );
-                }
-                if interactive {
+        if interactive {
+            for event in events.iter() {
+                if let AgentEvent::ToolResult {
+                    name,
+                    is_error,
+                    content,
+                    ..
+                } = event
+                {
                     let mark = if *is_error { "!" } else { "·" };
                     let preview: String = content.chars().take(80).collect();
                     writeln!(
@@ -258,11 +265,7 @@ pub fn run(args: ChatArgs) -> i32 {
 /// 参数：`operation` 是失败的写入动作，`path` 是 session 文件，`error` 是存储错误。
 /// 返回：失败操作固定返回 1。
 /// 安全：只输出路径与错误文本，不输出消息正文。
-fn report_persistence_error(
-    operation: &str,
-    path: &std::path::Path,
-    error: &openpaw_store::SessionError,
-) -> i32 {
+fn report_persistence_error(operation: &str, path: &std::path::Path, error: &str) -> i32 {
     eprintln!("error: failed to {operation}: {error}");
     eprintln!(
         "why: the session file {} could not be written completely.",

@@ -16,8 +16,9 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-llm", 5_200),
     ("openpaw-tools", 14_000),
     ("openpaw-mcp", 2_400),
-    // CHG-2026-0024：共享 transcript/catalog 迁入 Store，保留原持久格式与完整 Rustdoc。
-    ("openpaw-store", 3_000),
+    // CHG-2026-0025：事务、修复与 Fork/Revert 迁入后实测 3,065 行，保留约 400 行余量。
+    // 用户授权按实测调整，仅增加 Store 上限，计数规则与严格门禁不变。
+    ("openpaw-store", 3_500),
     ("openpaw-memory", 7_400),
     ("openpaw-plugins", 1_300),
     ("openpaw-cli", 4_500),

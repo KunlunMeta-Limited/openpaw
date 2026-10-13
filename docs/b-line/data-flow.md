@@ -1,5 +1,20 @@
 # B 线数据流
 
+## CHG-2026-0025 共享执行与提交
+
+Host 接收仍在同 session 闸门内完成幂等检查、Engine admission 和 Store 接收事实写入；
+写入成功后发布输入并启动任务。CLI 先通过 Store journal 保存用户输入，再加入内存。
+两端均在已接收输入之后调用 Engine turn_execution，使用完整 Session 检查点保护执行。
+
+执行错误、取消或 future drop 恢复消息、用量及压缩等字段；工具已完成的外部操作保留。
+执行成功后，Host 在取消/终态共用闸门内委托 Store finish 提交 prepare/Message/commit，
+随后发布缓存、终态和 idle。CLI 委托 Store append_messages 保存全部产出，包含工具结果，
+再刷新 SQLite 索引和输出。提交失败时两端恢复执行检查点，沿用各入口的错误返回方式。
+
+Fork 的消息重键与文件发布、Revert 的历史边界和状态保留由 Store 提供；Host 仍负责
+公开消息身份验证、活动冲突、会话登记及 SSE。普通 catalog 查询只读，尾行修复仅由
+显式恢复接口执行。共享模块不接入 HTTP/SSE、Office 或终端，也不提供跨进程同时写锁。
+
 ## 回合时序
 
 ```text

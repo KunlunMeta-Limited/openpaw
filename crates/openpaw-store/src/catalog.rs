@@ -156,6 +156,31 @@ pub fn read(home: &Path, id: &str) -> Result<Snapshot, CatalogError> {
     })
 }
 
+/// 功能：从安全目录快照确定同一来源的下一个分支序号。
+/// 参数：home 为会话根目录，source_id 为直接来源编号。
+/// 返回：当前最大合法来源序号加一。
+/// 错误：目录扫描失败或序号耗尽；损坏会话独立跳过。
+/// 状态：只读，不创建 writer 或修改历史。
+/// 并发与取消：调用方持有分支创建闸门，同步扫描不跨 await。
+/// 权限：复用 catalog 的链接、越界和身份校验。
+/// 关联：CHG-2026-0025。
+pub fn next_fork_ordinal(home: &Path, source_id: &str) -> Result<u64, CatalogError> {
+    let mut maximum = 0u64;
+    for id in discover(home)? {
+        let Ok(snapshot) = read(home, &id) else {
+            continue;
+        };
+        if let Some(origin) = snapshot.transcript.mutation.fork_origin {
+            if origin.source_session_id == source_id {
+                maximum = maximum.max(origin.ordinal);
+            }
+        }
+    }
+    maximum
+        .checked_add(1)
+        .ok_or_else(|| CatalogError("会话分支序号已耗尽".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
