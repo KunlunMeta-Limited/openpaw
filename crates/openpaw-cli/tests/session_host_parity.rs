@@ -133,6 +133,8 @@ fn cli_reads_an_active_host_turn_without_recovering_or_cancelling_it() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         };
+        // Windows 可继承 listener 的非阻塞模式；后续读写使用阻塞超时。
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

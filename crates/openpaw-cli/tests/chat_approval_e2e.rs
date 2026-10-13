@@ -28,6 +28,8 @@ fn manual_headless_denies_tool_and_keeps_next_chat_prompt() {
                     Err(_) => panic!("missing fixture request {index}"),
                 }
             };
+            // Windows 可继承 listener 的非阻塞模式；后续读写使用阻塞超时。
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

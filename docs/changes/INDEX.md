@@ -28,4 +28,4 @@
 | CHG-2026-0021 | 按回合回退会话 | approved | medium | OpenPaw Host 接口与运行时负责人（待确认） | 1 | 9 |
 | CHG-2026-0022 | 回退替换与 API 错误透传 | approved | medium | OpenPaw Host 接口与运行时负责人（待确认） | 4 | 20 |
 | CHG-2026-0023 | CLI 与 Host 运行能力统一 | approved | high | CLI、LLM、Store、Engine 与 Host 负责人（待确认） | 1 | 41 |
-| CHG-2026-0024 | PR 门禁修复与本地检查 | approved / 本地验证完成 | medium | 用户授权；Codex 实施 | 0 | 28 |
+| CHG-2026-0024 | PR 门禁修复与本地检查 | approved / 本地验证完成 | medium | 用户授权；Codex 实施 | 0 | 31 |

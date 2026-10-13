@@ -35,6 +35,8 @@ fn network_case(provider: &'static str, prefix: &str, explicit: bool) {
                 Err(_) => panic!("CLI did not request the configured endpoint"),
             }
         };
+        // Windows 可继承 listener 的非阻塞模式；后续读写使用阻塞超时。
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
