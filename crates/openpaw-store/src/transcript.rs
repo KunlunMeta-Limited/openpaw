@@ -455,8 +455,8 @@ pub enum SessionMutationEvent {
     RevertStaged(SessionRevertStagedV1),
     /// 清除暂存回退游标。
     RevertCleared,
-    /// 永久提交回退并接收替换 prompt。
-    RevertCommitted(SessionRevertCommittedV1),
+    /// 永久提交回退并接收替换 prompt；装箱避免大载荷扩大所有枚举值。
+    RevertCommitted(Box<SessionRevertCommittedV1>),
 }
 
 impl SessionMutationEvent {
@@ -562,7 +562,7 @@ impl SessionMutationProjection {
 /// 状态：纯计算。
 /// 并发与取消：同步无锁，不可取消。
 /// 权限：不读取消息正文之外的资源。
-/// 关联：`API-HOST-SESSION-F03`。
+/// 关联：`API-HOST-SESSION-F03`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 pub fn wire_message_id(session_id: &str, index: usize, message: &Message) -> String {
     message
         .uuid
@@ -649,7 +649,7 @@ pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, P
                         session_id,
                         &mut projection,
                         &mut message_ids,
-                        commit.clone(),
+                        (*commit).clone(),
                     )?;
                     projection
                         .mutation

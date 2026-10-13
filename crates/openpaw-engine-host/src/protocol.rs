@@ -1,7 +1,7 @@
 //! 功能：定义 OpenCode v1 子集的稳定线协议类型。
 //! 输入输出边界：HTTP 请求、SSE 事件和 JSONL 摘要都通过本模块的 serde 类型转换。
 //! 设计约束：未知客户端元数据不影响已登记字段；本模块不负责路由、session 写入或业务决策。
-//! 关联：`DES-OPENPAW-B-2026-09-15`、`API-HOST-*`、`EVT-HOST-*`。
+//! 关联：`DES-OPENPAW-B-2026-09-15`、`API-HOST-*`、`EVT-HOST-*`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 
 use std::path::PathBuf;
 
@@ -161,19 +161,6 @@ impl TurnOutcome {
     /// 关联：`CHG-2026-0012`。
     pub fn to_session_event(&self) -> openpaw_core::SessionEvent {
         openpaw_store::transcript::encode(self, "turn_outcome")
-    }
-
-    /// 功能：从未知 JSONL 事件解析已登记的回合快照。
-    /// 参数：`event` 为 SessionReader 返回的事件。
-    /// 返回：仅 `type=turn_outcome` 且字段合法时返回快照，否则返回 None。
-    /// 错误：未知事件和旧版本附加事件被安全忽略。
-    /// 状态：纯解析，不修改 JSONL。
-    /// 关联：`CHG-2026-0012`。
-    #[cfg(test)]
-    pub fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        openpaw_store::transcript::decode(event, "turn_outcome")
-            .ok()
-            .flatten()
     }
 }
 
@@ -336,7 +323,7 @@ pub struct SessionTime {
 /// 功能：表示客户端仍可取消的会话级暂存回退。
 /// 数据来源：Host 私有 `session_revert_staged_v1` 投影。
 /// 数据去向：Session REST 响应、SSE 和 OpenWork transcript。
-/// 关联：`API-HOST-SESSION-F02`。
+/// 关联：`API-HOST-SESSION-F02`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRevert {
     /// 第一条被隐藏消息的稳定编号。
@@ -375,7 +362,7 @@ pub struct UpdateSessionRequest {
 
 /// 功能：表示会话更新时间对象中允许写入的字段。
 /// 数据边界：正数表示归档，零表示取消归档。
-/// 关联：`API-HOST-SESSION-F01`。
+/// 关联：`API-HOST-SESSION-F01`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct UpdateSessionTime {
     /// 归档 Unix 毫秒；零表示恢复会话。
@@ -458,23 +445,6 @@ pub(crate) struct RequestAdmission {
     pub user_message_id: String,
 }
 
-impl RequestAdmission {
-    /// 功能：从 session 未知事件恢复持久幂等接收事实。
-    /// 参数：`event` 为 SessionReader 读取的单条事件。
-    /// 返回：合法 `request_admission` 返回记录，其他事件返回 None。
-    /// 错误：字段缺失、类型错误或未知版本安全返回 None，不修改原文件。
-    /// 状态：纯解析，不更新运行时索引。
-    /// 并发与取消：纯同步解析，无锁且不可取消。
-    /// 权限：不记录或返回事件之外的文件路径和正文。
-    /// 关联：`CHG-2026-0013`、`DAT-HOST-IDEMPOTENCY-003`。
-    #[cfg(test)]
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        openpaw_store::transcript::decode(event, "request_admission")
-            .ok()
-            .flatten()
-    }
-}
-
 /// 功能：把用户消息、首个回合状态和可选幂等事实封装为一次崩溃原子的接收记录。
 /// 字段语义：单条 JSONL 行即接收提交点，避免多次 fsync 之间出现半接收回合。
 /// 数据来源：Host 完成同 session 幂等检查、回合保留和全局容量接收之后。
@@ -509,21 +479,6 @@ impl TurnAcceptV1 {
     pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
         openpaw_store::transcript::encode(self, "turn_accept_v1")
     }
-
-    /// 功能：从 session 未知事件解析崩溃原子的回合接收记录。
-    /// 参数：`event` 为 SessionReader 返回的单条事件。
-    /// 返回：类型和字段均合法时返回记录，其他事件返回 None。
-    /// 错误：结构错误由恢复状态机归类；本解析器不修改文件。
-    /// 状态：纯解析，不更新消息、outcome 或 requestID 索引。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：只读取事件自身内容，不记录正文或文件路径。
-    /// 关联：`CHG-2026-0013`、`DAT-HOST-TURN-001`。
-    #[cfg(test)]
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        openpaw_store::transcript::decode(event, "turn_accept_v1")
-            .ok()
-            .flatten()
-    }
 }
 
 /// 功能：标记一次生成消息批次的开始，使 commit 之前的 Message 在恢复时保持不可见。
@@ -551,21 +506,6 @@ impl TurnFinishPrepareV1 {
     /// 关联：`CHG-2026-0013`。
     pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
         openpaw_store::transcript::encode(self, "turn_finish_prepare_v1")
-    }
-
-    /// 功能：解析生成消息事务的 prepare 事件。
-    /// 参数：`event` 为 SessionReader 读取的事件。
-    /// 返回：合法 prepare 返回记录，其他事件返回 None。
-    /// 错误：字段损坏返回 None，由恢复状态机按普通未知事件处理。
-    /// 状态：纯解析。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：不接触消息正文。
-    /// 关联：`CHG-2026-0013`。
-    #[cfg(test)]
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        openpaw_store::transcript::decode(event, "turn_finish_prepare_v1")
-            .ok()
-            .flatten()
     }
 }
 
@@ -663,21 +603,6 @@ impl TurnFinishCommitV1 {
     /// 关联：`CHG-2026-0013`。
     pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
         openpaw_store::transcript::encode(self, "turn_finish_commit_v1")
-    }
-
-    /// 功能：解析生成消息事务的 commit 事件。
-    /// 参数：`event` 为 SessionReader 读取的事件。
-    /// 返回：字段可反序列化时返回记录，事务一致性由恢复状态机继续校验。
-    /// 错误：未知或结构损坏事件返回 None，不直接投影消息。
-    /// 状态：纯解析。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：不读取消息正文。
-    /// 关联：`CHG-2026-0013`。
-    #[cfg(test)]
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        openpaw_store::transcript::decode(event, "turn_finish_commit_v1")
-            .ok()
-            .flatten()
     }
 }
 

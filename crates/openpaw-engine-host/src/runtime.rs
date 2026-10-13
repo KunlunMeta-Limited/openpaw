@@ -2339,10 +2339,10 @@ pub(crate) fn append_user_and_turn(
         staged_visible_len(&handle.id, &session.messages, staged_message_id.as_deref())
             .ok_or_else(|| "会话回退游标无法匹配完整消息历史".to_string())?;
     let mutation_event = staged_message_id.map(|message_id| {
-        SessionMutationEvent::RevertCommitted(SessionRevertCommittedV1 {
+        SessionMutationEvent::RevertCommitted(Box::new(SessionRevertCommittedV1 {
             message_id,
             accept: accept.clone(),
-        })
+        }))
     });
     let previous_wire = mutation_event.is_some().then(|| handle.wire_messages());
     let persisted_event = mutation_event

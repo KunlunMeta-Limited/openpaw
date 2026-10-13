@@ -25,17 +25,16 @@ pub fn is_bwrap_available() -> bool {
     which_bwrap().is_some()
 }
 
-/// Check if Landlock is available on the current kernel.
-///
-/// Landlock requires kernel >= 5.13 and the `landlock` syscall to be available.
-/// This is a best-effort check; actual enforcement depends on kernel support.
-pub fn is_landlock_available() -> bool {
+/// 测试辅助：按内核版本估计 Landlock 支持，不代表已启用隔离。
+#[cfg(test)]
+fn is_landlock_available() -> bool {
     // Check kernel version
     let version = get_kernel_version();
     version.as_ref().map(|v| v >= &(5, 13)).unwrap_or(false)
 }
 
 /// Get the Linux kernel version as (major, minor).
+#[cfg(test)]
 fn get_kernel_version() -> Option<(u32, u32)> {
     let output = std::process::Command::new("uname")
         .arg("-r")
@@ -47,6 +46,7 @@ fn get_kernel_version() -> Option<(u32, u32)> {
 }
 
 /// Parse a kernel version string like "5.15.0-generic" into (5, 15).
+#[cfg(test)]
 fn parse_kernel_version(version: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = version.trim().split('.').collect();
     if parts.len() < 2 {
@@ -123,8 +123,7 @@ pub async fn exec_bwrap(
     // syscall filtering. Known bwrap escape vectors via syscalls like
     // `keyctl`, `perf_event_open`, `bpf`, and `ptrace` are not blocked.
     // Seccomp filters or Landlock would be needed to close this gap.
-    // Landlock availability is detected (is_landlock_available) but never
-    // applied — this should be addressed in a future enhancement.
+    // Landlock is not applied; the kernel-version probe exists only in tests.
 
     // Add writable roots for WorkspaceWrite policy
     if let FileSystemPolicy::WorkspaceWrite { roots } = policy.fs_policy() {
@@ -211,10 +210,9 @@ pub async fn exec_bwrap(
     })
 }
 
-/// Get the list of available sandbox backends on Linux.
-///
-/// Returns a list of backend names that are available, in order of preference.
-pub fn available_backends() -> Vec<&'static str> {
+/// 测试辅助：列出可探测的后端名称，不作为运行时可用性承诺。
+#[cfg(test)]
+fn available_backends() -> Vec<&'static str> {
     let mut backends = Vec::new();
     if is_bwrap_available() {
         backends.push("bubblewrap");
@@ -248,7 +246,7 @@ mod tests {
     #[test]
     fn landlock_requires_5_13() {
         // Verify our version check logic
-        assert!(is_landlock_available() || get_kernel_version().map_or(true, |v| v < (5, 13)));
+        assert!(is_landlock_available() || get_kernel_version().is_none_or(|v| v < (5, 13)));
     }
 
     #[test]

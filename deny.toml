@@ -12,6 +12,12 @@ no-default-features = false
 version = 2
 allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.93
+# 仅放行现有 crate 的具体许可证，不扩大其他依赖的全局许可集合。
+# option-ext 使用文件级 MPL；webpki-roots 分发 CDLA 许可的根证书数据。
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots@1.0.9" },
+]
 
 [bans]
 multiple-versions = "warn"

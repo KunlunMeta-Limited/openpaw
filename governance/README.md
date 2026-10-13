@@ -1,22 +1,12 @@
-# OpenPaw 治理入口
+# OpenPaw 本地变更记录
 
-本目录只登记项目适配信息，不保存 B 线业务规则。通用规则位于
-`D:/Workspace/_bak/test/framework`，正式使用时通过 `AI_GOVERNANCE_FRAMEWORK` 固定版本。
+CHG-2026-0024 经用户授权停用外部治理框架。CI workflow、转发入口和外部 profile 已移除，
+日常开发不需要 `AI_GOVERNANCE_FRAMEWORK` 或特定本机目录。
 
-先执行：
+继续使用本仓 `docs/changes/` 记录变更范围、用户授权、接口影响、测试和回滚；
+`docs/governance/` 保存设计基线、验收要求及中文注释规范，供人工审阅。历史 CHG 的
+外部工具命令和失败结果是历史证据，不是当前检查入口。
 
-```text
-python governance/check.py validate --profile governance/project-profile.toml
-python governance/check.py contracts --dir contracts
-python governance/check.py index --changes docs/changes --output docs/changes/INDEX.md
-```
-
-当前接入处于反向扫描阶段，CHG 为 `草案（draft）`，不能生成编码任务包。以后人审核 CHG
-后再由人执行：
-
-```text
-python governance/check.py approve --change docs/changes/CHG-2026-0001-治理接入.md --by "真实姓名"
-```
-
-Git 建立后，PR 必须执行 `pr-check`、`comments-diff` 和 profile 中对应的格式、测试、依赖
-命令；未登记文件、未批准 CHG 或保护路径缺少 CODEOWNER 审查都应阻断合并。
+机器检查由 `.github/workflows/ci.yml` 和仓库自带 `cargo` / `xtask` 提供；
+当前本地自检入口见 `AGENTS.md`。PR 描述记录实际退出码，CODEOWNER 继续承担人工审查。
+移除外部工具不代表构建、测试、lint 或本地工程预算可以跳过。
