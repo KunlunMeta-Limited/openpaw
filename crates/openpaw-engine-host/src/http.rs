@@ -20,7 +20,6 @@ use axum::response::{
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use openpaw_core::Message;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -54,7 +53,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 .patch(update_session)
                 .delete(delete_session),
         )
-        .route("/session/{id}/message", get(messages).post(message))
+        .route(
+            "/session/{id}/message",
+            get(messages)
+                .post(message)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    openpaw_core::media::MAX_REQUEST_BYTES,
+                )),
+        )
         .route("/session/{id}/message/{message_id}", get(messages))
         .route("/session/{id}/turns", get(turns))
         .route("/session/{id}/command", post(no_content))
@@ -63,7 +69,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/revert", post(revert_session))
         .route("/session/{id}/unrevert", post(unrevert_session))
         .route("/session/{id}/summarize", post(no_content))
-        .route("/session/{id}/prompt_async", post(prompt_async))
+        .route(
+            "/session/{id}/prompt_async",
+            post(prompt_async).layer(axum::extract::DefaultBodyLimit::max(
+                openpaw_core::media::MAX_REQUEST_BYTES,
+            )),
+        )
         .route("/session/{id}/abort", post(abort))
         .route("/session/{id}/todo", get(todo))
         .route("/session/status", get(status))
@@ -303,7 +314,7 @@ async fn update_session(
 ) -> Response {
     let Json(body) = match body {
         Ok(body) => body,
-        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error.body_text()),
     };
     match state.update_session(&id, body).await {
         Ok(session) => Json(session).into_response(),
@@ -330,7 +341,7 @@ async fn revert_session(
 ) -> Response {
     let Json(body) = match body {
         Ok(body) => body,
-        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error.body_text()),
     };
     if body.part_id.is_some() {
         return bad_with_code(
@@ -401,7 +412,16 @@ async fn message(
 ) -> Response {
     let Json(body) = match body {
         Ok(body) => body,
-        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => {
+            return bad(
+                if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "invalid JSON request body",
+            )
+        }
     };
     schedule_turn(state, id, body, false).await
 }
@@ -413,7 +433,16 @@ async fn prompt_async(
 ) -> Response {
     let Json(body) = match body {
         Ok(body) => body,
-        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => {
+            return bad(
+                if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "invalid JSON request body",
+            )
+        }
     };
     schedule_turn(state, id, body, true).await
 }
@@ -425,7 +454,12 @@ async fn schedule_turn(
     asynchronous: bool,
 ) -> Response {
     let text = body.text();
-    if text.trim().is_empty() {
+    let mut user = match body.message() {
+        Ok(message) => message,
+        Err(error) => return media_error(error),
+    };
+    let input_media = openpaw_core::media::message_media(std::slice::from_ref(&user));
+    if text.trim().is_empty() && input_media.is_empty() {
         return bad(StatusCode::BAD_REQUEST, "消息文本不能为空");
     }
     body.request_id = body.request_id.or_else(|| body.message_id.clone());
@@ -504,12 +538,18 @@ async fn schedule_turn(
         Ok(provider) => provider,
         Err(error) => return bad(StatusCode::BAD_REQUEST, error),
     };
+    if let Err(error) =
+        openpaw_core::media::validate_media(&input_media, provider.model_capabilities(&model_name))
+    {
+        return media_error(error);
+    }
     let turn_id = handle.next_turn_id();
     let user_message_id = body
         .message_id
         .clone()
         .unwrap_or_else(|| format!("msg_{id}_{turn_id}_user"));
-    let user = Message::user_text(text.clone()).with_uuid(user_message_id.clone());
+    user.uuid = Some(user_message_id.clone());
+    let input_content = user.content.clone();
     let request_admission =
         body.request_id
             .clone()
@@ -572,11 +612,24 @@ async fn schedule_turn(
         &id,
         &accepted.user_message_id,
     ));
-    handle.emit(crate::events::user_text_part(
-        &id,
-        &accepted.user_message_id,
-        &text,
-    ));
+    for (index, block) in input_content.iter().enumerate() {
+        if input_media.is_empty() {
+            handle.emit(crate::events::user_text_part(
+                &id,
+                &accepted.user_message_id,
+                &text,
+            ));
+            break;
+        }
+        if let Some(part) =
+            crate::message_projection::input_part(&id, &accepted.user_message_id, index, block)
+        {
+            handle.emit(OpenCodeEvent::new(
+                "message.part.updated",
+                serde_json::json!({"part":part}),
+            ));
+        }
+    }
     let response_turn_id = accepted.turn_id.clone();
     let task = state.spawn_turn(
         host_admission,
@@ -664,7 +717,10 @@ async fn provider(State(state): State<Arc<AppState>>) -> Json<serde_json::Value>
             let models: serde_json::Map<_, _> = config
                 .models(id)
                 .into_iter()
-                .map(|model| (model.clone(), serde_json::json!({"id":model,"name":model})))
+                .map(|model| {
+                    let caps = config.capabilities(id, &model).unwrap_or_default();
+                    (model.clone(), serde_json::json!({"id":model,"name":model,"capabilities":{"input":{"text":true,"image":caps.image_input,"audio":caps.audio_input}}}))
+                })
                 .collect();
             serde_json::json!({"id":id,"name":name,"models":models})
         })
@@ -702,7 +758,7 @@ async fn permission_reply(
     }
     let Json(body) = match body {
         Ok(body) => body,
-        Err(error) => return bad(StatusCode::BAD_REQUEST, error.to_string()),
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error.body_text()),
     };
     let Some(reply) = body.reply.as_deref() else {
         return bad(
@@ -835,7 +891,38 @@ fn request_fingerprint(body: &MessageRequest, provider: &str, model: &str) -> St
     if let Some(message_id) = &body.message_id {
         canonical.extend_from_slice(message_id.as_bytes());
     }
+    if body
+        .parts
+        .iter()
+        .any(|part| part.kind.as_deref() == Some("file"))
+    {
+        if let Ok(message) = body.message() {
+            let content: Vec<_> = message.content.iter().map(|block| {
+                match openpaw_core::media::block_media(block) {
+                    Ok(Some(media)) => serde_json::json!({"mime":media.mime,"data":media.data,"filename":media.filename}),
+                    _ => serde_json::to_value(block).unwrap_or_default(),
+                }
+            }).collect();
+            canonical.extend_from_slice(
+                serde_json::to_string(&content)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+        }
+    }
     sha256_hex(&canonical)
+}
+
+fn media_error(error: openpaw_core::Error) -> Response {
+    let detail = error.to_string();
+    bad(
+        if detail.contains("byte limit") {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        detail,
+    )
 }
 
 fn sha256_hex(input: &[u8]) -> String {

@@ -162,6 +162,15 @@ pub fn run_show(home: &Path, id: &str) -> i32 {
             index + 1,
             truncate(&message.text(), 100)
         );
+        for media in openpaw_core::media::message_media(std::slice::from_ref(message)) {
+            println!(
+                "     attachment {} {} {} ({} bytes)",
+                media.id,
+                media.mime,
+                media.filename.as_deref().unwrap_or(""),
+                media.bytes().map(|bytes| bytes.len()).unwrap_or(0)
+            );
+        }
         for block in &message.content {
             if let openpaw_core::ContentBlock::ToolResult { name, is_error, .. } = block {
                 println!(

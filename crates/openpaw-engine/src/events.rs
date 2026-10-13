@@ -27,6 +27,8 @@ pub enum AgentEvent {
         name: String,
     },
     ToolResult {
+        /// 功能：已批准工具结果的媒体附件；Office 不消费原件。
+        media: Vec<openpaw_core::InlineMedia>,
         tool_use_id: String,
         content: String,
         is_error: bool,
@@ -77,6 +79,7 @@ mod tests {
         );
         assert_eq!(
             AgentEvent::ToolResult {
+                media: Vec::new(),
                 tool_use_id: "c1".into(),
                 content: "y".into(),
                 is_error: false,

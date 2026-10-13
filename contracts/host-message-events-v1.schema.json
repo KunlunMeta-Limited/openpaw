@@ -2,28 +2,62 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openpaw.local/contracts/host-message-events-v1.schema.json",
   "title": "OpenCode v1 消息、删除与安全执行错误投影",
-  "description": "CHG-2026-0022：只验证兼容消息投影，不改变 Gateway turns；错误详情不得包含原始响应、请求、凭据或路径。",
+  "description": "CHG-2026-0022 / CHG-2026-0026：消息、内联 file 与工具 attachments 投影；错误详情不得包含原始响应、请求、凭据或路径。",
   "oneOf": [
-    { "$ref": "#/$defs/event" },
-    { "$ref": "#/$defs/message" }
+    {
+      "$ref": "#/$defs/event"
+    },
+    {
+      "$ref": "#/$defs/message"
+    }
   ],
   "$defs": {
     "error": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "data"],
+      "required": [
+        "name",
+        "data"
+      ],
       "properties": {
-        "name": { "enum": ["APIError", "UnknownError"] },
+        "name": {
+          "enum": [
+            "APIError",
+            "UnknownError"
+          ]
+        },
         "data": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["message", "code", "isRetryable"],
+          "required": [
+            "message",
+            "code",
+            "isRetryable"
+          ],
           "properties": {
-            "message": { "type": "string", "minLength": 1, "maxLength": 512 },
-            "code": { "type": "string", "minLength": 1 },
-            "isRetryable": { "type": "boolean" },
-            "statusCode": { "type": "integer", "minimum": 400, "maximum": 599 },
-            "providerID": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "code": {
+              "type": "string",
+              "minLength": 1
+            },
+            "isRetryable": {
+              "type": "boolean"
+            },
+            "statusCode": {
+              "type": "integer",
+              "minimum": 400,
+              "maximum": 599
+            },
+            "providerID": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
           }
         }
       }
@@ -31,80 +65,365 @@
     "info": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "sessionID", "role", "time"],
+      "required": [
+        "id",
+        "sessionID",
+        "role",
+        "time"
+      ],
       "properties": {
-        "id": { "type": "string", "minLength": 1 },
-        "sessionID": { "type": "string", "minLength": 1 },
-        "role": { "enum": ["user", "assistant"] },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "role": {
+          "enum": [
+            "user",
+            "assistant"
+          ]
+        },
         "time": {
           "type": "object",
           "additionalProperties": false,
-          "properties": { "created": { "type": "integer" }, "completed": { "type": ["integer", "null"] } }
+          "properties": {
+            "created": {
+              "type": "integer"
+            },
+            "completed": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
         },
-        "error": { "$ref": "#/$defs/error" }
+        "error": {
+          "$ref": "#/$defs/error"
+        }
       }
     },
     "textPart": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "messageID", "sessionID", "type", "text"],
+      "required": [
+        "id",
+        "messageID",
+        "sessionID",
+        "type",
+        "text"
+      ],
       "properties": {
-        "id": { "type": "string", "minLength": 1 },
-        "messageID": { "type": "string", "minLength": 1 },
-        "sessionID": { "type": "string", "minLength": 1 },
-        "type": { "const": "text" },
-        "text": { "type": "string" }
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "messageID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sessionID": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "const": "text"
+        },
+        "text": {
+          "type": "string"
+        }
       }
     },
     "message": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["info", "parts"],
-      "properties": { "info": { "$ref": "#/$defs/info" }, "parts": { "type": "array", "items": { "type": "object" } } }
+      "required": [
+        "info",
+        "parts"
+      ],
+      "properties": {
+        "info": {
+          "$ref": "#/$defs/info"
+        },
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "file"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "$ref": "#/$defs/filePart"
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "tool"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "attachments": {
+                      "$ref": "#/$defs/toolAttachments"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
     },
     "event": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "properties"],
+      "required": [
+        "type",
+        "properties"
+      ],
       "oneOf": [
         {
           "properties": {
-            "type": { "const": "message.removed" },
+            "type": {
+              "const": "message.removed"
+            },
             "properties": {
-              "type": "object", "additionalProperties": false, "required": ["sessionID", "messageID"],
-              "properties": { "sessionID": { "type": "string", "minLength": 1 }, "messageID": { "type": "string", "minLength": 1 } }
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "sessionID",
+                "messageID"
+              ],
+              "properties": {
+                "sessionID": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "messageID": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
             }
           }
         },
         {
           "properties": {
-            "type": { "const": "session.error" },
+            "type": {
+              "const": "session.error"
+            },
             "properties": {
-              "type": "object", "additionalProperties": false, "required": ["sessionID", "error"],
-              "properties": { "sessionID": { "type": "string", "minLength": 1 }, "error": { "$ref": "#/$defs/error" } }
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "sessionID",
+                "error"
+              ],
+              "properties": {
+                "sessionID": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "error": {
+                  "$ref": "#/$defs/error"
+                }
+              }
             }
           }
         },
         {
           "properties": {
-            "type": { "const": "message.updated" },
+            "type": {
+              "const": "message.updated"
+            },
             "properties": {
-              "type": "object", "additionalProperties": false, "required": ["info"],
-              "properties": { "info": { "$ref": "#/$defs/info" } }
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "info"
+              ],
+              "properties": {
+                "info": {
+                  "$ref": "#/$defs/info"
+                }
+              }
             }
           }
         },
         {
           "properties": {
-            "type": { "const": "message.part.updated" },
+            "type": {
+              "const": "message.part.updated"
+            },
             "properties": {
-              "type": "object", "additionalProperties": false, "required": ["part"],
-              "properties": { "part": { "$ref": "#/$defs/textPart" } }
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "part"
+              ],
+              "properties": {
+                "part": {
+                  "type": "object",
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "type": {
+                            "const": "file"
+                          }
+                        },
+                        "required": [
+                          "type"
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/$defs/filePart"
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "type": {
+                            "const": "tool"
+                          }
+                        },
+                        "required": [
+                          "type"
+                        ]
+                      },
+                      "then": {
+                        "properties": {
+                          "attachments": {
+                            "$ref": "#/$defs/toolAttachments"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
             }
           }
         }
       ],
-      "properties": { "type": { "type": "string" }, "properties": { "type": "object" } }
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "properties": {
+          "type": "object"
+        }
+      }
+    },
+    "filePart": {
+      "type": "object",
+      "required": [
+        "type",
+        "mime",
+        "url",
+        "id",
+        "messageID",
+        "sessionID",
+        "attachmentID"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "mime": {
+          "enum": [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "image/gif",
+            "audio/wav",
+            "audio/x-wav",
+            "audio/mpeg",
+            "audio/mp3"
+          ]
+        },
+        "filename": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "url": {
+          "type": "string",
+          "pattern": "^data:[^;]+;base64,[A-Za-z0-9+/]*={0,2}$"
+        },
+        "id": {
+          "type": "string"
+        },
+        "messageID": {
+          "type": "string"
+        },
+        "sessionID": {
+          "type": "string"
+        },
+        "attachmentID": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "toolAttachments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "type",
+          "mime",
+          "url",
+          "attachmentID"
+        ],
+        "properties": {
+          "type": {
+            "const": "file"
+          },
+          "mime": {
+            "enum": [
+              "image/png",
+              "image/jpeg",
+              "image/webp",
+              "image/gif",
+              "audio/wav",
+              "audio/x-wav",
+              "audio/mpeg",
+              "audio/mp3"
+            ]
+          },
+          "filename": {
+            "type": "string",
+            "maxLength": 255
+          },
+          "url": {
+            "type": "string",
+            "pattern": "^data:[^;]+;base64,[A-Za-z0-9+/]*={0,2}$"
+          },
+          "attachmentID": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": true
+      }
     }
   }
 }

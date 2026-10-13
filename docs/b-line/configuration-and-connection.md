@@ -129,3 +129,40 @@ Ubuntu/Linux 为 `start-demo.sh`。macOS 可复用 Bash 脚本，但需自行安
 同名参数并自动转换为 Linux 路径；Ubuntu 直接设置 `OPENPAW_SOURCE_ROOT`、
 `AI_OFFICE_SOURCE_ROOT`、`OPENPAW_ENV_FILE`。两套验收脚本也读取相同的源码根变量，避免启动和
 验收指向不同副本。
+
+## 图片与原生音频配置（CHG-2026-0026）
+
+`OPENPAW_MODEL_CAPABILITIES` 是按 provider / model 键登记的 JSON。`input` 允许
+`text`、`image`、`audio`，`context_window` 可选且必须为正整数；缺省预算 128000。
+未声明的模型只接收文本。声明是本地配置，不能证明上游支持；Anthropic 的 audio 声明被拒绝，
+mock/echo 只允许 text。CLI model list / config show、Host /provider 展示同一输入声明。
+
+```powershell
+$env:OPENPAW_MODEL_CAPABILITIES = '{"openai":{"vision-model":{"input":["text","image"],"context_window":128000},"audio-model":{"input":["text","audio"]}},"anthropic":{"claude-vision":{"input":["text","image"],"context_window":200000}}}'
+openpaw chat --provider openai --model vision-model --attach "C:\images\screen.png"
+openpaw chat --provider openai --model audio-model --attach "C:\recordings\meeting.wav"
+```
+
+沿用已有 Key、base URL 和输出上限配置；`--attach` 可重复。输入文字发送所有待发送附件，
+`/attach <path>` 添加，`/send` 只发附件，`/clear-attachments` 清空，EOF 不发。
+工具 `read_file` 读取工作区图片或录音并返回内联原件；文本仍使用行号与 offset/limit，媒体忽略行范围。
+`read_attachment` 只接受当前有效历史中的 `attachmentID`，压缩后也可回看，不接受其他 session 或路径。
+两类工具均沿用审批、工作区和取消规则。
+
+Host `/session/:id/message` 或 `/prompt_async` 请求示例：
+
+```json
+{"messageID":"client-media-1","parts":[{"type":"text","text":"描述附件"},{"type":"file","mime":"image/png","filename":"screen.png","url":"data:image/png;base64,<原件的标准Base64>"}]}
+```
+
+只发 file 也合法。音频 MIME 为 audio/wav 或 audio/mpeg，兼容 audio/x-wav、audio/mp3 别名。
+直接 text 字段优先于 text parts；file 保持输入顺序。远程 URL 不下载。
+PNG/JPEG/WebP/GIF 图片 5 MiB（GIF 请求保留首帧，历史保存全部原件）、WAV/MP3 音频 20 MiB；每回合最多 4 个不同附件、原件总计20 MiB。
+重复读取同一附件编号不重复计数；读取同一文件产生新编号。请求体上限32 MiB。错误媒体/能力返回400，
+字节超限413，接收前拒绝不增加消息；同幂等键改变内容、位置、名称或模型返回409。
+
+原件内联到 JSONL，摘要保留稳定编号；压缩不改变公共完整历史。
+图片协议为 Chat image_url 或 Anthropic source，音频为 Chat input_audio 的 wav/mp3；回复仍为文字。
+Chat 工具结果保留文本和调用 ID，随后媒体 user 输入只是协议适配，不形成新用户回合。
+暂存回退保留 REST 原记录并提供 revert 游标，模型与分支只使用有效前缀。
+本轮仅本地契约验收，实际模型理解及第三方接受行为尚待验证。

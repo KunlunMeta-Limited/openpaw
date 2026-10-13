@@ -30,6 +30,7 @@
 | CHG-2026-0023 | CLI 与 Host 运行能力统一 | approved | high | CLI、LLM、Store、Engine 与 Host 负责人（待确认） | 1 | 41 |
 | CHG-2026-0024 | PR 门禁修复与本地检查 | approved / 本地验证完成 | medium | 用户授权；Codex 实施 | 0 | 31 |
 | CHG-2026-0025 | Host 运行职责下沉 | approved / 本地实施、验证与依赖审计完成 | high | 用户授权；Codex 实施 | 0 | 25 |
+| CHG-2026-0026 | 图片与音频附件理解 | approved / 本地实施、验证及 Docker Host 部署完成；真实图片直传通过 | high | 用户决策；Codex 实施 | 现有合同扩展，详见 CHG | 69 |
 
 CHG-2026-0025 的文件数量为当前 diff 的 25 个实际文件，不包含原有 `.ua/`。
 Q1–Q5 已确认，迁移、本地回归及 cargo-deny 0.20.2 依赖审计完成；审计经本机 7890

@@ -63,6 +63,13 @@ pub struct Cli {
 /// 功能：定义唯一 chat 参数。
 #[derive(Debug, clap::Args)]
 pub struct ChatArgs {
+    /// 功能：明确选择本地图片/音频，可重复；随下一条文字或 /send 发送。
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Attach a local image/audio file (repeatable)"
+    )]
+    pub attach: Vec<PathBuf>,
     /// 功能：支持 mock、echo、openai、anthropic。
     #[arg(
         long,

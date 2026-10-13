@@ -369,6 +369,7 @@ mod tests {
         d.observe(
             "session-a",
             &AgentEvent::ToolResult {
+                media: Vec::new(),
                 tool_use_id: "1".into(),
                 content: "ok".into(),
                 is_error: false,
@@ -392,6 +393,7 @@ mod tests {
         d.observe(
             "session-a",
             &AgentEvent::ToolResult {
+                media: Vec::new(),
                 tool_use_id: "2".into(),
                 content: "ok".into(),
                 is_error: false,
@@ -523,6 +525,7 @@ mod tests {
         dispatcher.observe(
             "session-a",
             &AgentEvent::ToolResult {
+                media: Vec::new(),
                 tool_use_id: "read-1".into(),
                 content: "ok".into(),
                 is_error: false,
@@ -539,6 +542,7 @@ mod tests {
         dispatcher.observe(
             "session-a",
             &AgentEvent::ToolResult {
+                media: Vec::new(),
                 tool_use_id: "read-2".into(),
                 content: "ok".into(),
                 is_error: false,
@@ -595,6 +599,7 @@ mod tests {
         dispatcher.observe(
             "session-a",
             &AgentEvent::ToolResult {
+                media: Vec::new(),
                 tool_use_id: "web".into(),
                 content: "ok".into(),
                 is_error: false,

@@ -1577,7 +1577,12 @@ fn configured_agent(
 ) -> Result<AgentLoop, String> {
     let mut agent = AgentLoop::new(provider)
         .with_model(model)
-        .with_tool_host(tool_host);
+        .with_tool_host(tool_host)
+        .with_compact_options(openpaw_engine::compaction::CompactOptions {
+            protect_head_pairs: 0,
+            keep_recent_pairs: 1,
+            ..Default::default()
+        });
     agent = agent
         .with_max_tokens(openpaw_llm::config::ConfigSnapshot::from_env().max_output_tokens(None)?);
     Ok(openpaw_engine::approval::configure(
@@ -2013,9 +2018,17 @@ pub(crate) fn append_user_and_turn(
         .unwrap_or_else(|error| error.into_inner())
         .revert_message_id
         .clone();
-    let visible_len =
-        staged_visible_len(&handle.id, &session.messages, staged_message_id.as_deref())
-            .ok_or_else(|| "会话回退游标无法匹配完整消息历史".to_string())?;
+    let mut published_messages = handle
+        .message_cache
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let visible_len = staged_visible_len(
+        &handle.id,
+        &published_messages,
+        staged_message_id.as_deref(),
+    )
+    .ok_or_else(|| "会话回退游标无法匹配完整消息历史".to_string())?;
     let mutation_event = staged_message_id.map(|message_id| {
         SessionMutationEvent::RevertCommitted(Box::new(SessionRevertCommittedV1 {
             message_id,
@@ -2029,10 +2042,11 @@ pub(crate) fn append_user_and_turn(
         .unwrap_or_else(|| accept.to_session_event());
     append_event(handle, &persisted_event)?;
     if mutation_event.is_some() {
-        session.messages.truncate(visible_len);
+        published_messages.truncate(visible_len);
+        session.messages = published_messages.clone();
     }
     session.messages.push(message.clone());
-    let published_messages = session.messages.clone();
+    published_messages.push(message.clone());
     {
         let _snapshot = handle
             .snapshot_gate
@@ -2277,14 +2291,13 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     handle.office.turn_started(&handle.id, &mut roles);
     handle.set_activity("thinking", None, "正在思考");
     handle.emit(events::session_status(&handle.id, "busy"));
-    let (before, result) = {
+    let (mut generated, result) = {
         let mut session = handle.session.lock().await;
-        let before = session.messages.len();
         // AgentLoop 会在 await 期间直接修改 messages、token 计数和压缩状态。
         // Provider、工具或事件投影若 panic，必须恢复整个回合前快照，避免半轮内存
         // 上下文进入下一次请求；生成消息尚未进入 JSONL，因此无需截断持久文件。
         if handle.cancel_requested.load(Ordering::Acquire) {
-            (before, Ok(openpaw_core::StopReason::EndTurn))
+            (Vec::new(), Ok(openpaw_core::StopReason::EndTurn))
         } else {
             if !text.trim().is_empty()
                 && handle
@@ -2341,12 +2354,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                         );
                     }
                     openpaw_engine::AgentEvent::MessageStart => {
-                        if response_index > 0 && completed_responses.insert(active_response_index) {
-                            handle.emit(events::assistant_completed_for_turn_response(
-                                &handle.id,
-                                Some(&turn_id),
-                                active_response_index,
-                            ));
+                        if response_index > 0 {
+                            completed_responses.insert(active_response_index);
                         }
                         active_response_index = response_index;
                         response_index = response_index.saturating_add(1);
@@ -2373,14 +2382,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                             true,
                         ));
                     }
-                    openpaw_engine::AgentEvent::TurnUsage { .. }
-                        if completed_responses.insert(active_response_index) =>
-                    {
-                        handle.emit(events::assistant_completed_for_turn_response(
-                            &handle.id,
-                            Some(&turn_id),
-                            active_response_index,
-                        ));
+                    openpaw_engine::AgentEvent::TurnUsage { .. } => {
+                        completed_responses.insert(active_response_index);
                     }
                     _ => {}
                 }
@@ -2415,6 +2418,15 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     }
                 }
             };
+            let attachments = {
+                let messages = handle
+                    .message_cache
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner());
+                openpaw_store::media::attachment_snapshot(&messages)
+                    .into_values()
+                    .collect()
+            };
             let execution = turn_execution::run_turn(
                 &handle.agent,
                 &mut session,
@@ -2423,6 +2435,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 TurnOptions {
                     cancel: turn_cancel.clone(),
                     provider_and_model: Some((provider, model)),
+                    attachments,
                     ..Default::default()
                 },
             )
@@ -2432,7 +2445,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             if let Err(error) = &result {
                 tracing::warn!(session_id = %handle.id, turn_id = %turn_id, error = %error, "回合执行失败");
             }
-            (before, result)
+            (execution.generated_messages, result)
         }
     };
     let reason = result
@@ -2456,7 +2469,9 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             handle.cancel_requested.load(Ordering::Acquire) || turn_cancel.is_cancelled();
         let mut assistant_index = 0usize;
         let mut generated_index = 0usize;
-        for message in session.messages.iter_mut().skip(before) {
+        let mut message_ids = std::collections::HashMap::new();
+        for message in &mut generated {
+            let original_id = message.uuid.take();
             if message.uuid.is_none() {
                 let suffix = match message.role {
                     openpaw_core::Role::Assistant => {
@@ -2473,16 +2488,20 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 message.uuid = Some(format!("msg_{}_{}_{}", handle.id, turn_id, suffix));
                 generated_index += 1;
             }
+            if let Some(original) = original_id {
+                message_ids.insert(original, message.uuid.clone());
+            }
+        }
+        for message in &mut session.messages {
+            if let Some(id) = message.uuid.as_ref().and_then(|id| message_ids.get(id)) {
+                message.uuid = id.clone();
+            }
         }
         if cancelled {
             cleanup.restore_session(&mut session);
         }
-        if response_index > 0 && completed_responses.insert(active_response_index) {
-            handle.emit(events::assistant_completed_for_turn_response(
-                &handle.id,
-                Some(&turn_id),
-                active_response_index,
-            ));
+        if response_index > 0 {
+            completed_responses.insert(active_response_index);
         }
         let intended_terminal = if cancelled {
             terminal_outcome(
@@ -2532,7 +2551,6 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 intended_terminal
             }
         } else {
-            let generated = session.messages[before..].to_vec();
             if let Err(error) = persist_finish_transaction(
                 &handle,
                 &turn_id,
@@ -2564,8 +2582,27 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         };
         cleanup.checkpoint = None;
         cleanup.message_count_before = session.messages.len();
-        let snapshot = session.messages.clone();
+        let mut snapshot = handle
+            .message_cache
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if terminal.state == TurnState::Completed {
+            snapshot.extend(generated);
+        }
+        let committed = matches!(terminal.state, TurnState::Completed | TurnState::Cancelled);
         handle.publish_terminal_snapshot(snapshot.clone(), terminal, failure);
+        if committed {
+            let mut completed: Vec<_> = completed_responses.into_iter().collect();
+            completed.sort_unstable();
+            for response in completed {
+                handle.emit(events::assistant_completed_for_turn_response(
+                    &handle.id,
+                    Some(&turn_id),
+                    response,
+                ));
+            }
+        }
         finish_turn_projection(&handle);
         handle.active.store(false, Ordering::Release);
         snapshot

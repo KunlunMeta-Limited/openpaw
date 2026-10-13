@@ -42,6 +42,14 @@ impl FakeProvider {
         ) -> Response {
             state.calls.fetch_add(1, Ordering::AcqRel);
             state.requests.lock().unwrap().push(body.clone());
+            if body["stream"] == false {
+                assert!(body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Summarize"));
+                assert!(!body.to_string().contains("base64,"));
+                return Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"old context summarized"},"finish_reason":"stop"}]})).into_response();
+            }
             let prompt = body["messages"]
                 .as_array()
                 .and_then(|messages| messages.last())
@@ -81,6 +89,12 @@ impl FakeProvider {
             }
             let permit = state.release.acquire().await.expect("release semaphore");
             permit.forget();
+            if body["model"] == "media-model"
+                && !body["messages"].to_string().contains("\"role\":\"tool\"")
+            {
+                return ([("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"image-read\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"first.gif\\\"}\"}},{\"index\":1,\"id\":\"audio-read\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"second.wav\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n").into_response();
+            }
             (
                 [("content-type", "text/event-stream")],
                 "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
@@ -128,6 +142,7 @@ impl Drop for FakeProvider {
 struct ProviderEnvironment {
     old_key: Option<std::ffi::OsString>,
     old_url: Option<std::ffi::OsString>,
+    old_caps: Option<std::ffi::OsString>,
 }
 impl ProviderEnvironment {
     fn set(address: std::net::SocketAddr) -> Self {
@@ -135,7 +150,12 @@ impl ProviderEnvironment {
         let old_url = std::env::var_os("OPENPAW_OPENAI_BASE_URL");
         std::env::set_var("OPENAI_API_KEY", "test-key");
         std::env::set_var("OPENPAW_OPENAI_BASE_URL", format!("http://{address}/v1"));
-        Self { old_key, old_url }
+        let old_caps = std::env::var_os("OPENPAW_MODEL_CAPABILITIES");
+        Self {
+            old_key,
+            old_url,
+            old_caps,
+        }
     }
 }
 impl Drop for ProviderEnvironment {
@@ -147,6 +167,10 @@ impl Drop for ProviderEnvironment {
         match self.old_url.take() {
             Some(value) => std::env::set_var("OPENPAW_OPENAI_BASE_URL", value),
             None => std::env::remove_var("OPENPAW_OPENAI_BASE_URL"),
+        }
+        match self.old_caps.take() {
+            Some(value) => std::env::set_var("OPENPAW_MODEL_CAPABILITIES", value),
+            None => std::env::remove_var("OPENPAW_MODEL_CAPABILITIES"),
         }
     }
 }
@@ -1009,4 +1033,264 @@ async fn terminal_persistence_failure_replaces_running_snapshot_in_turns() {
     let restored = get_json(&restarted, format!("/session/{id}/turns")).await;
     assert_eq!(restored[0]["state"], "failed");
     assert_eq!(restored[0]["error"]["code"], "persistence_failed");
+}
+
+#[tokio::test]
+async fn inline_media_compaction_tools_restart_fork_revert_and_idempotency() {
+    use openpaw_core::{InlineMedia, Message, SessionEvent};
+    use support::{request, request_with_headers};
+    let _guard = lock_provider_environment().await;
+    let home = TempDir::new().unwrap();
+    let workspace = TempDir::new().unwrap();
+    let (mut provider, _environment, state, app) = provider_app(&home, None).await;
+    std::env::set_var(
+        "OPENPAW_MODEL_CAPABILITIES",
+        r#"{"openai":{"media-model":{"input":["text","image","audio"],"context_window":90000}}}"#,
+    );
+    let image = InlineMedia::from_bytes(b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;", "image/gif", None).unwrap();
+    let audio = InlineMedia::from_bytes(b"RIFF0000WAVEfixture", "audio/wav", None).unwrap();
+    std::fs::write(workspace.path().join("first.gif"), image.bytes().unwrap()).unwrap();
+    std::fs::write(workspace.path().join("second.wav"), audio.bytes().unwrap()).unwrap();
+    let response = request_with_headers(
+        &app,
+        "POST",
+        "/session",
+        &[("x-opencode-directory", workspace.path().to_str().unwrap())],
+        r#"{"provider":"openai","model":"media-model"}"#,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = response_json(response).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // 构造可重启的旧历史，迫使下一回合压缩；媒体原件必须仍能公开读回。
+    let handle = state.get(&id).await.unwrap();
+    let mut old = Message::user_text("x".repeat(80_000)).with_uuid("old-image");
+    old.content.push(image.block());
+    {
+        let mut writer = handle.writer.lock().unwrap();
+        for message in [
+            old,
+            Message::assistant_text("x".repeat(80_000)).with_uuid("old-answer"),
+            Message::user_text("x".repeat(80_000)).with_uuid("old-question-2"),
+            Message::assistant_text("x".repeat(80_000)).with_uuid("old-answer-2"),
+        ] {
+            writer
+                .as_mut()
+                .unwrap()
+                .append(&SessionEvent::Message(message))
+                .unwrap();
+        }
+    }
+    drop(handle);
+    drop(app);
+    drop(state);
+    let config = HostConfig {
+        home: home.path().into(),
+        provider: "openai".into(),
+        office_url: None,
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let mut events = state.global_events.subscribe();
+    let app = build_router(state.clone());
+    let catalog = get_json(&app, "/provider").await;
+    assert_eq!(
+        catalog["all"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "openai")
+            .unwrap()["models"]["media-model"]["capabilities"]["input"]["audio"],
+        true
+    );
+    let part = |media: &InlineMedia| serde_json::json!({"type":"file","mime":media.mime,"url":media.data_url()});
+    let body = serde_json::json!({"messageID":"media-input","parts":[part(&image),part(&audio)]});
+    let uri = format!("/session/{id}/prompt_async");
+    assert_eq!(
+        request(&app, "POST", &uri, body.to_string()).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    provider.next_prompt().await;
+    let immediate = get_json(&app, format!("/session/{id}/message/media-input")).await;
+    assert_eq!(immediate["parts"][0]["url"], image.data_url());
+    assert_eq!(immediate["parts"][1]["url"], audio.data_url());
+    let mut input_events = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if event.event_type == "message.part.updated"
+            && event.properties["part"]["messageID"] == "media-input"
+        {
+            input_events.push(event.properties["part"].clone());
+        }
+    }
+    assert_eq!(input_events, immediate["parts"].as_array().unwrap().clone());
+    provider.release.add_permits(2);
+    let turns = wait_for_terminal(&app, &id).await;
+    assert_eq!(turns[0]["state"], "completed", "{turns}");
+    let history = get_json(&app, format!("/session/{id}/message")).await;
+    assert_eq!(history.as_array().unwrap().len(), 7);
+    assert_eq!(
+        history[0]["parts"][0]["text"].as_str().unwrap().len(),
+        80_000
+    );
+    let tool_parts: Vec<_> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message["parts"].as_array().unwrap())
+        .filter(|part| part["type"] == "tool")
+        .collect();
+    assert_eq!(tool_parts.len(), 2);
+    for part in &tool_parts {
+        assert_eq!(
+            part["attachments"][0]["mime"],
+            if part["callID"] == "image-read" {
+                "image/gif"
+            } else {
+                "audio/wav"
+            }
+        );
+    }
+    assert!(
+        tool_parts
+            .iter()
+            .all(|part| part["state"]["status"] == "completed"
+                && part["attachments"].as_array().unwrap().len() == 1),
+        "{tool_parts:?}"
+    );
+    let handle = state.get(&id).await.unwrap();
+    assert!(handle.session.lock().await.messages.len() < 8);
+    drop(handle);
+    let requests = provider.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["model"], "media-model");
+    assert_eq!(requests[0]["stream"], false);
+    assert!(requests[1]["messages"].to_string().contains(&image.id));
+    assert!(requests[1]["messages"].to_string().contains("input_audio"));
+    assert!(requests[2]["messages"].to_string().contains("audio-read"));
+    let replay = request(&app, "POST", &uri, body.to_string()).await;
+    assert_eq!(replay.status(), StatusCode::NO_CONTENT);
+    let mut conflict = body.clone();
+    conflict["parts"][0]["filename"] = "different.gif".into();
+    assert_eq!(
+        request(&app, "POST", &uri, conflict.to_string())
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    for (parts, status) in [
+        (
+            serde_json::json!([{"type":"file","mime":"image/gif","url":"https://invalid/image"}]),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            serde_json::json!([
+                part(&image),
+                part(&image),
+                part(&image),
+                part(&image),
+                part(&image)
+            ]),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                &uri,
+                serde_json::json!({"parts":parts}).to_string()
+            )
+            .await
+            .status(),
+            status
+        );
+    }
+    let oversized = format!("{{\"text\":\"{}\"}}", "x".repeat(32 * 1024 * 1024));
+    assert_eq!(
+        request(&app, "POST", &uri, oversized).await.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        get_json(&app, format!("/session/{id}/message")).await,
+        history
+    );
+    drop(app);
+    drop(state);
+    let restarted = build_router(AppState::new(config));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        history
+    );
+    assert_eq!(
+        request(&restarted, "POST", &uri, body.to_string())
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(provider.calls.load(Ordering::Acquire), 3);
+    let fork =
+        response_json(request(&restarted, "POST", format!("/session/{id}/fork"), "{}").await).await;
+    let forked = get_json(
+        &restarted,
+        format!("/session/{}/message", fork["id"].as_str().unwrap()),
+    )
+    .await;
+    let fork_input = forked
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| {
+            message["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|part| part["mime"] == "audio/wav")
+        })
+        .unwrap();
+    assert_eq!(fork_input["parts"][1]["url"], audio.data_url());
+    assert_eq!(
+        fork_input["parts"][1]["attachmentID"],
+        immediate["parts"][1]["attachmentID"]
+    );
+    assert_eq!(
+        request(
+            &restarted,
+            "POST",
+            format!("/session/{id}/revert"),
+            r#"{"messageID":"media-input"}"#
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}")).await["revert"]["messageID"],
+        "media-input"
+    );
+    // 暂存回退保留完整 REST 记录，模型/分支使用可见前缀。
+    let visible_fork =
+        response_json(request(&restarted, "POST", format!("/session/{id}/fork"), "{}").await).await;
+    assert_eq!(
+        get_json(
+            &restarted,
+            format!("/session/{}/message", visible_fork["id"].as_str().unwrap())
+        )
+        .await
+        .as_array()
+        .unwrap()
+        .len(),
+        4
+    );
+    assert_eq!(
+        request(&restarted, "POST", format!("/session/{id}/unrevert"), "{}")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        history
+    );
 }

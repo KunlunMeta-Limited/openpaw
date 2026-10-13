@@ -161,6 +161,7 @@ fn message_wire(
         match block {
             openpaw_core::ContentBlock::Text { text } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"text","text":text})),
             openpaw_core::ContentBlock::Thinking { thinking, .. } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"reasoning","text":thinking})),
+            openpaw_core::ContentBlock::Image { .. } | openpaw_core::ContentBlock::Audio { .. } => input_part(session_id, &message_id, part_index, block),
             openpaw_core::ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"tool","callID":id,"tool":name,"state":{"status":"running","input":input,"output":"","error":""}})),
             openpaw_core::ContentBlock::ToolResult { tool_use_id, content, is_error, name, .. } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"tool","callID":tool_use_id,"tool":name,"state":{"status":if *is_error {"error"} else {"completed"},"input":{},"output":if *is_error {""} else {content},"error":if *is_error {content} else {""}}})),
             _ => None,
@@ -213,8 +214,9 @@ pub(crate) fn messages_wire(
                             tool_use_id,
                             content,
                             is_error,
+                            media,
                             ..
-                        } => Some((tool_use_id, content, *is_error)),
+                        } => Some((tool_use_id, content, *is_error, media)),
                         _ => None,
                     })
                     .collect::<Option<Vec<_>>>()
@@ -223,10 +225,10 @@ pub(crate) fn messages_wire(
         if let Some(tool_results) = tool_results {
             let targets = tool_results
                 .iter()
-                .map(|(tool_use_id, _, _)| tool_parts.get(*tool_use_id).copied())
+                .map(|(tool_use_id, _, _, _)| tool_parts.get(*tool_use_id).copied())
                 .collect::<Option<Vec<_>>>();
             if let Some(targets) = targets {
-                for ((wire_message_index, part_index), (_, content, is_error)) in
+                for ((wire_message_index, part_index), (_, content, is_error, media)) in
                     targets.into_iter().zip(tool_results)
                 {
                     let state = &mut result[wire_message_index]["parts"][part_index]["state"];
@@ -234,6 +236,10 @@ pub(crate) fn messages_wire(
                         serde_json::json!(if is_error { "error" } else { "completed" });
                     state["output"] = serde_json::json!(if is_error { "" } else { content });
                     state["error"] = serde_json::json!(if is_error { content } else { "" });
+                    if !media.is_empty() {
+                        result[wire_message_index]["parts"][part_index]["attachments"] =
+                            serde_json::json!(attachments(media));
+                    }
                 }
                 continue;
             }
@@ -307,4 +313,52 @@ pub(crate) fn messages_wire(
         }
     }
     result
+}
+
+/// 功能：将单个用户输入块投影为公开 part。
+/// 参数：会话、消息编号和原始块次序。
+/// 返回：text/file part 或 None。
+/// 错误：无；无原件的旧图片不自动下载。
+/// 状态：纯转换。
+/// 并发与取消：无共享状态。
+/// 权限：媒体仅用于授权消息响应，不输出诊断。
+/// 关联：REST 与即时 SSE 输入。
+pub(crate) fn input_part(
+    session_id: &str,
+    message_id: &str,
+    index: usize,
+    block: &openpaw_core::ContentBlock,
+) -> Option<serde_json::Value> {
+    let mut part = serde_json::json!({"id":format!("prt_{message_id}_{index}"),"messageID":message_id,"sessionID":session_id});
+    if let openpaw_core::ContentBlock::Text { text } = block {
+        part["type"] = "text".into();
+        part["text"] = text.clone().into();
+    } else if let Ok(Some(media)) = openpaw_core::media::block_media(block) {
+        part["type"] = "file".into();
+        part["mime"] = media.mime.clone().into();
+        part["url"] = media.data_url().into();
+        part["attachmentID"] = media.id.into();
+        if let Some(name) = media.filename {
+            part["filename"] = name.into();
+        }
+    } else {
+        return None;
+    }
+    Some(part)
+}
+
+/// 功能：投影工具结果的内联附件。
+/// 参数：media 为已经校验的原件。
+/// 返回：带稳定编号的 file 列表。
+/// 错误：无。
+/// 状态：纯计算。
+/// 并发与取消：同步。
+/// 权限：只用于授权消息接口。
+/// 关联：REST/SSE 工具结果。
+pub(crate) fn attachments(media: &[openpaw_core::InlineMedia]) -> Vec<serde_json::Value> {
+    media.iter().map(|item| {
+        let mut part = serde_json::json!({"type":"file","attachmentID":item.id,"mime":item.mime,"url":item.data_url()});
+        if let Some(filename) = &item.filename { part["filename"] = filename.clone().into(); }
+        part
+    }).collect()
 }

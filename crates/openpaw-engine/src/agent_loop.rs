@@ -30,6 +30,7 @@ struct TurnRuntime {
 struct ActiveTurnGuard<'a> {
     runtime: &'a std::sync::Mutex<TurnRuntime>,
     token: CancellationToken,
+    tool_host: &'a dyn ToolHost,
 }
 
 impl Drop for ActiveTurnGuard<'_> {
@@ -37,6 +38,7 @@ impl Drop for ActiveTurnGuard<'_> {
         // 父回合 future 被 Host 强制 abort 时也必须先取消内部回合令牌，
         // 让审批、Provider 和工具子任务统一停止，再释放实例级活动闸门。
         self.token.cancel();
+        self.tool_host.set_media_context(Vec::new());
         let mut runtime = self
             .runtime
             .lock()
@@ -237,6 +239,7 @@ impl AgentLoop {
         let guard = ActiveTurnGuard {
             runtime: &self.turn_runtime,
             token,
+            tool_host: &*self.tool_host,
         };
         self.budget.reset();
         if let Some(tracker) = self.token_budget_mut().as_mut() {
@@ -274,6 +277,7 @@ impl AgentLoop {
             event_sink,
             CancellationToken::new(),
             (provider, model),
+            (&mut Vec::new(), Vec::new()),
         )
         .await
     }
@@ -296,8 +300,16 @@ impl AgentLoop {
     ) -> Result<StopReason> {
         let provider = Arc::clone(&self.provider);
         let model = self.model.clone();
-        self.run_turn_inner(session, system, tools, event_sink, token, (provider, model))
-            .await
+        self.run_turn_inner(
+            session,
+            system,
+            tools,
+            event_sink,
+            token,
+            (provider, model),
+            (&mut Vec::new(), Vec::new()),
+        )
+        .await
     }
 
     /// 功能：按单次请求选择 provider 和 model 执行回合，同时保留执行器的工具、护栏和审批状态。
@@ -324,10 +336,43 @@ impl AgentLoop {
             event_sink,
             token,
             provider_and_model,
+            (&mut Vec::new(), Vec::new()),
         )
         .await
     }
 
+    /// 功能：执行回合并收集每一条真实生成消息，独立于压缩后的上下文。
+    /// 参数：session、tools、sink 沿用回合输入，options 提供媒体快照和模型，generated 接收产出。
+    /// 返回：停止原因；完整消息交由入口提交。
+    /// 错误：模型、预算或工具媒体非法时返回既有错误。
+    /// 状态：更新模型上下文与本轮收集器；不写文件。
+    /// 并发与取消：每个执行器仅一个活动回合，取消由 options 令牌控制。
+    /// 权限：沿用工具分类、审批和工作区规则。
+    /// 关联：turn_execution::run_turn、CLI/Host 完整历史。
+    pub(crate) async fn run_turn_collect(
+        &self,
+        session: &mut openpaw_core::Session,
+        tools: &[ToolSpec],
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
+        options: crate::turn_execution::TurnOptions,
+        generated: &mut Vec<Message>,
+    ) -> Result<StopReason> {
+        let selection = options
+            .provider_and_model
+            .unwrap_or_else(|| (self.provider.clone(), self.model.clone()));
+        self.run_turn_inner(
+            session,
+            options.system,
+            tools,
+            sink,
+            options.cancel,
+            selection,
+            (generated, options.attachments),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // 中立入口保留原有参数；额外收集记录独立于上下文。
     async fn run_turn_inner(
         &self,
         session: &mut openpaw_core::Session,
@@ -336,12 +381,40 @@ impl AgentLoop {
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         token: CancellationToken,
         provider_and_model: (Arc<dyn LlmProvider>, String),
+        collection: (&mut Vec<Message>, Vec<openpaw_core::InlineMedia>),
     ) -> Result<StopReason> {
+        let (generated, attachments) = collection;
+        let mut known_media = std::collections::HashMap::<String, openpaw_core::InlineMedia>::new();
+        for media in attachments
+            .iter()
+            .cloned()
+            .chain(openpaw_core::media::message_media(&session.messages))
+        {
+            if let Some(original) = known_media.get(&media.id) {
+                if original.mime != media.mime || original.data != media.data {
+                    return Err(Error::session(
+                        "attachment ID conflicts with original content",
+                    ));
+                }
+            }
+            known_media.insert(media.id.clone(), media);
+        }
         let (provider, model) = provider_and_model;
         // Engine 只持有调用方令牌的子令牌：外部取消会向下传播，但正常完成、
         // panic 或父 future 被丢弃时的内部清理不能反向污染 Host 的终态判断。
         let token = token.child_token();
         let _active_turn = self.begin_turn(token.clone())?;
+        self.tool_host.set_media_context(attachments);
+        let mut turn_media = openpaw_core::media::message_media(
+            session
+                .messages
+                .last()
+                .map(std::slice::from_ref)
+                .unwrap_or(&[]),
+        );
+        self.tool_host
+            .remember_media(openpaw_core::media::message_media(&session.messages));
+        openpaw_core::media::validate_media(&turn_media, provider.model_capabilities(&model))?;
 
         loop {
             // ① 检查取消
@@ -360,6 +433,15 @@ impl AgentLoop {
             // ④ 上下文压缩：只估算一次，根据结果决定是否通过单次摘要调用压缩。
             // （E2 语义见 docs/spikes/S1-agent-loop.md 第 2 节 ④。）
             if let Some(opts) = &self.compact_options {
+                let mut opts = opts.clone();
+                // 生产入口允许短历史压缩；仍以可保留的当前回合决定实际切点。
+                opts.min_messages_before_compact = opts.min_messages_before_compact.min(2);
+                opts.model_limit = opts
+                    .model_limit
+                    .min(provider.model_capabilities(&model).context_window as usize);
+                opts.keep_recent_pairs = opts
+                    .keep_recent_pairs
+                    .max((generated.len() + 2).div_ceil(2));
                 let tools_json_approx: usize =
                     tools.iter().map(|t| t.input_schema.to_string().len()).sum();
                 let estimated = crate::compaction::estimate_session_tokens(
@@ -368,12 +450,22 @@ impl AgentLoop {
                     tools_json_approx,
                 );
                 let trigger = crate::compaction::should_compact_with_options_estimated(
-                    session, opts, estimated,
+                    session,
+                    &opts,
+                    estimated.saturating_add(self.max_tokens as usize),
                 );
-                if trigger != crate::compaction::CompactTrigger::None {
+                let media_bytes: usize = openpaw_core::media::message_media(&session.messages)
+                    .iter()
+                    .map(|item| item.data.len())
+                    .sum();
+                if trigger != crate::compaction::CompactTrigger::None
+                    || media_bytes > 24 * 1024 * 1024
+                {
                     let compacted = match cancel_or(
                         &token,
-                        crate::compaction::compact_session(&*provider, session, opts),
+                        crate::compaction::compact_session_for_model(
+                            &*provider, &model, session, &opts,
+                        ),
                     )
                     .await
                     {
@@ -395,6 +487,23 @@ impl AgentLoop {
             }
 
             // ⑤ 构造模型请求
+            if self.compact_options.is_some() {
+                let estimated = crate::compaction::estimate_session_tokens(
+                    system.as_deref().unwrap_or(""),
+                    session,
+                    tools
+                        .iter()
+                        .map(|tool| tool.input_schema.to_string().len())
+                        .sum(),
+                );
+                if estimated.saturating_add(self.max_tokens as usize)
+                    > provider.model_capabilities(&model).context_window as usize
+                {
+                    return Err(Error::context_too_long(
+                        "current input cannot fit the model context budget",
+                    ));
+                }
+            }
             let req = CompletionRequest {
                 model: model.clone(),
                 system: system.clone(),
@@ -433,11 +542,14 @@ impl AgentLoop {
             }
 
             // 回填 assistant 消息（可能包含 tool_use 内容块）。
-            session.messages.push(Message {
+            let assistant = Message {
                 role: openpaw_core::Role::Assistant,
                 content: resp.content.clone(),
                 ..Default::default()
-            });
+            };
+            let assistant = assistant.identified();
+            generated.push(assistant.clone());
+            session.messages.push(assistant);
 
             if resp.stop_reason != StopReason::ToolUse {
                 // Token 预算继续：模型已停止，但仍有有效预算且收益未递减时，提示其继续工作。
@@ -456,7 +568,9 @@ impl AgentLoop {
                     }
                 };
                 if let Some(nudge) = nudge {
-                    session.messages.push(Message::user_text(nudge));
+                    let nudge = Message::user_text(nudge).identified();
+                    generated.push(nudge.clone());
+                    session.messages.push(nudge);
                     continue;
                 }
                 return Ok(resp.stop_reason);
@@ -480,13 +594,42 @@ impl AgentLoop {
                 });
             }
             let results = self.execute_tools(tool_uses, event_sink).await;
+            let media: Vec<_> = results
+                .iter()
+                .flat_map(|block| {
+                    if let ContentBlock::ToolResult { media, .. } = block {
+                        media.clone()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            for item in &media {
+                if let Some(original) = known_media.get(&item.id) {
+                    if original.mime != item.mime || original.data != item.data {
+                        return Err(Error::session(
+                            "attachment ID conflicts with original content",
+                        ));
+                    }
+                } else {
+                    known_media.insert(item.id.clone(), item.clone());
+                }
+                if !turn_media.iter().any(|previous| previous.id == item.id) {
+                    turn_media.push(item.clone());
+                }
+            }
+            openpaw_core::media::validate_media(&turn_media, provider.model_capabilities(&model))?;
+            self.tool_host.remember_media(media);
 
             // ⑨ 将工具结果作为下一条 user 消息回填（tool_result 内容块使用 user 角色承载）。
-            session.messages.push(Message {
+            let tool_message = Message {
                 role: openpaw_core::Role::User,
                 content: results,
                 ..Default::default()
-            });
+            };
+            let tool_message = tool_message.identified();
+            generated.push(tool_message.clone());
+            session.messages.push(tool_message);
         }
     }
 
@@ -498,6 +641,7 @@ impl AgentLoop {
         req: CompletionRequest,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<openpaw_core::CompletionResponse> {
+        let has_media = !openpaw_core::media::message_media(&req.messages).is_empty();
         let mut attempts: u32 = 0;
         'outer: loop {
             let token = self.current_cancel_token();
@@ -513,6 +657,11 @@ impl AgentLoop {
             let stream = match stream_result {
                 Ok(s) => s,
                 Err(e) => {
+                    let e = if has_media {
+                        openpaw_core::media::redact_error(e)
+                    } else {
+                        e
+                    };
                     let class = classify_api_error(&e);
                     let retry_limit =
                         retry_limit_for_error(&e, class, self.retry_policy.max_retries as u32);
@@ -565,6 +714,11 @@ impl AgentLoop {
                 let ev = match next {
                     Ok(Some(Ok(ev))) => ev,
                     Ok(Some(Err(error))) => {
+                        let error = if has_media {
+                            openpaw_core::media::redact_error(error)
+                        } else {
+                            error
+                        };
                         let class = classify_api_error(&error);
                         let retry_limit = retry_limit_for_error(
                             &error,
@@ -904,6 +1058,7 @@ impl AgentLoop {
                 let duration_ms =
                     Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
                 event_sink(AgentEvent::ToolResult {
+                    media: outcome.media.clone(),
                     tool_use_id: id.clone(),
                     content: outcome.content.clone(),
                     is_error: outcome.is_error,
@@ -916,6 +1071,7 @@ impl AgentLoop {
                     is_error: outcome.is_error,
                     name: Some(name),
                     protected: false,
+                    media: outcome.media,
                 });
             }
         }
@@ -949,6 +1105,7 @@ impl AgentLoop {
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             event_sink(AgentEvent::ToolResult {
+                media: outcome.media.clone(),
                 tool_use_id: id.clone(),
                 content: outcome.content.clone(),
                 is_error: outcome.is_error,
@@ -961,6 +1118,7 @@ impl AgentLoop {
                 is_error: outcome.is_error,
                 name: Some(name),
                 protected: false,
+                media: outcome.media,
             });
         }
 
@@ -1066,6 +1224,7 @@ impl AgentLoop {
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             event_sink(AgentEvent::ToolResult {
+                media: outcome.media.clone(),
                 tool_use_id: id.clone(),
                 content: outcome.content.clone(),
                 is_error: outcome.is_error,
@@ -1078,6 +1237,7 @@ impl AgentLoop {
                 is_error: outcome.is_error,
                 name: Some(name),
                 protected: false,
+                media: outcome.media,
             });
         }
 
@@ -1169,6 +1329,7 @@ fn tool_result_event(
     duration_ms: Option<u64>,
 ) -> AgentEvent {
     AgentEvent::ToolResult {
+        media: outcome.media.clone(),
         tool_use_id: id.to_string(),
         content: outcome.content.clone(),
         is_error: outcome.is_error,
@@ -1184,6 +1345,7 @@ fn tool_result_block(id: &str, name: &str, outcome: &ToolCallOutcome) -> Content
         is_error: outcome.is_error,
         name: Some(name.to_string()),
         protected: false,
+        media: outcome.media.clone(),
     }
 }
 
@@ -1214,7 +1376,7 @@ async fn execute_prepared(
     ctx: &CheckContext,
 ) -> ToolCallOutcome {
     let Some(chain) = hook_chain else {
-        return execute_one(host, name, input, ctx).await;
+        return sanitize_outcome(execute_one(host, name, input, ctx).await);
     };
 
     let mut outcome = execute_one(host, name, input.clone(), ctx).await;
@@ -1227,15 +1389,35 @@ async fn execute_prepared(
             "result": {
                 "content": outcome.content.clone(),
                 "is_error": outcome.is_error,
+                "media": outcome.media,
             },
         });
         if let HookDecision::Replace(val) = chain.run(HookPoint::AfterToolCall, payload).await {
+            outcome.media = match val.pointer("/result/media") {
+                Some(value) => match serde_json::from_value(value.clone()) {
+                    Ok(media) => media,
+                    Err(_) => return ToolCallOutcome::error("invalid media in hook replacement"),
+                },
+                None => Vec::new(),
+            };
             if let Some(content) = val.pointer("/result/content").and_then(|c| c.as_str()) {
                 outcome.content = content.to_string();
             }
             if let Some(is_error) = val.pointer("/result/is_error").and_then(|e| e.as_bool()) {
                 outcome.is_error = is_error;
             }
+        }
+    }
+    sanitize_outcome(outcome)
+}
+
+fn sanitize_outcome(mut outcome: ToolCallOutcome) -> ToolCallOutcome {
+    if outcome.is_error {
+        outcome.media.clear();
+    }
+    for media in &outcome.media {
+        if let Err(error) = media.bytes() {
+            return ToolCallOutcome::error(error.to_string());
         }
     }
     outcome
@@ -1258,6 +1440,43 @@ async fn execute_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn media_hook_replacements_are_validated_and_never_keep_stale_media() {
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::write(workspace.path().join("media.gif"), b"GIF89afixture")
+            .await
+            .unwrap();
+        let host = openpaw_tools::ToolRegistry::new(workspace.path());
+        let original =
+            openpaw_core::InlineMedia::from_bytes(b"GIF89afixture", "image/gif", None).unwrap();
+        for replacement in [
+            serde_json::json!({"result":{"content":"redacted"}}),
+            serde_json::json!({"result":{"is_error":true,"media":[original.clone()]}}),
+            serde_json::json!({"result":{"media":[{"id":"bad","mime":"image/gif","data":"???"}]}}),
+            serde_json::json!({"result":{"media":"wrong-shape"}}),
+        ] {
+            let mut chain = HookChain::new();
+            chain.register(HookPoint::AfterToolCall, "media-replacement", move |_| {
+                let replacement = replacement.clone();
+                async move {
+                    openpaw_plugins::HookResult {
+                        decision: HookDecision::Replace(replacement),
+                        modified_payload: None,
+                    }
+                }
+            });
+            let outcome = execute_prepared(
+                Some(&chain),
+                &host,
+                "read_file",
+                serde_json::json!({"path":"media.gif"}),
+                &CheckContext::default(),
+            )
+            .await;
+            assert!(outcome.media.is_empty());
+        }
+    }
     use futures::stream::BoxStream;
     use openpaw_core::{CompletionResponse, LlmProvider, Role, Session, StreamEvent};
     use std::sync::atomic::{AtomicUsize, Ordering};

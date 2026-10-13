@@ -52,6 +52,17 @@ pub fn run_show(home: &Path) -> i32 {
             Err(error) => println!("{name}: unavailable ({error})"),
         }
     }
+    for (provider, _, _) in openpaw_llm::config::PROVIDERS {
+        for model in config.models(provider) {
+            if let Ok(caps) = config.capabilities(provider, &model) {
+                println!(
+                    "{provider}/{model}: input=text{}{}",
+                    if caps.image_input { ",image" } else { "" },
+                    if caps.audio_input { ",audio" } else { "" }
+                );
+            }
+        }
+    }
     0
 }
 

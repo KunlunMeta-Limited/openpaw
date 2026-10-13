@@ -567,3 +567,244 @@ async fn provider_http_rejects_malformed_json_and_truncated_utf8() {
         }
     }
 }
+
+fn capture_request(response: String) -> (String, std::sync::mpsc::Receiver<serde_json::Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        let header_end = loop {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+            if let Some(end) = find_header_end(&request) {
+                break end;
+            }
+        };
+        let length = parse_content_length(&request[..header_end]);
+        while request.len() < header_end + length {
+            let n = socket.read(&mut buffer).unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&buffer[..n]);
+        }
+        tx.send(serde_json::from_slice(&request[header_end..header_end + length]).unwrap())
+            .unwrap();
+        socket.write_all(response.as_bytes()).unwrap();
+    });
+    (address, rx)
+}
+
+#[tokio::test]
+async fn images_and_tool_media_are_encoded_in_actual_http_requests() {
+    let media = openpaw_core::InlineMedia::from_bytes(
+        b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;",
+        "image/gif",
+        Some("test.gif".into()),
+    )
+    .unwrap();
+    let mut animation = media.bytes().unwrap();
+    animation.pop();
+    animation.extend_from_slice(&media.bytes().unwrap()[19..]);
+    let media = openpaw_core::InlineMedia::from_bytes(&animation, "image/gif", None).unwrap();
+    let expected_data = media.model_data().unwrap();
+    let expected_url = format!("data:image/gif;base64,{expected_data}");
+    for anthropic in [false, true] {
+        let response = if anthropic {
+            json!({"id":"fixture","type":"message","role":"assistant","model":"vision","content":[{"type":"text","text":"contract reply"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}})
+        } else {
+            json!({"id":"fixture","choices":[{"message":{"role":"assistant","content":"contract reply"},"finish_reason":"stop"}]})
+        };
+        let (address, rx) = capture_request(http_json(&response));
+        let caps = std::collections::HashMap::from([(
+            "vision".into(),
+            openpaw_core::Capabilities {
+                image_input: true,
+                ..Default::default()
+            },
+        )]);
+        let provider: Box<dyn LlmProvider> = if anthropic {
+            Box::new(
+                AnthropicProvider::new("fixture-key", "vision")
+                    .with_base_url(format!("http://{address}"))
+                    .with_model_capabilities(caps),
+            )
+        } else {
+            Box::new(
+                OpenAiProvider::new("fixture-key", "vision")
+                    .with_base_url(format!("http://{address}/v1"))
+                    .with_model_capabilities(caps),
+            )
+        };
+        let mut user = Message::user_text("before");
+        user.content.push(media.block());
+        user.content.push(ContentBlock::Text {
+            text: "after".into(),
+        });
+        let assistant = Message {
+            role: openpaw_core::Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "read_file".into(),
+                input: json!({"path":"test.gif"}),
+            }],
+            ..Default::default()
+        };
+        let tool = Message {
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                name: Some("read_file".into()),
+                content: "original".into(),
+                is_error: false,
+                protected: false,
+                media: vec![media.clone()],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            provider
+                .complete(CompletionRequest {
+                    model: "vision".into(),
+                    messages: vec![user, assistant, tool],
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .text(),
+            "contract reply"
+        );
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"][0]["text"], "before");
+        assert_eq!(messages[0]["content"][2]["text"], "after");
+        if anthropic {
+            assert_eq!(messages[0]["content"][1]["source"]["data"], expected_data);
+            assert_eq!(messages[2]["content"][0]["tool_use_id"], "call-1");
+            assert_eq!(
+                messages[2]["content"][0]["content"][1]["source"]["data"],
+                expected_data
+            );
+            assert!(messages[0].get("uuid").is_none());
+        } else {
+            assert_eq!(messages[0]["content"][1]["image_url"]["url"], expected_url);
+            assert_eq!(messages[2]["role"], "tool");
+            assert_eq!(messages[2]["tool_call_id"], "call-1");
+            assert_eq!(messages[3]["content"][1]["image_url"]["url"], expected_url);
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_wav_and_mp3_inputs_use_chat_and_model_overrides_are_checked() {
+    for (bytes, mime, format) in [
+        (b"RIFF0000WAVEfixture".as_slice(), "audio/wav", "wav"),
+        (b"ID3fixture".as_slice(), "audio/mpeg", "mp3"),
+    ] {
+        let media = openpaw_core::InlineMedia::from_bytes(bytes, mime, None).unwrap();
+        let (address, rx) = capture_request(http_json(
+            &json!({"choices":[{"message":{"role":"assistant","content":"audio contract"},"finish_reason":"stop"}]}),
+        ));
+        let provider = OpenAiProvider::new("fixture", "audio")
+            .with_base_url(format!("http://{address}/v1"))
+            .with_model_capabilities(std::collections::HashMap::from([(
+                "audio".into(),
+                openpaw_core::Capabilities {
+                    audio_input: true,
+                    ..Default::default()
+                },
+            )]));
+        let mut user = Message::default();
+        user.content.push(media.block());
+        let req = CompletionRequest {
+            model: "other-text-model".into(),
+            messages: vec![user.clone()],
+            ..Default::default()
+        };
+        assert!(provider
+            .complete(req)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("does not support"));
+        provider
+            .complete(CompletionRequest {
+                model: "audio".into(),
+                messages: vec![user],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let request = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            request["messages"][0]["content"][0]["input_audio"]["data"],
+            media.data
+        );
+        assert_eq!(
+            request["messages"][0]["content"][0]["input_audio"]["format"],
+            format
+        );
+        assert!(request.get("audio").is_none());
+    }
+}
+
+#[tokio::test]
+async fn media_provider_errors_remove_upstream_echo_for_complete_and_stream() {
+    let media = openpaw_core::InlineMedia::from_bytes(b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;", "image/gif", None).unwrap();
+    for anthropic in [false, true] {
+        for stream in [false, true] {
+            let echo = format!("private-echo {}", media.data);
+            let response = format!("HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{echo}",echo.len());
+            let (address, rx) = capture_request(response);
+            let caps = std::collections::HashMap::from([(
+                "vision".into(),
+                openpaw_core::Capabilities {
+                    image_input: true,
+                    ..Default::default()
+                },
+            )]);
+            let provider: Box<dyn LlmProvider> = if anthropic {
+                Box::new(
+                    AnthropicProvider::new("fixture", "vision")
+                        .with_base_url(format!("http://{address}"))
+                        .with_model_capabilities(caps),
+                )
+            } else {
+                Box::new(
+                    OpenAiProvider::new("fixture", "vision")
+                        .with_base_url(format!("http://{address}/v1"))
+                        .with_model_capabilities(caps),
+                )
+            };
+            let request = CompletionRequest {
+                model: "vision".into(),
+                messages: vec![Message {
+                    content: vec![media.block()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let error = if stream {
+                match provider.stream(request).await {
+                    Err(error) => error,
+                    Ok(_) => panic!("expected failure"),
+                }
+            } else {
+                provider.complete(request).await.unwrap_err()
+            };
+            assert!(matches!(
+                error,
+                openpaw_core::Error::AuthFailed { status: 401, .. }
+            ));
+            assert!(
+                !error.to_string().contains("private-echo")
+                    && !error.to_string().contains(&media.data)
+            );
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }
+    }
+}

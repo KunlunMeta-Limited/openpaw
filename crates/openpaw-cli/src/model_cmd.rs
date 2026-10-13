@@ -36,7 +36,18 @@ pub fn run_list() -> i32 {
     let config = openpaw_llm::config::ConfigSnapshot::from_env();
     for (name, _, notes) in openpaw_llm::config::PROVIDERS {
         for model in config.models(name) {
-            println!("{name:<10} {model:<18} {notes}");
+            let caps = match config.capabilities(name, &model) {
+                Ok(caps) => caps,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return 2;
+                }
+            };
+            println!(
+                "{name:<10} {model:<18} {notes}; input=text{}{}",
+                if caps.image_input { ",image" } else { "" },
+                if caps.audio_input { ",audio" } else { "" }
+            );
         }
     }
     0

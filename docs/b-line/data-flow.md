@@ -216,3 +216,14 @@ accept 展开内嵌 user，prepare 批次仅在合法 finish commit 后公开；
 CLI 查询不进行 Host 恢复，不追加 interrupted。search/chat 先取得 SQLite IMMEDIATE 写事务，再读取快照并替换单会话可见消息/FTS；不把扫描时间当活动时间，不迁移 schema，不删除全 DB。
 索引刷新保留审计和非 transcript 标记。损坏会话的旧消息索引失效；搜索只输出当前合法目录/投影中的 ID。
 目录扫描/重放成本随历史规模增长，本轮不增加缓存 schema。
+
+## 附件与完整产出流（CHG-2026-0026）
+
+CLI 本地文件 / Host 内联 file → InlineMedia 校验 → 单一用户 Message 接收 → JSONL 内联原件。
+有效完整历史 → Store attachment_snapshot → 回合 ToolRegistry 缓存；read_file / read_attachment 的富结果经过
+AfterToolCall Hook、原件和回合预算校验 → ToolResult.media → Provider 适配 → 下一次模型请求。
+Chat 保留 tool 文本与调用 ID，再附媒体输入；Anthropic 用原生 tool_result 图片。
+
+旧模型上下文 → 不含原件的摘要正文＋确定性附件编号清单 → 保留当前输入/本轮产出及工具配对。
+生成收集器 → 完整消息事务 → 公开历史快照 → 完成事件及 idle；内部摘要不成为用户回合。
+失败/取消/未提交消息不进入完整历史或附件索引。Fork 复制有效前缀原件；新输入提交回退时裁剪旧尾部。

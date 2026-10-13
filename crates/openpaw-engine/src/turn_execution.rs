@@ -45,7 +45,9 @@ pub struct TurnOptions {
     pub system: Option<String>,
     /// 调用方拥有的取消令牌，内部清理不反向取消它。
     pub cancel: CancellationToken,
-    /// 本回合可选 Provider/模型覆盖；无覆盖时使用执行器默认值。
+    /// 功能：当前有效完整历史的附件快照，用于压缩后的会话内回看。
+    pub attachments: Vec<openpaw_core::InlineMedia>,
+    /// 本回合可选 Provider 与模型。
     pub provider_and_model: Option<(Arc<dyn LlmProvider>, String)>,
 }
 
@@ -55,6 +57,8 @@ pub struct TurnExecution {
     pub result: openpaw_core::Result<StopReason>,
     /// 已接收输入之后的检查点；成功执行不等于持久化提交。
     pub checkpoint: SessionCheckpoint,
+    /// 功能：完整真实产出；失败/取消时为空，不包含压缩摘要。
+    pub generated_messages: Vec<openpaw_core::Message>,
 }
 
 struct RestoreGuard<'a> {
@@ -89,31 +93,18 @@ pub async fn run_turn(
         session,
         checkpoint: Some(checkpoint),
     };
-    let cancel = options.cancel;
-    let execution = async {
-        if let Some(provider_and_model) = options.provider_and_model {
-            agent
-                .run_turn_with_provider_and_cancel_token(
-                    guard.session,
-                    options.system,
-                    tools,
-                    event_sink,
-                    cancel.clone(),
-                    provider_and_model,
-                )
-                .await
-        } else {
-            agent
-                .run_turn_with_cancel_token(
-                    guard.session,
-                    options.system,
-                    tools,
-                    event_sink,
-                    cancel.clone(),
-                )
-                .await
-        }
-    };
+    let cancel = options.cancel.clone();
+    let mut generated_messages = Vec::new();
+    let execution = agent.run_turn_collect(
+        guard.session,
+        tools,
+        event_sink,
+        TurnOptions {
+            cancel: cancel.clone(),
+            ..options
+        },
+        &mut generated_messages,
+    );
     let result = std::panic::AssertUnwindSafe(execution)
         .catch_unwind()
         .await
@@ -121,8 +112,13 @@ pub async fn run_turn(
     let checkpoint = guard.checkpoint.take().expect("execution checkpoint");
     if result.is_err() || cancel.is_cancelled() {
         checkpoint.restore(guard.session);
+        generated_messages.clear();
     }
-    TurnExecution { result, checkpoint }
+    TurnExecution {
+        result,
+        checkpoint,
+        generated_messages,
+    }
 }
 
 #[cfg(test)]

@@ -372,3 +372,18 @@ Host approval：原 once/always/reject、SSE 顺序/取消，以及丢弃 future
 verdict passed，2/2、0 skip、退出 0。通过实际 DOM 与命中验证后的鼠标点击验收回退行为，
 不把验证镜像操作区的透明样式或像素可见性写成通过项。更新本机引擎后，独立 fork、普通两轮
 及报告旧会话的真实浏览器复测均通过；原会话输入/输出均隐藏且无 unresolved 卡，其他游标保持不变。
+
+## 多模态本地验收（CHG-2026-0026）
+
+Core 单元测试覆盖旧 JSON、MIME别名、稳定旧图片编号、5/20 MiB边界、4个/总量上限与安全诊断；
+GIF 单元及HTTP测试验证首帧请求与原件保留。LLM mock_server_contract 检查两种图片 HTTP、Chat WAV/MP3、工具配对、模型覆盖及上游错误回显脱敏。
+CLI chat_e2e 运行真实进程，验证重复附件操作、含空格路径、纯附件发送、图片/音频 HTTP、JSONL 与 EOF不发送。
+Tools media_read_e2e 验证文本兼容、扩展名/容器签名、路径越界、无效媒体和会话缓存生命周期。
+Store media_history 验证内联重启、Fork 和可见前缀；Engine multimodal_e2e 验证压缩编号回看、完整产出、图片/WAV/MP3
+及第二次请求失败恢复。Engine 单元测试覆盖 Hook 清空/非法替换，不保留旧媒体。
+
+Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP服务，覆盖强制压缩、图片＋WAV纯附件、
+并行图片/音频工具、REST/SSE一致性、完整提交、重启/Fork/暂存回退、幂等冲突和400/413不入历史。
+既有会话取消、panic/drop、提交失败和CLI/Host parity一起回归。所有测试使用临时home/workspace；测试权限环境显式auto。
+样例是协议字节夹具，不能作为完整解码图像、音频可播放或模型理解的证据。真实模型按 Q16 后续验证。
+最终命令、退出码及平台限制见本 CHG 验证记录。

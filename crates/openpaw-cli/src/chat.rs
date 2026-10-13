@@ -64,10 +64,32 @@ pub fn run(args: ChatArgs) -> i32 {
     // Offline providers (mock/echo) ignore the declaration and keep their
     // deterministic replies. Fetch once — the registry is static per run.
     let specs = rt.block_on(tool_host.list_tools()).unwrap_or_default();
+    let caps = provider.model_capabilities(&config.model);
+    let mut pending = Vec::new();
+    for path in &args.attach {
+        match rt.block_on(openpaw_tools::fs::media::read_media(path)) {
+            Ok(media) => pending.push(media),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 2;
+            }
+        }
+    }
+    if let Err(error) = openpaw_core::media::validate_media(&pending, caps) {
+        eprintln!("error: {error}");
+        return 2;
+    }
+    let mut original_history = Vec::new();
     let agent = AgentLoop::new(provider.clone())
         .with_model(&config.model)
         .with_max_tokens(config.max_output_tokens)
-        .with_tool_host(tool_host);
+        .with_tool_host(tool_host)
+        .with_compact_options(openpaw_engine::compaction::CompactOptions {
+            model_limit: caps.context_window as usize,
+            protect_head_pairs: 0,
+            keep_recent_pairs: 1,
+            ..Default::default()
+        });
 
     let (approval_tx, mut approval_rx) = tokio::sync::mpsc::unbounded_channel();
     let next_id = std::sync::atomic::AtomicU64::new(0);
@@ -139,15 +161,53 @@ pub fn run(args: ChatArgs) -> i32 {
             break;
         }
 
-        let user_msg = openpaw_core::Message::user_text(trimmed.to_string());
-        let pre_len = session.messages.len();
+        if trimmed == "/clear-attachments" {
+            pending.clear();
+            continue;
+        }
+        if let Some(path) = trimmed.strip_prefix("/attach ") {
+            match rt.block_on(openpaw_tools::fs::media::read_media(std::path::Path::new(
+                path.trim().trim_matches('"'),
+            ))) {
+                Ok(media) => {
+                    let mut candidate = pending.clone();
+                    candidate.push(media);
+                    match openpaw_core::media::validate_media(&candidate, caps) {
+                        Ok(()) => pending = candidate,
+                        Err(error) => eprintln!("error: {error}"),
+                    }
+                }
+                Err(error) => eprintln!("error: {error}"),
+            }
+            continue;
+        }
+        if trimmed == "/attach" {
+            eprintln!("usage: /attach <path>");
+            continue;
+        }
+        if trimmed == "/send" && pending.is_empty() {
+            eprintln!("no pending attachments");
+            continue;
+        }
+
+        let mut user_msg = if trimmed == "/send" {
+            openpaw_core::Message::default()
+        } else {
+            openpaw_core::Message::user_text(trimmed.to_string())
+        };
+        user_msg
+            .content
+            .extend(pending.iter().map(openpaw_core::InlineMedia::block));
+        user_msg = user_msg.identified();
         // The transcript is the durable conversation record: a failed append
         // means the session on disk no longer matches this run, so the
         // command must fail loudly instead of returning 0.
         if let Err(error) = journal::append(&mut writer, &SessionEvent::Message(user_msg.clone())) {
             return report_persistence_error("persist the user message", &transcript_path, &error);
         }
+        original_history.push(user_msg.clone());
         session.messages.push(user_msg);
+        pending.clear();
         let log: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
         let mut sink = move |ev: AgentEvent| {
@@ -156,7 +216,8 @@ pub fn run(args: ChatArgs) -> i32 {
 
         approvals.begin_turn();
         let execution = rt.block_on(async {
-            let turn = turn_execution::run_turn(&agent, &mut session, &specs, &mut sink, TurnOptions::default());
+            let attachments = openpaw_store::media::attachment_snapshot(&original_history).into_values().collect();
+            let turn = turn_execution::run_turn(&agent, &mut session, &specs, &mut sink, TurnOptions { attachments, ..Default::default() });
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -201,11 +262,8 @@ pub fn run(args: ChatArgs) -> i32 {
                 }
             })
             .collect();
-        let persisted = session
-            .messages
-            .get(pre_len + 1..)
-            .ok_or_else(|| "会话历史的持久化边界不一致".to_string())
-            .and_then(|messages| journal::append_messages(&mut writer, messages, &completions));
+        let persisted =
+            journal::append_messages(&mut writer, &execution.generated_messages, &completions);
         if let Err(error) = persisted {
             checkpoint.restore(&mut session);
             return report_persistence_error(
@@ -214,6 +272,7 @@ pub fn run(args: ChatArgs) -> i32 {
                 &error,
             );
         }
+        original_history.extend(execution.generated_messages);
         if let Some(db) = &session_db {
             if let Err(error) = db.refresh_transcript(&home, &session.meta.id) {
                 eprintln!("warn: {error}");

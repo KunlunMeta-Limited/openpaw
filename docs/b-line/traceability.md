@@ -97,3 +97,13 @@ tracked 与未忽略 untracked 的 10,044 个条目，其中 10,043 个现存文
 
 初始红灯和修复候选的实际命令输出保存在仓库外 `../artifacts/chat-runtime-audit/`；当前验收结果在 CHG-0023 第 12 节。
 当前编码与功能验证完成，Rust 回归及 OpenWork attached 契约通过；行数门禁失败、外部治理框架缺失，正式验收仍受阻。
+
+## CHG-2026-0026 对应关系
+
+| 需求 | 实现 | 验收证据 |
+| --- | --- | --- |
+| Q1–Q5、Q7、Q15：媒体理解与显式模型 | Core.media、LLM config/OpenAI/Anthropic | Core/config单元、mock_server_contract |
+| Q6、Q9、Q17：内联原件与自动压缩 | Store.media、Engine compaction/TurnExecution、CLI/Host完整历史 | media_history、multimodal_e2e、Host inline_media |
+| Q8、Q11：工具读取与协议适配 | read_file/read_attachment、ToolResult.media、Provider | media_read_e2e、HTTP工具配对、Hook单元、Host并行工具 |
+| Q10、Q12–Q14：入口、限制与客户端范围 | CLI附件命令、Host file parts、schemas | chat_e2e、Host inline_media、schema样例校验 |
+| Q16：本地验收 | 临时目录与假服务，不使用真实模型 | 实际命令/退出码见CHG；真实理解效果暂未验收 |

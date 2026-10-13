@@ -39,7 +39,8 @@
               "type": "object",
               "required": [
                 "id",
-                "name"
+                "name",
+                "capabilities"
               ],
               "properties": {
                 "id": {
@@ -47,6 +48,35 @@
                 },
                 "name": {
                   "type": "string"
+                },
+                "capabilities": {
+                  "type": "object",
+                  "required": [
+                    "input"
+                  ],
+                  "properties": {
+                    "input": {
+                      "type": "object",
+                      "required": [
+                        "text",
+                        "image",
+                        "audio"
+                      ],
+                      "properties": {
+                        "text": {
+                          "type": "boolean"
+                        },
+                        "image": {
+                          "type": "boolean"
+                        },
+                        "audio": {
+                          "type": "boolean"
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  },
+                  "additionalProperties": false
                 }
               }
             }

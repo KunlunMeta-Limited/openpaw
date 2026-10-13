@@ -14,12 +14,25 @@ use serde_json::json;
 use crate::http::{classify_http_error, complete_client, stream_client};
 use crate::sse::MAX_STREAM_ACCUMULATED_BYTES;
 
+fn media_part(media: &openpaw_core::InlineMedia) -> Result<serde_json::Value> {
+    if media.mime.starts_with("image/") {
+        Ok(
+            json!({"type":"image_url", "image_url":{"url":format!("data:{};base64,{}",media.mime,media.model_data()?)}}),
+        )
+    } else {
+        Ok(
+            json!({"type":"input_audio", "input_audio":{"data":media.data, "format":if media.mime == "audio/wav" { "wav" } else { "mp3" }}}),
+        )
+    }
+}
+
 pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     default_model: String,
     client: reqwest::Client,
     stream_client: reqwest::Client,
+    model_capabilities: std::collections::HashMap<String, Capabilities>,
 }
 
 impl OpenAiProvider {
@@ -30,11 +43,28 @@ impl OpenAiProvider {
             default_model: default_model.into(),
             client: complete_client(),
             stream_client: stream_client(),
+            model_capabilities: Default::default(),
         }
     }
 
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// 功能：设置逐模型显式媒体能力。
+    /// 参数：不可变配置快照。
+    /// 返回：Provider。
+    /// 错误：无；配置解析先校验。
+    /// 状态：替换目录。
+    /// 并发与取消：构造时执行。
+    /// 权限：不访问服务。
+    /// 关联：ConfigSnapshot。
+    pub fn with_model_capabilities(
+        mut self,
+        capabilities: std::collections::HashMap<String, Capabilities>,
+    ) -> Self {
+        self.model_capabilities = capabilities;
         self
     }
 
@@ -46,7 +76,7 @@ impl OpenAiProvider {
         &self,
         req: &CompletionRequest,
         include_reasoning: bool,
-    ) -> Vec<serde_json::Value> {
+    ) -> Result<Vec<serde_json::Value>> {
         let mut messages: Vec<serde_json::Value> = Vec::new();
         if let Some(system) = &req.system {
             messages.push(json!({"role": "system", "content": system}));
@@ -57,11 +87,14 @@ impl OpenAiProvider {
                     // Split tool_result blocks into `tool` messages; text
                     // stays a normal user message.
                     let mut text_parts: Vec<String> = Vec::new();
+                    let mut input_parts = Vec::new();
+                    let mut tool_media_parts = Vec::new();
                     for block in &m.content {
                         match block {
                             ContentBlock::ToolResult {
                                 tool_use_id,
                                 content,
+                                media,
                                 ..
                             } => {
                                 messages.push(json!({
@@ -69,13 +102,30 @@ impl OpenAiProvider {
                                     "tool_call_id": tool_use_id,
                                     "content": content,
                                 }));
+                                for item in media {
+                                    tool_media_parts.push(json!({"type":"text", "text":format!("Tool {tool_use_id}, attachment {} ({})", item.id, item.mime)}));
+                                    tool_media_parts.push(media_part(item)?);
+                                }
                             }
-                            ContentBlock::Text { text } => text_parts.push(text.clone()),
+                            ContentBlock::Text { text } => {
+                                text_parts.push(text.clone());
+                                input_parts.push(json!({"type":"text","text":text}));
+                            }
+                            ContentBlock::Image { .. } | ContentBlock::Audio { .. } => {
+                                if let Some(item) = openpaw_core::media::block_media(block)? {
+                                    input_parts.push(media_part(&item)?);
+                                }
+                            }
                             _ => {}
                         }
                     }
-                    if !text_parts.is_empty() {
+                    if input_parts.iter().any(|part| part["type"] != "text") {
+                        messages.push(json!({"role":"user", "content":input_parts}));
+                    } else if !text_parts.is_empty() {
                         messages.push(json!({"role": "user", "content": text_parts.join("\n")}));
+                    }
+                    if !tool_media_parts.is_empty() {
+                        messages.push(json!({"role":"user", "content":tool_media_parts}));
                     }
                 }
                 Role::Assistant => {
@@ -115,10 +165,10 @@ impl OpenAiProvider {
                 }
             }
         }
-        messages
+        Ok(messages)
     }
 
-    fn build_body(&self, req: &CompletionRequest, stream: bool) -> serde_json::Value {
+    fn build_body(&self, req: &CompletionRequest, stream: bool) -> Result<serde_json::Value> {
         let model = if req.model.is_empty() {
             self.default_model.clone()
         } else {
@@ -126,9 +176,18 @@ impl OpenAiProvider {
         };
         let deepseek_dialect = model.to_ascii_lowercase().starts_with("deepseek-")
             || self.base_url.to_ascii_lowercase().contains("deepseek");
+        for message in &req.messages {
+            openpaw_core::media::validate_media(
+                &openpaw_core::media::message_media(std::slice::from_ref(message)),
+                self.model_capabilities(&model),
+            )?;
+            for block in &message.content {
+                openpaw_core::media::block_media(block)?;
+            }
+        }
         let mut body = json!({
             "model": model,
-            "messages": self.build_messages(req, deepseek_dialect),
+            "messages": self.build_messages(req, deepseek_dialect)?,
             "max_tokens": if req.max_tokens > 0 { req.max_tokens } else { 4096 },
             "stream": stream,
         });
@@ -152,7 +211,10 @@ impl OpenAiProvider {
                 .collect();
             body["tools"] = json!(tools);
         }
-        body
+        if body.to_string().len() > openpaw_core::media::MAX_REQUEST_BYTES {
+            return Err(Error::session("model request exceeds byte limit"));
+        }
+        Ok(body)
     }
 
     fn parse_usage(u: Option<&serde_json::Value>) -> Usage {
@@ -186,12 +248,8 @@ impl OpenAiProvider {
             None => Err(Error::Provider("OpenAI 兼容服务缺少 finish_reason".into())),
         }
     }
-}
-
-#[async_trait]
-impl LlmProvider for OpenAiProvider {
-    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
-        let body = self.build_body(&req, false);
+    async fn complete_request(&self, req: CompletionRequest) -> Result<CompletionResponse> {
+        let body = self.build_body(&req, false)?;
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
             .client
@@ -275,11 +333,11 @@ impl LlmProvider for OpenAiProvider {
         })
     }
 
-    async fn stream(
+    async fn stream_request(
         &self,
         req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
-        let body = self.build_body(&req, true);
+        let body = self.build_body(&req, true)?;
         let url = format!("{}/chat/completions", self.base_url);
         let resp = self
             .stream_client
@@ -371,6 +429,43 @@ impl LlmProvider for OpenAiProvider {
             },
         )))
     }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiProvider {
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
+        let media = !openpaw_core::media::message_media(&req.messages).is_empty();
+        self.complete_request(req).await.map_err(|error| {
+            if media {
+                openpaw_core::media::redact_error(error)
+            } else {
+                error
+            }
+        })
+    }
+
+    async fn stream(
+        &self,
+        req: CompletionRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        let media = !openpaw_core::media::message_media(&req.messages).is_empty();
+        let stream = self.stream_request(req).await.map_err(|error| {
+            if media {
+                openpaw_core::media::redact_error(error)
+            } else {
+                error
+            }
+        })?;
+        Ok(Box::pin(stream.map(move |result| {
+            result.map_err(|error| {
+                if media {
+                    openpaw_core::media::redact_error(error)
+                } else {
+                    error
+                }
+            })
+        })))
+    }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -383,6 +478,16 @@ impl LlmProvider for OpenAiProvider {
 
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn model_capabilities(&self, model: &str) -> Capabilities {
+        let mut caps = self.capabilities();
+        if let Some(declared) = self.model_capabilities.get(model) {
+            caps.image_input = declared.image_input;
+            caps.audio_input = declared.audio_input;
+            caps.context_window = declared.context_window;
+        }
+        caps
     }
 
     fn default_model(&self) -> &str {
@@ -773,7 +878,7 @@ mod stream_state_tests {
             tools: vec![ToolSpec::new("read_file", "读取文件")],
             ..Default::default()
         };
-        let body = provider.build_body(&request, true);
+        let body = provider.build_body(&request, true).unwrap();
         assert_eq!(body["max_tokens"], json!(100));
         assert_eq!(body["messages"][0]["reasoning_content"], json!("分析"));
         assert_eq!(body["messages"][0]["tool_calls"][0]["id"], json!("call_1"));

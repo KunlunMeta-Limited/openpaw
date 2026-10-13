@@ -138,3 +138,15 @@ transcript 接管 Fork/Revert 的纯历史变换和持久类型，catalog 接管
 Host 持有 writer 与协调锁并决定接收、终态和恢复策略；SSE/Office 发布保持在 Host。
 CLI 保留终端输入、审批交互和 SQLite 索引刷新，完整持久化 User 角色承载的 ToolResult。
 Engine/Store 不依赖 Host，Engine 不新增 Store 依赖；默认 CLI 不引入 Axum。
+
+## 内联媒体与压缩边界（CHG-2026-0026）
+
+Core InlineMedia 定义稳定编号、规范 MIME、Base64 原件和可选名称；Image 兼容旧字段，Audio 与
+ToolResult.media 承载录音和富工具结果。CLI/Host 在接收前规范化并校验所选模型能力；LLM 负责协议转换，
+Tools 负责有界读取与会话内查找。Engine 不依赖 Store、HTTP 或 Office。
+
+CLI 与 Host 启用同一个自动压缩器。模型 Session 是可压缩视图，入口保存的有效完整历史是持久化/REST/分支事实。
+TurnExecution 收集本回合完整真实产出，避免压缩后索引切片丢失助手与工具消息。失败、取消、panic/drop 和保存失败
+恢复 checkpoint；工具已完成的外部副作用不回滚。附件临时缓存随活动回合清理，不能跨会话或失败续留。
+
+新增依赖仅复用已有 Base64（Core）和测试用 serde_json（CLI）；默认 CLI 仍无 Axum，Office 动作语义保持既有合同。

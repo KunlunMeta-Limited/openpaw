@@ -56,6 +56,8 @@ impl LlmProvider for EchoProvider {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
+            audio_input: false,
             tool_use: false,
             prompt_caching: false,
             streaming: false,

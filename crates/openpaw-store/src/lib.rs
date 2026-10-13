@@ -19,6 +19,8 @@
 pub mod catalog;
 pub mod frontmatter;
 pub mod global_db;
+/// 功能：有效历史附件索引。
+pub mod media;
 pub mod session;
 pub mod sqlite;
 /// 功能：导出共享 transcript 能力。

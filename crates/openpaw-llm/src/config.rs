@@ -10,6 +10,13 @@
 use openpaw_core::LlmProvider;
 use std::{collections::HashMap, sync::Arc};
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelInput {
+    input: Vec<String>,
+    context_window: Option<std::num::NonZeroU32>,
+}
+
 /// 功能：提供支持协议、默认模型和显示名称的唯一目录。
 pub const PROVIDERS: [(&str, &str, &str); 4] = [
     ("mock", "mock-1", "OpenPaw mock"),
@@ -46,6 +53,7 @@ pub struct ResolvedConfig {
     /// 功能：有效输出上限。参数：无。返回：正整数。错误：无。状态：内存。并发与取消：只读。权限：无。关联：AgentLoop。
     pub max_output_tokens: u32,
     key: Option<String>,
+    model_capabilities: HashMap<String, openpaw_core::Capabilities>,
 }
 
 impl ConfigSnapshot {
@@ -66,6 +74,7 @@ impl ConfigSnapshot {
             "OPENPAW_OPENAI_MODEL",
             "OPENPAW_ANTHROPIC_MODEL",
             "OPENPAW_MAX_OUTPUT_TOKENS",
+            "OPENPAW_MODEL_CAPABILITIES",
         ];
         Self::from_pairs(names.into_iter().filter_map(|name| {
             std::env::var_os(name)
@@ -145,6 +154,7 @@ impl ConfigSnapshot {
             max_output_tokens,
             base_url: None,
             key: None,
+            model_capabilities: self.capability_map(name)?,
         };
         if matches!(name, "openai" | "anthropic") {
             let prefix = name.to_ascii_uppercase();
@@ -208,7 +218,86 @@ impl ConfigSnapshot {
                 models.push(model);
             }
         }
+        if let Ok(capabilities) = self.capability_map(name) {
+            let mut declared: Vec<_> = capabilities.into_keys().collect();
+            declared.sort();
+            for model in declared {
+                if !models.contains(&model) {
+                    models.push(model);
+                }
+            }
+        }
         models
+    }
+
+    fn capability_map(
+        &self,
+        name: &str,
+    ) -> Result<HashMap<String, openpaw_core::Capabilities>, String> {
+        let Some(value) = self.values.get("OPENPAW_MODEL_CAPABILITIES") else {
+            return Ok(HashMap::new());
+        };
+        let map: HashMap<String, HashMap<String, ModelInput>> = serde_json::from_str(value)
+            .map_err(|_| "OPENPAW_MODEL_CAPABILITIES is invalid".to_string())?;
+        let mut result = HashMap::new();
+        for (provider, models) in map {
+            if !PROVIDERS.iter().any(|(id, _, _)| *id == provider) {
+                return Err("OPENPAW_MODEL_CAPABILITIES has an unknown provider".into());
+            }
+            for (model, input) in models {
+                if model.trim().is_empty()
+                    || input
+                        .input
+                        .iter()
+                        .any(|value| !matches!(value.as_str(), "text" | "image" | "audio"))
+                {
+                    return Err("OPENPAW_MODEL_CAPABILITIES has an invalid model/input".into());
+                }
+                if (provider == "anthropic" && input.input.iter().any(|value| value == "audio"))
+                    || (matches!(provider.as_str(), "mock" | "echo")
+                        && input.input.iter().any(|value| value != "text"))
+                {
+                    return Err(
+                        "OPENPAW_MODEL_CAPABILITIES declares unsupported protocol input".into(),
+                    );
+                }
+                if provider == name {
+                    result.insert(
+                        model,
+                        openpaw_core::Capabilities {
+                            image_input: input.input.iter().any(|value| value == "image"),
+                            audio_input: input.input.iter().any(|value| value == "audio"),
+                            context_window: input
+                                .context_window
+                                .map(|value| value.get())
+                                .unwrap_or(128_000),
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// 功能：取得所选模型的显式输入能力。
+    /// 参数：协议和模型名。
+    /// 返回：输入能力和上下文窗口；未声明为纯文本。
+    /// 错误：脱敏配置错误。
+    /// 状态：只读快照。
+    /// 并发与取消：不访问网络。
+    /// 权限：声明不代替真实服务验证。
+    /// 关联：CLI model list 和 Host /provider。
+    pub fn capabilities(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<openpaw_core::Capabilities, String> {
+        Ok(self
+            .capability_map(provider)?
+            .get(model)
+            .copied()
+            .unwrap_or_default())
     }
 }
 
@@ -225,11 +314,13 @@ impl ResolvedConfig {
         match self.provider.as_str() {
             "openai" => Arc::new(
                 crate::OpenAiProvider::new(self.key.clone().unwrap_or_default(), &self.model)
-                    .with_base_url(self.base_url.clone().unwrap_or_default()),
+                    .with_base_url(self.base_url.clone().unwrap_or_default())
+                    .with_model_capabilities(self.model_capabilities.clone()),
             ),
             "anthropic" => Arc::new(
                 crate::AnthropicProvider::new(self.key.clone().unwrap_or_default(), &self.model)
-                    .with_base_url(self.base_url.clone().unwrap_or_default()),
+                    .with_base_url(self.base_url.clone().unwrap_or_default())
+                    .with_model_capabilities(self.model_capabilities.clone()),
             ),
             "echo" => Arc::new(crate::EchoProvider::new()),
             _ => Arc::new(crate::MockProvider::counter("mock-reply-")),
@@ -251,6 +342,36 @@ mod tests {
     use super::*;
     fn snapshot(pairs: &[(&str, &str)]) -> ConfigSnapshot {
         ConfigSnapshot::from_pairs(pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
+    }
+    #[test]
+    fn model_media_registry_validates_and_preserves_text_defaults() {
+        for value in [
+            r#"{"anthropic":{"m":{"input":["audio"]}}}"#,
+            r#"{"mock":{"m":{"input":["image"]}}}"#,
+            r#"{"openai":{"m":{"input":["video"]}}}"#,
+            r#"{"other":{}}"#,
+            r#"{"openai":{"m":{"input":["text"],"context_window":0}}}"#,
+        ] {
+            assert!(snapshot(&[("OPENPAW_MODEL_CAPABILITIES", value)])
+                .capabilities("openai", "m")
+                .is_err());
+        }
+        let registry = snapshot(&[
+            ("OPENAI_API_KEY", "fixture"),
+            (
+                "OPENPAW_MODEL_CAPABILITIES",
+                r#"{"openai":{"vision":{"input":["text","image"],"context_window":32768},"audio":{"input":["text","audio"]}}}"#,
+            ),
+        ]);
+        let caps = registry.capabilities("openai", "vision").unwrap();
+        assert!(caps.image_input && !caps.audio_input);
+        assert_eq!(caps.context_window, 32768);
+        let provider = registry
+            .resolve("openai", Default::default())
+            .unwrap()
+            .build();
+        assert!(provider.model_capabilities("audio").audio_input);
+        assert!(!provider.model_capabilities("unknown").image_input);
     }
     #[test]
     fn invalid_configuration_never_exposes_credentials_and_offline_is_independent() {

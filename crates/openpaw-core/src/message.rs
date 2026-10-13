@@ -92,6 +92,19 @@ impl Message {
         self
     }
 
+    /// 功能：为新消息分配中立身份。
+    /// 参数：无。
+    /// 返回：带 UUID 的消息。
+    /// 错误：无。
+    /// 状态：仅修改自身，不写历史。
+    /// 并发与取消：独立构造。
+    /// 权限：无。
+    /// 关联：完整生成消息收集。Stability: unstable.
+    pub fn identified(mut self) -> Self {
+        self.uuid = Some(uuid::Uuid::new_v4().to_string());
+        self
+    }
+
     /// Concatenated plain text of all Text blocks.
     pub fn text(&self) -> String {
         self.content
@@ -133,6 +146,9 @@ pub enum ContentBlock {
         name: Option<String>,
         #[serde(default)]
         protected: bool,
+        /// 功能：保留工具返回的内联附件。Stability: unstable.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        media: Vec<crate::InlineMedia>,
     },
     Image {
         url: String,
@@ -140,6 +156,17 @@ pub enum ContentBlock {
         media_type: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<String>,
+        /// 功能：图片原件的稳定编号。Stability: unstable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// 功能：可选展示名称。Stability: unstable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filename: Option<String>,
+    },
+    /// 功能：模型原生音频输入；输出仍为文字。Stability: unstable.
+    Audio {
+        /// 功能：音频原件、稳定编号和 MIME。Stability: unstable.
+        media: crate::InlineMedia,
     },
     Document {
         url: String,
@@ -220,6 +247,8 @@ mod tests {
                     url: "https://example.com/img.png".into(),
                     media_type: None,
                     data: None,
+                    id: None,
+                    filename: None,
                 },
             ],
             timestamp: Some("2026-08-30T12:00:00Z".into()),

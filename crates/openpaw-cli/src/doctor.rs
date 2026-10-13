@@ -76,6 +76,18 @@ pub fn run(home: &Path, workspace: &Path) -> i32 {
     }
 
     let config = openpaw_llm::config::ConfigSnapshot::from_env();
+    let media_check = match config.capabilities("openai", "") {
+        Ok(_) => Check::Pass(
+            "model input capabilities: valid local declarations (undeclared models are text only)"
+                .into(),
+        ),
+        Err(error) => Check::warn(
+            error,
+            "model capability configuration is invalid",
+            "check OPENPAW_MODEL_CAPABILITIES JSON without adding credentials",
+        ),
+    };
+    emit(media_check, &mut pass, &mut warn);
     for (name, _, _) in openpaw_llm::config::PROVIDERS {
         let check = match config.resolve(name, Default::default()) {
             Ok(c) => Check::Pass(format!(

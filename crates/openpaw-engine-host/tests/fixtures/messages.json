@@ -4,7 +4,10 @@
       "id": "msg-user",
       "sessionID": "session-id",
       "role": "user",
-      "time": { "created": 0, "completed": 0 }
+      "time": {
+        "created": 0,
+        "completed": 0
+      }
     },
     "parts": [
       {
@@ -13,6 +16,16 @@
         "sessionID": "session-id",
         "type": "text",
         "text": "hello"
+      },
+      {
+        "type": "file",
+        "mime": "image/gif",
+        "filename": "sample.gif",
+        "url": "data:image/gif;base64,R0lGODlhZml4dHVyZQ==",
+        "attachmentID": "att-fixture",
+        "id": "prt-user-file",
+        "messageID": "msg-user",
+        "sessionID": "session-id"
       }
     ]
   },
@@ -21,7 +34,10 @@
       "id": "msg-assistant",
       "sessionID": "session-id",
       "role": "assistant",
-      "time": { "created": 1, "completed": 2 }
+      "time": {
+        "created": 1,
+        "completed": 2
+      }
     },
     "parts": [
       {
@@ -44,7 +60,16 @@
           "output": "ok",
           "error": "",
           "durationMs": 5
-        }
+        },
+        "attachments": [
+          {
+            "type": "file",
+            "mime": "image/gif",
+            "filename": "sample.gif",
+            "url": "data:image/gif;base64,R0lGODlhZml4dHVyZQ==",
+            "attachmentID": "att-fixture"
+          }
+        ]
       },
       {
         "id": "prt-assistant-text",

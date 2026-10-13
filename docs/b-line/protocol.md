@@ -174,3 +174,17 @@ mock/echo 需要有效通用生成配置；openai/anthropic 还需要非空 Key�
 无效网络配置不影响离线项；无效通用 token 配置使各协议都不可用。此判断不验证上游认证或网络连通性。
 default 保留显式 Host provider，即使不可用也不切换到 mock；实际模型请求明确返回配置错误或上游失败。
 字段契约见 `contracts/host-provider-v1.schema.json`，共享配置由 openpaw-llm::config 提供。
+
+## 图片与原生音频合同（CHG-2026-0026）
+
+POST message / prompt_async 接受 `parts:[{type:"file",mime,url,filename?}]`；url 限内联 data URL。
+纯附件请求有效，文本与附件顺序保留；直接 text 沿用优先规则。接收前校验 MIME/头/Base64、数量、大小和有效模型能力，
+非法输入400、原件或body超限413；同 requestID / messageID 的规范内容相同重放，字节、顺序、名称或模型不同409。
+最大4个/20 MiB原件、图片5 MiB、body32 MiB；具体 schema 见 contracts/host-prompt-v1.schema.json。
+
+REST 和即时 message.part.updated 使用相同 file id/attachmentID/MIME/data URL；工具 parts 保留 callID，
+completed 结果增加 attachments。GET /provider models 增加 capabilities.input 的 text/image/audio 布尔值，
+connected 仍只表示本地配置。所有媒体只出现在授权消息接口，Office 活动、CLI摘要/FTS和诊断不输出原件。
+Schemas 为 host-message-events-v1 和 host-provider-v1；旧 text 请求、tool 文本与 SSE 类型保持兼容。
+
+OpenWork 已有图片 file part 形状在 OpenPaw 契约测试中覆盖；其音频入口和 AI Office 界面尚未实现，本轮不修改客户端仓库。

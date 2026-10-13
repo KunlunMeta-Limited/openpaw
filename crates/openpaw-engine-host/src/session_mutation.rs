@@ -115,6 +115,7 @@ mod tests {
                         is_error: false,
                         name: Some("read_file".into()),
                         protected: false,
+                        media: Vec::new(),
                     },
                     ContentBlock::CompactBoundary {
                         metadata: CompactMetadata {

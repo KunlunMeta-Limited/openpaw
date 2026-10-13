@@ -679,6 +679,7 @@ async fn tool_results_coalesce_across_fork_revert_and_restart() {
                     is_error: false,
                     name: Some("read_file".into()),
                     protected: false,
+                    media: Vec::new(),
                 }],
                 uuid: Some("message-result-source".into()),
                 ..Default::default()
@@ -1095,6 +1096,7 @@ async fn assert_untracked_assistant_revert(has_uuid: bool, fork: bool) {
                 is_error: false,
                 name: Some("read_file".into()),
                 protected: false,
+                media: Vec::new(),
             }],
             ..Default::default()
         },
