@@ -1,5 +1,17 @@
 # OpenPaw B 线追踪矩阵
 
+## CHG-2026-0025 当前重构追踪
+
+| 本轮要求 | 最终职责与实现 | 验收入口 |
+| --- | --- | --- |
+| runtime 通用职责下沉 | Engine scheduler/turn_execution；Store journal/transcript/catalog；Host 留协调及协议适配 | Engine/Store 单元与既有 Host HTTP/reliability |
+| CLI 实际复用 | CLI chat 调用相同 Engine 执行包装及 Store 消息事务 | chat_e2e/chat_approval_e2e；session_host_parity |
+| ToolResult 不漏存 | 只排除已保存输入，保留 User 角色的工具结果 | 真实 CLI 保存 6 条消息；基线探针 0 个结果、当前 1 个结果 |
+| 完整状态恢复 | 完整 Session checkpoint；异常、取消、future drop 或提交失败时恢复 | Engine usage/压缩/丢弃测试；Host 取消与提交失败的完整状态断言 |
+| 保留严格行数门禁 | Store 按实测由 3000 调至 3500；其他上限和计数规则不变 | xtask lines 及 CHG 实测表 |
+
+本节只追踪当前已批准范围，历史审计、跨平台 CI、真实服务与完整发布裁决分别记录。
+
 > 历史审计快照：本文件保留 2026-09-17 早期反向审计结论，不能作为当前候选事实源。当前实现状态和未关闭发布项以 `../../ai-office-react-main/docs/01-需求基线.md`、`03-测试大纲.md`、`04-验收记录.md` 为准。
 
 审计日期：2026-09-17
@@ -73,3 +85,15 @@ tracked 与未忽略 untracked 的 10,044 个条目，其中 10,043 个现存文
 | 输入直到输出结束才可见 | HTTP 接收后在执行前发布完整 user text part | 阻塞 provider 断言；真实 OpenWork 首输出前唯一正文可见，刷新一致 | 局部验证；新旅程 Passed，发布门禁仍阻断 |
 
 此追踪只针对已批准 CHG-0022；不改变上文完整 master-plan、压力和发布验收状态。
+
+## CHG-2026-0023 修复追踪
+
+| 缺陷 | 共享实现 / 接线 | 回归 |
+| --- | --- | --- |
+| CLI 第三方配置与模型占位 | LLM config；唯一 ChatArgs；chat/config/model/doctor 与 Host 工厂 | CFG-001～008；chat_e2e/provider_config_e2e、Host provider/override |
+| Host 会话未被 CLI 发现，隐藏历史泄露风险 | Store transcript/catalog；SQLite 原子刷新；CLI 与 Host 形状 adapter | HIST-001～010；session_host_parity、Store 与既有 Host 恢复/回退 |
+| CLI 无人工审批与重复 pending | Engine gate/manual；CLI 输入所有者；Host permission adapter | APR-001～007；chat_approval_e2e 与 Host approval/HTTP |
+| 历史/分支回复 Revert 仅隐藏输出并出现 unresolved | Host normalize_revert_boundary 保留回合关联，缺记录时从已验证真实 assistant 定位最近输入并跳过纯工具结果 | HTTP 两项 red→green；Host 99/99、CLI 互通 3/3、OpenWork UI 2/2 零 skip；本机已部署、报告旧游标可撤销修复后 DOM 无残留输入/提示，其他会话游标保持不变；细节及既有门禁限制见 CHG 第 13 节 |
+
+初始红灯和修复候选的实际命令输出保存在仓库外 `../artifacts/chat-runtime-audit/`；当前验收结果在 CHG-0023 第 12 节。
+当前编码与功能验证完成，Rust 回归及 OpenWork attached 契约通过；行数门禁失败、外部治理框架缺失，正式验收仍受阻。

@@ -61,15 +61,7 @@ fn main() {
     }
     let code = match cli.command {
         Some(Command::Hello) => hello::run(),
-        Some(Command::Chat {
-            provider,
-            workspace,
-            home,
-        }) => chat::run(chat::ChatArgs {
-            provider,
-            workspace,
-            home,
-        }),
+        Some(Command::Chat(args)) => chat::run(args),
         Some(Command::Session { cmd }) => match cmd {
             session_cmd::Command::List { limit, home } => {
                 session_cmd::run_list(&resolve_home(home), limit)

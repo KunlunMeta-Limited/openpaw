@@ -1327,12 +1327,21 @@ mod tests {
             _request: CompletionRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let empty = self
-                .empty_calls
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    (remaining > 0).then(|| remaining - 1)
-                })
-                .is_ok();
+            let mut remaining = self.empty_calls.load(Ordering::SeqCst);
+            let empty = loop {
+                if remaining == 0 {
+                    break false;
+                }
+                match self.empty_calls.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break true,
+                    Err(current) => remaining = current,
+                }
+            };
             let content = (!empty)
                 .then(|| ContentBlock::Text {
                     text: "recovered".into(),

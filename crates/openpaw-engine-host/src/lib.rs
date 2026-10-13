@@ -2,7 +2,7 @@
 //! 输入输出边界：从 CLI 接收 HostConfig，向 OpenWork/AI Office 提供 REST、SSE 和动作投影。
 //! 依赖约束：本 crate 只在 `engine-host` feature 下启用；默认核心构建不得引入 axum。
 //! 禁止承担：不修改 `openpaw-core` 公共 trait，不绕过 runtime 直接写 session。
-//! 关联：`DES-OPENPAW-B-2026-09-15`、`REQ-B-HOST-008`。
+//! 关联：`DES-OPENPAW-B-2026-09-15`、`REQ-B-HOST-008`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 
 #[cfg(feature = "engine-host")]
 mod approval;

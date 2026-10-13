@@ -34,7 +34,9 @@ host 实现 `master-plan.md` 第 3.2 节规定的 OpenCode v1 子集。所有 SS
 - 已归档 Session 额外返回正数 Unix 毫秒 `time.archived`；unarchive 请求写 `0`，响应省略该字段。
 - staged revert 返回 `revert.messageID`；请求 user 边界时保持原游标，请求可由
   `TurnOutcome` 可靠关联的 `assistant` / `assistant_n` 边界时返回同回合 user 游标，
-  从而隐藏完整回合及尾部。无法可靠关联的旧 assistant 边界保持原游标。
+  从而隐藏完整回合及尾部。旧消息或完整分支没有有效回合关联时，已验证的真实 assistant
+  按同会话顺序定位最近真实 user 输入，跳过非空且全部为 ToolResult 的 user 消息；没有此前输入时保持原游标。
+  未知或已隐藏 ID 仍拒绝；失败展示消息仍须有已验证的回合关联。
   Branch 是新根会话，不返回 `parentID`。
 - `GET /session/:id/message` 将可完整匹配此前 assistant tool part 的纯 ToolResult
   user 消息折叠到该 part 的 `state`；普通用户文本、混合内容和无法匹配的旧数据保持逐条投影。
@@ -167,6 +169,8 @@ OpenCode 兼容层先发布归属失败回合的 assistant `message.updated`，�
 稳定的回环 URL，不依赖本地化前缀。该文案偏离 master-plan 的早期英文示例，兼容
 决策记录于 ADR-002。
 
-`provider.connected` 按 OpenCode v1 最小形状固定列四个协议适配器，含义是“可选
-适配器”而不是“凭据已验证”。缺少外部 key 时实际 prompt 返回 400。环境变量配置
-自定义模型时，`all[].models` 同时保留 master-plan 要求的默认模型并加入配置模型。
+`GET /provider` 保留 `all/connected/default` 字段：all 列出四个支持协议及默认/有效配置模型；connected 是无重复子集，表示本地配置满足运行条件。
+mock/echo 需要有效通用生成配置；openai/anthropic 还需要非空 Key、合法 URL 和非空模型。
+无效网络配置不影响离线项；无效通用 token 配置使各协议都不可用。此判断不验证上游认证或网络连通性。
+default 保留显式 Host provider，即使不可用也不切换到 mock；实际模型请求明确返回配置错误或上游失败。
+字段契约见 `contracts/host-provider-v1.schema.json`，共享配置由 openpaw-llm::config 提供。

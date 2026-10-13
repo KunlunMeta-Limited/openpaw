@@ -51,11 +51,14 @@ pub fn backend_name() -> &'static str {
     }
 }
 
-/// Execute a command with the given sandbox policy.
-///
-/// Dispatches to the platform-specific implementation. If native
-/// sandboxing is unavailable for a restricted policy, returns
-/// `SandboxError::PlatformUnavailable` (fail-closed).
+/// 功能：按平台后端执行命令，受限策略缺少后端时拒绝执行。
+/// 参数：`policy` 为隔离策略，`command` 为命令，`cwd` 为可选工作目录。
+/// 返回：命令输出、退出码及审计记录。
+/// 错误：后端不可用返回 `PlatformUnavailable`；执行错误由对应后端返回。
+/// 状态：可启动子进程并按策略访问文件系统。
+/// 并发与取消：异步等待后端执行；沿用后端的进程与取消语义。
+/// 权限：只有非受限策略可直接执行，受限策略不得静默降级。
+/// 关联：`command::exec_unrestricted` 与平台隔离后端。
 pub async fn exec_sandboxed(
     policy: &SandboxPolicy,
     command: &str,
@@ -73,9 +76,9 @@ pub async fn exec_sandboxed(
             return linux::exec_bwrap(policy, command, cwd).await;
         }
         // Fail closed: cannot enforce a restricted policy without bwrap
-        return Err(SandboxError::PlatformUnavailable(
+        Err(SandboxError::PlatformUnavailable(
             "bwrap not found on Linux; cannot enforce restricted sandbox policy".to_string(),
-        ));
+        ))
     }
 
     #[cfg(target_os = "macos")]
@@ -84,14 +87,14 @@ pub async fn exec_sandboxed(
             return macos::exec_seatbelt(policy, command, cwd).await;
         }
         // Fail closed: cannot enforce a restricted policy without sandbox-exec
-        return Err(SandboxError::PlatformUnavailable(
+        Err(SandboxError::PlatformUnavailable(
             "sandbox-exec not found on macOS; cannot enforce restricted sandbox policy".to_string(),
-        ));
+        ))
     }
 
     #[cfg(target_os = "windows")]
     {
-        return windows::exec_restricted(policy, command, cwd).await;
+        windows::exec_restricted(policy, command, cwd).await
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

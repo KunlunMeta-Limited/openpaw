@@ -15,8 +15,11 @@
 
 | 命令 | 退出码 | 结果或报告地址 |
 | --- | ---: | --- |
-| `python governance/check.py pr-check ...` |  |  |
-| `python governance/check.py comments-diff ...` |  |  |
+| `cargo fmt --all -- --check` |  |  |
+| `cargo clippy --workspace --all-targets -- -D warnings` |  |  |
+| `cargo test --workspace` |  |  |
+| `cargo run -p xtask -- lines` |  |  |
+| diff 范围与中文 Rustdoc 人工核对 |  |  |
 | 与本次风险等级对应的测试 |  |  |
 
 ## 审核确认

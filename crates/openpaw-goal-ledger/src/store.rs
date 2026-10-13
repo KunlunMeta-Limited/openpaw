@@ -9,7 +9,9 @@
 //! - only an in-process write mutex is kept; the cross-process run-lock
 //!   facility is deliberately NOT ported (hard red line).
 
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use walkdir::WalkDir;

@@ -39,7 +39,9 @@ OpenCode v1 client
 | `lib.rs` | Cargo feature | public API | 仅在 `engine-host` feature 下导出 host |
 | `protocol.rs` | HTTP JSON | serde types | OpenCode v1 子集、HostConfig、时间字段 |
 | `http.rs` | HTTP/SSE | runtime calls | 路由、鉴权、工作区优先级、错误码 |
-| `runtime.rs` | prompt/session calls | AgentLoop、JSONL、SSE | session 生命周期、恢复、provider 选择、持久化 |
+| `runtime.rs` | prompt/session calls | Engine/Store 调用、SSE | session 所有权、协调锁、恢复策略、协议和 Office 组装 |
+| Engine `scheduler/turn_execution` | 中立容量、AgentLoop、Session | 运行凭据、结果与检查点 | FIFO、完整会话快照、错误/取消/future drop 恢复 |
+| Store `journal/transcript/catalog` | 独占 writer、事件或目录 | 已提交历史与写入结果 | 文件事务、尾行修复、Fork 发布、历史变换和只读查询 |
 | `events.rs` | `AgentEvent` | `OpenCodeEvent` | message/part/status/todo 事件投影 |
 | `approval.rs` | guardrail request/reply/abort | approval response + SSE | 单 session、单代际 pending permission |
 | `office.rs` | turn/tool/approval event | ordered action POST | 名册映射、单 visit、跨 session 角色仲裁 |
@@ -117,3 +119,22 @@ URL 并移除末尾 `/`。OpenAI base URL 应包含版本路径（默认 `/v1`�
 `run_turn` 和 `run_turn_with_cancel_token` 保持兼容。
 CLI 仅在显式 feature 下构造 HostConfig。关闭 feature 后默认命令、sidecar 行为和
 依赖树不变。回滚 B 线只需停用 feature，既有 JSONL 仍由 openpaw-store 读取。
+
+## CHG-2026-0023 共享能力边界
+
+CLI 与 Host 都调用 openpaw-llm::config 的配置/工厂和生成设置、openpaw-store::transcript/catalog 的中立 codec/历史重放/目录快照、openpaw-engine::approval 的审批 gate/manual 策略。
+Host 保留 REST/OpenCode 类型及字段转换，CLI 保留终端输入/提示。runtime 继续持有 session、锁、回合调度、恢复和 writer，只对选定共享能力组装和调用。
+共享模块不包含 HTTP、Office 或终端依赖；Core trait、AgentLoop、Tools 策略及默认 feature 的依赖边界保持不变。
+Anthropic endpoint 对服务根路径或已有 /v1 前缀规范化；OpenAI 保留自定义父路径。
+
+## CHG-2026-0025 运行职责下沉
+
+Engine 拥有独立的 FIFO scheduler 与 turn_execution；AgentLoop 的模型/工具算法未修改。
+CLI 和 Host 都实际调用受保护执行：接收输入后捕获完整 Session，异常、取消或 future drop
+恢复执行前状态；成功结果保留检查点，供调用方在持久化失败时恢复。恢复不撤销工具外部操作。
+
+Store journal 接管独占 writer 的追加、批次回滚、finish 提交、尾行修复及 Fork 文件发布；
+transcript 接管 Fork/Revert 的纯历史变换和持久类型，catalog 接管分支序号扫描。
+Host 持有 writer 与协调锁并决定接收、终态和恢复策略；SSE/Office 发布保持在 Host。
+CLI 保留终端输入、审批交互和 SQLite 索引刷新，完整持久化 User 角色承载的 ToolResult。
+Engine/Store 不依赖 Host，Engine 不新增 Store 依赖；默认 CLI 不引入 Axum。

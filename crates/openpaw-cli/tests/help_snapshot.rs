@@ -120,7 +120,18 @@ fn each_subcommand_help_carries_key_names() {
     // (subcommand, substrings that must appear in its rendered help).
     let cases: &[(&str, &[&str])] = &[
         ("hello", &["echo"]),
-        ("chat", &["--provider", "--workspace", "--home"]),
+        (
+            "chat",
+            &[
+                "--provider",
+                "--workspace",
+                "--home",
+                "--base-url",
+                "--model",
+                "--max-output-tokens",
+                "--permissions",
+            ],
+        ),
         ("session", &["list", "show", "search"]),
         ("memory", &["list", "search", "show", "delete"]),
         ("evolve", &["status", "reset"]),

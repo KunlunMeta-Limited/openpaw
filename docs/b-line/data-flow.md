@@ -1,5 +1,20 @@
 # B 线数据流
 
+## CHG-2026-0025 共享执行与提交
+
+Host 接收仍在同 session 闸门内完成幂等检查、Engine admission 和 Store 接收事实写入；
+写入成功后发布输入并启动任务。CLI 先通过 Store journal 保存用户输入，再加入内存。
+两端均在已接收输入之后调用 Engine turn_execution，使用完整 Session 检查点保护执行。
+
+执行错误、取消或 future drop 恢复消息、用量及压缩等字段；工具已完成的外部操作保留。
+执行成功后，Host 在取消/终态共用闸门内委托 Store finish 提交 prepare/Message/commit，
+随后发布缓存、终态和 idle。CLI 委托 Store append_messages 保存全部产出，包含工具结果，
+再刷新 SQLite 索引和输出。提交失败时两端恢复执行检查点，沿用各入口的错误返回方式。
+
+Fork 的消息重键与文件发布、Revert 的历史边界和状态保留由 Store 提供；Host 仍负责
+公开消息身份验证、活动冲突、会话登记及 SSE。普通 catalog 查询只读，尾行修复仅由
+显式恢复接口执行。共享模块不接入 HTTP/SSE、Office 或终端，也不提供跨进程同时写锁。
+
 ## 回合时序
 
 ```text
@@ -192,3 +207,12 @@ assistant completed 事件。
 对账。terminal 已出现但 assistant 正文尚未可见时，应在有界窗口继续读取，不能立即生成
 `completed_without_reply`。messages 与 turns 任一暂时失败时，另一路的可用正文不应被
 `Promise.all` 一并阻塞；该项仍列入发布前优化清单。
+
+## CHG-2026-0023 持久历史与索引
+
+CLI/Host 都写 JSONL，SQLite 是 CLI 的可重建 transcript 索引，也是 audit 等其他数据的宿主。
+目录快照 -> 版本化 codec -> 纯重放 -> 已提交完整消息 + staged 可见前缀 -> CLI digest / Host REST adapter。
+accept 展开内嵌 user，prepare 批次仅在合法 finish commit 后公开；commit revert 逻辑裁剪历史；未知版本保留兼容，已登记损坏版本拒绝读取。
+CLI 查询不进行 Host 恢复，不追加 interrupted。search/chat 先取得 SQLite IMMEDIATE 写事务，再读取快照并替换单会话可见消息/FTS；不把扫描时间当活动时间，不迁移 schema，不删除全 DB。
+索引刷新保留审计和非 transcript 标记。损坏会话的旧消息索引失效；搜索只输出当前合法目录/投影中的 ID。
+目录扫描/重放成本随历史规模增长，本轮不增加缓存 schema。

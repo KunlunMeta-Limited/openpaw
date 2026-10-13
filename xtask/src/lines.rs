@@ -16,12 +16,15 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-llm", 5_200),
     ("openpaw-tools", 14_000),
     ("openpaw-mcp", 2_400),
-    ("openpaw-store", 2_000),
+    // CHG-2026-0025：事务、修复与 Fork/Revert 迁入后实测 3,065 行，保留约 400 行余量。
+    // 用户授权按实测调整，仅增加 Store 上限，计数规则与严格门禁不变。
+    ("openpaw-store", 3_500),
     ("openpaw-memory", 7_400),
     ("openpaw-plugins", 1_300),
     ("openpaw-cli", 4_500),
     ("openpaw-reflect-lite", 3_000),
-    ("openpaw-engine-host", 5_700),
+    // CHG-2026-0024：覆盖既有 Host 规模和中文文档，仍单独限制业务代码。
+    ("openpaw-engine-host", 7_000),
     ("openpaw-goal-ledger", 2_000),
     // Local sandbox (plan section 3.4 budget lives in the tools domain; the
     // crate is standalone for the crate-level unsafe allowance, D-9).
@@ -34,12 +37,14 @@ const CRATE_CAPS: &[(&str, usize)] = &[
 /// 带入 A 线的 sidecar 到达顺序回归夹具：`recv_response` 改为缓冲乱序帧而不是丢弃，
 /// 修掉了「丢帧导致下一次等待永久挂起」的抖动。该夹具 +12 行，使 aux 由 9,991 升至
 /// 10,003。这里按合并范围把上限从 10,000 调到 10,100，而不是删除这条可靠性夹具。
-const AUX_CAP: usize = 10_100;
+/// CHG-2026-0024：跨 CLI/Host 会话与审批回归增加，用户授权将辅助预算扩到 11,500。
+const AUX_CAP: usize = 11_500;
 /// B 线 engine-host 独立验证预算。
 ///
 /// engine-host 已作为独立 feature 扩展并拥有单独业务代码上限；其 HTTP、并发、持久化和重启
 /// 契约测试不能挤占原工程的测试余量，也不能通过删除可靠性测试规避门禁，因此单列 1,900 行。
-const ENGINE_HOST_TEST_CAP: usize = 1_900;
+/// CHG-2026-0024：保留完整 HTTP、恢复、取消与回退用例，用户授权扩到 4,000。
+const ENGINE_HOST_TEST_CAP: usize = 4_000;
 pub fn run(root: &Path) -> Result<()> {
     let crates_dir = root.join("crates");
     let mut total_business = 0usize;

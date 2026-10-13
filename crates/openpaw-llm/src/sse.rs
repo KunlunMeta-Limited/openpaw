@@ -3,7 +3,7 @@
 //! 输入边界：接收 HTTP 层任意切分的原始字节，只有完整 SSE 行才执行严格 UTF-8 和 JSON
 //! 解码；输出边界：向 provider 层交付有序 [`Frame`] 或明确错误。
 //! 禁止职责：本模块不发起网络请求、不重试 provider，也不把截断或畸形输入收敛为成功。
-//! 关联：`CHG-2026-0013/B10`、`G02`、`G07`、`G08`。
+//! 关联：`CHG-2026-0013/B10`、`G02`、`G07`、`G08`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 
 use openpaw_core::{ContentBlock, Error, Result, StopReason, StreamEvent, Usage};
 
@@ -16,7 +16,7 @@ const MAX_SSE_DATA_BYTES: usize = 2 * 1024 * 1024;
 /// 状态：编译期常量，不随请求或会话变化。
 /// 并发与取消：无共享可变状态；取消不会改变上限。
 /// 权限：不包含正文、凭据或用户配置。
-/// 关联：`CHG-2026-0013/B10`、`G08`。
+/// 关联：`CHG-2026-0013/B10`、`G08`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 pub(crate) const MAX_STREAM_ACCUMULATED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTENT_BLOCKS: usize = 1024;
 
@@ -26,7 +26,7 @@ const MAX_CONTENT_BLOCKS: usize = 1024;
 /// 数据去向：OpenAI 与 Anthropic 协议状态机。
 /// 约束：畸形 JSON 不会生成任何变体；Anthropic 不接受 `Done`。
 /// 稳定性：crate 公共解析类型；新增变体必须更新两个 provider 的穷尽处理。
-/// 关联：`CHG-2026-0013/B11`、`G07`。
+/// 关联：`CHG-2026-0013/B11`、`G07`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Debug)]
 pub enum SseData {
     /// 严格 JSON 值，不包含 OpenAI 终止标记。
@@ -41,7 +41,7 @@ pub enum SseData {
 /// 数据去向：OpenAI 与 Anthropic 流组装器。
 /// 约束：`data` 不包含畸形 JSON；单帧数据不得超过 [`MAX_SSE_DATA_BYTES`]。
 /// 稳定性：crate 公共解析类型；字段语义变更必须同步 provider 契约测试。
-/// 关联：`CHG-2026-0013/B10`、`G02`、`G07`。
+/// 关联：`CHG-2026-0013/B10`、`G02`、`G07`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Debug)]
 pub struct Frame {
     /// SSE `event:` 字段；上游省略时为空字符串。
@@ -56,7 +56,7 @@ pub struct Frame {
 /// 数据去向：[`Frame`] 序列或 [`Error::Provider`]。
 /// 约束：UTF-8 无损且严格；行、单帧数据和内部残留均有固定上限。
 /// 稳定性：crate 公共传输组件；错误必须保持 fail-closed，不能替换为 `U+FFFD`。
-/// 关联：`CHG-2026-0013/B10`、`G02`、`G07`、`G08`。
+/// 关联：`CHG-2026-0013/B10`、`G02`、`G07`、`G08`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Default)]
 pub struct SseDecoder {
     line_buf: String,
@@ -106,7 +106,7 @@ impl SseDecoder {
     /// 状态：成功后清空所有待处理数据；失败后实例保持失败状态。
     /// 并发与取消：必须在输入流结束后串行调用一次；取消无需调用。
     /// 权限：只处理内存字节，不持久化响应正文。
-    /// 关联：`CHG-2026-0013/B10`、`G02`、`G07`。
+    /// 关联：`CHG-2026-0013/B10`、`G02`、`G07`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
     pub fn finish(&mut self) -> Result<Vec<Frame>> {
         self.ensure_healthy()?;
         if !self.utf8_tail.is_empty() {
@@ -242,7 +242,7 @@ enum BlockBuilder {
 /// 数据去向：provider 流中的 [`StreamEvent`] 和最终 [`openpaw_core::CompletionResponse`]。
 /// 约束：必须看到 `message_stop` 才能成功；累计保留内容不得超过固定上限。
 /// 稳定性：crate 公共组装组件；截断、畸形 tool JSON 和越界必须明确失败。
-/// 关联：`CHG-2026-0013/B10`、`G07`、`G08`。
+/// 关联：`CHG-2026-0013/B10`、`G07`、`G08`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Debug, Default)]
 pub struct AnthropicStreamAssembler {
     blocks: std::collections::BTreeMap<usize, BlockBuilder>,
@@ -261,7 +261,7 @@ impl AnthropicStreamAssembler {
     /// 状态：block、usage 和累计字节均为空或零。
     /// 并发与取消：实例由单个响应流串行驱动；取消时可直接丢弃。
     /// 权限：不读取凭据或外部状态。
-    /// 关联：`CHG-2026-0013/B10`、`G07`。
+    /// 关联：`CHG-2026-0013/B10`、`G07`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
     pub fn new() -> Self {
         Self::default()
     }
@@ -305,7 +305,7 @@ impl AnthropicStreamAssembler {
     /// 状态：成功时更新 block、usage、stop reason 或 `message_stop` 标记。
     /// 并发与取消：必须按网络顺序串行调用；失败后不可恢复或继续组装。
     /// 权限：只保留生成最终响应所需内容，不记录凭据或请求正文。
-    /// 关联：`CHG-2026-0013/B10`、`G07`、`G08`。
+    /// 关联：`CHG-2026-0013/B10`、`G07`、`G08`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
     pub fn absorb(&mut self, frame: &Frame) -> Result<Vec<StreamEvent>> {
         if let Some(message) = &self.failure {
             return Err(Error::Provider(message.clone()));
@@ -532,7 +532,7 @@ impl AnthropicStreamAssembler {
     /// 状态：只读组装，不修改已累加内容，允许调用方在 EOF 时调用一次。
     /// 并发与取消：不得与 `absorb` 并发；取消或网络错误时调用方不应伪造 finalize。
     /// 权限：只返回内存响应，不落盘或记录模型正文。
-    /// 关联：`CHG-2026-0013/B10`、`G07`。
+    /// 关联：`CHG-2026-0013/B10`、`G07`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
     pub fn finalize(&self) -> Result<openpaw_core::CompletionResponse> {
         if let Some(message) = &self.failure {
             return Err(Error::Provider(message.clone()));

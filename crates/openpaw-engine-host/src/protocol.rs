@@ -1,7 +1,7 @@
 //! 功能：定义 OpenCode v1 子集的稳定线协议类型。
 //! 输入输出边界：HTTP 请求、SSE 事件和 JSONL 摘要都通过本模块的 serde 类型转换。
 //! 设计约束：未知客户端元数据不影响已登记字段；本模块不负责路由、session 写入或业务决策。
-//! 关联：`DES-OPENPAW-B-2026-09-15`、`API-HOST-*`、`EVT-HOST-*`。
+//! 关联：`DES-OPENPAW-B-2026-09-15`、`API-HOST-*`、`EVT-HOST-*`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 
 use std::path::PathBuf;
 
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// 功能：定义 Host 进程级回合调度容量。
 /// 字段语义：`max_concurrent_turns` 为同时运行上限，`max_queued_turns` 为等待队列上限。
 /// 数据来源：`OPENPAW_MAX_CONCURRENT_TURNS` 和 `OPENPAW_MAX_QUEUED_TURNS` 环境变量。
-/// 数据去向：`runtime::TurnScheduler` 的活动槽位、FIFO 队列与有界排队计数。
+/// 数据去向：Engine TurnScheduler 的活动槽位、FIFO 队列与有界排队计数。
 /// 约束：并发范围为 1..=32，队列范围为 0..=1024；非法值回退默认 4/32。
 /// 稳定性：Host 进程配置；修改默认值或边界必须更新 CHG 和并发测试。
 /// 关联：`CHG-2026-0012`、`API-HOST-SESSION-006`。
@@ -60,6 +60,23 @@ impl TurnSchedulerConfig {
     }
 }
 
+impl From<TurnSchedulerConfig> for openpaw_engine::scheduler::SchedulerLimits {
+    /// 功能：把 Host 已校验的容量转换为 Engine 中立调度输入。
+    /// 参数：config 为 Host 显式配置或环境读取结果。
+    /// 返回：相同运行和排队容量的 SchedulerLimits。
+    /// 错误：无；不替代 HostConfig 的容量校验。
+    /// 状态：不改变默认值，不读取或写入环境。
+    /// 并发与取消：同步值转换，无锁和取消等待。
+    /// 权限：不访问会话或外部资源。
+    /// 关联：CHG-2026-0025。
+    fn from(config: TurnSchedulerConfig) -> Self {
+        Self {
+            max_concurrent_turns: config.max_concurrent_turns,
+            max_queued_turns: config.max_queued_turns,
+        }
+    }
+}
+
 fn bounded_env_usize(name: &str, minimum: usize, maximum: usize, default: usize) -> usize {
     match std::env::var(name) {
         Ok(value) => match value.parse::<usize>() {
@@ -73,115 +90,8 @@ fn bounded_env_usize(name: &str, minimum: usize, maximum: usize, default: usize)
     }
 }
 
-/// 功能：表示一个回合在 Host 调度和执行状态机中的稳定状态。
-/// 变体语义：状态只允许 queued、running、completed、failed、cancelled 单向推进。
-/// 数据来源：HTTP 接收、调度器、AgentLoop 结果和 Host 重启恢复。
-/// 数据去向：session JSONL `turn_outcome` 未知事件和 `GET /session/:id/turns`。
-/// 约束：终态不得回退为活动态；失败状态不作为模型消息。
-/// 稳定性：跨 Gateway 公共协议，枚举值受 Schema 固定。
-/// 关联：`CHG-2026-0012`、`host-turn-outcome-v1.schema.json`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TurnState {
-    /// 回合已接受，正在等待全局 Provider 容量。
-    Queued,
-    /// 回合已取得全局 permit，正在执行 AgentLoop。
-    Running,
-    /// 回合成功结束并完成消息持久化。
-    Completed,
-    /// 回合因脱敏错误结束。
-    Failed,
-    /// 回合在排队或运行期间被用户取消。
-    Cancelled,
-}
-
-impl TurnState {
-    /// 功能：判断状态是否为不可继续推进的终态。
-    /// 返回：completed、failed、cancelled 返回 true，其余返回 false。
-    /// 状态：纯只读，不改变回合。
-    /// 关联：`CHG-2026-0012`。
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-
-/// 功能：向 Gateway 暴露脱敏后的回合失败信息。
-/// 字段语义：`code` 为稳定机器码，`message` 为安全中文说明，`retryable` 表示可否重试。
-/// 数据来源：Host 对 `openpaw_core::Error`、取消和重启异常的分类。
-/// 数据去向：JSONL 与 turns REST；原始 Provider 错误不得进入本类型。
-/// 约束：只允许 CHG 登记的错误码，不含凭据、Prompt、路径或上游响应正文。
-/// 稳定性：跨 Gateway 公共协议。
-/// 关联：`CHG-2026-0012`、`host-turn-outcome-v1.schema.json`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnError {
-    /// 功能：保存稳定错误分类码。
-    pub code: String,
-    /// 功能：保存可直接展示的脱敏中文失败说明。
-    pub message: String,
-    /// 功能：指示相同输入稍后重试是否可能成功。
-    pub retryable: bool,
-}
-
-/// 功能：表示 Gateway 可查询的单回合状态快照。
-/// 字段语义：ID 使用固定 `turnID/userMessageID`；时间均为 Unix 毫秒且按状态可选。
-/// 数据来源：runtime 状态机和 session JSONL 的 `turn_outcome` 未知事件。
-/// 数据去向：`GET /session/:id/turns` 和 Host 重启恢复。
-/// 约束：序列化字段严格为 camelCase，`turnID/userMessageID` 保留大写 ID；error 仅在失败/取消时出现。
-/// 稳定性：跨 Gateway 公共协议，字段删除或改名必须升版。
-/// 关联：`CHG-2026-0012`、`host-turn-outcome-v1.schema.json`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnOutcome {
-    /// 功能：保存回合稳定编号。
-    #[serde(rename = "turnID")]
-    pub turn_id: String,
-    /// 功能：保存触发本回合的用户消息编号。
-    #[serde(rename = "userMessageID")]
-    pub user_message_id: String,
-    /// 功能：保存当前或最终回合状态。
-    pub state: TurnState,
-    /// 功能：保存进入全局等待队列的时间；立即运行时省略。
-    #[serde(rename = "queuedAt", skip_serializing_if = "Option::is_none")]
-    pub queued_at: Option<i64>,
-    /// 功能：保存取得 Provider permit 的时间。
-    #[serde(rename = "startedAt", skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<i64>,
-    /// 功能：保存 completed、failed 或 cancelled 的结束时间。
-    #[serde(rename = "completedAt", skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<i64>,
-    /// 功能：保存脱敏错误；成功和活动状态省略。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<TurnError>,
-}
-
-impl TurnOutcome {
-    /// 功能：把回合快照包装为前向兼容的 `SessionEvent::Unknown` JSON。
-    /// 返回：带 `type=turn_outcome` 的未知事件，不进入模型消息上下文。
-    /// 错误：本类型字段均可序列化；异常时返回最小空对象供写入层报错。
-    /// 状态：不修改当前快照。
-    /// 关联：`CHG-2026-0012`。
-    pub fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_outcome"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
-    }
-
-    /// 功能：从未知 JSONL 事件解析已登记的回合快照。
-    /// 参数：`event` 为 SessionReader 返回的事件。
-    /// 返回：仅 `type=turn_outcome` 且字段合法时返回快照，否则返回 None。
-    /// 错误：未知事件和旧版本附加事件被安全忽略。
-    /// 状态：纯解析，不修改 JSONL。
-    /// 关联：`CHG-2026-0012`。
-    pub fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_outcome"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
-            .flatten()
-    }
-}
+/// 功能：沿用共享持久化回合类型；外部序列化字段保持既有合同。
+pub use openpaw_store::transcript::{TurnError, TurnOutcome, TurnState};
 
 /// 功能：保存 engine-host 启动、认证、工作区、Office 投影和默认 provider 配置。
 /// 状态：`engine-host` feature 开启时由 CLI 创建并在启动前校验。
@@ -342,7 +252,7 @@ pub struct SessionTime {
 /// 功能：表示客户端仍可取消的会话级暂存回退。
 /// 数据来源：Host 私有 `session_revert_staged_v1` 投影。
 /// 数据去向：Session REST 响应、SSE 和 OpenWork transcript。
-/// 关联：`API-HOST-SESSION-F02`。
+/// 关联：`API-HOST-SESSION-F02`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRevert {
     /// 第一条被隐藏消息的稳定编号。
@@ -381,7 +291,7 @@ pub struct UpdateSessionRequest {
 
 /// 功能：表示会话更新时间对象中允许写入的字段。
 /// 数据边界：正数表示归档，零表示取消归档。
-/// 关联：`API-HOST-SESSION-F01`。
+/// 关联：`API-HOST-SESSION-F01`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct UpdateSessionTime {
     /// 归档 Unix 毫秒；零表示恢复会话。
@@ -442,270 +352,11 @@ pub struct MessageRequest {
     pub model: Option<ModelRequest>,
 }
 
-/// 功能：持久记录一次已接收消息请求与稳定回合身份的对应关系。
-/// 字段语义：`request_id` 在单 session 内唯一，`fingerprint` 只保存规范化请求的摘要。
-/// 数据来源：HTTP message/prompt 接收路径。
-/// 数据去向：session JSONL `request_admission` 未知事件和运行时幂等索引。
-/// 约束：不得包含原始 Prompt、认证信息、路径或时间；同键不同指纹必须冲突。
-/// 稳定性：向后兼容的 JSONL 内部事件；旧版 reader 可忽略未知类型。
-/// 关联：`CHG-2026-0013`、`API-HOST-IDEMPOTENCY-003`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RequestAdmission {
-    /// 客户端提供的幂等键。
-    #[serde(rename = "requestID")]
-    pub request_id: String,
-    /// 规范化正文、provider、model 和协议版本的确定性 256-bit 十六进制摘要。
-    pub fingerprint: String,
-    /// Host 首次接收时生成的稳定回合编号。
-    #[serde(rename = "turnID")]
-    pub turn_id: String,
-    /// Host 首次接收时生成的稳定用户消息编号。
-    #[serde(rename = "userMessageID")]
-    pub user_message_id: String,
-}
-
-impl RequestAdmission {
-    /// 功能：从 session 未知事件恢复持久幂等接收事实。
-    /// 参数：`event` 为 SessionReader 读取的单条事件。
-    /// 返回：合法 `request_admission` 返回记录，其他事件返回 None。
-    /// 错误：字段缺失、类型错误或未知版本安全返回 None，不修改原文件。
-    /// 状态：纯解析，不更新运行时索引。
-    /// 并发与取消：纯同步解析，无锁且不可取消。
-    /// 权限：不记录或返回事件之外的文件路径和正文。
-    /// 关联：`CHG-2026-0013`、`DAT-HOST-IDEMPOTENCY-003`。
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("request_admission"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
-            .flatten()
-    }
-}
-
-/// 功能：把用户消息、首个回合状态和可选幂等事实封装为一次崩溃原子的接收记录。
-/// 字段语义：单条 JSONL 行即接收提交点，避免多次 fsync 之间出现半接收回合。
-/// 数据来源：Host 完成同 session 幂等检查、回合保留和全局容量接收之后。
-/// 数据去向：session JSONL `turn_accept_v1` 未知事件和重启恢复投影。
-/// 约束：message 必须是带 UUID 的 user，且 UUID 必须与 outcome/admission 的 userMessageID 一致。
-/// 稳定性：Host 私有持久化事件；旧 reader 可忽略未知类型，新 reader 同时兼容旧三事件格式。
-/// 关联：`CHG-2026-0013`、`API-HOST-IDEMPOTENCY-003`、`DAT-HOST-TURN-001`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct TurnAcceptV1 {
-    /// 功能：保存本轮原始用户消息；不包含 Provider 回复。
-    pub message: openpaw_core::Message,
-    /// 功能：保存 queued 或 running 首状态。
-    pub outcome: TurnOutcome,
-    /// 功能：保存可选 requestID 幂等事实。
-    #[serde(
-        rename = "requestAdmission",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub request_admission: Option<RequestAdmission>,
-}
-
-impl TurnAcceptV1 {
-    /// 功能：把接收事务编码为单条前向兼容 session 未知事件。
-    /// 参数：无，使用当前消息、首状态和幂等事实。
-    /// 返回：`type=turn_accept_v1` 的 `SessionEvent::Unknown`。
-    /// 错误：字段序列化失败时返回最小对象并由写入层报告；正常字段均可序列化。
-    /// 状态：纯转换，不修改内存投影或 session 文件。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：只包含本轮用户消息和脱敏状态，不包含凭据、路径或 Provider 错误正文。
-    /// 关联：`CHG-2026-0013`、`DAT-HOST-TURN-001`。
-    pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_accept_v1"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
-    }
-
-    /// 功能：从 session 未知事件解析崩溃原子的回合接收记录。
-    /// 参数：`event` 为 SessionReader 返回的单条事件。
-    /// 返回：类型和字段均合法时返回记录，其他事件返回 None。
-    /// 错误：结构错误由恢复状态机归类；本解析器不修改文件。
-    /// 状态：纯解析，不更新消息、outcome 或 requestID 索引。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：只读取事件自身内容，不记录正文或文件路径。
-    /// 关联：`CHG-2026-0013`、`DAT-HOST-TURN-001`。
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_accept_v1"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
-            .flatten()
-    }
-}
-
-/// 功能：标记一次生成消息批次的开始，使 commit 之前的 Message 在恢复时保持不可见。
-/// 字段语义：`turn_id` 关联当前回合；正文仍逐条写入既有 Message 事件。
-/// 数据来源：AgentLoop 已完成且生成消息 UUID 已固定之后。
-/// 数据去向：session JSONL `turn_finish_prepare_v1` 未知事件。
-/// 约束：一个 prepare 只允许由同 turn 的合法 commit 闭合。
-/// 稳定性：Host 私有持久化事件，旧 reader 可忽略。
-/// 关联：`CHG-2026-0013`、`DAT-HOST-TURN-001`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct TurnFinishPrepareV1 {
-    /// 功能：保存当前生成批次所属的稳定回合编号。
-    #[serde(rename = "turnID")]
-    pub turn_id: String,
-}
-
-impl TurnFinishPrepareV1 {
-    /// 功能：把生成批次起点编码为 session 未知事件。
-    /// 参数：无。
-    /// 返回：`type=turn_finish_prepare_v1` 的未知事件。
-    /// 错误：字符串字段可序列化；异常时由写入层报告。
-    /// 状态：不写文件、不修改回合。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：只包含不透明 turnID。
-    /// 关联：`CHG-2026-0013`。
-    pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_finish_prepare_v1"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
-    }
-
-    /// 功能：解析生成消息事务的 prepare 事件。
-    /// 参数：`event` 为 SessionReader 读取的事件。
-    /// 返回：合法 prepare 返回记录，其他事件返回 None。
-    /// 错误：字段损坏返回 None，由恢复状态机按普通未知事件处理。
-    /// 状态：纯解析。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：不接触消息正文。
-    /// 关联：`CHG-2026-0013`。
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_finish_prepare_v1"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
-            .flatten()
-    }
-}
-
-/// 功能：提交一批逐条持久化的生成消息及其唯一终态。
-/// 字段语义：只保存有界 message ID 清单和脱敏 terminal，不复制长回复正文。
-/// 数据来源：prepare 后全部 Message 已成功 fsync 的回合结束路径。
-/// 数据去向：session JSONL `turn_finish_commit_v1` 和重启恢复状态机。
-/// 约束：message ID 顺序必须与 prepare 区间中的 Message 完全一致，terminal 必须为终态。
-/// 稳定性：Host 私有持久化事件，旧 reader 可忽略。
-/// 关联：`CHG-2026-0013`、`DAT-HOST-TURN-001`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct TurnFinishCommitV1 {
-    /// 功能：保存当前生成批次所属的稳定回合编号。
-    #[serde(rename = "turnID")]
-    pub turn_id: String,
-    /// 功能：按 JSONL 顺序保存本批次生成消息 UUID；不保存正文。
-    #[serde(rename = "generatedMessageIDs")]
-    pub generated_message_ids: Vec<String>,
-    /// 功能：保存与消息批次同时生效的 completed 或 failed 终态。
-    pub terminal: TurnOutcome,
-    /// 功能：保存与 failed 终态原子提交的安全 OpenCode 错误；旧记录缺省为空。
-    #[serde(
-        rename = "openCodeError",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) open_code_error: Option<OpenCodeTurnErrorV1>,
-}
-
-/// 功能：记录失败回合的展示消息身份及安全错误，不作为模型消息。
-/// 字段语义：messageID 与实时 assistant header 一致，error 仅含已过滤的公开详情。
-/// 数据来源：Host 最终失败投影；数据去向：私有 finish commit、SSE 与 REST。
-/// 约束：只能随同一回合 failed 终态提交，禁止携带原始 Provider 响应。
-/// 稳定性：Host 私有可选字段，旧 reader 可忽略。
-/// 关联：`CHG-2026-0022`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OpenCodeTurnErrorV1 {
-    /// 功能：保存该回合稳定的 assistant 展示消息编号。
-    #[serde(rename = "messageID")]
-    pub(crate) message_id: String,
-    /// 功能：保存实时事件与历史查询共用的安全错误。
-    pub(crate) error: OpenCodeErrorV1,
-}
-
-/// 功能：表示已有 OpenCode 消费者支持的错误 envelope。
-/// 字段语义：name 为 APIError 或 UnknownError，data 为安全详情。
-/// 数据来源：Host 错误分类；数据去向：session.error 与 assistant info.error。
-/// 约束：不包含响应头、原始响应体、凭据或请求文本。
-/// 稳定性：OpenCode v1 兼容子集，不改变公共 turns 合同。
-/// 关联：`CHG-2026-0022`、`host-message-events-v1.schema.json`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OpenCodeErrorV1 {
-    /// 功能：保存消费者识别的错误名称。
-    pub(crate) name: String,
-    /// 功能：保存有界且过滤后的错误详情。
-    pub(crate) data: OpenCodeErrorDataV1,
-}
-
-/// 功能：保存可公开的失败说明及可靠可知的 API 元数据。
-/// 字段语义：message/code/isRetryable 必填，状态码与 provider 无事实依据时省略。
-/// 数据来源：稳定 TurnError 与过滤后的 HTTP 错误摘要。
-/// 数据去向：Host 私有 JSONL、OpenCode SSE/REST；不进入模型上下文。
-/// 约束：上游说明最多 300 字符，禁止 raw body、headers 或 URL。
-/// 稳定性：OpenCode v1 可选详情，不修改 TurnError。
-/// 关联：`CHG-2026-0022`。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct OpenCodeErrorDataV1 {
-    /// 功能：保存安全分类说明与允许公开的上游摘要。
-    pub(crate) message: String,
-    /// 功能：保存稳定的 Host 错误分类码。
-    pub(crate) code: String,
-    /// 功能：保留是否可能重试成功的原有判断。
-    pub(crate) is_retryable: bool,
-    /// 功能：保存确知的上游 HTTP 状态码。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) status_code: Option<u16>,
-    /// 功能：保存实际执行 provider 的稳定名称。
-    #[serde(
-        rename = "providerID",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub(crate) provider_id: Option<String>,
-}
-
-impl TurnFinishCommitV1 {
-    /// 功能：把生成批次提交点编码为 session 未知事件。
-    /// 参数：无。
-    /// 返回：`type=turn_finish_commit_v1` 的未知事件。
-    /// 错误：字段序列化异常由写入层报告。
-    /// 状态：纯转换，不修改文件或内存投影。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：不包含生成消息正文、工具输出副本或 Provider 原始错误。
-    /// 关联：`CHG-2026-0013`。
-    pub(crate) fn to_session_event(&self) -> openpaw_core::SessionEvent {
-        let mut value = serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}));
-        if let Some(object) = value.as_object_mut() {
-            object.insert("type".into(), serde_json::json!("turn_finish_commit_v1"));
-        }
-        openpaw_core::SessionEvent::Unknown(Box::new(value))
-    }
-
-    /// 功能：解析生成消息事务的 commit 事件。
-    /// 参数：`event` 为 SessionReader 读取的事件。
-    /// 返回：字段可反序列化时返回记录，事务一致性由恢复状态机继续校验。
-    /// 错误：未知或结构损坏事件返回 None，不直接投影消息。
-    /// 状态：纯解析。
-    /// 并发与取消：同步无锁，不可取消。
-    /// 权限：不读取消息正文。
-    /// 关联：`CHG-2026-0013`。
-    pub(crate) fn from_session_event(event: &openpaw_core::SessionEvent) -> Option<Self> {
-        let openpaw_core::SessionEvent::Unknown(value) = event else {
-            return None;
-        };
-        (value.get("type").and_then(serde_json::Value::as_str) == Some("turn_finish_commit_v1"))
-            .then(|| serde_json::from_value((**value).clone()).ok())
-            .flatten()
-    }
-}
+/// 功能：复用 Store 的接收记录及安全错误数据，Host 保留公开展示校验。
+pub(crate) use openpaw_store::transcript::{
+    RecordedFailure as OpenCodeTurnErrorV1, RequestAdmission, SafeError as OpenCodeErrorV1,
+    SafeErrorData as OpenCodeErrorDataV1, TurnAcceptV1,
+};
 
 /// 功能：指定单次消息请求使用的 provider 和 model。
 /// 约束：providerID 只能是 Host 支持的 provider；缺省时沿用 session/default 配置。
@@ -949,7 +600,7 @@ mod tests {
         let provider: ProviderListWire = roundtrip(include_str!("../tests/fixtures/provider.json"));
         let ids: Vec<&str> = provider.all.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(ids, ["mock", "echo", "anthropic", "openai"]);
-        assert_eq!(provider.connected, ids);
+        assert_eq!(provider.connected, vec!["mock", "echo"]);
 
         let message_json = serde_json::to_value(&messages).expect("messages json");
         let tool_json = &message_json[1]["parts"][1];

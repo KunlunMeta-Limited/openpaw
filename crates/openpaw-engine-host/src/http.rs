@@ -500,7 +500,7 @@ async fn schedule_turn(
             );
         }
     }
-    let provider = match runtime::build_provider(&provider_name) {
+    let provider = match runtime::build_provider_for_model(&provider_name, Some(&model_name)) {
         Ok(provider) => provider,
         Err(error) => return bad(StatusCode::BAD_REQUEST, error),
     };
@@ -657,32 +657,24 @@ async fn global_event_stream(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn provider(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let anthropic_models =
-        provider_models(runtime::DEFAULT_ANTHROPIC_MODEL, "OPENPAW_ANTHROPIC_MODEL");
-    let openai_models = provider_models(runtime::DEFAULT_OPENAI_MODEL, "OPENPAW_OPENAI_MODEL");
-    Json(serde_json::json!({
-        "all":[
-            {"id":"mock","name":"OpenPaw mock","models":{"mock-1":{"id":"mock-1","name":"mock-1"}}},
-            {"id":"echo","name":"OpenPaw echo","models":{"echo-1":{"id":"echo-1","name":"echo-1"}}},
-            {"id":"anthropic","name":"Anthropic","models":anthropic_models},
-            {"id":"openai","name":"OpenAI","models":openai_models}
-        ],
-        "connected":["mock","echo","anthropic","openai"],
-        "default":state.config.provider
-    }))
-}
-
-fn provider_models(required: &str, environment: &str) -> serde_json::Value {
-    let configured = std::env::var(environment)
-        .ok()
-        .filter(|model| !model.trim().is_empty());
-    let mut models = serde_json::Map::new();
-    for model in std::iter::once(required.to_string()).chain(configured) {
-        models
-            .entry(model.clone())
-            .or_insert_with(|| serde_json::json!({"id":model,"name":model}));
-    }
-    serde_json::Value::Object(models)
+    let config = openpaw_llm::config::ConfigSnapshot::from_env();
+    let all: Vec<_> = openpaw_llm::config::PROVIDERS
+        .iter()
+        .map(|(id, _, name)| {
+            let models: serde_json::Map<_, _> = config
+                .models(id)
+                .into_iter()
+                .map(|model| (model.clone(), serde_json::json!({"id":model,"name":model})))
+                .collect();
+            serde_json::json!({"id":id,"name":name,"models":models})
+        })
+        .collect();
+    let connected: Vec<_> = openpaw_llm::config::PROVIDERS
+        .iter()
+        .filter(|(id, _, _)| config.resolve(id, Default::default()).is_ok())
+        .map(|(id, _, _)| *id)
+        .collect();
+    Json(serde_json::json!({"all":all,"connected":connected,"default":state.config.provider}))
 }
 
 async fn permissions(

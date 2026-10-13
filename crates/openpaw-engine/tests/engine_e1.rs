@@ -392,13 +392,21 @@ struct FlakyProvider {
     fail_times: AtomicUsize,
 }
 impl_stream_provider!(FlakyProvider, "flaky", "flaky-1", this, {
-    let should_fail = this
-        .fail_times
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            (n > 0).then(|| n - 1)
-        })
-        .map(|n| n > 0)
-        .unwrap_or(false);
+    let mut remaining = this.fail_times.load(Ordering::SeqCst);
+    let should_fail = loop {
+        if remaining == 0 {
+            break false;
+        }
+        match this.fail_times.compare_exchange_weak(
+            remaining,
+            remaining - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => break true,
+            Err(current) => remaining = current,
+        }
+    };
     if should_fail {
         return Err(Error::server_error(503, "try again later"));
     }
