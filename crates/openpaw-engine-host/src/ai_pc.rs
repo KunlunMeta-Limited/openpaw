@@ -230,6 +230,14 @@ impl ToolExecutor for DesktopTools {
     fn remember_media(&self, media: Vec<openpaw_core::InlineMedia>) {
         self.inner.remember_media(media);
     }
+    /// 功能：列出内置工具及当前会话已登记的桌面工具。
+    /// 参数：无。
+    /// 返回：不含凭据的工具声明列表。
+    /// 错误：透传内置工具枚举错误。
+    /// 状态：只读，不修改会话或登记。
+    /// 并发与取消：登记读锁不跨 await；回合期间禁止替换登记。
+    /// 权限：只有可信身份已登记时追加两个桌面工具。
+    /// 关联：CHG-2026-0028、specs。
     async fn list_tools(&self) -> openpaw_core::Result<Vec<ToolSpec>> {
         let mut tools = self.inner.list_tools().await?;
         if self.registration().is_some() {
@@ -237,6 +245,14 @@ impl ToolExecutor for DesktopTools {
         }
         Ok(tools)
     }
+    /// 功能：执行内置或已授权的会话桌面工具。
+    /// 参数：name 为工具名，args 为严格工具参数。
+    /// 返回：内置结果或桌面授权文字结果，拒绝时为错误结果。
+    /// 错误：内置调用错误透传；桌面网络/格式失败转换为无凭据错误。
+    /// 状态：桌面查询按最新授权交付，不写 Host 登记或 journal。
+    /// 并发与取消：登记快照释放锁后请求；桌面请求有界超时。
+    /// 权限：注入可信会话身份，拒绝未登记调用和已登记会话全局检索。
+    /// 关联：CHG-2026-0028、desktop_call。
     async fn call(&self, name: &str, args: Value) -> openpaw_core::Result<ToolCallOutcome> {
         let registration = self.registration();
         if matches!(name, "ai_pc_current_context" | "ai_pc_history_search") {
@@ -258,6 +274,14 @@ impl ToolExecutor for DesktopTools {
 }
 #[async_trait]
 impl ToolHostValidator for DesktopTools {
+    /// 功能：在执行前校验桌面或内置工具参数。
+    /// 参数：name 为工具名，input 为调用参数。
+    /// 返回：合法参数返回空值。
+    /// 错误：桌面额外字段或无效范围返回中文错误，其他工具错误透传。
+    /// 状态：不修改登记、权限或媒体上下文。
+    /// 并发与取消：桌面校验同步，内置异步校验沿用原合同。
+    /// 权限：桌面参数不允许自报身份、模式或凭据。
+    /// 关联：CHG-2026-0028、validate。
     async fn validate_input(&self, name: &str, input: &Value) -> Result<(), String> {
         if matches!(name, "ai_pc_current_context" | "ai_pc_history_search") {
             validate(name, input)
@@ -265,6 +289,14 @@ impl ToolHostValidator for DesktopTools {
             self.inner.validate_input(name, input).await
         }
     }
+    /// 功能：沿用内置工具的同批错误级联策略。
+    /// 参数：name 为工具名，outcome 为执行结果。
+    /// 返回：是否取消同批其他调用。
+    /// 错误：无。
+    /// 状态：不修改回合或登记。
+    /// 并发与取消：同步查询，取消执行由引擎负责。
+    /// 权限：不扩大桌面授权或内置工具权限。
+    /// 关联：CHG-2026-0028、ToolHostValidator。
     fn should_cascade_on_error(&self, name: &str, outcome: &ToolCallOutcome) -> bool {
         self.inner.should_cascade_on_error(name, outcome)
     }

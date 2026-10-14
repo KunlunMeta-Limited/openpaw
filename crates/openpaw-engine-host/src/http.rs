@@ -677,6 +677,7 @@ async fn abort(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Re
     handle.abort().await;
     Json(true).into_response()
 }
+// API-HOST-AI-PC-REGISTER-001：认证登记入口，由 runtime 协调身份和空闲闸门。
 async fn register_ai_pc(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -687,6 +688,7 @@ async fn register_ai_pc(
     };
     ai_pc_response(state.register_ai_pc(&id, Some(input)).await)
 }
+// API-HOST-AI-PC-UNREGISTER-001：认证撤销入口，与登记共享 runtime 生命周期规则。
 async fn unregister_ai_pc(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     ai_pc_response(state.register_ai_pc(&id, None).await)
 }

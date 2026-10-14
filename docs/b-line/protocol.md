@@ -209,6 +209,8 @@ staged Revert/Unrevert 保留完整历史，提交回退同步裁剪注解。压
 
 ## AI PC 会话专属桌面桥接（CHG-2026-0026）
 
+稳定接口编号：`API-HOST-AI-PC-REGISTER-001` 对应 PUT 登记；`API-HOST-AI-PC-UNREGISTER-001` 对应 DELETE 撤销。CHG-2026-0028 补齐编号，既有路径、字段与失败语义保持下述合同。
+
 `PUT /session/{id}/ai-pc` 登记严格 JSON：`{"bridge_url":"http://host.docker.internal:PORT/ai-pc","token":"随机会话令牌"}`。仅接受 localhost、127.0.0.1、host.docker.internal 的 HTTP(S)，固定 `/ai-pc`，禁止用户信息、查询、片段与额外字段。请求限 8 KiB，令牌 32–256 个 ASCII 字母、数字、`-` 或 `_`。`DELETE` 同一路径撤销登记。
 
 两入口均受 Host Basic 认证保护，并要求已配置非空用户名与密码。无配置 503、无效认证 401、未知会话 404、活动回合 409、非法请求 400、成功 204。登记只在内存，Host 重启需重新登记；fork 不继承，成功删除会话清除登记，删除失败保留原登记。
