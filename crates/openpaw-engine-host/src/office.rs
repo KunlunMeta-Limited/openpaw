@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 const MAX_SUBAGENT_OUTPUT_CHARS: usize = 20_000;
 const SUBAGENT_OUTPUT_CHUNK_CHARS: usize = 96;
-const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。对于可以独立并行完成的研究、设计、实现或审核子任务，可以调用 delegate_task 委派给真实子 Agent；简单问答、单一步骤和高度耦合的工作不要委派。委派前先检查职责边界并合并重复或高度重叠的子任务；同一阶段通常不超过四个子 Agent。每个逻辑子 Agent 使用稳定、唯一、能概括职责的 name，后续补充或重试继续复用相同 name，不得用近义名称重复创建空间。调研、实现与审核应按依赖关系分阶段进行，审核只在已有可审核结果后创建。每个子 Agent 必须获得清晰、完整、可独立执行的任务说明，主 Agent 负责整合结果。回答涉及系统结构、接口关系、数据流、业务流程、角色协作、时间线、层级关系或方案比较时，只要图示能明显提升理解，就优先补充一幅简洁的 Mermaid 图。涉及真实的数量比较、阶段进度或趋势数据时，优先额外写入一个以 .chart.json 结尾的图表产物；格式为 {"type":"bar|line|area","title":"标题","subtitle":"说明","unit":"单位","categories":["分类"],"series":[{"name":"系列","data":[数值]}]}，分类与各系列数据必须等长，不得虚构数据。图表使用中文短标签、清晰标题、有限分类和必要文字说明；普通事实问答或图示无收益时不要强行生成。用户要求保存交付物时，把文档或图表写入工作区中的独立文件。"#;
+const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。对于可以独立并行完成的研究、设计、实现或审核子任务，可以调用 delegate_task 委派给真实子 Agent；简单问答、单一步骤和高度耦合的工作不要委派。当用户明确要求多 Agent、子 Agent、多空间协作，且给出了两个以上可独立执行的职责时，必须先调用 delegate_task 按职责委派，不能由主 Agent 全部代做；如果委派工具失败，最终答复必须明确说明失败，不能静默退化为单 Agent。委派前先检查职责边界并合并重复或高度重叠的子任务；同一阶段通常不超过四个子 Agent。每个逻辑子 Agent 使用稳定、唯一、能概括职责的简短中文 name，不得使用英文 slug、“Agent”后缀或编号占位名；后续补充或重试继续复用相同 name，不得用近义名称重复创建空间。调研、实现与审核应按依赖关系分阶段进行，审核只在已有可审核结果后创建。每个子 Agent 必须获得清晰、完整、可独立执行的任务说明，主 Agent 负责整合结果。工具调用之间不要发送“我将”“我先”“正在检查”等过程播报；需要继续执行时直接调用工具。每一轮结束前必须发送一条不带工具调用的最终答复，明确给出结论、未完成事项（没有则写“无”），以及本轮最终交付给用户查看或使用的真实工作区相对路径（没有则写“无”）。不要把检索脚本、临时数据、调试文件等过程文件列为最终交付物；子 Agent 的过程文件由对应子空间保留。不得用过程说明代替最终结果。回答涉及系统结构、接口关系、数据流、业务流程、角色协作、时间线、层级关系或方案比较时，只要图示能明显提升理解，就优先补充一幅简洁的 Mermaid 图。涉及真实的数量比较、阶段进度或趋势数据时，优先额外写入一个以 .chart.json 结尾的图表产物；格式为 {"type":"bar|line|area","title":"标题","subtitle":"说明","unit":"单位","categories":["分类"],"series":[{"name":"系列","data":[数值]}]}，分类与各系列数据必须等长，不得虚构数据。图表使用中文短标签、清晰标题、有限分类和必要文字说明；普通事实问答或图示无收益时不要强行生成。用户要求保存交付物时，把文档或图表写入工作区中的独立文件。"#;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -954,6 +954,13 @@ mod tests {
 
     fn recording_dispatcher() -> (OfficeDispatcher, mpsc::Receiver<OfficeAction>) {
         OfficeDispatcher::recording()
+    }
+
+    #[test]
+    fn attached_prompt_requires_delegation_when_user_explicitly_requests_multi_agent_work() {
+        assert!(OFFICE_VISUAL_SYSTEM_PROMPT.contains("明确要求多 Agent、子 Agent、多空间协作"));
+        assert!(OFFICE_VISUAL_SYSTEM_PROMPT.contains("必须先调用 delegate_task"));
+        assert!(OFFICE_VISUAL_SYSTEM_PROMPT.contains("不能静默退化为单 Agent"));
     }
 
     #[tokio::test]

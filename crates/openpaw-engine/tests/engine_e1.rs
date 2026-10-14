@@ -904,20 +904,130 @@ async fn same_agent_loop_gate_is_stable_across_one_thousand_races() {
     }
 }
 #[tokio::test]
-async fn budget_exhaustion_ends_turn_gracefully() {
-    let p = Arc::new(MockProvider::tool_use(
-        "echo_tool",
-        serde_json::json!({"text": "again"}),
-        "looping",
-    ));
-    let l = AgentLoop::new(p)
+async fn budget_exhaustion_forces_a_tool_free_final_reply() {
+    let p = Arc::new(MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "echo_tool".into(),
+            input: serde_json::json!({"text": "again"}),
+            text: "looping".into(),
+        },
+        MockMode::Fixed("最终结果：已完成；产物：result.txt；未完成事项：无".into()),
+    ]));
+    let l = AgentLoop::new(p.clone())
         .with_tool_host(echo_tool_host())
-        .with_budget(IterationBudget::new(2))
+        .with_budget(IterationBudget::new_elastic(1, 1, 0))
         .with_parallel_tools(false);
     let mut session = Session::new("mock-1", "mock");
     session.messages.push(Message::user_text("go"));
     let (stop, _) = run_simple(&l, &mut session, &[]).await;
     assert_eq!(stop.unwrap(), StopReason::EndTurn);
-    // A handful of iterations ran, then the budget (2 + 1 grace) ended it.
-    assert!(session.messages.len() < 12, "budget must bound the loop");
+    assert_eq!(p.call_count(), 2, "耗尽后只能追加一次最终答复调用");
+    assert_eq!(
+        session.messages.last().unwrap().text(),
+        "最终结果：已完成；产物：result.txt；未完成事项：无"
+    );
+}
+
+#[tokio::test]
+async fn budget_exhaustion_repairs_dsml_without_exposing_protocol_text() {
+    let dsml = r#"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="todo_update"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"#;
+    let p = Arc::new(MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "echo_tool".into(),
+            input: serde_json::json!({"text": "again"}),
+            text: "looping".into(),
+        },
+        MockMode::StreamText {
+            text: dsml.into(),
+            chunks: 4,
+        },
+        MockMode::StreamText {
+            text: "最终结果：已完成；产物：result.txt；未完成事项：无".into(),
+            chunks: 3,
+        },
+    ]));
+    let l = AgentLoop::new(p.clone())
+        .with_tool_host(echo_tool_host())
+        .with_budget(IterationBudget::new_elastic(1, 1, 0))
+        .with_parallel_tools(false);
+    let mut session = Session::new("mock-1", "mock");
+    session.messages.push(Message::user_text("go"));
+    let (stop, events) = run_simple(&l, &mut session, &[]).await;
+
+    assert_eq!(stop.unwrap(), StopReason::EndTurn);
+    assert_eq!(p.call_count(), 3, "DSML 候选只允许一次纯文本纠正");
+    assert_eq!(
+        session.messages.last().unwrap().text(),
+        "最终结果：已完成；产物：result.txt；未完成事项：无"
+    );
+    assert!(events.iter().all(|event| {
+        !matches!(event, AgentEvent::TextDelta { text } if text.contains("DSML") || text.contains("todo_update"))
+    }));
+}
+
+#[tokio::test]
+async fn budget_exhaustion_rejects_repeated_dsml_without_exposing_protocol_text() {
+    let dsml = r#"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="todo_update"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"#;
+    let p = Arc::new(MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "echo_tool".into(),
+            input: serde_json::json!({"text": "again"}),
+            text: "looping".into(),
+        },
+        MockMode::StreamText {
+            text: dsml.into(),
+            chunks: 4,
+        },
+    ]));
+    let l = AgentLoop::new(p.clone())
+        .with_tool_host(echo_tool_host())
+        .with_budget(IterationBudget::new_elastic(1, 1, 0))
+        .with_parallel_tools(false);
+    let mut session = Session::new("mock-1", "mock");
+    session.messages.push(Message::user_text("go"));
+    let (stop, events) = run_simple(&l, &mut session, &[]).await;
+
+    assert!(matches!(
+        stop,
+        Err(Error::Provider(message)) if message.contains("未返回可展示的最终答复")
+    ));
+    assert_eq!(p.call_count(), 3, "重复 DSML 后必须停止，不能无限纠正");
+    assert!(events.iter().all(|event| {
+        !matches!(event, AgentEvent::TextDelta { text } if text.contains("DSML") || text.contains("todo_update"))
+    }));
+    assert!(matches!(
+        session
+            .messages
+            .last()
+            .and_then(|message| message.content.last()),
+        Some(ContentBlock::ToolResult { .. })
+    ));
+}
+
+#[tokio::test]
+async fn budget_exhaustion_without_final_text_is_an_error() {
+    let p = Arc::new(MockProvider::tool_use(
+        "echo_tool",
+        serde_json::json!({"text": "again"}),
+        "looping",
+    ));
+    let l = AgentLoop::new(p.clone())
+        .with_tool_host(echo_tool_host())
+        .with_budget(IterationBudget::new_elastic(2, 2, 0))
+        .with_parallel_tools(false);
+    let mut session = Session::new("mock-1", "mock");
+    session.messages.push(Message::user_text("go"));
+    let (stop, _) = run_simple(&l, &mut session, &[]).await;
+    assert!(matches!(
+        stop,
+        Err(Error::Provider(message)) if message.contains("未返回可展示的最终答复")
+    ));
+    assert_eq!(p.call_count(), 3, "两次工具迭代后只能追加一次最终答复调用");
+    assert!(matches!(
+        session
+            .messages
+            .last()
+            .and_then(|message| message.content.last()),
+        Some(ContentBlock::ToolResult { .. })
+    ));
 }

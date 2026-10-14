@@ -201,6 +201,7 @@ impl DelegationContext {
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
         let requested_name = normalized_name(input.name.as_deref(), sequence)?;
+        let display_name = chinese_workspace_name(&requested_name, task);
         let requested_logical_key = logical_agent_key(&requested_name);
         let task_fingerprint = normalized_task_fingerprint(task);
         let (workspace_id, name, logical_key) = {
@@ -268,14 +269,14 @@ impl DelegationContext {
                     requested_logical_key.clone(),
                     DelegationRecord {
                         workspace_id: workspace_id.clone(),
-                        workspace_name: requested_name.clone(),
+                        workspace_name: display_name.clone(),
                         task_fingerprint: task_fingerprint.clone(),
                         task: task.to_string(),
                         running: true,
                         completed: None,
                     },
                 );
-                (workspace_id, requested_name.clone(), requested_logical_key)
+                (workspace_id, display_name, requested_logical_key)
             }
         };
         let (provider, model, cancel) = {
@@ -509,7 +510,7 @@ fn cancelled_outcome(workspace_id: &str, name: &str, parent_session_id: &str) ->
 }
 
 fn normalized_name(value: Option<&str>, sequence: u64) -> openpaw_core::Result<String> {
-    let fallback = format!("子 Agent {sequence}");
+    let fallback = format!("协作子任务{}", chinese_digits(sequence));
     let value = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -520,6 +521,64 @@ fn normalized_name(value: Option<&str>, sequence: u64) -> openpaw_core::Result<S
         )));
     }
     Ok(value.to_string())
+}
+
+fn contains_cjk(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character as u32,
+            0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff
+        )
+    })
+}
+
+fn chinese_digits(value: u64) -> String {
+    const DIGITS: [char; 10] = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+    value
+        .to_string()
+        .bytes()
+        .map(|digit| DIGITS[usize::from(digit - b'0')])
+        .collect()
+}
+
+fn chinese_hash_suffix(value: &str) -> String {
+    const DIGITS: [char; 16] = [
+        '零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '甲', '乙', '丙', '丁', '戊', '己',
+    ];
+    let hash = stable_logical_hash(value);
+    (0..4)
+        .rev()
+        .map(|shift| DIGITS[((hash >> (shift * 4)) & 0xf) as usize])
+        .collect()
+}
+
+fn chinese_workspace_name(requested_name: &str, task: &str) -> String {
+    if contains_cjk(requested_name) {
+        return requested_name
+            .chars()
+            .filter(|character| {
+                !character.is_ascii_alphanumeric()
+                    && !character.is_ascii_whitespace()
+                    && !matches!(character, '_' | '-')
+            })
+            .collect();
+    }
+    let searchable = format!("{} {}", requested_name, task).to_lowercase();
+    let mappings: &[(&[&str], &str)] = &[
+        (&["audit", "review", "verify", "check", "qa", "test", "审核", "验收"], "审核验收"),
+        (&["research", "investigate", "analysis", "analyze", "调研", "研究", "分析"], "调研分析"),
+        (&["transport", "traffic", "route", "map", "geo", "交通", "路线", "地图", "地理"], "交通地理"),
+        (&["hotel", "lodging", "food", "dining", "住宿", "酒店", "餐饮", "美食"], "住宿餐饮"),
+        (&["document", "report", "visual", "文档", "报告", "可视化"], "文档整理"),
+        (&["code", "develop", "implement", "frontend", "backend", "开发", "实现", "编码"], "开发实现"),
+        (&["data", "dataset", "数据"], "数据处理"),
+        (&["plan", "design", "architect", "方案", "设计", "架构"], "方案设计"),
+    ];
+    mappings
+        .iter()
+        .find(|(keywords, _)| keywords.iter().any(|keyword| searchable.contains(keyword)))
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| format!("协作子任务{}", chinese_hash_suffix(&searchable)))
 }
 
 fn logical_agent_key(name: &str) -> String {
@@ -731,12 +790,16 @@ fn load_delegations(
                 && !record.task.trim().is_empty()
                 && record.task.chars().count() <= MAX_DELEGATE_TASK_CHARS
         })
-        .map(|record| {
+        .map(|mut record| {
+            let workspace_name = chinese_workspace_name(&record.workspace_name, &record.task);
+            if let Some(structured) = record.completed.structured.as_object_mut() {
+                structured.insert("workspaceName".into(), json!(workspace_name.clone()));
+            }
             (
                 record.logical_key,
                 DelegationRecord {
                     workspace_id: record.workspace_id,
-                    workspace_name: record.workspace_name,
+                    workspace_name,
                     task_fingerprint: record.task_fingerprint,
                     task: record.task,
                     running: false,
@@ -791,7 +854,7 @@ fn save_delegations(
 fn delegate_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate_task".into(),
-        description: "把一个清晰、可独立完成的子任务交给真实子 Agent，并等待其结果。委派前先合并重复或高度重叠的职责；同一逻辑 Agent 使用稳定且唯一的 name，后续工作继续复用该 name。适合并行研究、设计、实现或审核；简单任务不要调用。".into(),
+        description: "把一个清晰、可独立完成的子任务交给真实子 Agent，并等待其结果。委派前先合并重复或高度重叠的职责；同一逻辑 Agent 使用稳定且唯一的简短中文 name，后续工作继续复用该 name。适合并行研究、设计、实现或审核；简单任务不要调用。".into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1193,13 +1256,105 @@ mod tests {
         assert!(!outcome.is_error, "{}", outcome.content);
         assert!(outcome.content.contains("Echo: 整理测试结论"));
         let structured = outcome.structured.unwrap();
-        assert_eq!(structured["workspaceName"], "研究 Agent");
+        assert_eq!(structured["workspaceName"], "研究");
         assert_eq!(structured["parentSessionId"], "parent");
         assert_eq!(structured["status"], "completed");
         assert!(structured["workspaceId"]
             .as_str()
             .unwrap()
             .starts_with("parent:agent:"));
+    }
+
+    #[tokio::test]
+    async fn english_delegate_names_are_exposed_as_stable_chinese_workspace_names() {
+        let host = test_host();
+        let audit = host
+            .call(
+                "delegate_task",
+                json!({"name":"audit-review","task":"review release evidence"}),
+            )
+            .await
+            .unwrap()
+            .structured
+            .unwrap();
+        let first_unknown = host
+            .call(
+                "delegate_task",
+                json!({"name":"alpha-helper","task":"collect alpha facts"}),
+            )
+            .await
+            .unwrap()
+            .structured
+            .unwrap();
+        let second_unknown = host
+            .call(
+                "delegate_task",
+                json!({"name":"beta-helper","task":"collect beta facts"}),
+            )
+            .await
+            .unwrap()
+            .structured
+            .unwrap();
+
+        assert_eq!(audit["workspaceName"], "审核验收");
+        assert!(contains_cjk(first_unknown["workspaceName"].as_str().unwrap()));
+        assert!(contains_cjk(second_unknown["workspaceName"].as_str().unwrap()));
+        assert_ne!(first_unknown["workspaceName"], second_unknown["workspaceName"]);
+    }
+
+    #[tokio::test]
+    async fn persisted_english_workspace_names_are_migrated_when_loaded() {
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let state_file = delegation_state_file(&workspace, "legacy-parent");
+        save_delegations(
+            &state_file,
+            &PersistedDelegationState {
+                version: 1,
+                records: vec![PersistedDelegationRecord {
+                    logical_key: "audit-review".into(),
+                    workspace_id: "legacy-parent:agent:0000000000000001".into(),
+                    workspace_name: "audit-review".into(),
+                    task_fingerprint: "review release".into(),
+                    task: "review release".into(),
+                    completed: CachedDelegationOutcome {
+                        content: "legacy result".into(),
+                        structured: json!({
+                            "workspaceId": "legacy-parent:agent:0000000000000001",
+                            "workspaceName": "audit-review",
+                            "parentSessionId": "legacy-parent",
+                            "status": "completed"
+                        }),
+                    },
+                }],
+            },
+        )
+        .unwrap();
+        let (events, _) = broadcast::channel(8);
+        let approvals =
+            HostApprovalManager::new("legacy-parent", events, CancellationToken::new());
+        let context = test_context(
+            "legacy-parent",
+            workspace.clone(),
+            OfficeDispatcher::new(None),
+            approvals,
+            Arc::new(openpaw_llm::EchoProvider::new()),
+            "echo",
+            false,
+            CancellationToken::new(),
+        );
+        let host = DelegatingToolHost::new(workspace, context.clone());
+
+        assert!(context.context_prompt().unwrap().contains("name=审核验收"));
+        let cached = host
+            .call(
+                "delegate_task",
+                json!({"name":"audit-review","task":"review release"}),
+            )
+            .await
+            .unwrap()
+            .structured
+            .unwrap();
+        assert_eq!(cached["workspaceName"], "审核验收");
     }
 
     #[tokio::test]
@@ -1251,7 +1406,7 @@ mod tests {
         assert!(second.content.contains("补充系统安全规范与限制说明"));
         let second = second.structured.unwrap();
         assert_eq!(first["workspaceId"], second["workspaceId"]);
-        assert_eq!(second["workspaceName"], "安全规范调研 Agent");
+        assert_eq!(second["workspaceName"], "安全规范调研");
     }
 
     #[tokio::test]

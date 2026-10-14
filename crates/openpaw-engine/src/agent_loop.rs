@@ -88,6 +88,36 @@ fn retryable_stream_protocol_error(error: &Error) -> bool {
         || detail.contains("tool_use json")
 }
 
+fn response_contains_dsml_tool_call(response: &openpaw_core::CompletionResponse) -> bool {
+    response.content.iter().any(|block| {
+        let ContentBlock::Text { text } = block else {
+            return false;
+        };
+        let compact = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .replace('\u{ff5c}', "|")
+            .to_ascii_lowercase();
+        compact.contains("<||dsml||tool_calls>")
+            || compact.contains("<||dsml||invoke")
+            || compact.contains("</||dsml||tool_calls>")
+    })
+}
+
+fn add_usage(left: openpaw_core::Usage, right: openpaw_core::Usage) -> openpaw_core::Usage {
+    openpaw_core::Usage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_read_tokens: left
+            .cache_read_tokens
+            .saturating_add(right.cache_read_tokens),
+        cache_creation_tokens: left
+            .cache_creation_tokens
+            .saturating_add(right.cache_creation_tokens),
+    }
+}
+
 /// The agent loop. Cheap to share (`Arc`); per-turn state lives in the
 /// [`openpaw_core::Session`] passed to [`AgentLoop::run_turn`].
 pub struct AgentLoop {
@@ -349,12 +379,22 @@ impl AgentLoop {
                 return Ok(StopReason::EndTurn);
             }
 
-            // ③ 消费预算（弹性预算由 `expand` 向 max 逐步提升）
-            if !(self.budget.expand(1) && self.budget.try_consume()) {
-                // grace 机制在最终放弃前保留最后一次迭代。
-                if !self.budget.try_grace() {
-                    return Ok(StopReason::EndTurn);
-                }
+            // ③ 先消费当前预算，再按需扩展；耗尽后仅允许一次禁用工具的最终答复。
+            // 固定预算不能调用 expand，因此必须先 try_consume，否则 `new(n)` 实际只会
+            // 运行 grace 那一次。最终答复不占工具迭代预算，也不能再次请求工具。
+            if !self.budget.try_consume()
+                && !(self.budget.expand(1) && self.budget.try_consume())
+                && !self.budget.try_grace()
+            {
+                return self
+                    .finish_after_iteration_budget(
+                        session,
+                        system.as_deref(),
+                        &provider,
+                        &model,
+                        event_sink,
+                    )
+                    .await;
             }
 
             // ④ 上下文压缩：只估算一次，根据结果决定是否通过单次摘要调用压缩。
@@ -488,6 +528,100 @@ impl AgentLoop {
                 ..Default::default()
             });
         }
+    }
+
+    async fn finish_after_iteration_budget(
+        &self,
+        session: &mut openpaw_core::Session,
+        system: Option<&str>,
+        provider: &Arc<dyn LlmProvider>,
+        model: &str,
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+    ) -> Result<StopReason> {
+        let instruction = "工具调用轮次已达到上限。工具现已禁用。请仅依据已有消息和工具结果直接给出最终答复，明确说明完成结果、实际生成的文件相对路径及未完成事项；不得再请求或声称调用任何工具。";
+        let final_system = match system {
+            Some(value) if !value.trim().is_empty() => format!("{value}\n\n{instruction}"),
+            _ => instruction.to_string(),
+        };
+        let req = CompletionRequest {
+            model: model.to_string(),
+            system: Some(final_system),
+            messages: session.messages.clone(),
+            tools: Vec::new(),
+            max_tokens: self.max_tokens,
+            ..Default::default()
+        };
+        // 预算耗尽后的候选答复先缓冲，校验通过后才发布给 Host。部分 OpenAI
+        // 兼容模型会把工具调用退化为 DSML 正文；若边生成边转发，协议标记会被
+        // UI 当成最终答复永久保存。
+        let mut buffered_events = Vec::new();
+        let mut resp = {
+            let mut buffered_sink = |event| buffered_events.push(event);
+            self.stream_with_retry(provider, req.clone(), &mut buffered_sink)
+                .await?
+        };
+        let mut total_usage = resp.usage;
+
+        if response_contains_dsml_tool_call(&resp) {
+            let mut repair_messages = req.messages.clone();
+            repair_messages.push(Message {
+                role: openpaw_core::Role::Assistant,
+                content: resp.content,
+                ..Default::default()
+            });
+            repair_messages.push(Message::user_text(
+                "上一份候选答复错误地输出了 DSML/工具调用协议。工具已经禁用，请不要更新任务状态，也不要输出任何 XML、DSML、tool_calls 或 invoke 标记。现在只用自然语言给出最终结论、真实文件相对路径和未完成事项。",
+            ));
+            let repair_req = CompletionRequest {
+                messages: repair_messages,
+                ..req
+            };
+            buffered_events.clear();
+            resp = {
+                let mut buffered_sink = |event| buffered_events.push(event);
+                self.stream_with_retry(provider, repair_req, &mut buffered_sink)
+                    .await?
+            };
+            total_usage = add_usage(total_usage, resp.usage);
+        }
+
+        let has_final_text = resp
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()));
+        if resp.stop_reason == StopReason::ToolUse
+            || !has_final_text
+            || response_contains_dsml_tool_call(&resp)
+        {
+            return Err(Error::Provider(
+                "工具循环达到迭代上限后未返回可展示的最终答复".into(),
+            ));
+        }
+
+        for event in buffered_events {
+            event_sink(event);
+        }
+
+        let usage = total_usage;
+        session.total_input_tokens = session
+            .total_input_tokens
+            .saturating_add(usage.input_tokens);
+        session.total_output_tokens = session
+            .total_output_tokens
+            .saturating_add(usage.output_tokens);
+        event_sink(AgentEvent::TurnUsage { usage });
+        {
+            let mut guard = self.token_budget_mut();
+            if let Some(tracker) = guard.as_mut() {
+                tracker.record_turn(usage.input_tokens.saturating_add(usage.output_tokens) as u64);
+            }
+        }
+        session.messages.push(Message {
+            role: openpaw_core::Role::Assistant,
+            content: resp.content,
+            ..Default::default()
+        });
+        Ok(resp.stop_reason)
     }
 
     /// 功能：以分类重试策略读取一次 completion 流。

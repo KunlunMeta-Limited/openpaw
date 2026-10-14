@@ -18,3 +18,4 @@
 | CHG-2026-0014 | 会话因果动画可靠投递 | approved | high | OpenPaw Host/Office 项目负责人（待确认） | 7 | 32 |
 | CHG-2026-0015 | 会话懒加载隔离与受控关闭 | approved | high | OpenPaw Host 运行时负责人（待确认） | 8 | 18 |
 | CHG-2026-0016 | 运行配置回退与 sidecar 顺序收敛 | approved | medium | OpenPaw CLI 负责人（待确认） | 1 | 24 |
+| CHG-2026-0019 | 对话状态、脚本产物与最终结果闭环 | approved | high | OpenPaw Host / AI Office 项目负责人（用户授权） | 0 | 19 |
