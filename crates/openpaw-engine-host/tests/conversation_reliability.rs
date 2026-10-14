@@ -1036,6 +1036,55 @@ async fn terminal_persistence_failure_replaces_running_snapshot_in_turns() {
 }
 
 #[tokio::test]
+async fn media_only_titles_match_after_restart_with_or_without_helper() {
+    use openpaw_core::InlineMedia;
+    use support::request;
+    let _guard = lock_provider_environment().await;
+    let home = TempDir::new().unwrap();
+    let (mut provider, _environment, state, app) = provider_app(&home, None).await;
+    std::env::set_var(
+        "OPENPAW_MODEL_CAPABILITIES",
+        r#"{"openai":{"attachment-title":{"input":["text","image","audio"]}}}"#,
+    );
+    let image = InlineMedia::from_bytes(b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;", "image/gif", None).unwrap();
+    let audio = InlineMedia::from_bytes(b"RIFF0000WAVEfixture", "audio/wav", None).unwrap();
+    for (media, title) in [(&image, "图片附件"), (&audio, "音频附件")] {
+        for helper in [false, true] {
+            let id = support::create_session_with(
+                &app,
+                serde_json::json!({"provider":"openai","model":"attachment-title"}),
+            )
+            .await;
+            let mut parts =
+                vec![serde_json::json!({"type":"file","mime":media.mime,"url":media.data_url()})];
+            if helper {
+                parts.push(
+                    serde_json::json!({"type":"text","text":"attachment helper","synthetic":true}),
+                );
+            }
+            let response = request(
+                &app,
+                "POST",
+                format!("/session/{id}/prompt_async"),
+                serde_json::json!({"parts":parts}).to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            provider.next_prompt().await;
+            provider.release.add_permits(1);
+            assert_eq!(wait_for_terminal(&app, &id).await[0]["state"], "completed");
+            let restarted = build_router(AppState::new(state.config.clone()));
+            for reader in [&app, &restarted] {
+                assert_eq!(
+                    get_json(reader, format!("/session/{id}")).await["title"],
+                    title
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn inline_media_compaction_tools_restart_fork_revert_and_idempotency() {
     use openpaw_core::{InlineMedia, Message, SessionEvent};
     use support::{request, request_with_headers};
@@ -1106,7 +1155,10 @@ async fn inline_media_compaction_tools_restart_fork_revert_and_idempotency() {
         true
     );
     let part = |media: &InlineMedia| serde_json::json!({"type":"file","mime":media.mime,"url":media.data_url()});
-    let body = serde_json::json!({"messageID":"media-input","parts":[part(&image),part(&audio)]});
+    let body = serde_json::json!({"messageID":"media-input","parts":[part(&image),part(&audio),
+        {"type":"text","text":"attachment helper","synthetic":true,"metadata":{"fixture":"presentation-only"}},
+        {"type":"text","text":"分析附件"}
+    ]});
     let uri = format!("/session/{id}/prompt_async");
     assert_eq!(
         request(&app, "POST", &uri, body.to_string()).await.status(),
@@ -1116,6 +1168,12 @@ async fn inline_media_compaction_tools_restart_fork_revert_and_idempotency() {
     let immediate = get_json(&app, format!("/session/{id}/message/media-input")).await;
     assert_eq!(immediate["parts"][0]["url"], image.data_url());
     assert_eq!(immediate["parts"][1]["url"], audio.data_url());
+    assert_eq!(immediate["parts"][2]["synthetic"], true);
+    assert_eq!(
+        immediate["parts"][2]["metadata"]["fixture"],
+        "presentation-only"
+    );
+    assert_eq!(immediate["parts"][3]["text"], "分析附件");
     let mut input_events = Vec::new();
     while let Ok(event) = events.try_recv() {
         if event.event_type == "message.part.updated"
@@ -1168,6 +1226,12 @@ async fn inline_media_compaction_tools_restart_fork_revert_and_idempotency() {
     assert_eq!(requests[0]["stream"], false);
     assert!(requests[1]["messages"].to_string().contains(&image.id));
     assert!(requests[1]["messages"].to_string().contains("input_audio"));
+    assert!(requests[1]["messages"]
+        .to_string()
+        .contains("attachment helper"));
+    assert!(!requests[1]["messages"]
+        .to_string()
+        .contains("presentation-only"));
     assert!(requests[2]["messages"].to_string().contains("audio-read"));
     let replay = request(&app, "POST", &uri, body.to_string()).await;
     assert_eq!(replay.status(), StatusCode::NO_CONTENT);
@@ -1250,6 +1314,11 @@ async fn inline_media_compaction_tools_restart_fork_revert_and_idempotency() {
         })
         .unwrap();
     assert_eq!(fork_input["parts"][1]["url"], audio.data_url());
+    assert_eq!(fork_input["parts"][2]["synthetic"], true);
+    assert_eq!(
+        fork_input["parts"][2]["metadata"],
+        immediate["parts"][2]["metadata"]
+    );
     assert_eq!(
         fork_input["parts"][1]["attachmentID"],
         immediate["parts"][1]["attachmentID"]

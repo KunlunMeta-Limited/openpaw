@@ -454,8 +454,8 @@ async fn schedule_turn(
     asynchronous: bool,
 ) -> Response {
     let text = body.text();
-    let mut user = match body.message() {
-        Ok(message) => message,
+    let (mut user, presentation) = match crate::input_presentation::prepare(&body) {
+        Ok(input) => input,
         Err(error) => return media_error(error),
     };
     let input_media = openpaw_core::media::message_media(std::slice::from_ref(&user));
@@ -567,6 +567,7 @@ async fn schedule_turn(
         turn_id,
         user_message_id,
         request_admission,
+        presentation.clone(),
     ) {
         AcceptTurnResult::Accepted(accepted) => accepted,
         AcceptTurnResult::Replay(existing) => {
@@ -613,7 +614,7 @@ async fn schedule_turn(
         &accepted.user_message_id,
     ));
     for (index, block) in input_content.iter().enumerate() {
-        if input_media.is_empty() {
+        if input_media.is_empty() && presentation.is_none() {
             handle.emit(crate::events::user_text_part(
                 &id,
                 &accepted.user_message_id,
@@ -621,9 +622,13 @@ async fn schedule_turn(
             ));
             break;
         }
-        if let Some(part) =
-            crate::message_projection::input_part(&id, &accepted.user_message_id, index, block)
-        {
+        if let Some(part) = crate::message_projection::input_part(
+            &id,
+            &accepted.user_message_id,
+            index,
+            block,
+            presentation.as_ref(),
+        ) {
             handle.emit(OpenCodeEvent::new(
                 "message.part.updated",
                 serde_json::json!({"part":part}),
@@ -909,6 +914,17 @@ fn request_fingerprint(body: &MessageRequest, provider: &str, model: &str) -> St
                     .as_bytes(),
             );
         }
+    }
+    if let Ok((message, Some(presentation))) = crate::input_presentation::prepare(body) {
+        let content: Vec<_> = message.content.iter().map(|block| match openpaw_core::media::block_media(block) {
+            Ok(Some(media)) => serde_json::json!({"mime":media.mime,"data":media.data,"filename":media.filename}),
+            _ => serde_json::to_value(block).unwrap_or_default(),
+        }).collect();
+        canonical.extend_from_slice(
+            serde_json::to_string(&(content, presentation))
+                .unwrap_or_default()
+                .as_bytes(),
+        );
     }
     sha256_hex(&canonical)
 }

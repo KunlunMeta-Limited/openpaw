@@ -59,6 +59,7 @@ pub fn decode<T: DeserializeOwned>(
 }
 fn validate_record(event: &SessionEvent) -> Result<(), ProjectionError> {
     decode::<TurnAcceptV1>(event, "turn_accept_v1")?;
+    decode::<MessagePresentationRecordV1>(event, "message_presentation_v1")?;
     decode::<TurnFinishPrepareV1>(event, "turn_finish_prepare_v1")?;
     decode::<TurnFinishCommitV1>(event, "turn_finish_commit_v1")?;
     decode::<TurnOutcome>(event, "turn_outcome")?;
@@ -230,6 +231,77 @@ pub struct TurnAcceptV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub request_admission: Option<RequestAdmission>,
+    /// 功能：随输入原子保存展示注解；旧记录缺省无注解。
+    #[serde(
+        rename = "messagePresentation",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub message_presentation: Option<MessagePresentationV1>,
+}
+
+/// 功能：保存消息内容块的中立展示属性，不参与模型输入。
+/// 字段语义：version 固定为 1，parts 按内容块编号绑定；metadata 不解释客户端业务键。
+/// 关联：CHG-2026-0027；不包含媒体原件副本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessagePresentationV1 {
+    /// 功能：展示注解版本，当前仅支持 1。
+    pub version: u8,
+    /// 功能：具有展示属性的文本块；编号不得重复。
+    pub parts: Vec<PartPresentationV1>,
+}
+
+/// 功能：把辅助标志与不透明元数据绑定到同一消息中的文本块。
+/// 关联：CHG-2026-0027；块编号以完整原始消息为准。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartPresentationV1 {
+    /// 功能：原始 Message.content 的零基编号。
+    #[serde(rename = "blockIndex")]
+    pub block_index: usize,
+    /// 功能：标记自动生成的辅助正文，正文仍供模型使用。
+    pub auxiliary: bool,
+    /// 功能：保存客户端元数据对象，不访问其中的 URL。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// 功能：为分支的独立 Message 记录保存展示属性。
+/// 关联：CHG-2026-0027；与分支文件整体发布，普通接收使用 TurnAcceptV1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePresentationRecordV1 {
+    /// 功能：属性所属的已发布消息编号。
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    /// 功能：该消息的中立展示属性。
+    pub presentation: MessagePresentationV1,
+}
+
+impl MessagePresentationV1 {
+    /// 功能：校验注解版本、文本块身份与唯一性。
+    /// 参数：message 为属性所属的完整原始输入。
+    /// 返回：合法时返回 Ok。
+    /// 错误：版本、角色、块编号或重复编号非法时返回 ProjectionError。
+    /// 状态：只读，不写历史。
+    /// 并发与取消：同步无共享状态。
+    /// 权限：不解析元数据业务键，不访问网络或文件。
+    /// 关联：CHG-2026-0027；接收与恢复共同校验。
+    pub fn validate(&self, message: &Message) -> Result<(), ProjectionError> {
+        let mut indices = HashSet::new();
+        if self.version != 1 || message.role != openpaw_core::Role::User {
+            return Err(ProjectionError);
+        }
+        for part in &self.parts {
+            if !indices.insert(part.block_index)
+                || !matches!(
+                    message.content.get(part.block_index),
+                    Some(ContentBlock::Text { .. })
+                )
+            {
+                return Err(ProjectionError);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TurnAcceptV1 {
@@ -604,6 +676,8 @@ pub struct Transcript {
     pub turn_errors: HashMap<String, RecordedFailure>,
     /// 单会话持久幂等接收事实。
     pub request_admissions: HashMap<String, RequestAdmission>,
+    /// 功能：完整消息身份对应的展示属性，不作为模型内容。
+    pub message_presentations: HashMap<String, MessagePresentationV1>,
     /// 标题、归档、分支和回退附加状态。
     pub mutation: SessionMutationProjection,
     /// 已读回合编号的高水位，回退不会降低它。
@@ -629,6 +703,7 @@ pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, P
         turn_outcomes: Vec::new(),
         turn_errors: HashMap::new(),
         request_admissions: HashMap::new(),
+        message_presentations: HashMap::new(),
         mutation: SessionMutationProjection::default(),
         turn_sequence_high_water: 0,
     };
@@ -703,6 +778,22 @@ pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, P
             return Err(ProjectionError);
         } else if let SessionEvent::Message(message) = event {
             push_restored_message(&mut projection.messages, &mut message_ids, message.clone());
+        } else if let Some(record) =
+            decode::<MessagePresentationRecordV1>(event, "message_presentation_v1")?
+        {
+            let message = projection
+                .messages
+                .iter()
+                .find(|message| message.uuid.as_deref() == Some(record.message_id.as_str()))
+                .ok_or(ProjectionError)?;
+            record.presentation.validate(message)?;
+            if projection
+                .message_presentations
+                .insert(record.message_id, record.presentation)
+                .is_some()
+            {
+                return Err(ProjectionError);
+            }
         } else if is_transaction_event(event) {
             return Err(ProjectionError);
         }
@@ -726,6 +817,16 @@ fn apply_turn_accept(
     if let Some(admission) = accept.request_admission.as_ref() {
         if admission.turn_id != accept.outcome.turn_id
             || admission.user_message_id != accept.outcome.user_message_id
+        {
+            return Err(ProjectionError);
+        }
+    }
+    if let Some(presentation) = accept.message_presentation {
+        presentation.validate(&accept.message)?;
+        if projection
+            .message_presentations
+            .insert(accept.outcome.user_message_id.clone(), presentation)
+            .is_some()
         {
             return Err(ProjectionError);
         }
@@ -757,6 +858,9 @@ fn apply_revert_commit(
         .iter()
         .filter_map(|message| message.uuid.clone())
         .collect();
+    projection
+        .message_presentations
+        .retain(|id, _| message_ids.contains(id));
     retain_turn_state_for_messages(
         &projection.messages,
         &mut projection.turn_outcomes,
@@ -965,7 +1069,11 @@ impl Transcript {
     /// 权限：不扩大工具或文件权限，不记录认证信息。
     /// 关联：CHG-2026-0023 的共享能力和入口 adapter。
     pub fn title(&self) -> String {
-        session_title(self.mutation.title.as_deref(), &self.messages)
+        session_title_with_presentation(
+            self.mutation.title.as_deref(),
+            &self.messages,
+            &self.message_presentations,
+        )
     }
 }
 
@@ -978,13 +1086,66 @@ impl Transcript {
 /// 权限：不增加任何持久化或日志。
 /// 关联：Transcript::title 与 Host session_title。
 pub fn session_title(explicit: Option<&str>, messages: &[Message]) -> String {
+    session_title_with_presentation(explicit, messages, &HashMap::new())
+}
+
+/// 功能：统一选择显式标题或首条输入中的非辅助正文。
+/// 参数：explicit 为已有标题，messages 为完整历史，presentations 为消息展示属性。
+/// 返回：最多 80 字符的标题；仅附件使用附件默认标题。
+/// 错误：无；属性已经由接收或 replay 校验。
+/// 状态：纯计算，不修改历史或已有标题。
+/// 并发与取消：同步无锁。
+/// 权限：不解析客户端元数据，不输出正文到日志。
+/// 关联：CHG-2026-0027；Transcript 与 Host 共享。
+pub fn session_title_with_presentation(
+    explicit: Option<&str>,
+    messages: &[Message],
+    presentations: &HashMap<String, MessagePresentationV1>,
+) -> String {
     explicit
         .map(str::to_string)
         .or_else(|| {
             messages
                 .iter()
                 .find(|m| m.role == openpaw_core::Role::User)
-                .map(Message::text)
+                .map(|message| {
+                    let presentation = message.uuid.as_ref().and_then(|id| presentations.get(id));
+                    let text: String = message
+                        .content
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, block)| {
+                            if presentation.is_some_and(|value| {
+                                value
+                                    .parts
+                                    .iter()
+                                    .any(|part| part.block_index == index && part.auxiliary)
+                            }) {
+                                None
+                            } else {
+                                block.as_text()
+                            }
+                        })
+                        .collect();
+                    if !text.trim().is_empty() {
+                        return text;
+                    }
+                    if message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Image { .. }))
+                    {
+                        "图片附件".into()
+                    } else if message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Audio { .. }))
+                    {
+                        "音频附件".into()
+                    } else {
+                        "New session".into()
+                    }
+                })
         })
         .unwrap_or_else(|| "New session".into())
         .chars()
@@ -1161,6 +1322,60 @@ mod tests {
     use serde_json::json;
     fn unknown(value: serde_json::Value) -> SessionEvent {
         SessionEvent::Unknown(Box::new(value))
+    }
+    #[test]
+    fn presentation_records_validate_links_and_keep_old_accept_defaults() {
+        let media =
+            openpaw_core::InlineMedia::from_bytes(b"GIF89afixture", "image/gif", None).unwrap();
+        let mut user = Message::user_text("helper").with_uuid("user-1");
+        user.content.push(media.block());
+        let record = json!({"type":"turn_accept_v1","message":user,
+            "outcome":{"turnID":"1_turn","userMessageID":"user-1","state":"running"},
+            "messagePresentation":{"version":1,"parts":[{"blockIndex":0,"auxiliary":true}]}});
+        assert_eq!(
+            replay("session", &[unknown(record.clone())])
+                .unwrap()
+                .message_presentations
+                .len(),
+            1
+        );
+        for mutation in ["version", "image-block", "duplicate"] {
+            let mut bad = record.clone();
+            match mutation {
+                "version" => bad["messagePresentation"]["version"] = 2.into(),
+                "image-block" => bad["messagePresentation"]["parts"][0]["blockIndex"] = 1.into(),
+                _ => bad["messagePresentation"]["parts"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"blockIndex":0,"auxiliary":false})),
+            }
+            assert!(replay("session", &[unknown(bad)]).is_err());
+        }
+        let mut old = record.clone();
+        old.as_object_mut().unwrap().remove("messagePresentation");
+        assert!(replay("session", &[unknown(old)])
+            .unwrap()
+            .message_presentations
+            .is_empty());
+        assert!(replay("session", &[unknown(json!({"type":"message_presentation_v1","messageID":"missing","presentation":record["messagePresentation"]}))]).is_err());
+        let image_message = Message {
+            content: vec![media.block()],
+            ..Message::default()
+        };
+        assert_eq!(session_title(None, &[image_message]), "图片附件");
+        let audio =
+            openpaw_core::InlineMedia::from_bytes(b"RIFF0000WAVEfixture", "audio/wav", None)
+                .unwrap();
+        assert_eq!(
+            session_title(
+                None,
+                &[Message {
+                    content: vec![audio.block()],
+                    ..Message::default()
+                }]
+            ),
+            "音频附件"
+        );
     }
     #[test]
     fn incomplete_finish_stays_hidden_and_invalid_registered_records_fail_closed() {

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openpaw.local/contracts/host-message-events-v1.schema.json",
   "title": "OpenCode v1 消息、删除与安全执行错误投影",
-  "description": "CHG-2026-0022 / CHG-2026-0026：消息、内联 file 与工具 attachments 投影；错误详情不得包含原始响应、请求、凭据或路径。",
+  "description": "CHG-2026-0022 / CHG-2026-0026：消息、内联 file 与工具 attachments 投影；错误详情不得包含原始响应、请求、凭据或路径。 CHG-2026-0027：text part 保留可选 synthetic/metadata；辅助正文仍作为模型输入。",
   "oneOf": [
     {
       "$ref": "#/$defs/event"
@@ -134,6 +134,12 @@
         },
         "text": {
           "type": "string"
+        },
+        "synthetic": {
+          "type": "boolean"
+        },
+        "metadata": {
+          "type": "object"
         }
       }
     },
@@ -185,6 +191,21 @@
                       "$ref": "#/$defs/toolAttachments"
                     }
                   }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "text"
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ]
+                },
+                "then": {
+                  "$ref": "#/$defs/textPart"
                 }
               }
             ]
@@ -315,6 +336,21 @@
                             "$ref": "#/$defs/toolAttachments"
                           }
                         }
+                      }
+                    },
+                    {
+                      "if": {
+                        "properties": {
+                          "type": {
+                            "const": "text"
+                          }
+                        },
+                        "required": [
+                          "type"
+                        ]
+                      },
+                      "then": {
+                        "$ref": "#/$defs/textPart"
                       }
                     }
                   ]

@@ -332,7 +332,7 @@ pub struct RevertSessionRequest {
 /// 功能：解析 prompt/message 请求，支持旧的 text 字段和 OpenCode parts。
 /// 数据来源：HTTP JSON body。
 /// 数据去向：runtime 的 AgentLoop 回合。
-/// 约束：text 参与正文拼接，内联 file 作为媒体输入；未知非媒体 part 沿用忽略规则。
+/// 约束：直接 text 优先；有展示属性的文本保留独立块，内联 file 作为媒体输入；未知 part 沿用忽略规则。
 /// 关联：`API-HOST-SESSION-006`。
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct MessageRequest {
@@ -342,7 +342,7 @@ pub struct MessageRequest {
     /// 客户端提供的单 session 幂等键；省略时保持旧版非幂等行为。
     #[serde(rename = "requestID", alias = "requestId")]
     pub request_id: Option<String>,
-    /// OpenCode 消息 part 列表，按输入顺序拼接文本。
+    /// OpenCode 消息 part 列表；有展示属性时保留文本边界和输入顺序。
     #[serde(default)]
     pub parts: Vec<MessagePart>,
     /// 兼容简化客户端的直接文本字段。
@@ -380,6 +380,10 @@ pub struct MessagePart {
     pub kind: Option<String>,
     /// 文本 part 的正文。
     pub text: Option<String>,
+    /// 功能：OpenCode 辅助文本标志，仅影响展示属性。
+    pub synthetic: Option<bool>,
+    /// 功能：文本展示元数据对象，不参与模型正文。
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
     /// 功能：内联媒体的 MIME。
     pub mime: Option<String>,
     /// 功能：内联 data URL；不自动加载远程地址。
@@ -391,52 +395,14 @@ pub struct MessagePart {
 impl MessageRequest {
     /// 功能：构建文字与附件的共享消息。
     /// 参数：请求中按顺序排列的 parts。
-    /// 返回：中立用户消息，服务端身份稍后绑定。
+    /// 返回：中立用户消息；展示注解由 Host 接收路径另取，服务端身份稍后绑定。
     /// 错误：媒体格式、编码或大小非法。
     /// 状态：不接收回合、不写历史。
     /// 并发与取消：同步有界。
     /// 权限：不下载 URL。
     /// 关联：CHG-2026-0026、API-HOST-SESSION-006。
     pub fn message(&self) -> openpaw_core::Result<openpaw_core::Message> {
-        if !self
-            .parts
-            .iter()
-            .any(|part| part.kind.as_deref() == Some("file"))
-        {
-            return Ok(openpaw_core::Message::user_text(self.text()));
-        }
-        let mut message = openpaw_core::Message::default();
-        if let Some(text) = &self.text {
-            message
-                .content
-                .push(openpaw_core::ContentBlock::Text { text: text.clone() });
-        }
-        for part in &self.parts {
-            match part.kind.as_deref() {
-                Some("file") => {
-                    let mime = part
-                        .mime
-                        .as_deref()
-                        .ok_or_else(|| openpaw_core::Error::session("file part requires MIME"))?;
-                    let url = part.url.as_deref().ok_or_else(|| {
-                        openpaw_core::Error::session("file part requires inline data URL")
-                    })?;
-                    message.content.push(
-                        openpaw_core::InlineMedia::from_data_url(mime, url, part.filename.clone())?
-                            .block(),
-                    );
-                }
-                Some("text") if self.text.is_none() => {
-                    if let Some(text) = &part.text {
-                        message
-                            .content
-                            .push(openpaw_core::ContentBlock::Text { text: text.clone() });
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(message)
+        crate::input_presentation::prepare(self).map(|(message, _)| message)
     }
     /// 功能：按请求顺序取得所有 text part 的拼接结果。
     /// 返回：直接 text 字段优先；否则拼接 type=text 的 part，不插入分隔符。
@@ -522,7 +488,11 @@ pub(crate) mod wire {
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessageInfoWire { pub id: String, #[serde(rename="sessionID")] pub session_id: String, pub role: String, pub time: MessageTimeWire }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessageTimeWire { #[serde(skip_serializing_if="Option::is_none")] pub created: Option<i64>, #[serde(skip_serializing_if="Option::is_none")] pub completed: Option<i64> }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessageWire { pub info: MessageInfoWire, #[serde(default)] pub parts: Vec<MessagePartWire> }
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessagePartWire { #[serde(rename="type")] pub part_type: String, pub id: String, #[serde(rename="messageID")] pub message_id: String, #[serde(rename="sessionID")] pub session_id: String, #[serde(default, skip_serializing_if="Option::is_none")] pub text: Option<String>, #[serde(rename="callID", default, skip_serializing_if="Option::is_none")] pub call_id: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub tool: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub state: Option<ToolStateWire>, #[serde(default, skip_serializing_if="Option::is_none")] pub mime: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub url: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub filename: Option<String>, #[serde(rename="attachmentID", default, skip_serializing_if="Option::is_none")] pub attachment_id: Option<String>, #[serde(default, skip_serializing_if="Vec::is_empty")] pub attachments: Vec<serde_json::Value> }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessagePartWire { #[serde(rename="type")] pub part_type: String, pub id: String, #[serde(rename="messageID")] pub message_id: String, #[serde(rename="sessionID")] pub session_id: String, #[serde(default, skip_serializing_if="Option::is_none")] pub text: Option<String>,
+    /// 功能：保留 OpenCode 辅助文本展示标志。
+    #[serde(default, skip_serializing_if="Option::is_none")] pub synthetic: Option<bool>,
+    /// 功能：保留文本展示元数据对象。
+    #[serde(default, skip_serializing_if="Option::is_none")] pub metadata: Option<serde_json::Map<String, serde_json::Value>>, #[serde(rename="callID", default, skip_serializing_if="Option::is_none")] pub call_id: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub tool: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub state: Option<ToolStateWire>, #[serde(default, skip_serializing_if="Option::is_none")] pub mime: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub url: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub filename: Option<String>, #[serde(rename="attachmentID", default, skip_serializing_if="Option::is_none")] pub attachment_id: Option<String>, #[serde(default, skip_serializing_if="Vec::is_empty")] pub attachments: Vec<serde_json::Value> }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct ToolStateWire { pub status: ToolStatusWire, #[serde(default)] pub input: serde_json::Value, #[serde(default)] pub output: String, #[serde(default)] pub error: String, #[serde(rename="durationMs", skip_serializing_if="Option::is_none")] pub duration_ms: Option<u64> }
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all="lowercase")] pub enum ToolStatusWire { Running, Completed, Error }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct ProviderListWire { pub all: Vec<ProviderWire>, pub connected: Vec<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub default: Option<String> }

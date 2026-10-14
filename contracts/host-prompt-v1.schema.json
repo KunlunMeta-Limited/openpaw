@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openpaw.local/contracts/host-prompt-v1.schema.json",
   "title": "OpenPaw 文字与内联媒体输入",
-  "description": "CHG-2026-0026：直接 text 优先；file 原件单图5 MiB/单音频20 MiB、单回合4个且20 MiB。非法媒体400、原件或body超限413，接收前拒绝；模型能力不匹配400。远程URL不下载。",
+  "description": "CHG-2026-0026：直接 text 优先；file 原件单图5 MiB/单音频20 MiB、单回合4个且20 MiB。非法媒体400、原件或body超限413，接收前拒绝；模型能力不匹配400。远程URL不下载。 CHG-2026-0027：text part 支持可选 synthetic 和 metadata 对象；带属性时保留独立边界，属性随消息原子保存。",
   "type": "object",
   "properties": {
     "text": {
@@ -50,8 +50,32 @@
             "type": "object",
             "properties": {
               "type": {
+                "const": "text"
+              },
+              "text": {
+                "type": "string"
+              },
+              "synthetic": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "additionalProperties": true
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
                 "not": {
-                  "const": "file"
+                  "enum": [
+                    "file",
+                    "text"
+                  ]
                 }
               }
             }

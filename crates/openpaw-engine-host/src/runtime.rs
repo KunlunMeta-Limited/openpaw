@@ -22,7 +22,9 @@ use openpaw_engine::scheduler::{ScheduleError, TurnAdmission, TurnScheduler};
 use openpaw_engine::turn_execution::{self, SessionCheckpoint, TurnOptions};
 use openpaw_engine::AgentLoop;
 use openpaw_store::journal;
-use openpaw_store::transcript::retain_turn_state_for_messages;
+use openpaw_store::transcript::{
+    retain_turn_state_for_messages, MessagePresentationRecordV1, MessagePresentationV1,
+};
 use openpaw_store::{SessionError, SessionReader, SessionWriter};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -119,6 +121,8 @@ pub struct SessionHandle {
     pub id: String,
     pub session: Mutex<Session>,
     pub message_cache: std::sync::RwLock<Vec<openpaw_core::Message>>,
+    /// 功能：保存与完整消息同步发布的中立展示注解。
+    message_presentations: std::sync::RwLock<HashMap<String, MessagePresentationV1>>,
     pub writer: std::sync::Mutex<Option<SessionWriter>>,
     session_path: PathBuf,
     pub agent: AgentLoop,
@@ -345,7 +349,18 @@ impl SessionHandle {
             .turn_errors
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        message_projection::messages_wire(&self.id, self.created_at, &outcomes, &messages, &errors)
+        let presentations = self
+            .message_presentations
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        message_projection::messages_wire(
+            &self.id,
+            self.created_at,
+            &outcomes,
+            &messages,
+            &errors,
+            &presentations,
+        )
     }
     /// 功能：设置当前回合状态并追加 `turn_outcome` 未知事件。
     /// 并发与取消：同 session 单回合保证状态转换串行；writer 锁保护追加。
@@ -462,6 +477,7 @@ pub struct AppState {
 struct SessionHandleInit {
     session: Session,
     messages: Vec<openpaw_core::Message>,
+    message_presentations: HashMap<String, MessagePresentationV1>,
     writer: SessionWriter,
     session_path: PathBuf,
     agent: AgentLoop,
@@ -871,6 +887,7 @@ impl AppState {
             .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
         let projection = restored_session_projection(id, &read.events)?;
+        let message_presentations = projection.message_presentations;
         let messages = projection.messages;
         let mut turn_outcomes = projection.turn_outcomes;
         let turn_errors = projection.turn_errors;
@@ -894,12 +911,13 @@ impl AppState {
             approvals.clone(),
         )
         .map_err(|_| SessionLoadError::Unavailable)?;
-        let title = session_title(&mutation, &messages);
+        let title = session_title(&mutation, &messages, &message_presentations);
         let published_messages = messages.clone();
         session.messages = messages;
         Ok(self.build_session_handle(SessionHandleInit {
             session,
             messages: published_messages,
+            message_presentations,
             writer,
             session_path: path,
             agent,
@@ -970,6 +988,7 @@ impl AppState {
         let handle = self.build_session_handle(SessionHandleInit {
             session,
             messages: Vec::new(),
+            message_presentations: HashMap::new(),
             writer,
             session_path: path,
             agent,
@@ -993,6 +1012,7 @@ impl AppState {
         let SessionHandleInit {
             session,
             messages,
+            message_presentations,
             writer,
             session_path,
             agent,
@@ -1015,6 +1035,7 @@ impl AppState {
             session_model: session.meta.model.clone(),
             session: Mutex::new(session),
             message_cache: std::sync::RwLock::new(messages),
+            message_presentations: std::sync::RwLock::new(message_presentations),
             writer: std::sync::Mutex::new(Some(writer)),
             session_path,
             agent,
@@ -1171,7 +1192,7 @@ impl AppState {
                     "会话正在执行，无法创建分支".into(),
                 ));
             }
-            let (source_messages, source_title, revert_message_id) = {
+            let (source_messages, source_title, revert_message_id, source_presentations) = {
                 let _snapshot = source
                     .snapshot_gate
                     .read()
@@ -1192,6 +1213,11 @@ impl AppState {
                         .read()
                         .unwrap_or_else(|error| error.into_inner())
                         .revert_message_id
+                        .clone(),
+                    source
+                        .message_presentations
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
                         .clone(),
                 )
             };
@@ -1227,6 +1253,14 @@ impl AppState {
                 None => visible_messages.len(),
             };
             let messages = clone_messages_for_fork(&visible_messages[..fork_len]);
+            let message_presentations: HashMap<_, _> = visible_messages[..fork_len]
+                .iter()
+                .zip(&messages)
+                .filter_map(|(old, new)| {
+                    let presentation = source_presentations.get(old.uuid.as_ref()?)?;
+                    Some((new.uuid.clone()?, presentation.clone()))
+                })
+                .collect();
             let ordinal = next_fork_ordinal(&self.config.home, source_id)?;
             let title = format!("{source_title} ({ordinal})");
             let origin = SessionForkOriginV1 {
@@ -1266,12 +1300,28 @@ impl AppState {
                 metadata,
                 SessionMutationEvent::ForkOrigin(origin.clone()).to_session_event(),
             ];
-            records.extend(messages.iter().cloned().map(SessionEvent::Message));
+            for message in &messages {
+                records.push(SessionEvent::Message(message.clone()));
+                if let Some((id, presentation)) = message
+                    .uuid
+                    .as_ref()
+                    .and_then(|id| message_presentations.get(id).map(|value| (id, value)))
+                {
+                    records.push(openpaw_store::transcript::encode(
+                        &MessagePresentationRecordV1 {
+                            message_id: id.clone(),
+                            presentation: presentation.clone(),
+                        },
+                        "message_presentation_v1",
+                    ));
+                }
+            }
             let writer = journal::publish(&temporary_path, &final_path, &records)
                 .map_err(|_| SessionMutationError::Persistence("无法创建或发布会话分支".into()))?;
             self.build_session_handle(SessionHandleInit {
                 session,
                 messages,
+                message_presentations,
                 writer,
                 session_path: final_path,
                 agent,
@@ -1687,8 +1737,13 @@ fn wire_session_snapshot(handle: &SessionHandle) -> SessionWire {
 fn session_title(
     mutation: &SessionMutationProjection,
     messages: &[openpaw_core::Message],
+    presentations: &HashMap<String, MessagePresentationV1>,
 ) -> String {
-    openpaw_store::transcript::session_title(mutation.title.as_deref(), messages)
+    openpaw_store::transcript::session_title_with_presentation(
+        mutation.title.as_deref(),
+        messages,
+        presentations,
+    )
 }
 fn staged_visible_len(
     session_id: &str,
@@ -1892,7 +1947,13 @@ fn classify_turn_error(error: &openpaw_core::Error) -> TurnError {
     }
 }
 /// 功能：在同一 session gate 内原子完成幂等检查、回合保留、容量接收和首状态事务写入。
+/// 参数：state/handle 为接收环境，message/presentation 为输入及属性，其余字段为稳定回合身份和幂等事实。
+/// 返回：唯一接收结果，只有 Accepted 可以启动执行。
+/// 错误：冲突、忙碌或持久化失败作为结果返回。
+/// 状态：原子提交消息及注解，失败不发布。
 /// 并发与取消：turn_gate 线性化同键并发、旧回合终态提交和新回合接收；不同 session 互不阻塞。
+/// 权限：沿用 Host 接收权限，不记录正文或元数据。
+/// 关联：CHG-2026-0027。
 pub(crate) fn accept_turn(
     state: &AppState,
     handle: &SessionHandle,
@@ -1900,6 +1961,7 @@ pub(crate) fn accept_turn(
     turn_id: String,
     user_message_id: String,
     request_admission: Option<RequestAdmission>,
+    presentation: Option<MessagePresentationV1>,
 ) -> AcceptTurnResult {
     let _gate = handle
         .turn_gate
@@ -1981,6 +2043,7 @@ pub(crate) fn accept_turn(
         outcome,
         queue_ticket,
         request_admission,
+        presentation,
     ) {
         handle.active.store(false, Ordering::Release);
         return AcceptTurnResult::PersistenceFailed(error);
@@ -1992,7 +2055,7 @@ pub(crate) fn accept_turn(
     })
 }
 /// 功能：把用户消息与首个 queued/running outcome 原子追加到 session JSONL 和内存快照。
-/// 参数：handle、session 为已预留会话，message 为输入，outcome、queue_ticket、request_admission 为接收状态。
+/// 参数：handle/session 为预留会话，message/presentation 为输入及展示属性，其余参数为接收状态。
 /// 返回：消息与接收状态提交成功时返回 Ok。
 /// 错误：JSONL 追加失败时返回持久化错误，不发布删除或新输入。
 /// 状态：有 staged revert 时原子裁剪旧尾部与错误，并先发布公共消息删除。
@@ -2006,11 +2069,18 @@ pub(crate) fn append_user_and_turn(
     outcome: TurnOutcome,
     queue_ticket: Option<u64>,
     request_admission: Option<RequestAdmission>,
+    presentation: Option<MessagePresentationV1>,
 ) -> Result<(), String> {
+    if let Some(value) = &presentation {
+        value
+            .validate(&message)
+            .map_err(|_| "消息展示属性非法".to_string())?;
+    }
     let accept = TurnAcceptV1 {
         message: message.clone(),
         outcome: outcome.clone(),
         request_admission: request_admission.clone(),
+        message_presentation: presentation.clone(),
     };
     let staged_message_id = handle
         .mutation
@@ -2056,6 +2126,20 @@ pub(crate) fn append_user_and_turn(
             .message_cache
             .write()
             .unwrap_or_else(|error| error.into_inner()) = published_messages.clone();
+        let mut presentations = handle
+            .message_presentations
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if mutation_event.is_some() {
+            let ids: HashSet<_> = published_messages
+                .iter()
+                .filter_map(|message| message.uuid.as_ref())
+                .collect();
+            presentations.retain(|id, _| ids.contains(id));
+        }
+        if let Some(value) = presentation {
+            presentations.insert(outcome.user_message_id.clone(), value);
+        }
         if let Some(event) = mutation_event.as_ref() {
             let mut outcomes = handle
                 .turn_outcomes
@@ -2299,15 +2383,21 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         if handle.cancel_requested.load(Ordering::Acquire) {
             (Vec::new(), Ok(openpaw_core::StopReason::EndTurn))
         } else {
-            if !text.trim().is_empty()
-                && handle
-                    .title
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .as_str()
-                    == "New session"
+            if handle
+                .title
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_str()
+                == "New session"
             {
-                let title: String = text.chars().take(80).collect();
+                let title = openpaw_store::transcript::session_title_with_presentation(
+                    None,
+                    &session.messages,
+                    &handle
+                        .message_presentations
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner()),
+                );
                 let metadata = SessionEvent::Metadata {
                     title: Some(title.clone()),
                     mode: None,
@@ -3036,6 +3126,7 @@ mod tests {
                     openpaw_core::Message::user_text("trigger provider error")
                         .with_uuid(user_message_id.clone()),
                     initial,
+                    None,
                     None,
                     None,
                 )

@@ -147,6 +147,7 @@ fn message_wire(
     outcomes: &[TurnOutcome],
     index: usize,
     message: &openpaw_core::Message,
+    presentation: Option<&openpaw_store::transcript::MessagePresentationV1>,
 ) -> serde_json::Value {
     let message_id = message
         .uuid
@@ -159,9 +160,9 @@ fn message_wire(
     let parts = message.content.iter().enumerate().filter_map(|(part_index, block)| {
         let part_id = format!("prt_{message_id}_{part_index}");
         match block {
-            openpaw_core::ContentBlock::Text { text } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"text","text":text})),
+            openpaw_core::ContentBlock::Text { .. } => input_part(session_id, &message_id, part_index, block, presentation),
             openpaw_core::ContentBlock::Thinking { thinking, .. } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"reasoning","text":thinking})),
-            openpaw_core::ContentBlock::Image { .. } | openpaw_core::ContentBlock::Audio { .. } => input_part(session_id, &message_id, part_index, block),
+            openpaw_core::ContentBlock::Image { .. } | openpaw_core::ContentBlock::Audio { .. } => input_part(session_id, &message_id, part_index, block, presentation),
             openpaw_core::ContentBlock::ToolUse { id, name, input } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"tool","callID":id,"tool":name,"state":{"status":"running","input":input,"output":"","error":""}})),
             openpaw_core::ContentBlock::ToolResult { tool_use_id, content, is_error, name, .. } => Some(serde_json::json!({"id":part_id,"messageID":message_id,"sessionID":session_id,"type":"tool","callID":tool_use_id,"tool":name,"state":{"status":if *is_error {"error"} else {"completed"},"input":{},"output":if *is_error {""} else {content},"error":if *is_error {content} else {""}}})),
             _ => None,
@@ -186,7 +187,7 @@ fn message_wire(
 }
 
 /// 功能：将完整模型历史投影为公共消息，折叠工具结果并补齐失败展示。
-/// 参数：session_id、created_at 为会话身份，outcomes/errors 为同一快照回合状态，messages 为模型历史。
+/// 参数：session_id、created_at 为会话身份，outcomes/errors/presentations 为同一快照附加状态，messages 为模型历史。
 /// 返回：有序 REST 消息列表；失败占位仅存在于返回值。
 /// 错误：无；不匹配的旧工具结果保持独立投影。
 /// 状态：纯计算，不改变模型消息或持久化。
@@ -199,6 +200,7 @@ pub(crate) fn messages_wire(
     outcomes: &[TurnOutcome],
     messages: &[openpaw_core::Message],
     errors: &HashMap<String, OpenCodeTurnErrorV1>,
+    presentations: &HashMap<String, openpaw_store::transcript::MessagePresentationV1>,
 ) -> Vec<serde_json::Value> {
     let mut result = Vec::<serde_json::Value>::with_capacity(messages.len());
     let mut tool_parts = std::collections::HashMap::<String, (usize, usize)>::new();
@@ -252,6 +254,7 @@ pub(crate) fn messages_wire(
             outcomes,
             message_index,
             message,
+            message.uuid.as_ref().and_then(|id| presentations.get(id)),
         ));
         if message.role != openpaw_core::Role::Assistant {
             continue;
@@ -316,7 +319,7 @@ pub(crate) fn messages_wire(
 }
 
 /// 功能：将单个用户输入块投影为公开 part。
-/// 参数：会话、消息编号和原始块次序。
+/// 参数：会话、消息编号、原始块次序、内容和可选展示属性。
 /// 返回：text/file part 或 None。
 /// 错误：无；无原件的旧图片不自动下载。
 /// 状态：纯转换。
@@ -328,11 +331,13 @@ pub(crate) fn input_part(
     message_id: &str,
     index: usize,
     block: &openpaw_core::ContentBlock,
+    presentation: Option<&openpaw_store::transcript::MessagePresentationV1>,
 ) -> Option<serde_json::Value> {
     let mut part = serde_json::json!({"id":format!("prt_{message_id}_{index}"),"messageID":message_id,"sessionID":session_id});
     if let openpaw_core::ContentBlock::Text { text } = block {
         part["type"] = "text".into();
         part["text"] = text.clone().into();
+        crate::input_presentation::decorate(&mut part, index, presentation);
     } else if let Ok(Some(media)) = openpaw_core::media::block_media(block) {
         part["type"] = "file".into();
         part["mime"] = media.mime.clone().into();

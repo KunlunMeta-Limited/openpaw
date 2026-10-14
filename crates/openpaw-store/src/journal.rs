@@ -338,6 +338,71 @@ mod tests {
     }
 
     #[test]
+    fn presentation_rolls_back_with_input_and_publishes_with_fork() {
+        use crate::transcript::{MessagePresentationV1, PartPresentationV1, TurnAcceptV1};
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut writer, baseline) = fixture(dir.path());
+        let mut outcome = terminal();
+        outcome.state = TurnState::Running;
+        outcome.completed_at = None;
+        let accept = TurnAcceptV1 {
+            message: Message::user_text("helper").with_uuid("input-1"),
+            outcome,
+            request_admission: None,
+            message_presentation: Some(MessagePresentationV1 {
+                version: 1,
+                parts: vec![PartPresentationV1 {
+                    block_index: 0,
+                    auxiliary: true,
+                    metadata: None,
+                }],
+            }),
+        };
+        let event = accept.to_session_event();
+        assert!(transaction(&mut writer, |current| {
+            current.append(&event).unwrap();
+            Err("injected failure after presentation write".into())
+        })
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), baseline);
+        let data = SessionReader::read(&path).unwrap();
+        let empty = replay(&data.meta.id, &data.events).unwrap();
+        assert!(empty.messages.is_empty() && empty.message_presentations.is_empty());
+        append(&mut writer, &event).unwrap();
+        let data = SessionReader::read(&path).unwrap();
+        assert_eq!(
+            replay(&data.meta.id, &data.events)
+                .unwrap()
+                .message_presentations
+                .len(),
+            1
+        );
+        let temporary = dir.path().join("fork.tmp");
+        let final_path = dir.path().join("fork.jsonl");
+        let mut records = data.events;
+        records.push(crate::transcript::encode(
+            &crate::transcript::MessagePresentationRecordV1 {
+                message_id: "fork-input".into(),
+                presentation: accept.message_presentation.unwrap(),
+            },
+            "message_presentation_v1",
+        ));
+        records.insert(
+            records.len() - 1,
+            SessionEvent::Message(Message::user_text("fork helper").with_uuid("fork-input")),
+        );
+        drop(publish(&temporary, &final_path, &records).unwrap());
+        let data = SessionReader::read(&final_path).unwrap();
+        assert_eq!(
+            replay(&data.meta.id, &data.events)
+                .unwrap()
+                .message_presentations
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn failed_rollback_invalidates_writer_and_refuses_further_writes() {
         let dir = tempfile::tempdir().unwrap();
         let (path, mut writer, _) = fixture(dir.path());

@@ -166,3 +166,47 @@ xtask 的根目录通过编译时 CARGO_MANIFEST_DIR 固定；共享缓存曾误
 仅清理 xtask 构建缓存并在 `/src/xtask` 重编译后取得最终 6917/3140 计数。
 原始浏览器记录的 gitSha 是 OpenWork HEAD 3e58d95，测试含未提交变更；最终源码与文档
 指纹保存在 `candidate-manifest.json`，不能把该 HEAD 当作包含修复的已发布提交。
+
+## 2026-10-14 CHG-2026-0027 本地修复验证
+
+分支 `bugfix/attachment-presentation`，基线 `ba56f5a3f4cbf80ec3fac5d07963a6b0c0845845`。
+用户后续指定交付至现有 `feature/add-multimodal-capabilities`，两分支基线相同；
+本次直接携带变更切换并以“修复多模态附件辅助信息展示与会话标题”提交，白名单范围和被测源码保持一致。
+用户批准 Host + Store 展示属性修复；运行服务、用户历史与 OpenWork 源码保持原状。
+原始证据位于仓库外 `../artifacts/chg0027/`，记录格式如下：
+
+| 命令 / 检查 | 最终结果 |
+| --- | --- |
+| `cargo test --offline --locked --workspace -- --test-threads=1` | 退出 0；972 passed、0 failed、2 个既有 ignored；verified-test-default.log |
+| 同命令加 `--features engine-host` | 退出 0；1079 passed、0 failed、2 个既有 ignored；Host 104 项，CLI/Host parity 3 项；verified-test-host-workspace.log |
+| `cargo fmt --all -- --check` | Rust 1.88 与 1.99 均退出 0 |
+| 默认及 Host `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | Rust 1.99 两条均退出 0；strict-stable.log |
+| `cargo run --offline --locked -p xtask -- lines` | 退出 0；Store 3249/3500、Host 5731/7000、aux 11497/11500、Host tests 3943/4000；verified-lines.log |
+| xtask scrub / snapshot / golden / telemetry | 均退出 0；快照 11 traits、59 types，无漂移；预算、依赖和快照基线未调整 |
+| 默认 CLI `cargo tree --offline --locked -p openpaw-cli -e normal` | 退出 0，无 Axum；tree-default.log |
+| `cargo build --offline --locked -p openpaw-cli --features engine-host` | 退出 0；仅构建用于隔离页面验收的 debug 二进制 |
+| `cargo-deny 0.20.2 --workspace --locked --color never check --show-stats` | 退出 0；0 errors，bans 17 warnings、licenses 1 warning；deny.log |
+
+首次工具缺失、Rust 1.88 既有 sandbox lint、只读 fixture/target 写入及一次 CLI socket reset 均如实保留；
+补齐隔离工具链与可写测试目录，使用单线程完成全仓复验，未修改被测源码以规避这些环境问题。
+本地回归通过不代表已部署、真实模型全格式验收、完整 OpenWork journey 或整个 master-plan 完成。
+OpenWork 页面诊断、Schema 与降级兼容的最终结果在 CHG-0027 单独登记；中文 IME 不在通过范围。
+
+补充完成：原样 OpenWork 新会话、续聊、两轮刷新及 Host 重启后刷新，五次渲染诊断均通过；
+上一版 CHG-0026 实际 reader 在隔离数据上能读新接收及 Fork 记录。probe 退出 0，正式服务身份不变。
+Ajv 8.20.0 / Draft 2020-12 对两份合同验证 26 个正例、7 个负例，退出 0；
+样本包含实际页面生成的 4 条 REST 消息及对应 part 构造的事件；实际即时 SSE 同值由 Rust 回归覆盖。
+两次容器校验调用未取得可判定结果，改用当前 OpenWork 的同版本本地 Ajv；仓库依赖未改变。
+19 个实际文件全部属于 20 文件白名单，git diff --check 与中文 Rustdoc 人工检查通过。
+原始证据：openwork-probe.json、openwork-wire.json、openwork-render.png、schemas.json、scope.json。
+
+2026-10-14 用户后续明确授权启动并保留独立测试容器，含原样 OpenWork 前端。
+`node ../artifacts/chg0027/preview/start.mjs` 最终退出 0；两个测试容器 healthy，
+前端 `http://127.0.0.1:5188` 返回 200，独立 OpenWork API 8780 / Host 8799 鉴权代理通过。
+沿用现有 deepseek-flash 模型配置，Provider image=true；本次启动未发送真实模型请求。
+测试网络、工作区、历史及认证独立，正式容器 ID 和四个 OpenWork 关键业务文件哈希对照不变。
+首次 Edge 页面聊天输入框正常；新浏览器须在原有模型选择器选择 OpenAI / deepseek-flash。
+证据在 `../artifacts/chg0027/preview/preview-report.json`，授权和诊断环境校正见 CHG 第 11 节。
+测试环境保留供用户验收；不将其视为生产发布或中文 IME 修复。
+最终浏览器诊断退出 0、BROWSER_READY；输入框、OpenAI 分组中的 deepseek-flash 可用，
+通过原版 UI 选择后模型按钮正确显示。该模型偏好仅在诊断浏览器中保存；用户首次访问需选择一次。

@@ -387,3 +387,20 @@ Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP
 既有会话取消、panic/drop、提交失败和CLI/Host parity一起回归。所有测试使用临时home/workspace；测试权限环境显式auto。
 样例是协议字节夹具，不能作为完整解码图像、音频可播放或模型理解的证据。真实模型按 Q16 后续验证。
 最终命令、退出码及平台限制见本 CHG 验证记录。
+
+## 附件展示回归（CHG-2026-0027）
+
+| 入口 | 验证内容 |
+| --- | --- |
+| Host HTTP synthetic_input | 辅助/真实正文独立；REST/SSE 同属性；模型仍收到说明；幂等属性冲突；重启、Fork、续聊、回退替换 |
+| Host HTTP presentation_preserves | 直接 text 优先；显式 false/metadata 和标题；非法属性类型拒绝且无历史 |
+| Host reliability inline_media | 真实假 HTTP provider 收到媒体/说明但无展示 metadata；即时 parts；压缩、工具媒体、幂等、重启、Fork、Revert/Unrevert |
+| Host reliability media_only_titles | 图片/音频 × 有/无辅助说明，运行时及冷恢复标题一致 |
+| Store media_history | 实际 JSONL writer/read/replay 保留注解、内联原件和真实标题 |
+| Store transcript / journal | 旧 accept 缺省、损坏索引/版本/重复/无主属性拒绝；写盘故障整体回滚；分支整体发布恢复 |
+
+最终默认及 Host workspace 测试使用 Rust 1.88、隔离数据、auto 权限和单线程测试调度。
+既有 parity fixture 与 tools target 的写入重定向到仓库外副本/测试卷，源文件保持只读；
+两条全仓命令分别 972/1079 passed、0 failed、2 个既有 ignored。Host 104 项、CLI/Host parity 3 项全部通过。
+严格 Clippy/格式检查使用与 CHG-0026 相同的 Rust 1.99；实际命令和环境修正见当前 CHG。
+原样 OpenWork 的页面诊断单独记录，不将浏览器组合输入模拟或诊断 probe 当成正式发布 journey。

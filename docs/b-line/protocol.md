@@ -188,3 +188,21 @@ connected 仍只表示本地配置。所有媒体只出现在授权消息接口�
 Schemas 为 host-message-events-v1 和 host-provider-v1；旧 text 请求、tool 文本与 SSE 类型保持兼容。
 
 OpenWork 已有图片 file part 形状在 OpenPaw 契约测试中覆盖；其音频入口和 AI Office 界面尚未实现，本轮不修改客户端仓库。
+
+## 文本展示属性（CHG-2026-0027）
+
+现有 message / prompt_async 的 text part 接收可选 `synthetic:boolean`、`metadata:object`。
+带属性的文本保留独立内容块与输入顺序；直接 `text` 仍优先，忽略 part 的属性不迁移到正文。
+REST 和即时 `message.part.updated` 共用投影，保留属性及稳定 part ID；缺属性的旧纯文本入口沿用原合并行为。
+`synthetic=true` 只标记辅助正文，模型仍收到原 user 消息中的正文及附件，metadata 不进入模型内容。
+OpenWork 已有过滤消费该标记；`metadata.openworkAttachments` 是客户端业务键，Host/Store 不解释或下载其中的 URL。
+
+Store 的 `turn_accept_v1` 增加可选 `messagePresentation:{version:1,parts:[{blockIndex,auxiliary,metadata?}]}`。
+注解与 user/outcome/admission 同一事务接收；replay 检查版本、User 角色、唯一块编号和 Text 类型。
+Fork 在整体发布的分支文件中紧跟对应 Message 写 `message_presentation_v1:{messageID,presentation}`，并绑定新消息 ID；
+staged Revert/Unrevert 保留完整历史，提交回退同步裁剪注解。压缩不改变完整历史的属性或内联媒体原件。
+有展示属性的幂等指纹包含规范化块内容及属性，媒体使用 MIME/字节/名称，排除临时随机 attachmentID。
+
+自动标题来自首条输入中的非辅助文本，最多 80 字符；无真实正文的媒体输入使用“图片附件”或“音频附件”。
+已有显式标题与续聊标题保持优先。旧记录缺省无注解，已丢失属性的历史不按英文前缀猜测改写。
+该后端兼容修复不改变 OpenWork 的发送前中文组合输入行为。

@@ -107,3 +107,16 @@ tracked 与未忽略 untracked 的 10,044 个条目，其中 10,043 个现存文
 | Q8、Q11：工具读取与协议适配 | read_file/read_attachment、ToolResult.media、Provider | media_read_e2e、HTTP工具配对、Hook单元、Host并行工具 |
 | Q10、Q12–Q14：入口、限制与客户端范围 | CLI附件命令、Host file parts、schemas | chat_e2e、Host inline_media、schema样例校验 |
 | Q16：本地验收 | 临时目录与假服务，不使用真实模型 | 实际命令/退出码见CHG；真实理解效果暂未验收 |
+
+## CHG-2026-0027 附件展示与标题
+
+| 缺陷 / 验收 | 实现 | 证据 |
+| --- | --- | --- |
+| synthetic/metadata 丢失、辅助正文合并（A01–A03、A05） | Host input_presentation 保留边界；REST/SSE 共用属性投影 | HTTP RED → GREEN；媒体 reliability 的即时投影及 provider 正文检查 |
+| 新会话标题污染、纯附件标题（A04） | Store session_title_with_presentation 与 Host 自动标题共用 | HTTP 显式/真实标题；图片/音频四种输入的运行时及重启测试 |
+| 重启/Fork/Revert/压缩后标记丢失（A06–A08） | Store 中立可选注解；同事务接收；分支 ID 重绑定；回退同步裁剪 | 实际 JSONL 恢复与故障注入；Host 完整媒体生命周期测试 |
+| 旧历史兼容（A09） | 缺省无注解，不猜测旧辅助正文、不覆盖旧标题 | Store legacy accept 回归；降级兼容检查另见 CHG |
+| 当前 OpenWork 消费（A10） | 复用既有 synthetic 过滤，OpenWork 源码不修改 | 仓库外 openwork-probe 的真实页面证据，结果见 CHG |
+
+已批准范围仅为 OpenPaw Host + Store。Core、AgentLoop、LLM、Tools 和 OpenWork 未修改；
+中文 IME 卡住是发送前独立缺陷，不属于本次后端修复的通过项。完整门禁与交付状态见当前 CHG。

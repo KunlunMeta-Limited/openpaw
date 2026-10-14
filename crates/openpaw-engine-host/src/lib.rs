@@ -11,6 +11,8 @@ mod events;
 #[cfg(feature = "engine-host")]
 mod http;
 #[cfg(feature = "engine-host")]
+mod input_presentation;
+#[cfg(feature = "engine-host")]
 mod message_projection;
 #[cfg(feature = "engine-host")]
 mod office;

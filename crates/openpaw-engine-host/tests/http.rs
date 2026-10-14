@@ -95,6 +95,218 @@ fn assert_session_event(event: &OpenCodeEvent, event_type: &str, session_id: &st
 }
 
 #[tokio::test]
+async fn synthetic_input_keeps_part_boundaries_metadata_and_real_title_after_restart() {
+    let home = tempdir().unwrap();
+    let config = HostConfig {
+        home: home.path().into(),
+        ..Default::default()
+    };
+    let state = AppState::new(config.clone());
+    let app = build_router(state.clone());
+    let id = create_session_with(&app, serde_json::json!({"provider":"echo"})).await;
+    let handle = state.get(&id).await.unwrap();
+    let mut events = handle.global_events.subscribe();
+    let body = serde_json::json!({"requestID":"presentation-key","parts":[
+        {"type":"text","text":"attachment helper\n","synthetic":true,
+         "metadata":{"openworkAttachments":[],"fixture":"display-only"}},
+        {"type":"text","text":"分析这张图片"}
+    ]});
+    let response = request(
+        &app,
+        "POST",
+        format!("/session/{id}/message"),
+        body.to_string(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let history = get_json(&app, format!("/session/{id}/message")).await;
+    assert_eq!(history[0]["parts"].as_array().unwrap().len(), 2);
+    assert_eq!(history[0]["parts"][0]["synthetic"], true);
+    assert_eq!(
+        history[0]["parts"][0]["metadata"],
+        body["parts"][0]["metadata"]
+    );
+    assert_eq!(history[0]["parts"][1]["text"], "分析这张图片");
+    assert_eq!(
+        get_json(&app, format!("/session/{id}")).await["title"],
+        "分析这张图片"
+    );
+    let part_event = next_session_event(&mut events, "message.part.updated").await;
+    assert_eq!(part_event.properties["part"], history[0]["parts"][0]);
+    assert!(history[1]["parts"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("attachment helper"));
+    let replay = request(
+        &app,
+        "POST",
+        format!("/session/{id}/message"),
+        body.to_string(),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let mut changed = body.clone();
+    changed["parts"][0]["synthetic"] = false.into();
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            format!("/session/{id}/message"),
+            changed.to_string()
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    changed = body.clone();
+    changed["parts"][0]["metadata"]["fixture"] = "changed".into();
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            format!("/session/{id}/message"),
+            changed.to_string()
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let restarted = build_router(AppState::new(config.clone()));
+    assert_eq!(
+        get_json(&restarted, format!("/session/{id}/message")).await,
+        history
+    );
+    let fork =
+        response_json(request(&restarted, "POST", format!("/session/{id}/fork"), "{}").await).await;
+    let fork_id = fork["id"].as_str().unwrap();
+    let fresh = build_router(AppState::new(config.clone()));
+    let fork_history = get_json(&fresh, format!("/session/{fork_id}/message")).await;
+    assert_ne!(fork_history[0]["info"]["id"], history[0]["info"]["id"]);
+    assert_eq!(fork_history[0]["parts"][0]["synthetic"], true);
+    assert_eq!(
+        fork_history[0]["parts"][0]["metadata"],
+        body["parts"][0]["metadata"]
+    );
+    let mut next = body.clone();
+    next["requestID"] = "continued-key".into();
+    next["parts"][1]["text"] = "继续分析".into();
+    assert_eq!(
+        request(
+            &fresh,
+            "POST",
+            format!("/session/{id}/message"),
+            next.to_string()
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let continued = get_json(&fresh, format!("/session/{id}/message")).await;
+    assert_eq!(continued[2]["parts"][0]["synthetic"], true);
+    assert_eq!(
+        get_json(&fresh, format!("/session/{id}")).await["title"],
+        "分析这张图片"
+    );
+    let boundary = continued[2]["info"]["id"].as_str().unwrap();
+    assert_eq!(
+        request(
+            &fresh,
+            "POST",
+            format!("/session/{id}/revert"),
+            serde_json::json!({"messageID":boundary}).to_string()
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        sync_prompt_with_request_id(&fresh, &id, "replacement-key", "新的普通问题")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let replaced = get_json(&fresh, format!("/session/{id}/message")).await;
+    assert_eq!(replaced[2]["parts"][0]["text"], "新的普通问题");
+    assert!(replaced[2]["parts"][0].get("synthetic").is_none());
+    assert_eq!(
+        get_json(
+            &build_router(AppState::new(config)),
+            format!("/session/{id}/message")
+        )
+        .await,
+        replaced
+    );
+}
+
+#[tokio::test]
+async fn presentation_preserves_direct_text_priority_and_explicit_titles() {
+    let home = tempdir().unwrap();
+    let app = build_router(AppState::new(HostConfig {
+        home: home.path().into(),
+        ..Default::default()
+    }));
+    for body in [
+        serde_json::json!({"text":"direct","parts":[{"type":"text","text":"ignored","synthetic":true,"metadata":{"fixture":"ignored"}}]}),
+        serde_json::json!({"parts":[{"type":"text","text":"visible","synthetic":false,"metadata":{"fixture":"opaque"}}]}),
+        serde_json::json!({"parts":[{"type":"text","text":"helper","synthetic":true}]}),
+    ] {
+        let id = create_session_with(
+            &app,
+            serde_json::json!({"provider":"echo","title":"用户标题"}),
+        )
+        .await;
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                format!("/session/{id}/message"),
+                body.to_string()
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let history = get_json(&app, format!("/session/{id}/message")).await;
+        assert_eq!(
+            get_json(&app, format!("/session/{id}")).await["title"],
+            "用户标题"
+        );
+        if body.get("text").is_some() {
+            assert_eq!(history[0]["parts"][0]["text"], "direct");
+            assert!(history[0]["parts"][0].get("synthetic").is_none());
+            assert!(history[0]["parts"][0].get("metadata").is_none());
+        } else {
+            assert_eq!(
+                history[0]["parts"][0]["synthetic"],
+                body["parts"][0]["synthetic"]
+            );
+        }
+    }
+    for part in [
+        serde_json::json!({"type":"text","text":"test","synthetic":"yes"}),
+        serde_json::json!({"type":"text","text":"test","metadata":[]}),
+    ] {
+        let id = create_session(&app).await;
+        assert_eq!(
+            request(
+                &app,
+                "POST",
+                format!("/session/{id}/message"),
+                serde_json::json!({"parts":[part]}).to_string()
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(get_json(&app, format!("/session/{id}/message"))
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
 async fn health_and_session_wire_contract() {
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
