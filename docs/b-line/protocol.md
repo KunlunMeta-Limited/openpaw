@@ -174,3 +174,13 @@ mock/echo 需要有效通用生成配置；openai/anthropic 还需要非空 Key�
 无效网络配置不影响离线项；无效通用 token 配置使各协议都不可用。此判断不验证上游认证或网络连通性。
 default 保留显式 Host provider，即使不可用也不切换到 mock；实际模型请求明确返回配置错误或上游失败。
 字段契约见 `contracts/host-provider-v1.schema.json`，共享配置由 openpaw-llm::config 提供。
+
+## AI PC 会话专属桌面桥接（CHG-2026-0026）
+
+`PUT /session/{id}/ai-pc` 登记严格 JSON：`{"bridge_url":"http://host.docker.internal:PORT/ai-pc","token":"随机会话令牌"}`。仅接受 localhost、127.0.0.1、host.docker.internal 的 HTTP(S)，固定 `/ai-pc`，禁止用户信息、查询、片段与额外字段。请求限 8 KiB，令牌 32–256 个 ASCII 字母、数字、`-` 或 `_`。`DELETE` 同一路径撤销登记。
+
+两入口均受 Host Basic 认证保护，并要求已配置非空用户名与密码。无配置 503、无效认证 401、未知会话 404、活动回合 409、非法请求 400、成功 204。登记只在内存，Host 重启需重新登记；fork 不继承，成功删除会话清除登记，删除失败保留原登记。
+
+普通会话保留原 21 个工具。登记会话动态增加 `ai_pc_current_context`（严格空对象）和 `ai_pc_history_search`（可选 keyword/application，最多 256 字；from_ms/to_ms 为非负 Unix 毫秒，起点不晚于终点）。模型不能指定服务、会话、模式或凭据。包装器用可信 Host 会话 id 发 `POST /ai-pc/current` 或 `/history`，正文 `{"session_id":"真实身份","args":{...}}`，Bearer 使用登记令牌。不跟随重定向或系统代理，10 秒超时，响应最多 512 KiB，只接受 JSON 的 ok/empty/denied 状态。
+
+AI PC 每次查询检查令牌、受管会话及最新授权，交付前登记来源；受限检索只在授权片段上匹配。AI PC 会话的全局 `session_search` 拒绝调用并要求改用授权历史工具；普通会话的内置工具行为保持原合同。令牌不得进入工具声明、模型输入、journal、事件或日志。

@@ -129,3 +129,11 @@ Ubuntu/Linux 为 `start-demo.sh`。macOS 可复用 Bash 脚本，但需自行安
 同名参数并自动转换为 Linux 路径；Ubuntu 直接设置 `OPENPAW_SOURCE_ROOT`、
 `AI_OFFICE_SOURCE_ROOT`、`OPENPAW_ENV_FILE`。两套验收脚本也读取相同的源码根变量，避免启动和
 验收指向不同副本。
+
+## AI PC 专属工具连接
+
+适配源码基线为 `7c8262ee84eb77508a2da200714408e5f3aa5ebe`，独立分支 `feature/ai-pc-context-tools`（CHG-2026-0026）。AI PC 自动为自身创建的空闲会话登记 Windows 临时桥接端口，Docker Desktop 使用 `host.docker.internal`。Host 必须已启用 Basic 鉴权；该前提与模型运行在本地还是云端无关，权限由桌面的接收服务配置决定。
+
+桥接凭据保存在 Host 会话登记表内存，不使用进程环境；重启后 AI PC 在下一次自己会话的问答前重新登记。旧 Host 无登记接口时 AI PC 明确提示工具不可用，已有文字问答仍可运行。
+
+部署需在用户完成受保护接口审阅后单独批准。验证前记录现有镜像 identity、配置和卷映射；仅替换主 engine-host 镜像并保留配置/会话卷。先在独立测试 Host 验证 Basic、登记、默认会话隔离与容器到 Windows 桥接，再对批准后的主服务复验。回滚恢复原镜像，停止 AI PC 专属工具，保留会话数据。

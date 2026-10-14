@@ -42,6 +42,8 @@ const HOST_FORCE_HARVEST_MARGIN: Duration = Duration::from_millis(100);
 /// 参数：`state` 持有 session、审批、全局事件和配置。
 /// 返回：可供 axum server 使用的 Router。
 /// 错误：路由构建本身不执行 I/O；请求错误在各 handler 返回 4xx/5xx。
+/// 状态：不登记桌面会话，不更改会话历史。
+/// 并发与取消：请求由共享 runtime 协调；路由构建无 I/O。
 /// 权限：所有路由统一经过 Basic Authentication 中间件。
 /// 关联：`API-HOST-*`、`REQ-B-HOST-003`。
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -65,6 +67,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/session/{id}/summarize", post(no_content))
         .route("/session/{id}/prompt_async", post(prompt_async))
         .route("/session/{id}/abort", post(abort))
+        .route(
+            "/session/{id}/ai-pc",
+            axum::routing::put(register_ai_pc)
+                .delete(unregister_ai_pc)
+                .layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
         .route("/session/{id}/todo", get(todo))
         .route("/session/status", get(status))
         .route("/event", get(global_event_stream))
@@ -585,7 +593,7 @@ async fn schedule_turn(
             turn_id: accepted.turn_id,
             user_message_id: accepted.user_message_id,
             text: text.clone(),
-            provider_tools: handle.tools.clone(),
+            provider_tools: state.ai_pc_tools(&handle),
             provider,
             model: model_name,
             admission: accepted.admission,
@@ -610,6 +618,32 @@ async fn abort(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Re
     };
     handle.abort().await;
     Json(true).into_response()
+}
+async fn register_ai_pc(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<crate::ai_pc::RegistrationInput>, JsonRejection>,
+) -> Response {
+    let Ok(Json(input)) = body else {
+        return bad(StatusCode::BAD_REQUEST, "登记字段无效");
+    };
+    ai_pc_response(state.register_ai_pc(&id, Some(input)).await)
+}
+async fn unregister_ai_pc(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    ai_pc_response(state.register_ai_pc(&id, None).await)
+}
+fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Response {
+    use crate::ai_pc::RegistrationError;
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(RegistrationError::AuthenticationRequired) => bad(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "桌面登记需要配置 Host Basic 鉴权",
+        ),
+        Err(RegistrationError::NotFound) => bad(StatusCode::NOT_FOUND, "会话不存在"),
+        Err(RegistrationError::Busy) => bad(StatusCode::CONFLICT, "活动会话不能替换桌面登记"),
+        Err(RegistrationError::Invalid) => bad(StatusCode::BAD_REQUEST, "桌面登记字段无效"),
+    }
 }
 
 async fn todo(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {

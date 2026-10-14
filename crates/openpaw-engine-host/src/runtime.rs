@@ -449,6 +449,8 @@ impl SessionHandle {
 /// 功能：保存 Host 进程级配置、session 表、Office 投影和全局事件。
 /// 并发与取消：session 表使用读写锁；生命周期锁防止懒加载/删除竞态。
 pub struct AppState {
+    /// 功能：AI PC 可信会话登记，只保存在本 Host 进程内。
+    pub(crate) ai_pc: crate::ai_pc::Registrations,
     pub config: HostConfig,
     pub sessions: RwLock<HashMap<String, Arc<SessionHandle>>>,
     pub office: OfficeDispatcher,
@@ -501,7 +503,13 @@ impl AppState {
         ))
     }
     /// 功能：使用显式调度容量创建共享运行时状态，供可靠性测试和嵌入式 Host 使用。
+    /// 参数：config 为进程配置，scheduler_config 为调度上限。
+    /// 返回：持有空会话表与空桌面登记表的共享状态。
+    /// 错误：无；启动 I/O 由 Host 启动入口处理。
+    /// 状态：不恢复桌面凭据；后续需受认证重新登记。
     /// 并发与取消：所有 session 共享同一调度器；同 session 闸门仍独立生效。
+    /// 权限：创建状态不授予任何桌面访问权。
+    /// 关联：CHG-2026-0026。
     pub(crate) fn new_with_scheduler(
         config: HostConfig,
         scheduler_config: TurnSchedulerConfig,
@@ -509,6 +517,7 @@ impl AppState {
         let office = OfficeDispatcher::new(config.office_url.clone());
         let (global_events, _) = broadcast::channel(512);
         Arc::new(Self {
+            ai_pc: crate::ai_pc::Registrations::default(),
             config,
             sessions: RwLock::new(HashMap::new()),
             office,
@@ -800,6 +809,13 @@ impl AppState {
         Ok(handle)
     }
     /// 功能：删除单个非活动会话及其 JSONL 文件。
+    /// 参数：id 为待删除的 Host 会话身份。
+    /// 返回：会话存在时为 true，未知身份为 false。
+    /// 错误：活动回合或文件删除失败返回错误。
+    /// 状态：成功删除同步清除内存桌面登记；失败回滚保留登记。
+    /// 并发与取消：会话槽与 turn_gate 协调登记、加载、回合和删除。
+    /// 权限：仅删除指定会话及其凭据，不影响其他会话。
+    /// 关联：CHG-2026-0026。
     pub async fn delete_session(&self, id: &str) -> Result<bool, String> {
         if !valid_session_id(id) {
             return Ok(false);
@@ -825,10 +841,18 @@ impl AppState {
             .join(format!("{id}.jsonl"));
         match std::fs::remove_file(&path) {
             Ok(()) => {
+                self.ai_pc
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(id);
                 self.remove_session_slot(id, &slot).await;
                 Ok(true)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.ai_pc
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(id);
                 self.remove_session_slot(id, &slot).await;
                 Ok(handle.is_some())
             }
@@ -864,7 +888,11 @@ impl AppState {
             });
         let workspace = absolute_workspace(session_workspace(&read.events, &self.config.workspace))
             .map_err(|_| SessionLoadError::Unavailable)?;
-        let tool_host = openpaw_tools::arc_registry(&workspace);
+        let tool_host = crate::ai_pc::wrap(
+            openpaw_tools::arc_registry(&workspace),
+            id,
+            self.ai_pc.clone(),
+        );
         let tools = tool_host
             .list_tools()
             .await
@@ -914,6 +942,73 @@ impl AppState {
             request_admissions,
         }))
     }
+    /// 功能：为已存在的空闲会话登记或撤销桌面桥接。
+    /// 参数：id 为路由身份，input 为严格登记请求；None 表示撤销。
+    /// 返回：成功返回空值。
+    /// 错误：无 Basic、未知会话、活动回合或非法输入返回稳定分类。
+    /// 状态：仅修改进程内登记表，不写 journal。
+    /// 并发与取消：生命周期槽与 turn_gate 线性化删除、登记和回合接收；锁内无 await。
+    /// 权限：仅受认证 Host 管理入口使用，模型不能调用。
+    /// 关联：CHG-2026-0026。
+    pub(crate) async fn register_ai_pc(
+        &self,
+        id: &str,
+        input: Option<crate::ai_pc::RegistrationInput>,
+    ) -> Result<(), crate::ai_pc::RegistrationError> {
+        use crate::ai_pc::RegistrationError;
+        if self.config.username.as_ref().is_none_or(|s| s.is_empty())
+            || self.config.password.as_ref().is_none_or(|s| s.is_empty())
+        {
+            return Err(RegistrationError::AuthenticationRequired);
+        }
+        let registration = input
+            .map(crate::ai_pc::RegistrationInput::checked)
+            .transpose()?;
+        let handle = self
+            .get_typed(id)
+            .await
+            .map_err(|_| RegistrationError::NotFound)?;
+        let slot = self.session_slot(id).await;
+        let _lifecycle = slot.lock().await;
+        let _gate = handle.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if handle.is_deleting() {
+            return Err(RegistrationError::NotFound);
+        }
+        if handle.active.load(Ordering::Acquire) {
+            return Err(RegistrationError::Busy);
+        }
+        let mut registrations = self.ai_pc.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = registration {
+            registrations.insert(id.into(), r);
+        } else {
+            registrations.remove(id);
+        }
+        Ok(())
+    }
+    /// 功能：在已接收回合中取得最新工具声明。
+    /// 参数：handle 为可信运行时会话。
+    /// 返回：默认工具与该会话已登记的桌面工具。
+    /// 错误：无。
+    /// 状态：不改变工具或会话。
+    /// 并发与取消：登记读锁同步释放，活动回合禁止替换登记。
+    /// 权限：其他会话不增加声明。
+    /// 关联：CHG-2026-0026。
+    pub(crate) fn ai_pc_tools(&self, handle: &SessionHandle) -> Vec<openpaw_core::ToolSpec> {
+        let mut tools = handle.tools.clone();
+        if self
+            .ai_pc
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&handle.id)
+        {
+            for spec in crate::ai_pc::specs() {
+                if !tools.iter().any(|t| t.name == spec.name) {
+                    tools.push(spec);
+                }
+            }
+        }
+        tools
+    }
     /// 功能：创建 session、JSONL meta 和 AgentLoop 运行资源。
     /// 参数：provider_name、model 覆盖默认模型配置，workspace、title 指定工作区与标题。
     /// 返回：已登记且无历史消息或错误的新会话句柄。
@@ -942,7 +1037,11 @@ impl AppState {
         session.meta.id = id.clone();
         let cancel = CancellationToken::new();
         let approvals = HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel);
-        let tool_host = openpaw_tools::arc_registry(&workspace);
+        let tool_host = crate::ai_pc::wrap(
+            openpaw_tools::arc_registry(&workspace),
+            &id,
+            self.ai_pc.clone(),
+        );
         let tools = tool_host.list_tools().await.map_err(|e| e.to_string())?;
         let agent = configured_agent(provider, model_name, tool_host, approvals.clone())?;
         let home = self.config.home.clone();
@@ -1243,7 +1342,11 @@ impl AppState {
                 self.global_events.clone(),
                 CancellationToken::new(),
             );
-            let tool_host = openpaw_tools::arc_registry(&source.workspace);
+            let tool_host = crate::ai_pc::wrap(
+                openpaw_tools::arc_registry(&source.workspace),
+                &new_id,
+                self.ai_pc.clone(),
+            );
             let agent =
                 configured_agent(provider, model_name.clone(), tool_host, approvals.clone())
                     .map_err(|_| {
