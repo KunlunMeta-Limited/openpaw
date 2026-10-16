@@ -267,3 +267,27 @@ Everypaw对应候选 `d86a869` 已合最新 `6cb7593`。Recorder121/121、Deskto
 | `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0。复制单份独立 `openpaw-input11.exe` 供Desktop成对测试，SHA256 `DE0FED33B1CE351F6F4FC4312759433E6810DFD4F90AF4E5FEC856762B3231CF`，不复制缓存。 |
 
 Engine构建位已正式交08，后续08/最终17组合需重新核对实际制品。11不部署、不push、不切服务、不改DeepSeek、不读取真实用户桌面；真实Docker/管理员/混合DPI/登录重启、生产模型接受、CODEOWNER、历史来源DCO和CI仍独立保留。既有Windows snapshot和缺cargo-deny已如实列出。
+
+### 08 最终组合核验（2026-10-17）
+
+实现候选 `62bb441` 已合引擎集成 `67a22b2`，包含07/08/09/10/11全部产品路径。08新增ReadOnly/ParallelSafe正文工具，登记总数29，回执五种视觉工具完整；没有新增Core/AgentLoop/provider/依赖、全局工具、端口、权限开关或预算豁免。业务改动只在已预先登记的ai_pc.rs/ai_pc_visual.rs/http.rs；配套文档仍在原允许表内。中文公共/受限可见Rustdoc八栏目及DCO保留。
+
+| 实际命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 退出0。 |
+| `cargo test --workspace` | 退出0，默认配置完整workspace通过。 |
+| `cargo test --workspace --features engine-host` | 退出0，含Host62+16+36=114及CLI/Host parity3/3；混合动作真实21秒HTTP、正文严格schema/身份与原有结构/PNG保留。 |
+| 默认与显式Host的 `cargo clippy --workspace --all-targets -- -D warnings` | 两者退出0。 |
+| `cargo run -p xtask -- lines` | 退出0；Host6769/7000、外部tests3943/4000、aux11497/11500；预算与计数器未改。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，仍为06已在未实施基线证明的Windows CRLF/LF快照差异；未改受保护快照/检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 均退出0，golden全绿，284依赖/229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| 既有cargo-deny0.20.2绝对路径 `--workspace --locked --color never check --show-stats` | 实际退出1：`C:/Users/JingJia/.cargo/advisory-dbs/db.lock` exclusive lock on read-only path。二进制已存在；先前PATH下查不到命令不代表没有二进制。未新增工具、审计库、配置或豁免，审计未通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0；只复制一份独立 `openpaw-text08-62bb441.exe`，SHA256 `3AC6227018C57AD878D37423002873CFC67B5D0B92FAD5D8BBEC92EDB25C5719`。 |
+
+Everypaw对应App696430d：Recorder126/126、Desktop91＋通知2及两个manifest的fmt通过；自建屏幕外、不激活Win32 EDIT的真实TextPattern长正文1/1（0.76秒），18,001 UTF-16逐页拼接无遗漏，涵盖非BMP/组合/CRLF、负尾页、越界、夹断、实时更新及旧/跨context/关闭失败。真实HTTP＋受验证IPC检查原取得页、独立模型投影、精确ACK、撤销及超过5秒的迟到只归原调用。未读取用户应用或注入真实用户输入。
+
+新组合CLI的官方Host成对 `paired_ --ignored` 7/7通过（15.73秒），覆盖列窗、结构、正文、原始PNG、动作、混合输入和12追问/重生成。正文工具确由模型选择，offset1/limit3的实际下一次provider请求收到 `😀e`、UTF-16 range0..3、next3、exact7与10240估算token标记；逐值等于持久投影，原调用host_accepted且无令牌外露。ACK只证明Host已解析接受该精确投影，不等于生产模型理解。大PNG原件、部分动作与重生成不重放的既有证据仍通过。
+
+最终源码范围/预算未扩大，没有更换DeepSeek、启动/重启现有服务、push/部署或清理数据。snapshot、cargo-deny锁路径、真实Docker/管理员/Alt+Alt/混合DPI/登录重启、生产模型接受性、CODEOWNER、历史来源DCO和CI仍独立待验。完整Everypaw记录为 `ticket-08-verification.md`；纯文档集成更新不改变以上候选产品代码。

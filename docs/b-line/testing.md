@@ -422,6 +422,8 @@ Everypaw 对应测试使用真实桌面 HTTP 桥、已验证 named-pipe IPC、�
 Everypaw `ticket-07-verification.md` 分开记录：真实 HTTP/受验证 IPC/Recorder 的默认值、钳制、预算、空容器折叠、文本去重、权限收窄/ACK、停止与迟到结果；自建 Windows 层级的真实 UIA 方向、分页、当前名称变化、替换/关闭失败；实际官方 Host 进程与受控模型贯通。测试仅操作自建窗口或原生替身，不外发真实用户桌面。
 
 08的 `ai_pc::tests::text_tool_declares_utf16_paging_and_rejects_forged_scope_before_dispatch` 经真实登记工具包装入口验证ReadOnly/ParallelSafe、4096默认、带符号有界offset和严格身份/probe字段拒绝；首红未声明工具、实现后绿。Host全包当前62+16+36=114绿。Everypaw的正文HTTP/验证IPC、原取得页/独立模型投影、当前内容变化、UTF-16/长度可信度、权限/停止/迟到原调用归属、自建Windows长EDIT及官方Host实际provider输入分别记录于 `ticket-08-verification.md`；是否通过以该记录及本CHG最终组合表为准，不以模型回答措辞代替文字/范围/投影逐值断言。
+
+08最终组合62bb441已合11：默认workspace、Host-feature workspace（含Host114和parity3）、两种严格Clippy、fmt及lines/scrub/golden/telemetry均退出0；Windows snapshot退出1与cargo-deny既有审计库只读锁限制分别保留。隔离官方CLI `openpaw-text08-62bb441.exe` 与Everypaw paired全组7/7，正文模型请求的具体文本/范围严格等于本地已交付投影；真实Windows长EDIT1/1。具体SHA/数量/时点及未验环境见CHG08最终表，不把受控模型等同于现有DeepSeek或真实Docker。
 11 将既有 `action_batches_use_existing_write_approval_and_return_actual_partial_result_once` 扩为set_text/shortcut/wait混合批次，保留Write/NeverParallel与原调用精确ACK；缺text、负数/溢出wait、未知修饰键、组合主键及后续步骤非法时HTTP零分发。另真实延迟21秒HTTP结果验证声明wait不再被原20秒Host期限截断。Host全包61+16+36、默认workspace、两种严格Clippy、parity3/3及治理命令的具体退出码见CHG-0029，不把受控HTTP当作真实输入。
 
 Everypaw `ticket-11-verification.md` 记录公开问答/证据参数留存、真实桥与验证IPC的混合顺序/11秒wait/可取消wait、同步文字调用挂起时保持执行占位与迟到归属、部分键盘输入unknown不重发、官方Host进程成对交付，以及仅操作自建EDIT控件的真实Unicode整值替换与Ctrl+A。最后组装候选仍需重跑；管理员窗口、真实用户快捷键、登录重启、Docker和生产模型接受性不是这些用例的证明范围。
