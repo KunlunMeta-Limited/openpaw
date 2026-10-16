@@ -1,6 +1,6 @@
 # CHG-2026-0029：Everypaw 实时视觉工具
 
-状态：approved / 06 列窗与09 PNG源码、Host受控模型及Everypaw大图成对验收、09本地治理完成；既有平台与外部门禁保留，后续视觉票依任务图进行。日期：2026-10-16。
+状态：approved / 06列窗、07结构、09原始PNG、10调用/点击批次完成本地组合验收；08/11按任务图继续，既有平台与外部门禁保留。更新：2026-10-17。
 
 ## 授权、基线与边界
 
@@ -182,3 +182,52 @@
 Everypaw 已运行 `paired_official_host_model_desktop_http_ipc_and_store_roundtrip --ignored`（退出 0）：真实官方 `openpaw.exe` 隔离进程、本地受控 SSE 模型、真实桌面 HTTP 桥、受验证 named-pipe 原生替身、隔离 Recorder、精确 ACK 和第二轮模型请求贯通；ToolResult 与保存投影逐值一致、原回合关联正确、不含 token。另实际 Windows `metadata_window_list_retains_real_child_witness_without_initializing_uia --ignored` 退出 0，证明 EnumWindows 取得自建子进程窗口、应用身份和 -wv 引用、OS 销毁后失效，metadata 未初始化 UIA。这两个证明面分别记载于 Everypaw `ticket-06-verification.md`。
 
 真实 Docker Desktop Linux engine 管道不可用，未做容器连通验收；回环/原生替身不作为 Docker 通过证据。L3 CODEOWNER、来源 DCO 缺口、CI 和部署仍待独立完成；本轮不 push、不部署、不切换现有 DeepSeek 服务。
+
+## 07：实时结构查询
+
+本票从06的 `4acf3c8` 开始，在 `feature/everypaw-visual-07` 实施，Everypaw为 `feature/desktop-structure-07`。沿用上述既有用户授权及10文件边界；未改Core/Engine/Store/Tools/provider、依赖、预算或计数。先提交最小共同分发接缝 `4fe7b50`，其后只在已允许的 ai_pc/ai_pc_visual/http 和本文、b-line协议/连接/验证、索引中加入结构行为及证据。
+
+实际符号为 `validate_structure`、`specs` 的 `ai_pc_query_structure`、`DesktopTools::call/validate_input`、`ai_pc_visual::call` 的 `/ai-pc/structure`，登记头按实际实现增加结构工具。严格模型字段为原生generation/target_id/directions/offset/limit/boxes；默认all/0/128/false，正limit由桌面钳制1024，模型不能填写可信身份。仍为ReadOnly/ParallelSafe，单次HTTP→原始可信调用→精确ACK→既有ToolCallOutcome；无媒体、摘要模型、自动重试或新增权限流程。
+
+每次返回独立当前观察、紧凑节点/必要关系/状态/短正文，坐标按需；本地实际取得与4096估算token模型副本分别保留。原始窗口witness在metadata/UIA owner之间只传无COM的Arc租约并复核，-wv缓存同一短ID；引用关闭/替换/跨上下文/旧代次均不重绑。实际取得节点/字节/平台操作和同步调用间期限由桌面控制，返回及ACK重新检查当前信息规则。取消先到以pending_visual_tool占位，可信route晚到只纠正名称、拒绝执行；原生迟到completion仅保存原invocation本地。
+
+| 已执行命令 | 实际结果 |
+| --- | --- |
+| `cargo test -p openpaw-engine-host --features engine-host --lib -- --test-threads=1` | 退出0，60/60。新schema严格输入及真实Host Router/受控SSE模型选择structure、可信参数、精确ACK、第二次模型请求完整投影均通过；保留列窗/旧工具/附件/取消回归。 |
+| `cargo test --workspace --features engine-host -- --test-threads=1` | 退出0，全workspace及CLI/Host parity通过；源码路径明确是engine-visual-07，不以其他分支fresh冒充。 |
+| `cargo test --workspace -- --test-threads=1` | 退出0，默认workspace完整通过，保留默认依赖隔离。 |
+| `cargo fmt --all -- --check` | 退出0。 |
+| 默认及显式 `--features engine-host` 的 `cargo clippy --workspace --all-targets -- -D warnings` | 两条退出0。 |
+| `cargo run -p xtask -- lines` | 退出0：Host6526/7000、Host外部tests3943/4000、aux11497/11500。新测试在获准源文件内联，未移动旧测试或改变计数。并行视觉票最终叠加仍须重新测量。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，复现06已在未实施分支证明的Windows CRLF/LF逐字节差异；本票未改Core、快照或检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 两条退出0，golden全通过；284依赖、229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo deny --version` | 退出101，命令未安装；不安装新依赖，不宣称本地依赖审计通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0；仅隔离构建。留单份25,238,528字节 `openpaw-structure07.exe` 供共享target被下一票覆盖后的成对验收，非复制缓存。SHA256 `0D8ACAE7249254AA675C113CAF72BFA76A596E6F1F882593D9E6143F3023E1A9`。 |
+
+Everypaw真实HTTP/受验证IPC/SQLite边界最终1/1绿（6.61秒）：默认/钳制、严格参数、连续独立观察、1024实际节点/4096估算token、空容器折叠/文本去重、全局/服务/授权/应用收窄、精确ACK、cancel-before-request和超过5秒实际迟到归属均核对。大结构首红504来自逐节点pop重复序列化，改确定性前缀二分后绿，未提高超时/预算。自建离屏不激活STATIC/BUTTON子进程真实UIA测试1/1绿（3.56秒），保留方向/offset/越界/limit/boxes/同ID当前名称/替换旧ID拒绝/跨context及代次/关闭全部严格断言；首红查明S_OK+null在Windows binding表现为Err(code0)，修为真正失败HRESULT才记partial，未吞掉provider失败。
+
+以上是07独立阶段证据，最终组合见下节。完整通用来源/工具过程UI由Everypaw正式14消费本票的本地/交付/ACK证据；本票不冒称该界面、真实Docker、管理员快捷键、生产模型、CODEOWNER/DCO/CI或部署通过。
+
+### 07 与09/10最终组合（2026-10-17）
+
+07分支合入最新引擎集成 `a86abfbaa0017121cfa6a42624fdc23abbfae634`，明确合并结构/PNG/动作的声明、验证、路由与测试。最终实现候选 `663de83`；注册回执准确列四个新工具，已登记工具总数28。首跑仅旧合并断言27与实际28不符，按规格更新独立预期并完整重跑。结构的ReadOnly/ParallelSafe与动作Write/NeverParallel继续分开；未改默认工具审批、Core/AgentLoop/Store/provider、依赖、预算或计数。
+
+| 当前组合实际命令 | 结果 |
+| --- | --- |
+| `cargo test --workspace --features engine-host -- --test-threads=1` | 最终退出0，完整workspace；Host61+16+36=113，CLI/Host parity3/3。保留07结构Router与09六场景PNG/窄REST及10实际部分结果。 |
+| `cargo test --workspace -- --test-threads=1` | 退出0，完整默认workspace及doctest。跨树刷新源码mtime，编译输出明确engine-visual-07。 |
+| 默认与显式Host `cargo clippy --workspace --all-targets … -- -D warnings` | 两条退出0。 |
+| `cargo fmt --all -- --check` | 退出0。 |
+| `cargo run -p xtask -- lines` | 退出0，Host6638/7000、tests3943/4000、aux11497/11500，无预算/计数变化。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，仍为06已在未实施基线证明的Windows CRLF/LF平台差异；未修改受保护快照或检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 均退出0，golden全绿；284依赖、229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo deny --version` | 退出101，未安装；未新增工具，不宣称本地依赖审计通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0。由663de83重建隔离官方CLI `openpaw-structure07.exe`，SHA256 `3B2563AC0D5BDBFFFD91B6B6255968BC6A182E68C35107E23CF0EB6D49EAE5BA`，替代此前合09前的同名制品。 |
+
+Everypaw对应候选 `d86a869` 已合最新 `6cb7593`。Recorder121/121、Desktop88＋通知2、真实层级UIA/WGC像素/Invoke点击各1/1通过；新组合CLI官方paired4/4（11.77秒）：结构与列窗完整已交付投影/精确ACK、同轮四张4,841,533B原PNG与2,360,312B子区PNG的保存/provider字节及SSE/窄REST、动作实际部分结果/不重放。最新native注册/字段读取deadline也经真实层级复验。没有访问真实用户桌面或调用生产模型。
+
+最终变更仍仅10个允许文件，公共/受限可见Rust项的中文八栏目保持；实现与合并提交均带DCO。snapshot、cargo-deny缺失、真实Docker/管理员/登录重启、CODEOWNER/历史来源DCO/CI和部署仍待独立完成。完整Everypaw证据为其 `ticket-07-verification.md`；没有切换DeepSeek、运行服务、push或清理数据。
