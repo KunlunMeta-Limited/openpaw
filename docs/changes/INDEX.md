@@ -34,7 +34,7 @@
 | CHG-2026-0026（独立来源） | [AI PC 专属当前上下文及历史工具](CHG-2026-0026-AI-PC专属上下文工具.md) | approved / 源码实现与验证完成，部署待审阅 | high | 用户批准并负责接口审阅；Codex 实施 | 2 | 7 |
 | CHG-2026-0027 | 附件辅助信息展示与标题修复 | approved / 实施与验证完成；按用户指示直接提交多模态 feature 分支；独立测试前端运行于 5188；IME 单独保留 | medium | 用户批准；Codex 实施 | 现有消息合同扩展，详见 CHG | 实际 19 / 批准 20（全部 OpenPaw） |
 | CHG-2026-0028 | [多模态与 AI PC 工具集成](CHG-2026-0028-多模态与AI-PC工具集成.md) | approved / 本地集成、检查及两轴审查完成；来源 DCO 与人工接口审阅待处理；未推送/部署 | high | 用户批准并负责接口审阅；Codex 实施 | 沿用来源合同 | 9 |
-| CHG-2026-0029 | [Everypaw 实时视觉工具](CHG-2026-0029-Everypaw实时视觉工具.md) | approved / 06 列窗源码及 Host 本地验证完成；既有 Windows snapshot、缺失 cargo-deny 与 Docker 验收如实保留，人工接口审阅/来源 DCO/CI/部署待完成 | high | 用户规格决策；Codex 实施 | 既有登记扩展，已实现列窗；后续四类仍依任务图，详见 CHG | 允许 10，当前 10 |
+| CHG-2026-0029 | [Everypaw 实时视觉工具](CHG-2026-0029-Everypaw实时视觉工具.md) | approved / 06列窗与09原始PNG、受控主模型、同轮四图成对及09本地治理完成；既有Windows snapshot/缺cargo-deny/Docker与人工接口审阅/来源DCO/CI/部署保留 | high | 用户规格决策；Codex 实施 | 既有登记及API-HOST-SESSION-004可选窄读取扩展；已实现列窗/PNG，其余依任务图 | 允许 10，当前 10 |
 
 CHG-2026-0025 的文件数量为当前 diff 的 25 个实际文件，不包含原有 `.ua/`。
 Q1–Q5 已确认，迁移、本地回归及 cargo-deny 0.20.2 依赖审计完成；审计经本机 7890
