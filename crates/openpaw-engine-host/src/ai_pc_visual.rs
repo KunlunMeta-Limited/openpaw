@@ -144,6 +144,7 @@ pub(super) async fn call(
 ) -> Result<ToolCallOutcome, String> {
     let path = match name {
         "ai_pc_list_windows" => "/ai-pc/windows",
+        "ai_pc_query_structure" => "/ai-pc/structure",
         "ai_pc_action_batch" => "/ai-pc/actions",
         "ai_pc_capture_target" => "/ai-pc/capture",
         _ => return Err("此实时桌面工具尚未实现。".into()),

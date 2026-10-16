@@ -736,7 +736,7 @@ fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Respon
                 ("openpaw-desktop-protocol", "1"),
                 (
                     "openpaw-desktop-tools",
-                    "ai_pc_list_windows,ai_pc_capture_target,ai_pc_action_batch",
+                    "ai_pc_list_windows,ai_pc_query_structure,ai_pc_capture_target,ai_pc_action_batch",
                 ),
             ],
         )
@@ -1527,22 +1527,40 @@ mod tests {
 
     #[tokio::test]
     async fn registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
+        visual_roundtrip("ai_pc_list_windows",serde_json::json!({}),"windows",serde_json::json!({"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]})).await;
+    }
+
+    #[tokio::test]
+    async fn registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
+        visual_roundtrip("ai_pc_query_structure",serde_json::json!({"generation":"native","target_id":"native-v1","directions":"children,parent","offset":2,"limit":5000,"boxes":true}),"structure",serde_json::json!({"kind":"untrusted_ui_data","observation":"live_structure","controls":[{"id":"native-v1","name":"本次控件","box":[-10,20,40,50]}]})).await;
+    }
+
+    async fn visual_roundtrip(
+        name: &'static str,
+        args: serde_json::Value,
+        path: &str,
+        projection: serde_json::Value,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _env = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
-        for case in 0..6 {
-            let capture = case != 0;
+        for case in if name == "ai_pc_query_structure" {
+            6..7
+        } else {
+            0..6
+        } {
+            let capture = (1..6).contains(&case);
             let tool_name = if capture {
                 "ai_pc_capture_target"
             } else {
-                "ai_pc_list_windows"
+                name
             };
             let tool_args = if capture {
-                r#"{"target_id":"native-v1"}"#
+                r#"{"target_id":"native-v1"}"#.to_string()
             } else {
-                "{}"
+                args.to_string()
             };
             let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLttAAAAABJRU5ErkJggg==";
             let calls = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
@@ -1551,7 +1569,7 @@ mod tests {
             let seen = model_seen.clone();
             let count = model_calls.clone();
             let model = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
-            let (seen, count) = (seen.clone(), count.clone());
+            let (seen, count, tool_args) = (seen.clone(), count.clone(), tool_args.clone());
             async move {
                 seen.lock().await.push(body);
                 let chunk = if count.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -1566,9 +1584,15 @@ mod tests {
                 axum::serve(listener, model).await.unwrap();
             });
             let observed = calls.clone();
-            let bridge = Router::new().route(if capture { "/ai-pc/capture" } else { "/ai-pc/windows" },post(move |Json(body): Json<serde_json::Value>| {
-            let observed = observed.clone();
-            async move { observed.lock().await.push(body.clone()); let mut value = serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":{"kind":"untrusted_ui_data","target_id":"native-v1"}}); if capture { value["media"] = serde_json::json!([{"id":"att_fixture","mime":if case==4{"image/jpeg"}else{"image/png"},"data":if case==5{"AAAA"}else{png},"filename":"target.png"}]); } Json(value) }
+            let saved_projection = if capture {
+                serde_json::json!({"kind":"untrusted_ui_data","target_id":"native-v1"})
+            } else {
+                projection.clone()
+            };
+            let bridge_projection = saved_projection.clone();
+            let bridge = Router::new().route(&format!("/ai-pc/{}", if capture { "capture" } else { path }),post(move |Json(body): Json<serde_json::Value>| {
+            let (observed,projection) = (observed.clone(), bridge_projection.clone());
+            async move { observed.lock().await.push(body.clone()); let mut value = serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":projection}); if capture { value["media"] = serde_json::json!([{"id":"att_fixture","mime":if case==4{"image/jpeg"}else{"image/png"},"data":if case==5{"AAAA"}else{png},"filename":"target.png"}]); } Json(value) }
         }));
             let observed = calls.clone();
             let bridge = bridge.route(
@@ -1646,7 +1670,7 @@ mod tests {
             bridge_task.abort();
             assert_eq!(status, StatusCode::OK);
             let calls = calls.lock().await;
-            if case >= 2 {
+            if (2..6).contains(&case) {
                 assert_eq!(
                     calls.len(),
                     if case < 4 { 0 } else { 1 },
@@ -1668,6 +1692,14 @@ mod tests {
             );
             assert_eq!(calls[0]["session_id"], handle.id);
             assert_eq!(calls[0]["request_id"], "trusted-request");
+            assert_eq!(
+                calls[0]["args"],
+                if capture {
+                    serde_json::json!({"target_id":"native-v1"})
+                } else {
+                    args.clone()
+                }
+            );
             assert!(calls[0]["host_turn_id"].is_string());
             assert!(calls[0]["generation"].is_string());
             assert_eq!(calls[1]["call"], calls[0]);
@@ -1725,6 +1757,11 @@ mod tests {
                 .find(|m| m["role"] == "tool")
                 .unwrap();
             assert_eq!(tool["tool_call_id"], "provider-list");
+            let model_result =
+                serde_json::from_str::<serde_json::Value>(tool["content"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(model_result["result"], saved_projection);
+            assert_eq!(model_result["invocation_id"], calls[0]["invocation_id"]);
             assert!(tool["content"].as_str().unwrap().contains("native-v1"));
             assert!(!tool["content"].as_str().unwrap().contains(&"a".repeat(64)));
             if capture {
