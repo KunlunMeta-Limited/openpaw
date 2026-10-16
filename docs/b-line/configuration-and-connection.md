@@ -176,3 +176,7 @@ Chat 工具结果保留文本和调用 ID，随后媒体 user 输入只是协议
 部署需在用户完成受保护接口审阅后单独批准。验证前记录现有镜像 identity、配置和卷映射；仅替换主 engine-host 镜像并保留配置/会话卷。先在独立测试 Host 验证 Basic、登记、默认会话隔离与容器到 Windows 桥接，再对批准后的主服务复验。回滚恢复原镜像，停止 AI PC 专属工具，保留会话数据。
 
 多模态与 AI PC 工具的集成分支为 `merge/multimodal-ai-pc-context-tools`（CHG-2026-0028），起点多模态 `8d88e44`，合入 AI PC `a6b4703`；两份来源 CHG-0026 以完整标题区分。媒体能力声明与模型配置沿用多模态分支，桌面登记不会扩展模型能力或桌面外发权限。
+
+Everypaw 实时列窗源码基于 `c105d80356f7217138d3b70bfab1d72d5a271f4d`，任务分支 `feature/everypaw-visual-06`，集成分支 `feature/everypaw-desktop-visual-integration`（CHG-0029）。构建仍显式启用 `engine-host`。登记 204 的 version/tools 响应头是实际能力协商，缺头是 legacy，不能按 Host 在线或普通文字成功推断实时工具可用。
+
+桌面桥继续绑定 `0.0.0.0` 随机端口并返回 `http://host.docker.internal:PORT/ai-pc`，原生 IPC 仍只验证本机对端，不增加网络原生入口。回环受控测试仅证明协议/授权/证据逻辑；当前 Docker Desktop Linux pipe 不可用，真实容器可达验证待环境恢复。本轮只构建隔离源码与测试，不替换现有服务、镜像、数据卷或 DeepSeek 云端配置。

@@ -7,6 +7,8 @@
 #[cfg(feature = "engine-host")]
 mod ai_pc;
 #[cfg(feature = "engine-host")]
+mod ai_pc_visual;
+#[cfg(feature = "engine-host")]
 mod approval;
 #[cfg(feature = "engine-host")]
 mod events;

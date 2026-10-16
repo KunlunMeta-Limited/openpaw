@@ -220,3 +220,21 @@ staged Revert/Unrevert 保留完整历史，提交回退同步裁剪注解。压
 AI PC 每次查询检查令牌、受管会话及最新授权，交付前登记来源；受限检索只在授权片段上匹配。AI PC 会话的全局 `session_search` 拒绝调用并要求改用授权历史工具；普通会话的内置工具行为保持原合同。令牌不得进入工具声明、模型输入、journal、事件或日志。
 
 CHG-2026-0028 集成保留会话原生附件安装、回看与回合结束清理；AI PC 包装器透传媒体上下文给同一会话的内置工具。桌面当前/历史工具仍只返回授权文字 JSON、空媒体列表，不自动发送截图。
+
+### Everypaw 实时列窗扩展（CHG-2026-0029 / 06）
+
+上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows`。当前已登记工具共 25 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称其他视觉工具已经存在。
+
+`ai_pc_list_windows` 参数严格为 `{}`，声明 ReadOnly/ParallelSafe。runtime 在真实接收回合获准 running 后，从持久 admission 取得 requestID/Host turn，以原取消 token、每次执行随机 generation 和所选 provider 实际 image_input 能力安装私有上下文；退出守卫只清除自身 generation。模型输入不能填写身份。
+
+Host 单次 POST `/ai-pc/windows`，Bearer 为原登记令牌，JSON 为 `{session_id, request_id, host_turn_id, generation, invocation_id, args:{}}`。invocation_id 是 Host 新生成 UUID，不能按工具名称、参数或并发顺序猜配 provider callID。Host generation 与结果中的能力进程 generation 是不同层次。
+
+成功响应严格为 `{protocol_version:1, invocation_id, delivery_id, status:"ok", projection:{...}}`，投影标记 `kind:"untrusted_ui_data"`，包括 observation_id/native generation/observed_at_ms、windows（id/app/process_id/title）、partial、估算器和必要原因。窗口是当前观察，界面文字不能作为指令；无窗口数量默认上限。窗口短 ID 绑定原聊天上下文、真实窗口存活 witness 和能力进程代次，本身不授予权限。
+
+Host 完整解析、校验身份/容量/活动代次后 POST `/ai-pc/ack`，正文 `{call:原完整可信调用, delivery_id:原唯一交付nonce}`；仅严格 `{status:"accepted"}` 视为桌面接纳该精确 ACK。桌面在响应与 ACK 时重新核对服务、Host、原回合/授权及当前应用权限。ACK 只执行短 Recorder 检查，不等待 UIA/native。结果交给模型的结构为 `{invocation_id,status,result:projection}`，无 token、应用完整路径或本地 acquired 原件。此状态表示 Host 解析接受，不表示 provider 接收或模型理解。
+
+工程限额：桥整体 HTTP 收包 3 秒、body 8 KiB；列窗 Host 等待 20 秒、结果 1 MiB，ACK/补充 cancel 各 2 秒；桌面 HTTP native 等待 10 秒、最多两个 detached acquisition 工作位，另留其余 HTTP 容量处理控制和旧工具。原生列窗目标预算 3 秒、实际内容约 8 MiB（含 JSON escaping/本地应用身份），IPC 帧仍为 64 MiB；标题在 16,383 UTF-16 单元处有界并报告 partial。默认模型投影 20,000 估算 token（utf8_bytes/4），还受现有用户交付字节预算约束，裁剪明确。短收包期限不充当 UIA 期限。
+
+取消正文为原调用，路径 `/ai-pc/cancel`。桌面在工作前建立取消 tombstone，晚到同 invocation 不执行；等待期间撤销、切换服务或停止后，实际迟到内容仅保存原调用本地证据，不生成/恢复模型结果。列窗显式保留 IPC 实际 completion：超时或 cancel 不丢弃同 ID/native generation 的真实结果；bounded acquisition 工作位保持到真实完成或进程断连。旧 background/01 路径保持原 discard 语义。Host future Drop 使用独立 64 项有界队列 try_send 补充 cancel，运行时退出或队满不保证送达；桌面原回合 Stop 是主路径。所有工具和控制均不自行重试。
+
+metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment。各 worker 持有自己的原生对象，仅共享无 COM 的 ID/active/completed authority，统一执行每上下文 8 个非空视觉回合、总计 2048 个不同 ID 的软限及最新轮保护。同轮多个附件/工具采用并集；metadata 使用 `-wv` 命名空间，控件使用 `-v`，防止跨表碰撞。Complete/Abandon 有界异步广播，不等待卡住的 provider。后续 UIA 读取窗口引用须在能力进程内延续同一 witness、创建前后复核，不能把 HWND 当永久身份或跨 apartment 传递 Rc/COM。
