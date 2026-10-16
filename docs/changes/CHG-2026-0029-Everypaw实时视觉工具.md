@@ -60,6 +60,12 @@
 
 ## 执行记录
 
+### 11 实施前登记（2026-10-17）
+
+正式11在既有批准的 ai_pc.rs、ai_pc_visual.rs 与本表文档范围内扩展同一 `ai_pc_action_batch`，不增加工具、依赖、审批或预算。模型步骤增加 `set_text:{target_id,text}`（text显式必填、允许空字符串）、`shortcut:{target_id,key,modifiers?}`（VK名称及明确修饰键白名单，未知值整批拒绝）与 `wait:{delay_ms}`（非负 signed32、允许0）。所有步骤严格解析后才可分发任何效果；wait不接受target，输入动作仍绑定原context/native generation/窗口witness。
+
+沿用10的桌面会话FIFO、原调用证据、独立取消与未知不重放。仅动作批次的工程等待期限按已校验wait总毫秒加既有native/桌面10秒、Host20秒计算，使用u64安全求和；不把短HTTP收包期限当作wait产品上限，不扩大其他工具期限。已有悬浮问答180秒总体期限仍保留，其取消不证明同步输入已经结束。实际Windows通过自建隔离EDIT验证ValuePattern整值替换、只读/不支持、目标焦点与真实快捷键；部分SendInput可能已经生效，保留接受数量并报告unknown，不补发。
+
 ### 10 Host 局部验证（2026-10-16）
 
 动作票在 `feature/everypaw-visual-10` 复用 07 的私有 `call(name, ...)` 接缝（本分支提交 `b5428a4`），只修改已登记的七个文件：ai_pc.rs、ai_pc_visual.rs、http.rs、本记录及三份 b-line 文档。`validate` 严格验证 generation、1–64 步 invoke/click 与 target_id，拒绝额外字段；`specs` 声明 Write/NeverParallel，`DesktopTools::call/validate_input` 接通已授权路由。`ai_pc_visual::call` 将实际 error/unknown/cancelled 投影标为工具错误，保留一次请求、精确 ACK、原身份和无重试合同；登记回执只增加已实现动作工具。
@@ -225,3 +231,30 @@ Everypaw真实HTTP/受验证IPC/SQLite边界最终1/1绿（6.61秒）：默认/�
 Everypaw对应候选 `d86a869` 已合最新 `6cb7593`。Recorder121/121、Desktop88＋通知2、真实层级UIA/WGC像素/Invoke点击各1/1通过；新组合CLI官方paired4/4（11.77秒）：结构与列窗完整已交付投影/精确ACK、同轮四张4,841,533B原PNG与2,360,312B子区PNG的保存/provider字节及SSE/窄REST、动作实际部分结果/不重放。最新native注册/字段读取deadline也经真实层级复验。没有访问真实用户桌面或调用生产模型。
 
 最终变更仍仅10个允许文件，公共/受限可见Rust项的中文八栏目保持；实现与合并提交均带DCO。snapshot、cargo-deny缺失、真实Docker/管理员/登录重启、CODEOWNER/历史来源DCO/CI和部署仍待独立完成。完整Everypaw证据为其 `ticket-07-verification.md`；没有切换DeepSeek、运行服务、push或清理数据。
+
+### 11：文字、快捷键与可取消等待（2026-10-17）
+
+工作分支 `feature/everypaw-visual-11`，已合引擎集成 `1b2312e9b2a71639fba0c978cbfe4182efc35289`，保留07结构、09六场景PNG与窄REST、10动作的全部路径。实际产品改动仅表内 `ai_pc.rs` 的严格步骤解析/快捷键验证/schema和 `ai_pc_visual.rs` 的动作专属等待期限；配套更新本记录、INDEX、b-line协议/配置/测试。没有新增工具、Cargo依赖、Core/AgentLoop/Store/provider改动、审批模型、预算或计数豁免。
+
+动作枚举新增set_text/shortcut/wait，模型不能写可信身份；wait只接受非负i32、0合法、无target，整批解析失败不分发任何效果。仅动作Host期限为20,000毫秒加已验证wait总时长，使用u64检查求和；桌面/native为10,000加总wait，问答180秒总期限保留。键语法和原生实际效果契约见更新协议；未知输入不重试，不增逐步确认或自动后续观察。中文公共Rustdoc八栏目保持，新增校验函数和步骤为私有实现；签名提交和合并保留DCO。
+
+红绿证据：既有动作测试改为混合set_text/shortcut/wait后先因旧Host验证器真实失败，扩充严格步骤/schema后通过；非法后续步骤、缺text、负数/溢出wait、未知修饰键、组合主键在任何HTTP前拒绝。再加入真实21秒HTTP延迟，先在旧20秒期限失败，动作专属期限调整后1/1通过（21.05秒），未扩大其他工具期限。Everypaw的11秒wait、可取消wait、同步文字挂起/迟到和真实EDIT/Ctrl+A分别记录在其ticket-11-verification，不把HTTP替身当作真实输入。
+
+所有Cargo仍使用共享唯一engine-target、jobs1、dev/test debug0，经Everypaw native.ps1；刷新当前工作树源mtime并确认编译路径，避免跨树fresh伪证据。实际命令如下：
+
+| 命令 | 实际结果与范围 |
+| --- | --- |
+| `cargo test -p openpaw-engine-host --features engine-host` | 退出0，61+16+36=113项，混合批次及21秒真实等待通过，保留结构Router/PNG/原动作/附件/取消回归。 |
+| `cargo test --workspace -- --test-threads=1` | 退出0，完整默认workspace；未将此条冒称显式Host全workspace。 |
+| 默认与显式Host `cargo clippy --workspace --all-targets … -- -D warnings` | 两条退出0。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 退出0，3/3。 |
+| `cargo fmt --all -- --check` | 退出0。 |
+| `cargo run -p xtask -- lines` | 退出0：Host6734/7000、tests3943/4000、aux11497/11500；无计数或预算变化。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，仍为06已在未实施基线证明的Windows CRLF/LF差异；未修改受保护快照/检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 均退出0，golden全绿；284依赖/229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo deny --version` | 退出101，命令未安装；未安装额外依赖，不宣称本地审计通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0。复制单份独立 `openpaw-input11.exe` 供Desktop成对测试，SHA256 `DE0FED33B1CE351F6F4FC4312759433E6810DFD4F90AF4E5FEC856762B3231CF`，不复制缓存。 |
+
+Engine构建位已正式交08，后续08/最终17组合需重新核对实际制品。11不部署、不push、不切服务、不改DeepSeek、不读取真实用户桌面；真实Docker/管理员/混合DPI/登录重启、生产模型接受、CODEOWNER、历史来源DCO和CI仍独立保留。既有Windows snapshot和缺cargo-deny已如实列出。
