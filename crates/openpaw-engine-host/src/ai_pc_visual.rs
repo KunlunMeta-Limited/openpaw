@@ -126,8 +126,8 @@ struct ResultEnvelope {
     status: String,
     projection: Value,
 }
-/// 功能：执行一次实时列窗并回执精确解析结果。
-/// 参数：session_id 为可信登记会话，args 为已验证模型参数，r 为内存登记。
+/// 功能：按已实现工具选择桌面路由，执行一次实时调用并回执精确解析结果。
+/// 参数：name 为已验证工具名，session_id 为可信登记会话，args 为模型参数，r 为内存登记。
 /// 返回：不含凭据的不可变投影工具结果。
 /// 错误：身份、网络、超时、容量、格式或 ACK 失败时明确返回；不重试。
 /// 状态：每次分配唯一 invocation，保留原活动代次。
@@ -135,10 +135,15 @@ struct ResultEnvelope {
 /// 权限：仅已接收且仍活动回合，经原桌面授权链交付。
 /// 关联：CHG-2026-0029、API-HOST-AI-PC-REGISTER-001。
 pub(super) async fn call(
+    name: &str,
     session_id: &str,
     args: Value,
     r: Registration,
 ) -> Result<ToolCallOutcome, String> {
+    let path = match name {
+        "ai_pc_list_windows" => "/ai-pc/windows",
+        _ => return Err("此实时桌面工具尚未实现。".into()),
+    };
     let active = r.visual.snapshot()?;
     let invocation = uuid::Uuid::new_v4().to_string();
     let call = json!({"session_id":session_id,"request_id":active.request_id,"host_turn_id":active.host_turn_id,"generation":active.generation,"invocation_id":invocation,"args":args});
@@ -147,7 +152,7 @@ pub(super) async fn call(
         call: Some(call.clone()),
     };
     let mut url = r.url.clone();
-    url.set_path("/ai-pc/windows");
+    url.set_path(path);
     // 20 秒是列窗等待期限，不是 HTTP 收包期限，也不表示卡住的 UIA 可中断。
     let response = tokio::select! { biased; _ = active.cancel.cancelled() => return Err("原回合已取消。".into()), result = r.client.post(url).bearer_auth(&r.token).timeout(Duration::from_secs(20)).json(&call).send() => result.map_err(|_|"视觉工具连接失败；没有重发。")? };
     if !response.status().is_success() {
@@ -256,7 +261,12 @@ mod tests {
                 cancel.clone(),
                 false,
             );
-            let task = tokio::spawn(call("session", json!({}), registration.clone()));
+            let task = tokio::spawn(call(
+                "ai_pc_list_windows",
+                "session",
+                json!({}),
+                registration.clone(),
+            ));
             tokio::time::timeout(Duration::from_secs(2), fixture.started.notified())
                 .await
                 .unwrap();

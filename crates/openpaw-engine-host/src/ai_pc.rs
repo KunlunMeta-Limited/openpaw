@@ -269,7 +269,7 @@ impl ToolExecutor for DesktopTools {
         if name == "ai_pc_list_windows" {
             return Ok(match registration {
                 Some(r) => match validate(name, &args) {
-                    Ok(()) => crate::ai_pc_visual::call(&self.session_id, args, r)
+                    Ok(()) => crate::ai_pc_visual::call(name, &self.session_id, args, r)
                         .await
                         .unwrap_or_else(ToolCallOutcome::error),
                     Err(error) => ToolCallOutcome::error(error),
