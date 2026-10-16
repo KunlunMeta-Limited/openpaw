@@ -603,6 +603,7 @@ mod tests {
         let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let router = Router::new().route("/ai-pc/actions", post(|State(seen):State<Arc<tokio::sync::Mutex<Vec<Value>>>>, Json(call):Json<Value>| async move {
             seen.lock().await.push(call.clone());
+            if call["args"]["steps"][0]["delay_ms"] == 21000 { tokio::time::sleep(Duration::from_secs(21)).await; }
             Json(json!({"protocol_version":1,"invocation_id":call["invocation_id"],"delivery_id":"partial-delivery","status":"ok","projection":{"state":"error","steps":[{"index":0,"action":"set_text","target_id":"native-v1","text":"替换 😀","state":"completed"},{"index":1,"action":"shortcut","target_id":"native-v1","key":"VK_A","modifiers":"VK_CONTROL","state":"error"},{"index":2,"action":"wait","delay_ms":0,"state":"not_started"}]}}))
         })).route("/ai-pc/ack",post(|State(seen):State<Arc<tokio::sync::Mutex<Vec<Value>>>>,Json(ack):Json<Value>| async move {
             seen.lock().await.push(ack); Json(json!({"status":"accepted"}))
@@ -666,6 +667,19 @@ mod tests {
         assert_eq!(calls[1]["call"], calls[0]);
         assert_eq!(calls[1]["delivery_id"], "partial-delivery");
         assert!(!result.to_string().contains(&"a".repeat(64)));
+        drop(calls);
+        let waiting = tools
+            .call(
+                "ai_pc_action_batch",
+                json!({"generation":"native","steps":[{"action":"wait","delay_ms":21000}]}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&waiting.content).is_ok(),
+            "a declared wait must not be cut off by the former twenty-second HTTP deadline: {}",
+            waiting.content
+        );
         server.abort();
     }
     #[tokio::test]

@@ -165,8 +165,22 @@ pub(super) async fn call(
     };
     let mut url = r.url.clone();
     url.set_path(path);
-    // 20 秒是 Host 工具等待期限，不是 HTTP 收包期限，也不表示同步原生动作可中断。
-    let response = tokio::select! { biased; _ = active.cancel.cancelled() => return Err("原回合已取消。".into()), result = r.client.post(url).bearer_auth(&r.token).timeout(Duration::from_secs(20)).json(&call).send() => result.map_err(|_|"视觉工具连接失败；没有重发。")? };
+    // 已由工具验证器确认最多64个非负i32 wait；仅动作增加声明等待，其他工具仍为20秒。
+    let wait_ms = if name == "ai_pc_action_batch" {
+        call["args"]["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|step| step["action"] == "wait")
+            .try_fold(0u64, |sum, step| {
+                sum.checked_add(step["delay_ms"].as_u64().ok_or("等待参数无效")?)
+                    .ok_or("等待时间求和溢出")
+            })?
+    } else {
+        0
+    };
+    let timeout = Duration::from_millis(wait_ms.checked_add(20_000).ok_or("动作期限溢出")?);
+    let response = tokio::select! { biased; _ = active.cancel.cancelled() => return Err("原回合已取消。".into()), result = r.client.post(url).bearer_auth(&r.token).timeout(timeout).json(&call).send() => result.map_err(|_|"视觉工具连接失败；没有重发。")? };
     if !response.status().is_success() {
         return Err(format!("视觉工具拒绝 HTTP {}", response.status().as_u16()));
     }
