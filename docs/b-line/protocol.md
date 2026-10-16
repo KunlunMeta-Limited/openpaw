@@ -251,7 +251,7 @@ metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment
 
 `ai_pc_read_text` 为ReadOnly/ParallelSafe，通过同一可信调用及精确ACK单次POST `/ai-pc/text`。严格参数 `{generation,target_id,offset?,limit?}`，generation为原生代次；offset默认0、带符号UTF-16 code units，绝对值最多10,469,374；limit为正u64、默认4096，由桌面钳制16384。无媒体，无额外身份/权限字段或内部重试。
 
-每页实时读取原目标当前TextPattern，单次有界前缀probe最多10,485,760 UTF-16（独立工程上限），正offset至少4098并覆盖页后2单元边界/sentinel，负offset相对本次取得前缀末端。没有无界GetText(-1)/Value或跨页冻结全文缓存，不把TextUnit_Character移动量当UTF-16。返回 `text`、`range:{start,end,unit:"utf16_code_units"}`（半开）、`next`（末尾为null）、`length:{units,certainty:"exact"|"lower_bound"}`、请求范围、独立observation/time、partial/reason；仅取得前缀不能伪称精确全文长，负offset下界另标 `offset_basis:"bounded_prefix_end"`。显式offset进入低代理项时向前对齐，页尾收回完整scalar；limit1可返回完整pair的2单元。无效UTF-16明确失败；每页间编辑可能重叠/遗漏，不能把旧观察实时补读。
+每页实时读取原目标当前TextPattern，单次有界前缀probe最多10,485,760 UTF-16（独立工程上限），正offset至少4098并覆盖页后2单元边界/sentinel，负offset相对本次取得前缀末端。没有无界GetText(-1)/Value或跨页冻结全文缓存，不把TextUnit_Character移动量当UTF-16。返回 `text`、`range:{start,end,unit:"utf16_code_units"}`（半开）、`next`（无可用继续offset为null）、`length:{units,certainty:"exact"|"lower_bound"}`、请求范围、独立observation/time、partial/reason；仅取得前缀不能伪称精确全文长，负offset下界另标 `offset_basis:"bounded_prefix_end"`。若页末超过合法offset工程上限，next为null并明确partial/上限原因，不提供无法调用的next，也不把下界冒称全文结束。显式offset进入低代理项时向前对齐，页尾收回完整scalar；limit1可返回完整pair的2单元。无效UTF-16明确失败；每页间编辑可能重叠/遗漏，不能把旧观察实时补读。
 
 模型副本另限10240估算tokens（utf8_bytes/4），且受既有更小交付字节预算约束；裁剪后range.end/next严格跟随实际发送末端，完整取得页留本地。不改为摘要或第二模型。原窗口witness/保留对象、context/native generation不重绑；text_values与当前应用规则在取得、返回及ACK复查。Stop/超时后的真实completion保留在原invocation，不能重新生成或发给新回合；本页没有新增视觉ID，不推进8轮/2048ID保留计数。期限/结果容量沿用结构工具。
 
