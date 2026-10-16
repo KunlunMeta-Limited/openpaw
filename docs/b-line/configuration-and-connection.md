@@ -181,4 +181,6 @@ Everypaw 实时列窗源码基于 `c105d80356f7217138d3b70bfab1d72d5a271f4d`，�
 
 桌面桥继续绑定 `0.0.0.0` 随机端口并返回 `http://host.docker.internal:PORT/ai-pc`，原生 IPC 仍只验证本机对端，不增加网络原生入口。回环受控测试仅证明协议/授权/证据逻辑；当前 Docker Desktop Linux pipe 不可用，真实容器可达验证待环境恢复。本轮只构建隔离源码与测试，不替换现有服务、镜像、数据卷或 DeepSeek 云端配置。
 
+任务 10 的 `feature/everypaw-visual-10` 从同一引擎集成继续增加调用／点击批次。无需新环境变量或动作权限开关，沿用既有工具 auto/manual 设置与 Basic 登记。真实鼠标输入可能改变桌面焦点；停止是独立控制路径，不宣称能抢占正在同步执行的 UIA 调用。未部署此分支，所选 DeepSeek 云端配置保持原值。
+
 09目标PNG复用所选provider/model的 `OPENPAW_MODEL_CAPABILITIES` image声明；未知或仅text在捕获前失败。配置声明只证明本地允许，实际第三方接受与理解需独立验收。现有DeepSeek配置不因新增工具自动获得image声明；没有改动其生产配置。原图按5 MiB/张等既有媒体边界，不自动缩放。
