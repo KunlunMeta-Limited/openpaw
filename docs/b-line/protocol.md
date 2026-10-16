@@ -238,3 +238,13 @@ Host 完整解析、校验身份/容量/活动代次后 POST `/ai-pc/ack`，正�
 取消正文为原调用，路径 `/ai-pc/cancel`。桌面在工作前建立取消 tombstone，晚到同 invocation 不执行；等待期间撤销、切换服务或停止后，实际迟到内容仅保存原调用本地证据，不生成/恢复模型结果。列窗显式保留 IPC 实际 completion：超时或 cancel 不丢弃同 ID/native generation 的真实结果；bounded acquisition 工作位保持到真实完成或进程断连。旧 background/01 路径保持原 discard 语义。Host future Drop 使用独立 64 项有界队列 try_send 补充 cancel，运行时退出或队满不保证送达；桌面原回合 Stop 是主路径。所有工具和控制均不自行重试。
 
 metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment。各 worker 持有自己的原生对象，仅共享无 COM 的 ID/active/completed authority，统一执行每上下文 8 个非空视觉回合、总计 2048 个不同 ID 的软限及最新轮保护。同轮多个附件/工具采用并集；metadata 使用 `-wv` 命名空间，控件使用 `-v`，防止跨表碰撞。Complete/Abandon 有界异步广播，不等待卡住的 provider。后续 UIA 读取窗口引用须在能力进程内延续同一 witness、创建前后复核，不能把 HWND 当永久身份或跨 apartment 传递 Rc/COM。
+
+### Everypaw 原始目标 PNG（CHG-0029 / 09）
+
+新增 `ai_pc_capture_target`，ReadOnly/ParallelSafe，严格参数 `{target_id:非空字符串≤128字节}`；登记回执的已实现工具追加此名称。可信上下文/单次调用/取消与精确 ACK 沿用06，路由为 `/ai-pc/capture`。所选模型的实际 image=false 或未声明时，Host 在原生分发前明确失败；不按模型名猜测，不转 OCR/其他 VLM/更换模型。
+
+成功响应可含 `media:[{id,mime:"image/png",data:标准Base64,filename:"target.png"}]`，截图必须恰一张，经现有 InlineMedia 验证原件再 ACK；非截图视觉工具禁止媒体。响应工程容量7 MiB供合法5 MiB原件Base64与元数据；主模型每图5 MiB、回合4张/20 MiB、请求32 MiB仍由已有媒体层执行，不缩放。工具文字只含不可变projection、来源/附件编号、实际宽高/范围和独立UIA/PNG/QPC时点；Base64只进入 ToolCallOutcome.media，由原AgentLoop送实际下一次provider请求。
+
+Everypaw 使用公开 Windows WGC HWND API、原窗口存活租约和物理坐标。子区域必须落入可验证窗口纹理；窗口无效、最小化、cloaked、无帧或几何变化明确失败，不恢复目标、不改读桌面。原件在既有screenshots目录，独立visual_png_sources记录来源，visual_tool_calls关联交付；不是后台历史截图。全局/接收服务screenshots、Restricted、原automatic grant与应用排除/未知身份在取得及返回/ACK时复核；既有四项UIA/metadata开关不充当截图授权。Picker完整presentation epoch变化后，仅留本地实际证据，不交付媒体。
+
+`GET /session/:id/message?turnID=<id>&textOnly=true` 为可选窄读取（稳定编号 `API-HOST-MESSAGES-TURN-TEXT-001`），仅返回指定回合assistant文字parts及原info/error；非法/缺turnID返回400，turnID不单独使用。默认完整REST、按messageID读取及公共附件投影保持兼容。Host仍先复制wire_messages完整快照再过滤，历史内存/CPU开销不保证恒定。Everypaw对任意大SSE行（不限媒体）增量丢弃到换行，单行保留≤1 MiB、总wire≤128 MiB且原180秒期限；每2秒和EOF/idle/error检查权威回合，失败回合明确失败，完成回合从窄REST恢复正文。正文/窄REST≤2 MiB，任一超限明确失败。合法同轮4张/20MiB图片不受旧8MiB累计限制；该容量并非无限历史保证，也不是图片token预算。

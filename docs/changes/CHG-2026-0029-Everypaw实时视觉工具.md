@@ -66,6 +66,8 @@
 
 实测现有 Everypaw SSE 每行1 MiB、REST全历史2 MiB会被合法PNG附件撑破。允许 http.rs 在既有 messages 路由增加可选 `turnID` 与 `textOnly=true` 窄读取；默认路由内容和其他消费者保持原语义。窄读取只返回指定回合的 assistant text，既有 runtime 快照不改变持久化或公共投影。Everypaw SSE仅消费文字且有界丢弃超大非正文event，最终文字以该窄REST恢复。实际>1 MiB完整PNG经真实受控provider、SSE与REST验收，不以提高客户端总容量代替。
 
+此扩展沿用既有 GET messages 路径；稳定编号 `API-HOST-MESSAGES-TURN-TEXT-001` 标识同一路径的可选窄读取合同。新增私有 `MessageQuery`（turn_id/text_only）和扩充 `messages` 过滤逻辑：需有效ASCII turnID，保留指定回合assistant的info/error与text，缺省不变。没有新增Core/runtime接口或事件。Host当前仍先复制wire_messages历史快照再过滤，不能宣称历史内存或CPU开销恒定/全程流式。窄REST传输≤2MiB、SSE保留行≤1MiB/累计wire≤128MiB/180秒；同轮四张原件走四次工具结果，受控paired验证其实际主模型请求和最终文字恢复。超过任一工程边界明确失败，不删媒体以伪装成功。
+
 09新增行为测试优先扩充已有 Router 用例及 Everypaw 成对验收。当前 Host tests 3943/4000 仅余57行，若实测超过先记录必要用例和最小预算文件范围，不以搬迁测试避计数。
 ### 07 实施前登记（2026-10-16）
 

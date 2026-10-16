@@ -3,7 +3,7 @@
 //! 禁止承担：不改变 Core/AgentLoop，不重试原生操作，不把 ACK 称为模型理解。
 //! 关联：CHG-2026-0029、API-HOST-AI-PC-REGISTER-001。
 use crate::ai_pc::Registration;
-use openpaw_core::ToolCallOutcome;
+use openpaw_core::{InlineMedia, ToolCallOutcome};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -125,6 +125,8 @@ struct ResultEnvelope {
     delivery_id: String,
     status: String,
     projection: Value,
+    #[serde(default)]
+    media: Vec<InlineMedia>,
 }
 /// 功能：按已实现工具选择桌面路由，执行一次实时调用并回执精确解析结果。
 /// 参数：name 为已验证工具名，session_id 为可信登记会话，args 为模型参数，r 为内存登记。
@@ -142,9 +144,17 @@ pub(super) async fn call(
 ) -> Result<ToolCallOutcome, String> {
     let path = match name {
         "ai_pc_list_windows" => "/ai-pc/windows",
+        "ai_pc_capture_target" => "/ai-pc/capture",
         _ => return Err("此实时桌面工具尚未实现。".into()),
     };
     let active = r.visual.snapshot()?;
+    let capture = name == "ai_pc_capture_target";
+    if capture && !active.image {
+        return Err(
+            "实际所选主模型未声明 image 输入，不能取得或发送目标 PNG；未转换文字或更换模型。"
+                .into(),
+        );
+    }
     let invocation = uuid::Uuid::new_v4().to_string();
     let call = json!({"session_id":session_id,"request_id":active.request_id,"host_turn_id":active.host_turn_id,"generation":active.generation,"invocation_id":invocation,"args":args});
     let mut guard = CancelOnDrop {
@@ -162,8 +172,8 @@ pub(super) async fn call(
     let mut bytes = vec![];
     while let Some(chunk) = tokio::select! { biased; _=active.cancel.cancelled()=>return Err("原回合已取消。".into()), chunk=response.chunk()=>chunk.map_err(|_|"视觉结果传输失败。")? }
     {
-        if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
-            return Err("列窗结果超过 1 MiB 传输容量。".into());
+        if bytes.len().saturating_add(chunk.len()) > (if capture { 7 } else { 1 }) * 1024 * 1024 {
+            return Err("视觉结果超过本工具传输容量。".into());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -182,8 +192,16 @@ pub(super) async fn call(
     if current.generation != active.generation {
         return Err("视觉结果属于旧回合。".into());
     }
-    // 实际所选模型能力来自 runtime，留给后续 PNG 路径；绝不按模型名猜测。
-    let _image_supported = active.image;
+    if capture {
+        if result.media.len() != 1 || result.media[0].mime != "image/png" {
+            return Err("目标截图必须交付单张原始 PNG。".into());
+        }
+        result.media[0]
+            .bytes()
+            .map_err(|_| "PNG 媒体无效或超过既有原件容量。")?;
+    } else if !result.media.is_empty() {
+        return Err("此视觉工具不允许附带媒体。".into());
+    }
     let mut ack = r.url.clone();
     ack.set_path("/ai-pc/ack");
     let accepted = tokio::select! { biased; _=active.cancel.cancelled()=>return Err("原回合已取消。".into()), result=r.client.post(ack).bearer_auth(&r.token).timeout(Duration::from_secs(2)).json(&json!({"call":call,"delivery_id":result.delivery_id})).send()=>result.map_err(|_|"Host 解析回执未知；没有重发工具。")? };
@@ -219,7 +237,7 @@ pub(super) async fn call(
         content: structured.to_string(),
         structured: Some(structured),
         is_error: false,
-        media: vec![],
+        media: result.media,
     })
 }
 

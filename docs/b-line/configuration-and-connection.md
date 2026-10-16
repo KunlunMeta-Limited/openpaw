@@ -180,3 +180,5 @@ Chat 工具结果保留文本和调用 ID，随后媒体 user 输入只是协议
 Everypaw 实时列窗源码基于 `c105d80356f7217138d3b70bfab1d72d5a271f4d`，任务分支 `feature/everypaw-visual-06`，集成分支 `feature/everypaw-desktop-visual-integration`（CHG-0029）。构建仍显式启用 `engine-host`。登记 204 的 version/tools 响应头是实际能力协商，缺头是 legacy，不能按 Host 在线或普通文字成功推断实时工具可用。
 
 桌面桥继续绑定 `0.0.0.0` 随机端口并返回 `http://host.docker.internal:PORT/ai-pc`，原生 IPC 仍只验证本机对端，不增加网络原生入口。回环受控测试仅证明协议/授权/证据逻辑；当前 Docker Desktop Linux pipe 不可用，真实容器可达验证待环境恢复。本轮只构建隔离源码与测试，不替换现有服务、镜像、数据卷或 DeepSeek 云端配置。
+
+09目标PNG复用所选provider/model的 `OPENPAW_MODEL_CAPABILITIES` image声明；未知或仅text在捕获前失败。配置声明只证明本地允许，实际第三方接受与理解需独立验收。现有DeepSeek配置不因新增工具自动获得image声明；没有改动其生产配置。原图按5 MiB/张等既有媒体边界，不自动缩放。
