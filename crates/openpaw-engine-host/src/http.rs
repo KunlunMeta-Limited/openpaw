@@ -699,7 +699,10 @@ fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Respon
             StatusCode::NO_CONTENT,
             [
                 ("openpaw-desktop-protocol", "1"),
-                ("openpaw-desktop-tools", "ai_pc_list_windows"),
+                (
+                    "openpaw-desktop-tools",
+                    "ai_pc_list_windows,ai_pc_query_structure",
+                ),
             ],
         )
             .into_response(),
@@ -1489,6 +1492,20 @@ mod tests {
 
     #[tokio::test]
     async fn registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
+        visual_roundtrip("ai_pc_list_windows",serde_json::json!({}),"windows",serde_json::json!({"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]})).await;
+    }
+
+    #[tokio::test]
+    async fn registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
+        visual_roundtrip("ai_pc_query_structure",serde_json::json!({"generation":"native","target_id":"native-v1","directions":"children,parent","offset":2,"limit":5000,"boxes":true}),"structure",serde_json::json!({"kind":"untrusted_ui_data","observation":"live_structure","controls":[{"id":"native-v1","name":"本次控件","box":[-10,20,40,50]}]})).await;
+    }
+
+    async fn visual_roundtrip(
+        name: &'static str,
+        args: serde_json::Value,
+        path: &str,
+        projection: serde_json::Value,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _env = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -1499,12 +1516,13 @@ mod tests {
         let model_calls = Arc::new(AtomicUsize::new(0));
         let seen = model_seen.clone();
         let count = model_calls.clone();
+        let model_args = args.to_string();
         let model = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
-            let (seen, count) = (seen.clone(), count.clone());
+            let (seen, count,model_args) = (seen.clone(), count.clone(),model_args.clone());
             async move {
                 seen.lock().await.push(body);
                 let chunk = if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"provider-list","type":"function","function":{"name":"ai_pc_list_windows","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+                    serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"provider-list","type":"function","function":{"name":name,"arguments":model_args}}]},"finish_reason":"tool_calls"}]})
                 } else { serde_json::json!({"choices":[{"delta":{"content":"已取得窗口"},"finish_reason":"stop"}]}) };
                 ([("content-type","text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n"))
             }
@@ -1515,9 +1533,10 @@ mod tests {
             axum::serve(listener, model).await.unwrap();
         });
         let observed = calls.clone();
-        let bridge = Router::new().route("/ai-pc/windows",post(move |Json(body): Json<serde_json::Value>| {
-            let observed = observed.clone();
-            async move { observed.lock().await.push(body.clone()); Json(serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":{"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]}})) }
+        let saved_projection = projection.clone();
+        let bridge = Router::new().route(&format!("/ai-pc/{path}"),post(move |Json(body): Json<serde_json::Value>| {
+            let (observed,projection) = (observed.clone(),projection.clone());
+            async move { observed.lock().await.push(body.clone()); Json(serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":projection})) }
         }));
         let observed = calls.clone();
         let bridge = bridge.route(
@@ -1584,6 +1603,7 @@ mod tests {
         );
         assert_eq!(calls[0]["session_id"], handle.id);
         assert_eq!(calls[0]["request_id"], "trusted-request");
+        assert_eq!(calls[0]["args"], args);
         assert!(calls[0]["host_turn_id"].is_string());
         assert!(calls[0]["generation"].is_string());
         assert_eq!(calls[1]["call"], calls[0]);
@@ -1593,7 +1613,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["function"]["name"] == "ai_pc_list_windows"));
+            .any(|t| t["function"]["name"] == name));
         let tool = requests[1]["messages"]
             .as_array()
             .unwrap()
@@ -1601,6 +1621,10 @@ mod tests {
             .find(|m| m["role"] == "tool")
             .unwrap();
         assert_eq!(tool["tool_call_id"], "provider-list");
+        let model_result =
+            serde_json::from_str::<serde_json::Value>(tool["content"].as_str().unwrap()).unwrap();
+        assert_eq!(model_result["result"], saved_projection);
+        assert_eq!(model_result["invocation_id"], calls[0]["invocation_id"]);
         assert!(tool["content"].as_str().unwrap().contains("native-v1"));
         assert!(!tool["content"].as_str().unwrap().contains(&"a".repeat(64)));
     }

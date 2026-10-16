@@ -223,7 +223,7 @@ CHG-2026-0028 集成保留会话原生附件安装、回看与回合结束清理
 
 ### Everypaw 实时列窗扩展（CHG-2026-0029 / 06）
 
-上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows`。当前已登记工具共 25 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称其他视觉工具已经存在。
+上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows,ai_pc_query_structure`。当前已登记工具共 26 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称其他视觉工具已经存在。
 
 `ai_pc_list_windows` 参数严格为 `{}`，声明 ReadOnly/ParallelSafe。runtime 在真实接收回合获准 running 后，从持久 admission 取得 requestID/Host turn，以原取消 token、每次执行随机 generation 和所选 provider 实际 image_input 能力安装私有上下文；退出守卫只清除自身 generation。模型输入不能填写身份。
 
@@ -238,3 +238,11 @@ Host 完整解析、校验身份/容量/活动代次后 POST `/ai-pc/ack`，正�
 取消正文为原调用，路径 `/ai-pc/cancel`。桌面在工作前建立取消 tombstone，晚到同 invocation 不执行；等待期间撤销、切换服务或停止后，实际迟到内容仅保存原调用本地证据，不生成/恢复模型结果。列窗显式保留 IPC 实际 completion：超时或 cancel 不丢弃同 ID/native generation 的真实结果；bounded acquisition 工作位保持到真实完成或进程断连。旧 background/01 路径保持原 discard 语义。Host future Drop 使用独立 64 项有界队列 try_send 补充 cancel，运行时退出或队满不保证送达；桌面原回合 Stop 是主路径。所有工具和控制均不自行重试。
 
 metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment。各 worker 持有自己的原生对象，仅共享无 COM 的 ID/active/completed authority，统一执行每上下文 8 个非空视觉回合、总计 2048 个不同 ID 的软限及最新轮保护。同轮多个附件/工具采用并集；metadata 使用 `-wv` 命名空间，控件使用 `-v`，防止跨表碰撞。Complete/Abandon 有界异步广播，不等待卡住的 provider。后续 UIA 读取窗口引用须在能力进程内延续同一 witness、创建前后复核，不能把 HWND 当永久身份或跨 apartment 传递 Rc/COM。
+
+### Everypaw 实时结构扩展（CHG-0029 / 07）
+
+`ai_pc_query_structure` 通过同一受信封装单次 POST `/ai-pc/structure`。严格模型参数为 `generation`（原生观察代次）、`target_id`、可选 `directions`（默认 all）、`offset`（u32，默认 0）、`limit`（正 u64，默认 128，桌面钳制 1024）和 `boxes`（默认 false）。模型不能指定 context/session/Host turn/权限；外层 generation 仍是 Host 执行代次。
+
+方向逗号分隔、大小写无关并去空白：parent、child/children、previous/prev、next、sibling/siblings、all、none；空集合按 all。始终含起点，offset 独立作用于每个初始关系，parent 为直接父级（offset>0 跳过）；父级沿所选 parent/sibling 继续，子级/兄弟按所选 child 继续，止于原窗口。每次读取当前对象，不承诺冻结分页，无独立默认深度。
+
+实际取得上限为 1024 节点、8 MiB、3 秒及 8192 关系遍历操作；同步 UIA 调用之间检查期限，不承诺中断 provider。紧凑模型投影限 4096 估算 tokens（utf8_bytes/4），另受既有交付字节上限约束；包含一次观察元数据、必要节点关系/状态、短正文和明确 partial/truncated，坐标仅 boxes=true 且获准时出现，不常态附每节点 PID/时间/技术属性。原始取得与精确交付副本分别保存；原引用关闭、过期、移出边界、被替换、跨上下文/旧代次时失败，不按名称/路径/裸 HWND 重绑。返回及精确 ACK 重新投影并校验当前权限；停止、超时和迟到均延用原调用归属、不重试/恢复生成。结构工具使用与列窗相同的 Host/HTTP/ACK 期限和保留实际 completion 的原生通道。

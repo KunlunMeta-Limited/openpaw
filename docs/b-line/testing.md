@@ -412,3 +412,7 @@ Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP
 `ai_pc_visual::tests::cancel_and_old_generation_never_ack_or_replay_the_native_call` 使用真实 HTTP 和可控完成闸门，覆盖取消及旧 generation，检查补充取消仍携带原完整调用、无 ACK/重发、旧守卫不清理新执行。
 
 Everypaw 对应测试使用真实桌面 HTTP 桥、已验证 named-pipe IPC、隔离 SQLite 与原生替身，核对 acquired/投影/Host accepted、伪造身份/参数、cancel-before-request、撤销，以及超过原生期限后的真实 completion 只落原调用本地。独立 worker 的共享 ID authority 测试验证跨 owner 的 8 轮老化、同轮并集、总 soft limit 与最新超限轮保护。真实 Windows 窗口、Docker `host.docker.internal` 与生产所选模型属于不同集成证据；本地假模型/回环不能冒称通过。各命令实际退出码见 CHG-0029 与 Everypaw `ticket-06-verification.md`。
+
+07 增加 `ai_pc::tests::structure_tool_exposes_live_bounded_args_and_rejects_identity_fields`，验证真实登记工具的 schema/defaults/只读并行声明及模型身份字段拒绝。`http::tests::registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 复用受控 Host/model/bridge journey，核对模型选择的范围参数、可信执行身份、单次请求、精确 ACK 和第二次模型请求中的完整已交付投影。
+
+Everypaw `ticket-07-verification.md` 分开记录：真实 HTTP/受验证 IPC/Recorder 的默认值、钳制、预算、空容器折叠、文本去重、权限收窄/ACK、停止与迟到结果；自建 Windows 层级的真实 UIA 方向、分页、当前名称变化、替换/关闭失败；实际官方 Host 进程与受控模型贯通。测试仅操作自建窗口或原生替身，不外发真实用户桌面。

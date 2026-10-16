@@ -142,6 +142,7 @@ pub(super) async fn call(
 ) -> Result<ToolCallOutcome, String> {
     let path = match name {
         "ai_pc_list_windows" => "/ai-pc/windows",
+        "ai_pc_query_structure" => "/ai-pc/structure",
         _ => return Err("此实时桌面工具尚未实现。".into()),
     };
     let active = r.visual.snapshot()?;
