@@ -1,6 +1,6 @@
 # CHG-2026-0029：Everypaw 实时视觉工具
 
-状态：approved / 06列窗与09 PNG完成；07结构源码/受控Host及原生边界通过，与09组合的成对验收和最终记录进行中；既有平台与外部门禁保留。日期：2026-10-16。
+状态：approved / 06列窗、07结构、09原始PNG、10调用/点击批次完成本地组合验收；08/11按任务图继续，既有平台与外部门禁保留。更新：2026-10-17。
 
 ## 授权、基线与边界
 
@@ -202,4 +202,26 @@ Everypaw 已运行 `paired_official_host_model_desktop_http_ipc_and_store_roundt
 
 Everypaw真实HTTP/受验证IPC/SQLite边界最终1/1绿（6.61秒）：默认/钳制、严格参数、连续独立观察、1024实际节点/4096估算token、空容器折叠/文本去重、全局/服务/授权/应用收窄、精确ACK、cancel-before-request和超过5秒实际迟到归属均核对。大结构首红504来自逐节点pop重复序列化，改确定性前缀二分后绿，未提高超时/预算。自建离屏不激活STATIC/BUTTON子进程真实UIA测试1/1绿（3.56秒），保留方向/offset/越界/limit/boxes/同ID当前名称/替换旧ID拒绝/跨context及代次/关闭全部严格断言；首红查明S_OK+null在Windows binding表现为Err(code0)，修为真正失败HRESULT才记partial，未吞掉provider失败。
 
-07官方CLI成对验收的最终退出码在同一票继续补充。完整通用来源/工具过程UI由Everypaw正式14消费本票的本地/交付/ACK证据；本票不冒称该界面、真实Docker、管理员快捷键、生产模型、CODEOWNER/DCO/CI或部署通过。
+以上是07独立阶段证据，最终组合见下节。完整通用来源/工具过程UI由Everypaw正式14消费本票的本地/交付/ACK证据；本票不冒称该界面、真实Docker、管理员快捷键、生产模型、CODEOWNER/DCO/CI或部署通过。
+
+### 07 与09/10最终组合（2026-10-17）
+
+07分支合入最新引擎集成 `a86abfbaa0017121cfa6a42624fdc23abbfae634`，明确合并结构/PNG/动作的声明、验证、路由与测试。最终实现候选 `663de83`；注册回执准确列四个新工具，已登记工具总数28。首跑仅旧合并断言27与实际28不符，按规格更新独立预期并完整重跑。结构的ReadOnly/ParallelSafe与动作Write/NeverParallel继续分开；未改默认工具审批、Core/AgentLoop/Store/provider、依赖、预算或计数。
+
+| 当前组合实际命令 | 结果 |
+| --- | --- |
+| `cargo test --workspace --features engine-host -- --test-threads=1` | 最终退出0，完整workspace；Host61+16+36=113，CLI/Host parity3/3。保留07结构Router与09六场景PNG/窄REST及10实际部分结果。 |
+| `cargo test --workspace -- --test-threads=1` | 退出0，完整默认workspace及doctest。跨树刷新源码mtime，编译输出明确engine-visual-07。 |
+| 默认与显式Host `cargo clippy --workspace --all-targets … -- -D warnings` | 两条退出0。 |
+| `cargo fmt --all -- --check` | 退出0。 |
+| `cargo run -p xtask -- lines` | 退出0，Host6638/7000、tests3943/4000、aux11497/11500，无预算/计数变化。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，仍为06已在未实施基线证明的Windows CRLF/LF平台差异；未修改受保护快照或检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 均退出0，golden全绿；284依赖、229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo deny --version` | 退出101，未安装；未新增工具，不宣称本地依赖审计通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0。由663de83重建隔离官方CLI `openpaw-structure07.exe`，SHA256 `3B2563AC0D5BDBFFFD91B6B6255968BC6A182E68C35107E23CF0EB6D49EAE5BA`，替代此前合09前的同名制品。 |
+
+Everypaw对应候选 `d86a869` 已合最新 `6cb7593`。Recorder121/121、Desktop88＋通知2、真实层级UIA/WGC像素/Invoke点击各1/1通过；新组合CLI官方paired4/4（11.77秒）：结构与列窗完整已交付投影/精确ACK、同轮四张4,841,533B原PNG与2,360,312B子区PNG的保存/provider字节及SSE/窄REST、动作实际部分结果/不重放。最新native注册/字段读取deadline也经真实层级复验。没有访问真实用户桌面或调用生产模型。
+
+最终变更仍仅10个允许文件，公共/受限可见Rust项的中文八栏目保持；实现与合并提交均带DCO。snapshot、cargo-deny缺失、真实Docker/管理员/登录重启、CODEOWNER/历史来源DCO/CI和部署仍待独立完成。完整Everypaw证据为其 `ticket-07-verification.md`；没有切换DeepSeek、运行服务、push或清理数据。
