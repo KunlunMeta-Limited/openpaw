@@ -188,3 +188,4 @@ Everypaw 实时列窗源码基于 `c105d80356f7217138d3b70bfab1d72d5a271f4d`，�
 09目标PNG复用所选provider/model的 `OPENPAW_MODEL_CAPABILITIES` image声明；未知或仅text在捕获前失败。配置声明只证明本地允许，实际第三方接受与理解需独立验收。现有DeepSeek配置不因新增工具自动获得image声明；没有改动其生产配置。原图按5 MiB/张等既有媒体边界，不自动缩放。
 
 08正文分页分支为 `feature/everypaw-visual-08` / Everypaw `feature/desktop-text-08`，基于集成 `1b2312e` / `8be6fcb`并继续合入12。回执增加 `ai_pc_read_text`；UTF-16页长、原生有界probe、10240估算token模型副本分别见protocol/CHG0029。没有新服务端口、推理模型、OCR、配置开关或部署动作；当前DeepSeek服务保持用户既有选择，受控模型仅供隔离验收。
+11 的 `feature/everypaw-visual-11` 在同一动作工具内增加set_text、shortcut和wait，无新工具名、环境变量、依赖或动作开关。需要实际部署包含11的成对Host与Everypaw后才具备新步骤；旧10的相同工具名不能单独证明这些步骤可用。快捷键会置前并聚焦目标，文字仅走可写ValuePattern。声明wait总时长只延长动作工程等待，问答原180秒总期限仍保留；不改变生产服务或所选DeepSeek配置。

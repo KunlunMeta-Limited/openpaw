@@ -107,10 +107,27 @@ fn validate(name: &str, args: &Value) -> Result<(), String> {
                 steps: Vec<Step>,
             }
             #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Step {
-                action: String,
-                target_id: String,
+            #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+            enum Step {
+                Invoke {
+                    target_id: String,
+                },
+                Click {
+                    target_id: String,
+                },
+                SetText {
+                    target_id: String,
+                    text: String,
+                },
+                Shortcut {
+                    target_id: String,
+                    key: String,
+                    #[serde(default)]
+                    modifiers: String,
+                },
+                Wait {
+                    delay_ms: i32,
+                },
             }
             let batch: Batch =
                 serde_json::from_value(args.clone()).map_err(|_| "动作批次参数无效")?;
@@ -118,13 +135,34 @@ fn validate(name: &str, args: &Value) -> Result<(), String> {
                 || batch.generation.len() > 128
                 || batch.steps.is_empty()
                 || batch.steps.len() > 64
-                || batch.steps.iter().any(|s| {
-                    !matches!(s.action.as_str(), "invoke" | "click")
-                        || s.target_id.is_empty()
-                        || s.target_id.len() > 128
-                })
             {
                 return Err("动作种类、引用或步数无效".into());
+            }
+            for step in batch.steps {
+                let target = match step {
+                    Step::Invoke { target_id } | Step::Click { target_id } => target_id,
+                    Step::SetText { target_id, text } => {
+                        let _ = text;
+                        target_id
+                    }
+                    Step::Shortcut {
+                        target_id,
+                        key,
+                        modifiers,
+                    } => {
+                        validate_shortcut(&key, &modifiers)?;
+                        target_id
+                    }
+                    Step::Wait { delay_ms } => {
+                        if delay_ms < 0 {
+                            return Err("等待毫秒数不得为负".into());
+                        }
+                        continue;
+                    }
+                };
+                if target.is_empty() || target.len() > 128 {
+                    return Err("动作引用无效".into());
+                }
             }
             Ok(())
         }
@@ -193,6 +231,50 @@ fn validate_text(args: &Value) -> Result<(), String> {
     }
     Ok(())
 }
+fn validate_shortcut(key: &str, modifiers: &str) -> Result<(), String> {
+    let key = key.trim().to_ascii_uppercase();
+    let name = key.strip_prefix("VK_").unwrap_or(&key);
+    let known = "BACK BACKSPACE TAB CLEAR RETURN ENTER SHIFT CONTROL CTRL MENU ALT PAUSE CAPITAL CAPSLOCK KANA JUNJA FINAL HANJA ESCAPE ESC CONVERT NONCONVERT ACCEPT MODECHANGE SPACE PRIOR PAGEUP NEXT PAGEDOWN END HOME LEFT UP RIGHT DOWN SELECT PRINT EXECUTE SNAPSHOT PRINTSCREEN INSERT DELETE HELP LWIN WIN RWIN APPS SLEEP MULTIPLY ADD SEPARATOR SUBTRACT DECIMAL DIVIDE NUMLOCK SCROLL LSHIFT RSHIFT LCONTROL RCONTROL LMENU RMENU BROWSER_BACK BROWSER_FORWARD BROWSER_REFRESH BROWSER_STOP BROWSER_SEARCH BROWSER_FAVORITES BROWSER_HOME VOLUME_MUTE VOLUME_DOWN VOLUME_UP MEDIA_NEXT_TRACK MEDIA_PREV_TRACK MEDIA_STOP MEDIA_PLAY_PAUSE LAUNCH_MAIL LAUNCH_MEDIA_SELECT LAUNCH_APP1 LAUNCH_APP2 OEM_1 OEM_PLUS OEM_COMMA OEM_MINUS OEM_PERIOD OEM_2 OEM_3 OEM_4 OEM_5 OEM_6 OEM_7 OEM_8 OEM_102 PROCESSKEY ATTN CRSEL EXSEL EREOF PLAY ZOOM PA1 OEM_CLEAR";
+    if !(name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric())
+        && !name
+            .strip_prefix('F')
+            .and_then(|s| s.parse::<u16>().ok())
+            .is_some_and(|n| (1..=24).contains(&n))
+        && !name
+            .strip_prefix("NUMPAD")
+            .and_then(|s| s.parse::<u16>().ok())
+            .is_some_and(|n| n <= 9)
+        && !known.split_whitespace().any(|s| s == name)
+    {
+        return Err("快捷键主键无效；使用单个虚拟键名".into());
+    }
+    for token in modifiers
+        .split([' ', '+', ',', ';'])
+        .filter(|s| !s.is_empty())
+    {
+        let token = token.to_ascii_uppercase();
+        if !matches!(
+            token.strip_prefix("VK_").unwrap_or(&token),
+            "CONTROL"
+                | "CTRL"
+                | "LCONTROL"
+                | "RCONTROL"
+                | "MENU"
+                | "ALT"
+                | "LMENU"
+                | "RMENU"
+                | "SHIFT"
+                | "LSHIFT"
+                | "RSHIFT"
+                | "WIN"
+                | "LWIN"
+                | "RWIN"
+        ) {
+            return Err("快捷键修饰键无效".into());
+        }
+    }
+    Ok(())
+}
 fn validate_structure(args: &Value) -> Result<(), String> {
     let value = args.as_object().ok_or("结构查询必须为对象")?;
     if value.keys().any(|key| {
@@ -253,7 +335,7 @@ fn validate_structure(args: &Value) -> Result<(), String> {
 }
 /// 功能：生成不含凭据的已实现桌面工具声明。
 /// 参数：无。
-/// 返回：当前上下文、历史检索、实时列窗、结构、正文、目标 PNG 及动作批次声明。
+/// 返回：当前上下文、历史检索、实时列窗、结构、正文、目标 PNG 及完整桌面动作批次声明。
 /// 错误：无。
 /// 状态：无。
 /// 并发与取消：无共享可变状态。
@@ -269,8 +351,8 @@ pub(crate) fn specs() -> Vec<ToolSpec> {
         .into_iter().map(|(name,description,input_schema)| ToolSpec { name:name.into(),description:description.into(),input_schema,category:Some(ToolCategory::ReadOnly),concurrency:Some(ToolConcurrency::ParallelSafe), ..Default::default() }).collect();
     tools.push(ToolSpec {
         name: "ai_pc_action_batch".into(),
-        description: "按顺序执行实时目标的 InvokePattern 调用或真实鼠标点击；同桌面批次串行。遇失败停止后续步骤，不回滚、不重试；未知不重放。真实点击可能改变鼠标、焦点及窗口前后。完成后自行决定是否观察。".into(),
-        input_schema: json!({"type":"object","properties":{"generation":{"type":"string","minLength":1,"maxLength":128},"steps":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"object","properties":{"action":{"type":"string","enum":["invoke","click"]},"target_id":{"type":"string","minLength":1,"maxLength":128}},"required":["action","target_id"],"additionalProperties":false}}},"required":["generation","steps"],"additionalProperties":false}),
+        description: "按顺序执行 invoke、真实 click、ValuePattern 全值替换 set_text、目标 shortcut 或可取消 wait；同桌面批次串行。shortcut.key 是 A/VK_A/RETURN/F1 等单个虚拟键名，modifiers 独立写 Control/Alt/Shift/Win（或对应 VK 名），可用空格、+、逗号、分号分隔，未知键拒绝整批；不要写 Ctrl+A 为主键。wait.delay_ms 是非负 signed32 毫秒，0合法。遇失败停止后续步骤，不回滚、不重试；未知不重放。真实输入可能改变焦点、鼠标及窗口前后；完成后自行决定是否观察。".into(),
+        input_schema: json!({"type":"object","properties":{"generation":{"type":"string","minLength":1,"maxLength":128},"steps":{"type":"array","minItems":1,"maxItems":64,"items":{"oneOf":[{"type":"object","properties":{"action":{"type":"string","enum":["invoke","click"]},"target_id":{"type":"string","minLength":1,"maxLength":128}},"required":["action","target_id"],"additionalProperties":false},{"type":"object","properties":{"action":{"type":"string","enum":["set_text"]},"target_id":{"type":"string","minLength":1,"maxLength":128},"text":{"type":"string"}},"required":["action","target_id","text"],"additionalProperties":false},{"type":"object","properties":{"action":{"type":"string","enum":["shortcut"]},"target_id":{"type":"string","minLength":1,"maxLength":128},"key":{"type":"string"},"modifiers":{"type":"string","default":""}},"required":["action","target_id","key"],"additionalProperties":false},{"type":"object","properties":{"action":{"type":"string","enum":["wait"]},"delay_ms":{"type":"integer","minimum":0,"maximum":2147483647}},"required":["action","delay_ms"],"additionalProperties":false}]}}},"required":["generation","steps"],"additionalProperties":false}),
         category:Some(ToolCategory::Write), concurrency:Some(ToolConcurrency::NeverParallel), ..Default::default()
     });
     tools
@@ -615,7 +697,8 @@ mod tests {
         let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let router = Router::new().route("/ai-pc/actions", post(|State(seen):State<Arc<tokio::sync::Mutex<Vec<Value>>>>, Json(call):Json<Value>| async move {
             seen.lock().await.push(call.clone());
-            Json(json!({"protocol_version":1,"invocation_id":call["invocation_id"],"delivery_id":"partial-delivery","status":"ok","projection":{"state":"error","steps":[{"index":0,"action":"invoke","target_id":"native-v1","state":"completed"},{"index":1,"action":"click","target_id":"native-v2","state":"error"},{"index":2,"action":"invoke","target_id":"native-v3","state":"not_started"}]}}))
+            if call["args"]["steps"][0]["delay_ms"] == 21000 { tokio::time::sleep(Duration::from_secs(21)).await; }
+            Json(json!({"protocol_version":1,"invocation_id":call["invocation_id"],"delivery_id":"partial-delivery","status":"ok","projection":{"state":"error","steps":[{"index":0,"action":"set_text","target_id":"native-v1","text":"替换 😀","state":"completed"},{"index":1,"action":"shortcut","target_id":"native-v1","key":"VK_A","modifiers":"VK_CONTROL","state":"error"},{"index":2,"action":"wait","delay_ms":0,"state":"not_started"}]}}))
         })).route("/ai-pc/ack",post(|State(seen):State<Arc<tokio::sync::Mutex<Vec<Value>>>>,Json(ack):Json<Value>| async move {
             seen.lock().await.push(ack); Json(json!({"status":"accepted"}))
         })).with_state(seen.clone());
@@ -647,7 +730,20 @@ mod tests {
             .expect("only implemented action kinds are declared");
         assert_eq!(spec.category, Some(ToolCategory::Write));
         assert_eq!(spec.concurrency, Some(ToolConcurrency::NeverParallel));
-        let args = json!({"generation":"native","steps":[{"action":"invoke","target_id":"native-v1"},{"action":"click","target_id":"native-v2"},{"action":"invoke","target_id":"native-v3"}]});
+        for invalid in [
+            json!({"action":"shortcut","target_id":"native-v1","key":"Ctrl+A"}),
+            json!({"action":"shortcut","target_id":"native-v1","key":"A","modifiers":"TYPO"}),
+            json!({"action":"wait","delay_ms":2147483648u64}),
+            json!({"action":"wait","delay_ms":-1}),
+            json!({"action":"set_text","target_id":"native-v1"}),
+        ] {
+            assert!(tools.call("ai_pc_action_batch",json!({"generation":"native","steps":[{"action":"invoke","target_id":"native-v1"},invalid]})).await.unwrap().is_error);
+        }
+        assert!(
+            seen.lock().await.is_empty(),
+            "invalid later shape cannot reach the native bridge"
+        );
+        let args = json!({"generation":"native","steps":[{"action":"set_text","target_id":"native-v1","text":"替换 😀"},{"action":"shortcut","target_id":"native-v1","key":"VK_A","modifiers":"VK_CONTROL"},{"action":"wait","delay_ms":0}]});
         let result = tools
             .call("ai_pc_action_batch", args.clone())
             .await
@@ -665,6 +761,19 @@ mod tests {
         assert_eq!(calls[1]["call"], calls[0]);
         assert_eq!(calls[1]["delivery_id"], "partial-delivery");
         assert!(!result.to_string().contains(&"a".repeat(64)));
+        drop(calls);
+        let waiting = tools
+            .call(
+                "ai_pc_action_batch",
+                json!({"generation":"native","steps":[{"action":"wait","delay_ms":21000}]}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&waiting.content).is_ok(),
+            "a declared wait must not be cut off by the former twenty-second HTTP deadline: {}",
+            waiting.content
+        );
         server.abort();
     }
     #[tokio::test]

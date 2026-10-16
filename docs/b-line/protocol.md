@@ -257,13 +257,23 @@ metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment
 
 ### Everypaw 调用／点击批次（CHG-0029 / 10）
 
-登记头另列已实现 `ai_pc_action_batch`；其声明采用既有 `Write/NeverParallel`，沿用当前 auto/manual 工具审批。严格参数为 `{generation:"能力进程代次",steps:[{action:"invoke"|"click",target_id:"实时引用"}]}`，1–64 步，字符串 1–128 字节，不接受身份、凭据或额外字段。此阶段没有 set-text、shortcut、wait；工具声明不提前承诺它们。
+登记头另列已实现 `ai_pc_action_batch`；其声明采用既有 `Write/NeverParallel`，沿用当前 auto/manual 工具审批。严格参数为 `{generation:"能力进程代次",steps:[{action:"invoke"|"click",target_id:"实时引用"}]}`，1–64 步，引用字符串 1–128 字节，不接受身份、凭据或额外字段。任务11在同一工具增加下文三种步骤。
 
 可信信封与精确解析 ACK 沿用上文，单次路径为 `/ai-pc/actions`，Host 等待 20 秒，响应最多 1 MiB；桌面最多等待 10 秒，native 期限 10 秒。结果投影 `{state,steps:[{index,action,target_id,state,error?}]}` 保留原顺序：completed 是实际返回成功；error 是已知失败；unknown 表示实际效果未确认；not_started 仅用于已确认没有启动的剩余步骤。工具失败仍可返回完整部分结果，Host 标记工具错误，模型自行决定下一次观察；不自动截图或查树。
 
 能力端对同一 Windows 桌面会话采用有界 FIFO：最多两个在途批次（一个执行、一个排队），每批完整串行；共享能力进程生命周期锁保证不会并存第二个本应用执行实例。读取保留各自既有有界 lane，不加入动作全局互斥。Stop、Host 取消／Drop 和桌面等待超时经独立 IPC Cancel 设置原 native 请求取消状态；未启动批次／步骤不执行，同步动作不能保证立即中断。HTTP 或生成结束不释放实际批次执行位置，只有 native 实际返回／进程确已结束后才释放。逐步进度以值形式独立回传并归档到原 invocation，迟到不能恢复生成或交给新回合。
 
 Invoke 使用原 UIA 对象的 InvokePattern，不支持时不悄悄改成点击；真实点击移动真实鼠标、尝试使原窗口到前台并发送鼠标输入，可能改变焦点和窗口前后。实时 ID 仍绑定 context/native generation/原窗口存活 witness。动作不使用冻结树路径，不跨上下文重绑，不逐步骤重新弹窗／重查信息分配规则。未知或失败动作均不自动重试、回滚或重放；原生对象不持久化为重启后可执行引用。
+
+### Everypaw 文字／快捷键／等待（CHG-0029 / 11）
+
+同一 `steps` 可混合 `{action:"set_text",target_id,text}`、`{action:"shortcut",target_id,key,modifiers?}`、`{action:"wait",delay_ms}`。text 必填、允许空串；modifiers 缺省为空串；delay_ms 是非负 signed32 毫秒，允许0、无附加产品上限，wait不接受target。整批形状和快捷键语法先严格验证才分发任何效果；实时目标/能力在各步执行时复核。结果步骤保留各自实际参数，wait没有target_id。
+
+key采用大小写不敏感、可选VK_前缀的单个虚拟键名，支持字母数字、F1–F24、NUMPAD0–9、导航/编辑、Windows、浏览器/媒体、OEM及明确IME键。modifiers独立以空格、加号、逗号或分号分隔，接受Control/CTRL、Alt/MENU、Shift、Win及相应VK_/左右名称；未知键拒绝，不静默忽略，key不能写成Ctrl+A。
+
+set_text 仅使用当前启用且非只读的 ValuePattern.SetValue 整值替换，不降级为剪贴板或模拟输入；shortcut将原窗口置前、聚焦当前目标并复核前台后发送真实键盘输入，可能改变焦点。已按下的多余修饰键先释放，保留所需修饰键，新增按键最后释放。部分SendInput保留已接受数量并报unknown，不补发、不回滚。wait由批次执行器每至多10毫秒检查取消，取消时保留此前completed、当前cancelled及后续not_started；停止仍不证明同步输入已经返回。
+
+仅动作批次的期限替换为 `10,000 + 已验证wait总毫秒`（native/桌面）和 `20,000 + 已验证wait总毫秒`（Host），使用u64检查求和。其他工具、HTTP收包/响应容量及ACK期限不变；现有悬浮问答180秒总体期限仍可能先请求取消。FIFO与实际完成占位沿用10，不因HTTP/生成先结束而放行下一批；未知输入和迟到结果仍只归原调用，不自动重发。
 
 ### Everypaw 原始目标 PNG（CHG-0029 / 09）
 
