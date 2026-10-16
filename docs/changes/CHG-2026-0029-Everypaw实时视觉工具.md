@@ -1,6 +1,6 @@
 # CHG-2026-0029：Everypaw 实时视觉工具
 
-状态：approved / 06 列窗源码、Host 本地门禁及 Everypaw 成对验收完成；后续视觉票继续进行。日期：2026-10-16。
+状态：approved / 06 列窗与09 PNG源码、Host受控模型及Everypaw大图成对验收、09本地治理完成；既有平台与外部门禁保留，后续视觉票依任务图进行。日期：2026-10-16。
 
 ## 授权、基线与边界
 
@@ -68,6 +68,47 @@
 
 含本票官方 CLI 的 Everypaw 成对模型/HTTP/IPC/隔离存储验收及最终组装门禁仍待本票后续记录。桌面排队取消正在补足独立原生控制确认；不是由 Host HTTP 成功推断原生已经停止。不启动生产服务、切换 DeepSeek、push 或部署，CODEOWNER、来源 DCO、CI 及实际 Docker 仍保留未完成边界。
 
+
+### 09 实施前的具体范围补充
+
+既有规格 D15/D16 与正式09要求 PNG 经实际主模型媒体路径交付。沿用本 CHG 已登记授权：在 ai_pc.rs/ai_pc_visual.rs 实施严格 `{target_id}` 的 `ai_pc_capture_target`，受信调用 `/ai-pc/capture`，只接受单张合法原始 PNG，runtime 的实际 image=false/unknown 在原生分发前失败。媒体置于 ToolCallOutcome.media，不复制到文字投影；最大响应 7 MiB 仅用于一张合法5 MiB原件的Base64及有界元数据，沿用原件限制，不缩放。
+
+实测现有 Everypaw SSE 每行1 MiB、REST全历史2 MiB会被合法PNG附件撑破。允许 http.rs 在既有 messages 路由增加可选 `turnID` 与 `textOnly=true` 窄读取；默认路由内容和其他消费者保持原语义。窄读取只返回指定回合的 assistant text，既有 runtime 快照不改变持久化或公共投影。Everypaw SSE仅消费文字且有界丢弃超大非正文event，最终文字以该窄REST恢复。实际>1 MiB完整PNG经真实受控provider、SSE与REST验收，不以提高客户端总容量代替。
+
+此扩展沿用既有 GET messages 路径和稳定编号 `API-HOST-SESSION-004`，是同一路径的可选窄读取合同。新增私有 `MessageQuery`（turn_id/text_only）和扩充 `messages` 过滤逻辑：需有效ASCII turnID，保留指定回合assistant的info/error与text，缺省不变。没有新增Core/runtime接口或事件。Host当前仍先复制wire_messages历史快照再过滤，不能宣称历史内存或CPU开销恒定/全程流式。窄REST传输≤2MiB、SSE保留行≤1MiB/累计wire≤128MiB/180秒；同轮四张原件走四次工具结果，受控paired验证其实际主模型请求和最终文字恢复。超过任一工程边界明确失败，不删媒体以伪装成功。
+
+09新增行为测试优先扩充已有 Router 用例及 Everypaw 成对验收。当前 Host tests 3943/4000 仅余57行，若实测超过先记录必要用例和最小预算文件范围，不以搬迁测试避计数。
+
+### 09 实际实现与本地验收（2026-10-16）
+
+隔离分支 `feature/everypaw-visual-09` 从集成 `4acf3c8` 实施。红测试提交266e078，借用07中性名称分发接缝54a676b（源4fe7b50），PNG实现8cf2283；Engine提交均带DCO。仅修改本表已批准文件；没有Core/AgentLoop/provider、Cargo、xtask或生产配置变化。新增私有字段不作为公共API；变动的pub(crate)工具声明说明与pub(super)调用函数保留中文八栏目。
+
+`ai_pc_capture_target`为ReadOnly/ParallelSafe，严格单个target_id；`ai_pc_visual::call`在取得前检查runtime实际image，capture最多7MiB并要求恰一张PNG，InlineMedia原件验证在精确ACK前完成，媒体仅走现有ToolCallOutcome.media。MessageQuery对turn_id显式命名turnID；该命名错误由真实Router窄REST断言先红后修绿，不靠客户端猜字段。
+
+| 已执行命令/场景 | 实际结果 |
+| --- | --- |
+| `registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` | 最终退出0；6场景list、PNG支持、image未知、仅text、错误MIME、非法原件；不支持时native0、非法媒体不ACK，实际第二provider请求包含相同PNG。窄REST正确过滤text/保留原info，默认REST仍含原件；缺参数/单turnID为400。 |
+| `cargo test -p openpaw-engine-host --features engine-host` | 最终退出0，58+16+36=110；包含窄REST参数和turnID修复后的全部测试。 |
+| `cargo test --workspace` | 退出0；跨工作树切换先刷新09 Host/CLI/xtask源mtime并确认实际编译路径，使用现有共享target、jobs=1、debug=0及隔离临时目录执行提权。 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 最终退出0。 |
+| `cargo clippy --workspace --all-targets --features engine-host -- -D warnings` | 最终退出0；PowerShell吞`--`的首次参数错误保留，后用cmd保持分隔符实际严格执行。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 退出0，3项通过。 |
+| `cargo fmt --all -- --check` 与 `git diff --check` | 最终退出0。 |
+| `cargo run -p xtask -- lines` | 最终退出0；Host6529/7000、tests3943/4000、aux11497/11500，无预算或计数变更。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，扫描356文件。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1；与06/07及未实施基线相同的Windows CRLF/LF快照偏差，未修改Core、快照或检查器掩盖。 |
+| `cargo run -p xtask -- golden` | 退出0，全部golden通过。 |
+| `cargo run -p xtask -- telemetry` | 退出0，284 dependencies、229 symbols clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，532行依赖树、axum匹配数0。 |
+| `cargo deny --version` | 退出1，未安装cargo-deny；不安装新工具，不冒称依赖审计通过，仍需CI门禁。 |
+| `cargo build -p openpaw-cli --features engine-host` | 退出0；独立09官方制品openpaw-png09.exe，SHA256 AA73B0709453596B631921E1C87C28E67F36EF001CA49D5F7BE0885B29C86467，未部署。 |
+| Everypaw同轮四张窗口＋子区PNG paired | 退出0，1/1（10.98秒）。真实官方Host进程/受控SSE provider/桌面HTTP/验证pipe/真实隔离Recorder。1100×1100原件4,841,533B×4=19,366,132B≈18.47MiB，同回合四个不同附件；子区768×768原件2,360,312B。完整解码核对RGBA，逐字节核对保存和实际provider data URL，最终SSE/窄REST回答成功。原列窗paired另1/1绿。 |
+| Everypaw真实WGC像素 | 自建320×240黑色窗口、80×90白EDIT、遮挡/自有picker marker、负坐标、最小化明确失败；最终1/1绿，07共享window缓存修正后再1/1绿。仅捕获自己的隔离测试窗口。 |
+| Everypaw大SSE文字/错误恢复 | 退出0；1.1MB文本行丢弃后窄REST原文恢复，2.1MB正文超过2MiB明确失败，超大error事件后权威failed明确失败。 |
+
+四图fixture首次1160² Fast噪声RGBA超过既有5MiB，在服务前失败；改1100²进入合法范围后绿，没有放宽产品上限。原生fixture曾因STATIC系统颜色、NOACTIVATE选窗规则及UIA数值类型50004误判失败，修正独立fixture后真实像素绿。完整失败及命令记录在Everypaw ticket-09-verification.md。
+
+09最终本地治理命令已按共享缓存序列完成，结果如上；Engine集成仍为基线4acf3c8，无新产品tip待合，Everypaw交付前已合最新纯文档13e059f。Desktop/Recorder和Engine共享构建/执行位均已释放给10。Docker、真实混合DPI/多屏/管理员、HDR及DeepSeek模态接受/理解未验证，不把受控模型或回环宣称这些通过；未改变DeepSeek image配置。CODEOWNER、CI、来源DCO缺口、部署与既有平台门禁独立保留。07后续结构工具合并需保留本票六场景Router与大图paired，并重新核对合并制品，不拿09独立SHA256代替。
 ### 07 实施前登记（2026-10-16）
 
 基于 `4acf3c8`，继续已批准路径内的实时结构工具：`ai_pc_query_structure`。模型仅传 native generation、target_id、逗号分隔 directions、offset、limit、boxes；可信会话/Host turn/执行 generation/invocation 继续由运行时安装。方向集合对齐固定 Everywhere 的 all/parent/child(children)/previous(prev)/next/sibling(siblings)/none，默认 all/0/128/false、limit 最大 1024，非法输入拒绝。工具为 ReadOnly/ParallelSafe；复用现有一次调用、取消及精确 ACK 合同，只按工具选择 `/ai-pc/windows` 或 `/ai-pc/structure`，不提前声明其他未完成工具。模型投影 Balanced4096 估算 tokens 和实际取得/信息权限由桌面负责。Host 新测试写在既有批准模块的自然 inline test seam，不移动已有测试、改变计数或预算；06 测得 Host business6454/7000、外部tests3943/4000、aux11497/11500，若真实增量超限先登记最小治理变更再继续。
@@ -77,6 +118,7 @@
 2026-10-16：正式任务 10 沿已批准 D16–D19 和既有允许文件表实施 `ai_pc_action_batch`。模型参数严格为 `{generation, steps:[{action:"invoke"|"click",target_id}]}`，最多 64 步；会话、原回合和 invocation 继续由可信 Host 封装。声明采用既有 Write/NeverParallel 工具分类与权限机制，不增加独立开关或逐步骤审批。此阶段不声明 set-text、shortcut、wait。
 
 复用 `ai_pc_visual::call` 的唯一调用、取消、精确 ACK 与无重试路径，按工具选择 `/ai-pc/actions`；仅返回实际步骤状态，不强制观察或重放。桌面主路径将 Stop、Host 取消和等待超时传入独立 IPC Cancel，能力端在每步开始前检查取消，整批串行并保留实际完成槽位。实现仅改允许表中的 ai_pc.rs、ai_pc_visual.rs、http.rs 和对应文档；不改 Core/Engine/Store、依赖、审批算法或预算。真实隔离 Windows 控件与受控 Host/HTTP/IPC 验收分别记录。
+
 
 2026-10-16：04 完成后，在 `feature/everypaw-visual-06`（`.local/engine-visual-06`）实施 06，基于已批准集成提交 `64d601c`。本轮实际改动为表内 10 个文件（包含本记录和索引），不修改 Core、Engine、Cargo、xtask 或生产服务。新增/修改公共 Rust 项已人工核对中文说明，函数/方法保留八栏目；登记路径保持原稳定编号。
 
