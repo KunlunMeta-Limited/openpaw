@@ -846,7 +846,7 @@ mod tests {
             .write()
             .unwrap()
             .insert("owned".into(), input.checked().ok().unwrap());
-        assert_eq!(tools.list_tools().await.unwrap().len(), 27);
+        assert_eq!(tools.list_tools().await.unwrap().len(), 28);
         assert!(
             tools
                 .call("ai_pc_current_context", json!({"mode":"open"}))

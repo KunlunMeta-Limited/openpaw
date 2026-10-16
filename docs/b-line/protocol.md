@@ -223,7 +223,7 @@ CHG-2026-0028 集成保留会话原生附件安装、回看与回合结束清理
 
 ### Everypaw 实时列窗扩展（CHG-2026-0029 / 06）
 
-上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows,ai_pc_query_structure`。当前已登记工具共 26 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称其他视觉工具已经存在。
+上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows,ai_pc_query_structure,ai_pc_capture_target,ai_pc_action_batch`。当前已登记工具共 28 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称正文或后续动作种类已经存在。
 
 `ai_pc_list_windows` 参数严格为 `{}`，声明 ReadOnly/ParallelSafe。runtime 在真实接收回合获准 running 后，从持久 admission 取得 requestID/Host turn，以原取消 token、每次执行随机 generation 和所选 provider 实际 image_input 能力安装私有上下文；退出守卫只清除自身 generation。模型输入不能填写身份。
 
