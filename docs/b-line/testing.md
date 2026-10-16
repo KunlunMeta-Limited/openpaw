@@ -413,6 +413,8 @@ Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP
 
 `ai_pc_visual::tests::cancel_and_old_generation_never_ack_or_replay_the_native_call` 使用真实 HTTP 和可控完成闸门，覆盖取消及旧 generation，检查补充取消仍携带原完整调用、无 ACK/重发、旧守卫不清理新执行。
 
+任务 10 的 `ai_pc::tests::action_batches_use_existing_write_approval_and_return_actual_partial_result_once` 经可信工具包装入口、真实 HTTP 和隔离桥替身验证动作声明沿用 Write/NeverParallel、模型不能填写身份、原调用关联、完整部分结果、精确 delivery ACK 和单次请求；工具错误保留已经完成与未开始步骤。与真实 Windows Invoke/click、桌面 HTTP＋验证 IPC 的取消／排队／迟到占位和官方 Host 进程成对测试分别记录，不把 HTTP 替身冒称实际桌面操作。10 当前定向测试 1/1、Host 全包 59+16+36=111 及 Host strict Clippy/lines 已通过，最终组装候选需重新验证。
+
 Everypaw 对应测试使用真实桌面 HTTP 桥、已验证 named-pipe IPC、隔离 SQLite 与原生替身，核对 acquired/投影/Host accepted、伪造身份/参数、cancel-before-request、撤销，以及超过原生期限后的真实 completion 只落原调用本地。独立 worker 的共享 ID authority 测试验证跨 owner 的 8 轮老化、同轮并集、总 soft limit 与最新超限轮保护。真实 Windows 窗口、Docker `host.docker.internal` 与生产所选模型属于不同集成证据；本地假模型/回环不能冒称通过。各命令实际退出码见 CHG-0029 与 Everypaw `ticket-06-verification.md`。
 
 07 增加 `ai_pc::tests::structure_tool_exposes_live_bounded_args_and_rejects_identity_fields`，验证真实登记工具的 schema/defaults/只读并行声明及模型身份字段拒绝。`http::tests::registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 复用受控 Host/model/bridge journey，核对模型选择的范围参数、可信执行身份、单次请求、精确 ACK 和第二次模型请求中的完整已交付投影。

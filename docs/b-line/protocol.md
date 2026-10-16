@@ -247,6 +247,16 @@ metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment
 
 实际取得上限为 1024 节点、8 MiB、3 秒及 8192 关系遍历操作；同步 UIA 调用之间检查期限，不承诺中断 provider。紧凑模型投影限 4096 估算 tokens（utf8_bytes/4），另受既有交付字节上限约束；包含一次观察元数据、必要节点关系/状态、短正文和明确 partial/truncated，坐标仅 boxes=true 且获准时出现，不常态附每节点 PID/时间/技术属性。原始取得与精确交付副本分别保存；原引用关闭、过期、移出边界、被替换、跨上下文/旧代次时失败，不按名称/路径/裸 HWND 重绑。返回及精确 ACK 重新投影并校验当前权限；停止、超时和迟到均延用原调用归属、不重试/恢复生成。结构工具使用与列窗相同的 Host/HTTP/ACK 期限和保留实际 completion 的原生通道。
 
+### Everypaw 调用／点击批次（CHG-0029 / 10）
+
+登记头另列已实现 `ai_pc_action_batch`；其声明采用既有 `Write/NeverParallel`，沿用当前 auto/manual 工具审批。严格参数为 `{generation:"能力进程代次",steps:[{action:"invoke"|"click",target_id:"实时引用"}]}`，1–64 步，字符串 1–128 字节，不接受身份、凭据或额外字段。此阶段没有 set-text、shortcut、wait；工具声明不提前承诺它们。
+
+可信信封与精确解析 ACK 沿用上文，单次路径为 `/ai-pc/actions`，Host 等待 20 秒，响应最多 1 MiB；桌面最多等待 10 秒，native 期限 10 秒。结果投影 `{state,steps:[{index,action,target_id,state,error?}]}` 保留原顺序：completed 是实际返回成功；error 是已知失败；unknown 表示实际效果未确认；not_started 仅用于已确认没有启动的剩余步骤。工具失败仍可返回完整部分结果，Host 标记工具错误，模型自行决定下一次观察；不自动截图或查树。
+
+能力端对同一 Windows 桌面会话采用有界 FIFO：最多两个在途批次（一个执行、一个排队），每批完整串行；共享能力进程生命周期锁保证不会并存第二个本应用执行实例。读取保留各自既有有界 lane，不加入动作全局互斥。Stop、Host 取消／Drop 和桌面等待超时经独立 IPC Cancel 设置原 native 请求取消状态；未启动批次／步骤不执行，同步动作不能保证立即中断。HTTP 或生成结束不释放实际批次执行位置，只有 native 实际返回／进程确已结束后才释放。逐步进度以值形式独立回传并归档到原 invocation，迟到不能恢复生成或交给新回合。
+
+Invoke 使用原 UIA 对象的 InvokePattern，不支持时不悄悄改成点击；真实点击移动真实鼠标、尝试使原窗口到前台并发送鼠标输入，可能改变焦点和窗口前后。实时 ID 仍绑定 context/native generation/原窗口存活 witness。动作不使用冻结树路径，不跨上下文重绑，不逐步骤重新弹窗／重查信息分配规则。未知或失败动作均不自动重试、回滚或重放；原生对象不持久化为重启后可执行引用。
+
 ### Everypaw 原始目标 PNG（CHG-0029 / 09）
 
 新增 `ai_pc_capture_target`，ReadOnly/ParallelSafe，严格参数 `{target_id:非空字符串≤128字节}`；登记回执的已实现工具追加此名称。可信上下文/单次调用/取消与精确 ACK 沿用06，路由为 `/ai-pc/capture`。所选模型的实际 image=false 或未声明时，Host 在原生分发前明确失败；不按模型名猜测，不转 OCR/其他 VLM/更换模型。

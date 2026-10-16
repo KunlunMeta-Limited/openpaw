@@ -60,6 +60,37 @@
 
 ## 执行记录
 
+### 10 Host 局部验证（2026-10-16）
+
+动作票在 `feature/everypaw-visual-10` 复用 07 的私有 `call(name, ...)` 接缝（本分支提交 `b5428a4`），只修改已登记的七个文件：ai_pc.rs、ai_pc_visual.rs、http.rs、本记录及三份 b-line 文档。`validate` 严格验证 generation、1–64 步 invoke/click 与 target_id，拒绝额外字段；`specs` 声明 Write/NeverParallel，`DesktopTools::call/validate_input` 接通已授权路由。`ai_pc_visual::call` 将实际 error/unknown/cancelled 投影标为工具错误，保留一次请求、精确 ACK、原身份和无重试合同；登记回执只增加已实现动作工具。
+
+新行为测试 `action_batches_use_existing_write_approval_and_return_actual_partial_result_once` 首先真实红（工具尚未声明），实现后 1/1 绿。此后 `cargo test -p openpaw-engine-host --features engine-host -- --test-threads=1` 退出 0（59+16+36=111 项），显式 Host 全目标严格 Clippy 退出 0，fmt 退出 0，`cargo run -p xtask -- lines` 退出 0（Host business6505/7000、Host外部tests3943/4000、aux11497/11500）。未修改预算、计数或依赖；新增测试位于原批准模块的自然内联边界。切换共享 target 后曾出现 0 tests 的旧分支缓存，刷新本分支源码时间并确认真实编译路径后重新完成上述红绿；旧缓存不计为通过。
+
+上述是早期单票局部结果。后续已完成独立原生取消控制确认、真实 pipe 断连取消、丢失回执保留 unknown 与原窗口遮挡检查；这些桌面行为由 Everypaw 应用边界和自建真实 Win32 控件验证，不由 Host HTTP 成功推断原生已停止。
+
+### 10 组合后验收（2026-10-16）
+
+实现提交 `027d3aa`，合引擎主线 `d568346`（含09）得到 `846c2e3`；Everypaw 合主线 `843d326`，组合代码 `53c9a5d`。冲突按已实现能力合并：list/PNG/actions 均保留、登记头三工具、工具总数27、PNG媒体保持、动作 error/unknown/cancelled 仍是工具错误。只修改相对主线已登记七个文件，没有依赖、预算、Core／AgentLoop／审批算法或生产配置变化。Engine 实现及合并提交带 Signed-off-by，未解决既有来源 DCO／CODEOWNER／CI 门禁。
+
+| 命令／验收 | 当前实际结果 |
+| --- | --- |
+| Host `cargo test -p openpaw-engine-host --features engine-host -- --test-threads=1` | 组合后退出0，59+16+36=111；动作原始调用与部分结果、09六场景Router、取消／代次和精确ACK均通过。 |
+| `cargo test --workspace` | 合09前退出0；最终相关变化由组合后Host111、两种workspace strict Clippy和parity复核，不声称最终全workspace重跑。 |
+| `cargo clippy --workspace --all-targets -- -D warnings` 与显式 `--features engine-host` | 组合后均退出0，数组splat保留`--`，无警告放行。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 组合后3/3绿。 |
+| fmt、lines、scrub、golden、telemetry | 组合后均退出0；实际Host6573/7000、外部tests3943/4000、aux11497/11500；scrub356，telemetry284 dependencies／229 symbols。 |
+| 默认 `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，既有Windows CRLF/LF快照偏差；未修改受保护快照／检查器。 |
+| `cargo deny --version` | 退出101，未安装cargo-deny；不安装新工具，依赖审计仍需CI。 |
+| `cargo build -p openpaw-cli --features engine-host` | 组合后退出0；仅保留单文件 `openpaw-actions10.exe`，SHA256 `1392AAD06DA65707DCD38F5144CD5ED206C30412D6F4F01570D7EA700F67B437`，未部署。 |
+| Everypaw组合后 `paired_ --ignored --test-threads=1` | 3/3绿（10.94秒）：真实官方Host隔离进程、受控SSE模型、HTTP桥、验证pipe原生替身及隔离Recorder。保留原列窗、09同轮四图窗口／子区PNG；独立动作场景list→invoke有效/click失效/invoke后续→answer，真实ToolResult等于保存投影，completed/error/not_started、执行1次、无强制观察／重放、无token。 |
+| Everypaw Desktop与真实控件 | 组合后主测试87通过/8ignored、通知2通过/1ignored；真实隔离Win32 Invoke/click1/1（0.31秒），拒跨context及遮挡窗口，失败后不点击后续目标。 |
+
+共享xtask的 `env!(CARGO_MANIFEST_DIR)` 会保留编译来源路径；首次lines误返回旧09的6529。刷新本分支xtask源码时间、确认真实编译路径后，五项xtask均重新执行，上表6573为正确组合值；未改算法或预算。一次PowerShell嵌套数组错误未实际执行检查，纠正数组后才取得上表结果，不将参数错误当业务失败。
+
+桌面实际执行位仅在原生返回／进程确认结束后释放；停止、排队取消和10秒超时四场景以及控制断连／回执丢失已从真实HTTP/IPC与保存证据核对。完整红绿及Recorder分阶段验证见Everypaw `ticket-10-verification.md`。三共享target的构建／执行已全部结束并明确交07继续结构组合验证；本票只剩本地文档提交。实际Docker、管理员／多屏DPI、DeepSeek真实调用／模态、CI和部署未验证，不把回环／替身作为通过。生产DeepSeek、服务、数据卷和配置均未改变，不push／部署。
+
+
 ### 09 实施前的具体范围补充
 
 既有规格 D15/D16 与正式09要求 PNG 经实际主模型媒体路径交付。沿用本 CHG 已登记授权：在 ai_pc.rs/ai_pc_visual.rs 实施严格 `{target_id}` 的 `ai_pc_capture_target`，受信调用 `/ai-pc/capture`，只接受单张合法原始 PNG，runtime 的实际 image=false/unknown 在原生分发前失败。媒体置于 ToolCallOutcome.media，不复制到文字投影；最大响应 7 MiB 仅用于一张合法5 MiB原件的Base64及有界元数据，沿用原件限制，不缩放。
@@ -103,6 +134,13 @@
 ### 07 实施前登记（2026-10-16）
 
 基于 `4acf3c8`，继续已批准路径内的实时结构工具：`ai_pc_query_structure`。模型仅传 native generation、target_id、逗号分隔 directions、offset、limit、boxes；可信会话/Host turn/执行 generation/invocation 继续由运行时安装。方向集合对齐固定 Everywhere 的 all/parent/child(children)/previous(prev)/next/sibling(siblings)/none，默认 all/0/128/false、limit 最大 1024，非法输入拒绝。工具为 ReadOnly/ParallelSafe；复用现有一次调用、取消及精确 ACK 合同，只按工具选择 `/ai-pc/windows` 或 `/ai-pc/structure`，不提前声明其他未完成工具。模型投影 Balanced4096 估算 tokens 和实际取得/信息权限由桌面负责。Host 新测试写在既有批准模块的自然 inline test seam，不移动已有测试、改变计数或预算；06 测得 Host business6454/7000、外部tests3943/4000、aux11497/11500，若真实增量超限先登记最小治理变更再继续。
+
+### 10 预实施登记
+
+2026-10-16：正式任务 10 沿已批准 D16–D19 和既有允许文件表实施 `ai_pc_action_batch`。模型参数严格为 `{generation, steps:[{action:"invoke"|"click",target_id}]}`，最多 64 步；会话、原回合和 invocation 继续由可信 Host 封装。声明采用既有 Write/NeverParallel 工具分类与权限机制，不增加独立开关或逐步骤审批。此阶段不声明 set-text、shortcut、wait。
+
+复用 `ai_pc_visual::call` 的唯一调用、取消、精确 ACK 与无重试路径，按工具选择 `/ai-pc/actions`；仅返回实际步骤状态，不强制观察或重放。桌面主路径将 Stop、Host 取消和等待超时传入独立 IPC Cancel，能力端在每步开始前检查取消，整批串行并保留实际完成槽位。实现仅改允许表中的 ai_pc.rs、ai_pc_visual.rs、http.rs 和对应文档；不改 Core/Engine/Store、依赖、审批算法或预算。真实隔离 Windows 控件与受控 Host/HTTP/IPC 验收分别记录。
+
 
 2026-10-16：04 完成后，在 `feature/everypaw-visual-06`（`.local/engine-visual-06`）实施 06，基于已批准集成提交 `64d601c`。本轮实际改动为表内 10 个文件（包含本记录和索引），不修改 Core、Engine、Cargo、xtask 或生产服务。新增/修改公共 Rust 项已人工核对中文说明，函数/方法保留八栏目；登记路径保持原稳定编号。
 

@@ -183,4 +183,6 @@ Everypaw 实时列窗源码基于 `c105d80356f7217138d3b70bfab1d72d5a271f4d`，�
 
 07 结构工具工作分支为 `feature/everypaw-visual-07`，基于已完成 06 的 `4acf3c8`；Everypaw 对应 `feature/desktop-structure-07`。Host 回执明确声明 `ai_pc_query_structure` 后，模型才能使用原生 generation/target_id 按需查询实时结构；其4096估算 token 投影限制独立于实际取得容量，部署和模型配置仍沿用上述独立门禁。
 
+任务 10 的 `feature/everypaw-visual-10` 从同一引擎集成继续增加调用／点击批次。无需新环境变量或动作权限开关，沿用既有工具 auto/manual 设置与 Basic 登记。真实鼠标输入可能改变桌面焦点；停止是独立控制路径，不宣称能抢占正在同步执行的 UIA 调用。未部署此分支，所选 DeepSeek 云端配置保持原值。
+
 09目标PNG复用所选provider/model的 `OPENPAW_MODEL_CAPABILITIES` image声明；未知或仅text在捕获前失败。配置声明只证明本地允许，实际第三方接受与理解需独立验收。现有DeepSeek配置不因新增工具自动获得image声明；没有改动其生产配置。原图按5 MiB/张等既有媒体边界，不自动缩放。
