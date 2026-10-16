@@ -151,6 +151,7 @@ pub struct SessionHandle {
     request_admissions: std::sync::RwLock<HashMap<String, RequestAdmission>>,
     turn_gate: std::sync::Mutex<()>,
     turn_cancel: std::sync::Mutex<CancellationToken>,
+    desktop_registrations: crate::ai_pc::Registrations,
 }
 #[derive(Debug, Clone)]
 struct ActiveTurn {
@@ -1160,6 +1161,7 @@ impl AppState {
             request_admissions: std::sync::RwLock::new(request_admissions),
             turn_gate: std::sync::Mutex::new(()),
             turn_cancel: std::sync::Mutex::new(CancellationToken::new()),
+            desktop_registrations: self.ai_pc.clone(),
         })
     }
     pub async fn wire_session(&self, handle: &SessionHandle) -> SessionWire {
@@ -2464,6 +2466,28 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         cleanup.finish();
         return;
     }
+    // 仅实际获准执行的可信回合可安装桌面工具身份。重放和排队取消不安装。
+    let request_id = handle
+        .request_admissions
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .find(|a| a.turn_id == turn_id)
+        .map(|a| a.request_id.clone());
+    let registration = handle
+        .desktop_registrations
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&handle.id)
+        .cloned();
+    let _visual_execution = request_id.zip(registration).map(|(request, registration)| {
+        registration.visual.enter(
+            request,
+            turn_id.clone(),
+            turn_cancel.clone(),
+            provider.model_capabilities(&model).image_input,
+        )
+    });
     let mut roles = {
         let mut previous = handle.office_working.lock().await;
         std::mem::take(&mut *previous)

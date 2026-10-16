@@ -404,3 +404,11 @@ Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP
 两条全仓命令分别 972/1079 passed、0 failed、2 个既有 ignored。Host 104 项、CLI/Host parity 3 项全部通过。
 严格 Clippy/格式检查使用与 CHG-0026 相同的 Rust 1.99；实际命令和环境修正见当前 CHG。
 原样 OpenWork 的页面诊断单独记录，不将浏览器组合输入模拟或诊断 probe 当成正式发布 journey。
+
+### Everypaw 实时列窗（CHG-0029 / 06）
+
+`http::tests::registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 经实际 Host Router、真实假 OpenAI SSE HTTP 与受控桥：检查第一个真实模型请求的工具声明、runtime 生成身份、单次 native 调用、精确 delivery ACK、第二个真实模型请求的 ToolResult/provider callID 以及不含 token。登记接口测试同时检查扩展响应头；原 current/history 和媒体透传回归保留。
+
+`ai_pc_visual::tests::cancel_and_old_generation_never_ack_or_replay_the_native_call` 使用真实 HTTP 和可控完成闸门，覆盖取消及旧 generation，检查补充取消仍携带原完整调用、无 ACK/重发、旧守卫不清理新执行。
+
+Everypaw 对应测试使用真实桌面 HTTP 桥、已验证 named-pipe IPC、隔离 SQLite 与原生替身，核对 acquired/投影/Host accepted、伪造身份/参数、cancel-before-request、撤销，以及超过原生期限后的真实 completion 只落原调用本地。独立 worker 的共享 ID authority 测试验证跨 owner 的 8 轮老化、同轮并集、总 soft limit 与最新超限轮保护。真实 Windows 窗口、Docker `host.docker.internal` 与生产所选模型属于不同集成证据；本地假模型/回环不能冒称通过。各命令实际退出码见 CHG-0029 与 Everypaw `ticket-06-verification.md`。

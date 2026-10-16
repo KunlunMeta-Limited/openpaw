@@ -1,6 +1,6 @@
 # CHG-2026-0029：Everypaw 实时视觉工具
 
-状态：approved / 已有用户范围授权登记；逐票实施和本地验证待完成。日期：2026-10-16。
+状态：approved / 06 列窗源码、Host 本地门禁及 Everypaw 成对验收完成；后续视觉票继续进行。日期：2026-10-16。
 
 ## 授权、基线与边界
 
@@ -60,4 +60,37 @@
 
 ## 执行记录
 
-2026-10-16：已完成基线和规则只读核对、建立隔离集成工作树并登记已有用户范围授权。尚未修改引擎业务代码、运行构建、调用模型或部署；待 Everypaw 04 完成后认领 06，后续逐票补实际选择及验证。
+2026-10-16：04 完成后，在 `feature/everypaw-visual-06`（`.local/engine-visual-06`）实施 06，基于已批准集成提交 `64d601c`。本轮实际改动为表内 10 个文件（包含本记录和索引），不修改 Core、Engine、Cargo、xtask 或生产服务。新增/修改公共 Rust 项已人工核对中文说明，函数/方法保留八栏目；登记路径保持原稳定编号。
+
+### 06 实际符号与工程选择
+
+- `ai_pc::Registration.visual`、`specs`、`DesktopTools::{call,list_tools}` 和 `ToolHostValidator::validate_input`：只新增 `ai_pc_list_windows`，严格空对象，沿用 ReadOnly/ParallelSafe；保留 current/history、受管 session_search 限制和媒体行为。
+- 私有 `ai_pc_visual::{VisualContext,ExecutionGuard,call}`：`runtime::run_turn` 在 durable admission 获准 running 后安装可信 request/Host turn/UUID generation/取消 token/实际模型 image 能力；guard 只清理自己的代次。调用创建独立 invocation，不猜配 provider callID。
+- `http` 现有登记入口成功回执增加 `openpaw-desktop-protocol: 1` 与 `openpaw-desktop-tools: ai_pc_list_windows`。桌面端只有看到此组合才宣称实时工具可用；旧 204 仍可普通文字问答和使用旧工具。
+- 每次工具只发一次，Host 列窗等待 20 秒、结果 1 MiB；完整解析后对精确 invocation/delivery ACK 等待 2 秒、严格接受不超过 128 字节的 `{status:"accepted"}`。独立 OnceLock 取消队列容量 64，Drop 使用 try_send、每条最多 2 秒且不重试；队满/运行时关闭不保证补充通知。桌面原回合 Stop 是主取消路径。
+- 桌面仍绑定随机端口 `0.0.0.0` 并登记 `host.docker.internal`；原生入口仅受验证本机 IPC。桌面桥 HTTP 收包 3 秒与 native 执行等待分开，最多两个 detached acquisition，占位到真实完成。迟到实际取得内容留在原调用本地，不恢复生成/不 ACK；此行为不等于取消了同步原生操作。
+
+### 06 已执行命令
+
+所有 Cargo 命令均经相邻 Everypaw `scripts/native.ps1`、独立 `.local/engine-target`，dev/test debug=0、jobs=1；未发出真实模型请求。
+
+| 命令 | 结果与证明范围 |
+| --- | --- |
+| `cargo test -p openpaw-engine-host --features engine-host` | 退出 0；58+16+36=110 项。包括真实受控 Router/模型 HTTP 的可信回合与精确 ACK、取消及旧代次不 ACK/不重放。 |
+| `cargo build -p openpaw-cli --features engine-host` | 退出 0；生成真实官方 `debug/openpaw.exe`，供后续 Everypaw 成对进程验收。 |
+| `cargo test --workspace` | 首次退出 101：既有 Windows `add_write_acl_on_temp_dir` 在沙箱中 SetNamedSecurityInfo 错误 5。随后对隔离临时目录以执行提权重跑完整 workspace，退出 0。未修改测试或 ACL 实现。 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 退出 0，默认依赖隔离保持。 |
+| `cargo clippy --workspace --all-targets --features engine-host -- -D warnings` | 最终退出 0，包含本轮新 Host 测试。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 退出 0，3 项通过。 |
+| `cargo fmt --all -- --check` | 退出 0。 |
+| `cargo run -p xtask -- lines` | 退出 0；Host business 6454/7000、Host tests 3943/4000、aux 11497/11500。未更改预算/计数。 |
+| `cargo run -p xtask -- scrub --check` | 退出 0，扫描 356 文件。 |
+| `cargo run -p xtask -- snapshot --check` | 退出 1：检测到既有快照在 Windows checkout 为 CRLF，而检查器逐字节比较 LF rendered；未改 Core/snapshot/检查器。对未实施 06 的 `engine-visual-integration`（64d601c）同命令也退出 1，记录既有平台门禁，未重写受保护快照来掩盖。 |
+| `cargo run -p xtask -- golden` | 退出 0，全部 golden 通过。 |
+| `cargo run -p xtask -- telemetry` | 退出 0，284 dependencies、229 symbols clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出 0，axum 匹配数 0。 |
+| `cargo deny --version` | 退出 1，本机未安装 cargo-deny；依赖审计由现行 CI 门禁完成，不宣称本地审计通过。 |
+
+Everypaw 已运行 `paired_official_host_model_desktop_http_ipc_and_store_roundtrip --ignored`（退出 0）：真实官方 `openpaw.exe` 隔离进程、本地受控 SSE 模型、真实桌面 HTTP 桥、受验证 named-pipe 原生替身、隔离 Recorder、精确 ACK 和第二轮模型请求贯通；ToolResult 与保存投影逐值一致、原回合关联正确、不含 token。另实际 Windows `metadata_window_list_retains_real_child_witness_without_initializing_uia --ignored` 退出 0，证明 EnumWindows 取得自建子进程窗口、应用身份和 -wv 引用、OS 销毁后失效，metadata 未初始化 UIA。这两个证明面分别记载于 Everypaw `ticket-06-verification.md`。
+
+真实 Docker Desktop Linux engine 管道不可用，未做容器连通验收；回环/原生替身不作为 Docker 通过证据。L3 CODEOWNER、来源 DCO 缺口、CI 和部署仍待独立完成；本轮不 push、不部署、不切换现有 DeepSeek 服务。
