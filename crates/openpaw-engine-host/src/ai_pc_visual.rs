@@ -142,6 +142,7 @@ pub(super) async fn call(
 ) -> Result<ToolCallOutcome, String> {
     let path = match name {
         "ai_pc_list_windows" => "/ai-pc/windows",
+        "ai_pc_action_batch" => "/ai-pc/actions",
         _ => return Err("此实时桌面工具尚未实现。".into()),
     };
     let active = r.visual.snapshot()?;
@@ -153,7 +154,7 @@ pub(super) async fn call(
     };
     let mut url = r.url.clone();
     url.set_path(path);
-    // 20 秒是列窗等待期限，不是 HTTP 收包期限，也不表示卡住的 UIA 可中断。
+    // 20 秒是 Host 工具等待期限，不是 HTTP 收包期限，也不表示同步原生动作可中断。
     let response = tokio::select! { biased; _ = active.cancel.cancelled() => return Err("原回合已取消。".into()), result = r.client.post(url).bearer_auth(&r.token).timeout(Duration::from_secs(20)).json(&call).send() => result.map_err(|_|"视觉工具连接失败；没有重发。")? };
     if !response.status().is_success() {
         return Err(format!("视觉工具拒绝 HTTP {}", response.status().as_u16()));
@@ -163,7 +164,7 @@ pub(super) async fn call(
     while let Some(chunk) = tokio::select! { biased; _=active.cancel.cancelled()=>return Err("原回合已取消。".into()), chunk=response.chunk()=>chunk.map_err(|_|"视觉结果传输失败。")? }
     {
         if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
-            return Err("列窗结果超过 1 MiB 传输容量。".into());
+            return Err("视觉结果超过 1 MiB 传输容量。".into());
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -218,7 +219,10 @@ pub(super) async fn call(
     Ok(ToolCallOutcome {
         content: structured.to_string(),
         structured: Some(structured),
-        is_error: false,
+        is_error: matches!(
+            result.projection["state"].as_str(),
+            Some("error" | "unknown" | "cancelled")
+        ),
         media: vec![],
     })
 }

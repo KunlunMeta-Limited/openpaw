@@ -60,9 +60,23 @@
 
 ## 执行记录
 
+### 10 Host 局部验证（2026-10-16）
+
+动作票在 `feature/everypaw-visual-10` 复用 07 的私有 `call(name, ...)` 接缝（本分支提交 `b5428a4`），只修改已登记的七个文件：ai_pc.rs、ai_pc_visual.rs、http.rs、本记录及三份 b-line 文档。`validate` 严格验证 generation、1–64 步 invoke/click 与 target_id，拒绝额外字段；`specs` 声明 Write/NeverParallel，`DesktopTools::call/validate_input` 接通已授权路由。`ai_pc_visual::call` 将实际 error/unknown/cancelled 投影标为工具错误，保留一次请求、精确 ACK、原身份和无重试合同；登记回执只增加已实现动作工具。
+
+新行为测试 `action_batches_use_existing_write_approval_and_return_actual_partial_result_once` 首先真实红（工具尚未声明），实现后 1/1 绿。此后 `cargo test -p openpaw-engine-host --features engine-host -- --test-threads=1` 退出 0（59+16+36=111 项），显式 Host 全目标严格 Clippy 退出 0，fmt 退出 0，`cargo run -p xtask -- lines` 退出 0（Host business6505/7000、Host外部tests3943/4000、aux11497/11500）。未修改预算、计数或依赖；新增测试位于原批准模块的自然内联边界。切换共享 target 后曾出现 0 tests 的旧分支缓存，刷新本分支源码时间并确认真实编译路径后重新完成上述红绿；旧缓存不计为通过。
+
+含本票官方 CLI 的 Everypaw 成对模型/HTTP/IPC/隔离存储验收及最终组装门禁仍待本票后续记录。桌面排队取消正在补足独立原生控制确认；不是由 Host HTTP 成功推断原生已经停止。不启动生产服务、切换 DeepSeek、push 或部署，CODEOWNER、来源 DCO、CI 及实际 Docker 仍保留未完成边界。
+
 ### 07 实施前登记（2026-10-16）
 
 基于 `4acf3c8`，继续已批准路径内的实时结构工具：`ai_pc_query_structure`。模型仅传 native generation、target_id、逗号分隔 directions、offset、limit、boxes；可信会话/Host turn/执行 generation/invocation 继续由运行时安装。方向集合对齐固定 Everywhere 的 all/parent/child(children)/previous(prev)/next/sibling(siblings)/none，默认 all/0/128/false、limit 最大 1024，非法输入拒绝。工具为 ReadOnly/ParallelSafe；复用现有一次调用、取消及精确 ACK 合同，只按工具选择 `/ai-pc/windows` 或 `/ai-pc/structure`，不提前声明其他未完成工具。模型投影 Balanced4096 估算 tokens 和实际取得/信息权限由桌面负责。Host 新测试写在既有批准模块的自然 inline test seam，不移动已有测试、改变计数或预算；06 测得 Host business6454/7000、外部tests3943/4000、aux11497/11500，若真实增量超限先登记最小治理变更再继续。
+
+### 10 预实施登记
+
+2026-10-16：正式任务 10 沿已批准 D16–D19 和既有允许文件表实施 `ai_pc_action_batch`。模型参数严格为 `{generation, steps:[{action:"invoke"|"click",target_id}]}`，最多 64 步；会话、原回合和 invocation 继续由可信 Host 封装。声明采用既有 Write/NeverParallel 工具分类与权限机制，不增加独立开关或逐步骤审批。此阶段不声明 set-text、shortcut、wait。
+
+复用 `ai_pc_visual::call` 的唯一调用、取消、精确 ACK 与无重试路径，按工具选择 `/ai-pc/actions`；仅返回实际步骤状态，不强制观察或重放。桌面主路径将 Stop、Host 取消和等待超时传入独立 IPC Cancel，能力端在每步开始前检查取消，整批串行并保留实际完成槽位。实现仅改允许表中的 ai_pc.rs、ai_pc_visual.rs、http.rs 和对应文档；不改 Core/Engine/Store、依赖、审批算法或预算。真实隔离 Windows 控件与受控 Host/HTTP/IPC 验收分别记录。
 
 2026-10-16：04 完成后，在 `feature/everypaw-visual-06`（`.local/engine-visual-06`）实施 06，基于已批准集成提交 `64d601c`。本轮实际改动为表内 10 个文件（包含本记录和索引），不修改 Core、Engine、Cargo、xtask 或生产服务。新增/修改公共 Rust 项已人工核对中文说明，函数/方法保留八栏目；登记路径保持原稳定编号。
 

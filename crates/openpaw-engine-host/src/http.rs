@@ -699,7 +699,10 @@ fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Respon
             StatusCode::NO_CONTENT,
             [
                 ("openpaw-desktop-protocol", "1"),
-                ("openpaw-desktop-tools", "ai_pc_list_windows"),
+                (
+                    "openpaw-desktop-tools",
+                    "ai_pc_list_windows,ai_pc_action_batch",
+                ),
             ],
         )
             .into_response(),

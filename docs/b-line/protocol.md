@@ -238,3 +238,13 @@ Host 完整解析、校验身份/容量/活动代次后 POST `/ai-pc/ack`，正�
 取消正文为原调用，路径 `/ai-pc/cancel`。桌面在工作前建立取消 tombstone，晚到同 invocation 不执行；等待期间撤销、切换服务或停止后，实际迟到内容仅保存原调用本地证据，不生成/恢复模型结果。列窗显式保留 IPC 实际 completion：超时或 cancel 不丢弃同 ID/native generation 的真实结果；bounded acquisition 工作位保持到真实完成或进程断连。旧 background/01 路径保持原 discard 语义。Host future Drop 使用独立 64 项有界队列 try_send 补充 cancel，运行时退出或队满不保证送达；桌面原回合 Stop 是主路径。所有工具和控制均不自行重试。
 
 metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment。各 worker 持有自己的原生对象，仅共享无 COM 的 ID/active/completed authority，统一执行每上下文 8 个非空视觉回合、总计 2048 个不同 ID 的软限及最新轮保护。同轮多个附件/工具采用并集；metadata 使用 `-wv` 命名空间，控件使用 `-v`，防止跨表碰撞。Complete/Abandon 有界异步广播，不等待卡住的 provider。后续 UIA 读取窗口引用须在能力进程内延续同一 witness、创建前后复核，不能把 HWND 当永久身份或跨 apartment 传递 Rc/COM。
+
+### Everypaw 调用／点击批次（CHG-0029 / 10）
+
+登记头另列已实现 `ai_pc_action_batch`；其声明采用既有 `Write/NeverParallel`，沿用当前 auto/manual 工具审批。严格参数为 `{generation:"能力进程代次",steps:[{action:"invoke"|"click",target_id:"实时引用"}]}`，1–64 步，字符串 1–128 字节，不接受身份、凭据或额外字段。此阶段没有 set-text、shortcut、wait；工具声明不提前承诺它们。
+
+可信信封与精确解析 ACK 沿用上文，单次路径为 `/ai-pc/actions`，Host 等待 20 秒，响应最多 1 MiB；桌面最多等待 10 秒，native 期限 10 秒。结果投影 `{state,steps:[{index,action,target_id,state,error?}]}` 保留原顺序：completed 是实际返回成功；error 是已知失败；unknown 表示实际效果未确认；not_started 仅用于已确认没有启动的剩余步骤。工具失败仍可返回完整部分结果，Host 标记工具错误，模型自行决定下一次观察；不自动截图或查树。
+
+能力端对同一 Windows 桌面会话采用有界 FIFO：最多两个在途批次（一个执行、一个排队），每批完整串行；共享能力进程生命周期锁保证不会并存第二个本应用执行实例。读取保留各自既有有界 lane，不加入动作全局互斥。Stop、Host 取消／Drop 和桌面等待超时经独立 IPC Cancel 设置原 native 请求取消状态；未启动批次／步骤不执行，同步动作不能保证立即中断。HTTP 或生成结束不释放实际批次执行位置，只有 native 实际返回／进程确已结束后才释放。逐步进度以值形式独立回传并归档到原 invocation，迟到不能恢复生成或交给新回合。
+
+Invoke 使用原 UIA 对象的 InvokePattern，不支持时不悄悄改成点击；真实点击移动真实鼠标、尝试使原窗口到前台并发送鼠标输入，可能改变焦点和窗口前后。实时 ID 仍绑定 context/native generation/原窗口存活 witness。动作不使用冻结树路径，不跨上下文重绑，不逐步骤重新弹窗／重查信息分配规则。未知或失败动作均不自动重试、回滚或重放；原生对象不持久化为重启后可执行引用。
