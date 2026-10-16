@@ -225,3 +225,11 @@ Everypaw真实HTTP/受验证IPC/SQLite边界最终1/1绿（6.61秒）：默认/�
 Everypaw对应候选 `d86a869` 已合最新 `6cb7593`。Recorder121/121、Desktop88＋通知2、真实层级UIA/WGC像素/Invoke点击各1/1通过；新组合CLI官方paired4/4（11.77秒）：结构与列窗完整已交付投影/精确ACK、同轮四张4,841,533B原PNG与2,360,312B子区PNG的保存/provider字节及SSE/窄REST、动作实际部分结果/不重放。最新native注册/字段读取deadline也经真实层级复验。没有访问真实用户桌面或调用生产模型。
 
 最终变更仍仅10个允许文件，公共/受限可见Rust项的中文八栏目保持；实现与合并提交均带DCO。snapshot、cargo-deny缺失、真实Docker/管理员/登录重启、CODEOWNER/历史来源DCO/CI和部署仍待独立完成。完整Everypaw证据为其 `ticket-07-verification.md`；没有切换DeepSeek、运行服务、push或清理数据。
+
+## 08：正文分页实施前范围登记
+
+沿用已批准正式08及D14/D19，基于集成 `1b2312e` 在 `feature/everypaw-visual-08` 实施。只修改允许表中的 ai_pc.rs（`validate_text`、`validate`、`specs`、`DesktopTools::call/validate_input`及自然内联测试）、ai_pc_visual.rs（`call`增加 `/ai-pc/text`）、http.rs（登记回执增加已实现工具）及三份b-line文档、本记录/索引；不新增依赖、不改Core/Engine/Store/provider或预算/计数。
+
+`ai_pc_read_text` 为ReadOnly/ParallelSafe，严格参数 `{generation,target_id,offset?,limit?}`；offset默认0、带符号UTF-16 code units，绝对值最多10,469,374；limit默认4096，正整数由桌面钳制16384。模型不能填写session/request/turn/invocation、权限或native probe。桌面单次probe最多10,485,760 UTF-16、正offset前缀至少4098且带额外边界/sentinel；负offset相对此次取得前缀末端，长度下界时明确bounded_prefix_end。返回当前独立观察、实际start/end/next与exact/lower_bound长度；不缓存冻结全文，不用TextUnit_Character冒充UTF-16，不作无界GetText/Value读取。模型投影另限10240估算tokens并复用既有更小字节预算，裁短则next严格跟随实际发送末尾；本地原取得页保持完整。代理项中间的start向前对齐，limit1可完整返回2单元pair；末尾收回边界，不替换或跳字。
+
+复用可信活动回合、单次HTTP、精确ACK/取消和实际迟到证据；不引入媒体、OCR、额外模型或权限弹窗。新增Operation明确保留真实completion；每次原生目标/权限及交付/ACK复查，失败不重绑或重试。通过既有已获用户确认的Host工具桥/真实HTTP/验证IPC/隔离Recorder与自建Windows长正文验证；真实生产模型、Docker、管理员和外部门禁继续单独记录。上述授权已覆盖本次具体符号/契约，按AGENTS已有授权条款继续，不重复索要确认。回滚仍为未部署独立分支回退，不删除任何用户数据。
