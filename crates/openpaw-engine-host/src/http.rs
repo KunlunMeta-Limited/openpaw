@@ -383,16 +383,51 @@ async fn delete_session(State(state): State<Arc<AppState>>, Path(id): Path<Strin
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MessageQuery {
+    #[serde(rename = "turnID")]
+    turn_id: Option<String>,
+    text_only: Option<bool>,
+}
 async fn messages(
     State(state): State<Arc<AppState>>,
     Path(path): Path<std::collections::HashMap<String, String>>,
+    Query(query): Query<MessageQuery>,
 ) -> Response {
     let handle = match state.get_typed(&path["id"]).await {
         Ok(handle) => handle,
         Err(error) => return session_load_error(error),
     };
     // 读取独立快照，避免模型/工具回合持有 Session 写锁时让前端轮询等待。
-    let result = handle.wire_messages();
+    let mut result = handle.wire_messages();
+    if query.text_only == Some(true) {
+        let Some(turn) = query.turn_id.filter(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        }) else {
+            return bad(StatusCode::BAD_REQUEST, "textOnly 需要合法 turnID");
+        };
+        let base = format!("msg_{}_{turn}_assistant", path["id"]);
+        result.retain(|m| {
+            m["info"]["role"] == "assistant"
+                && m["info"]["id"].as_str().is_some_and(|id| {
+                    id == base
+                        || id
+                            .strip_prefix(&(base.clone() + "_"))
+                            .is_some_and(|s| s.parse::<u32>().is_ok())
+                })
+        });
+        for message in &mut result {
+            if let Some(parts) = message["parts"].as_array_mut() {
+                parts.retain(|p| p["type"] == "text");
+            }
+        }
+    } else if query.turn_id.is_some() {
+        return bad(StatusCode::BAD_REQUEST, "turnID 仅用于 textOnly 读取");
+    }
     match path.get("message_id") {
         Some(id) => match result
             .into_iter()
@@ -699,7 +734,10 @@ fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Respon
             StatusCode::NO_CONTENT,
             [
                 ("openpaw-desktop-protocol", "1"),
-                ("openpaw-desktop-tools", "ai_pc_list_windows"),
+                (
+                    "openpaw-desktop-tools",
+                    "ai_pc_list_windows,ai_pc_query_structure,ai_pc_capture_target,ai_pc_action_batch",
+                ),
             ],
         )
             .into_response(),
@@ -1489,120 +1527,250 @@ mod tests {
 
     #[tokio::test]
     async fn registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
+        visual_roundtrip("ai_pc_list_windows",serde_json::json!({}),"windows",serde_json::json!({"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]})).await;
+    }
+
+    #[tokio::test]
+    async fn registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
+        visual_roundtrip("ai_pc_query_structure",serde_json::json!({"generation":"native","target_id":"native-v1","directions":"children,parent","offset":2,"limit":5000,"boxes":true}),"structure",serde_json::json!({"kind":"untrusted_ui_data","observation":"live_structure","controls":[{"id":"native-v1","name":"本次控件","box":[-10,20,40,50]}]})).await;
+    }
+
+    async fn visual_roundtrip(
+        name: &'static str,
+        args: serde_json::Value,
+        path: &str,
+        projection: serde_json::Value,
+    ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _env = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
-        let calls = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let model_seen = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
-        let model_calls = Arc::new(AtomicUsize::new(0));
-        let seen = model_seen.clone();
-        let count = model_calls.clone();
-        let model = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
-            let (seen, count) = (seen.clone(), count.clone());
+        for case in if name == "ai_pc_query_structure" {
+            6..7
+        } else {
+            0..6
+        } {
+            let capture = (1..6).contains(&case);
+            let tool_name = if capture {
+                "ai_pc_capture_target"
+            } else {
+                name
+            };
+            let tool_args = if capture {
+                r#"{"target_id":"native-v1"}"#.to_string()
+            } else {
+                args.to_string()
+            };
+            let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLttAAAAABJRU5ErkJggg==";
+            let calls = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let model_seen = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+            let model_calls = Arc::new(AtomicUsize::new(0));
+            let seen = model_seen.clone();
+            let count = model_calls.clone();
+            let model = Router::new().route("/v1/chat/completions", post(move |Json(body): Json<serde_json::Value>| {
+            let (seen, count, tool_args) = (seen.clone(), count.clone(), tool_args.clone());
             async move {
                 seen.lock().await.push(body);
                 let chunk = if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"provider-list","type":"function","function":{"name":"ai_pc_list_windows","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+                    serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"provider-list","type":"function","function":{"name":tool_name,"arguments":tool_args}}]},"finish_reason":"tool_calls"}]})
                 } else { serde_json::json!({"choices":[{"delta":{"content":"已取得窗口"},"finish_reason":"stop"}]}) };
                 ([("content-type","text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n"))
             }
         }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let model_url = format!("http://{}/v1", listener.local_addr().unwrap());
-        let model_task = tokio::spawn(async move {
-            axum::serve(listener, model).await.unwrap();
-        });
-        let observed = calls.clone();
-        let bridge = Router::new().route("/ai-pc/windows",post(move |Json(body): Json<serde_json::Value>| {
-            let observed = observed.clone();
-            async move { observed.lock().await.push(body.clone()); Json(serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":{"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]}})) }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let model_url = format!("http://{}/v1", listener.local_addr().unwrap());
+            let model_task = tokio::spawn(async move {
+                axum::serve(listener, model).await.unwrap();
+            });
+            let observed = calls.clone();
+            let saved_projection = if capture {
+                serde_json::json!({"kind":"untrusted_ui_data","target_id":"native-v1"})
+            } else {
+                projection.clone()
+            };
+            let bridge_projection = saved_projection.clone();
+            let bridge = Router::new().route(&format!("/ai-pc/{}", if capture { "capture" } else { path }),post(move |Json(body): Json<serde_json::Value>| {
+            let (observed,projection) = (observed.clone(), bridge_projection.clone());
+            async move { observed.lock().await.push(body.clone()); let mut value = serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":projection}); if capture { value["media"] = serde_json::json!([{"id":"att_fixture","mime":if case==4{"image/jpeg"}else{"image/png"},"data":if case==5{"AAAA"}else{png},"filename":"target.png"}]); } Json(value) }
         }));
-        let observed = calls.clone();
-        let bridge = bridge.route(
-            "/ai-pc/ack",
-            post(move |Json(body): Json<serde_json::Value>| {
-                let observed = observed.clone();
-                async move {
-                    observed.lock().await.push(body);
-                    Json(serde_json::json!({"status":"accepted"}))
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bridge_url = format!("http://{}/ai-pc", listener.local_addr().unwrap());
-        let bridge_task = tokio::spawn(async move {
-            axum::serve(listener, bridge).await.unwrap();
-        });
-        let old_key = std::env::var_os("OPENAI_API_KEY");
-        let old_url = std::env::var_os("OPENPAW_OPENAI_BASE_URL");
-        std::env::set_var("OPENAI_API_KEY", "test-key");
-        std::env::set_var("OPENPAW_OPENAI_BASE_URL", model_url);
-        let home = tempfile::tempdir().unwrap();
-        let state = AppState::new(HostConfig {
-            home: home.path().into(),
-            provider: "openai".into(),
-            username: Some("fixture".into()),
-            password: Some("secret".into()),
-            ..Default::default()
-        });
-        let handle = state
-            .create_session(None, Some("fixture-model"), None, None)
-            .await
-            .unwrap();
-        state
-            .register_ai_pc(
-                &handle.id,
-                Some(crate::ai_pc::RegistrationInput {
-                    bridge_url,
-                    token: "a".repeat(64),
+            let observed = calls.clone();
+            let bridge = bridge.route(
+                "/ai-pc/ack",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let observed = observed.clone();
+                    async move {
+                        observed.lock().await.push(body);
+                        Json(serde_json::json!({"status":"accepted"}))
+                    }
                 }),
-            )
-            .await
-            .ok()
-            .unwrap();
-        let response = build_router(state).oneshot(Request::builder().method("POST").uri(format!("/session/{}/message",handle.id)).header("content-type","application/json").header("authorization","Basic Zml4dHVyZTpzZWNyZXQ=").body(Body::from(r#"{"requestID":"trusted-request","parts":[{"type":"text","text":"列出窗口"}]}"#)).unwrap()).await.unwrap();
-        let status = response.status();
-        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        match old_key {
-            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
-            None => std::env::remove_var("OPENAI_API_KEY"),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let bridge_url = format!("http://{}/ai-pc", listener.local_addr().unwrap());
+            let bridge_task = tokio::spawn(async move {
+                axum::serve(listener, bridge).await.unwrap();
+            });
+            let old_key = std::env::var_os("OPENAI_API_KEY");
+            let old_url = std::env::var_os("OPENPAW_OPENAI_BASE_URL");
+            let old_capabilities = std::env::var_os("OPENPAW_MODEL_CAPABILITIES");
+            if case == 2 {
+                std::env::remove_var("OPENPAW_MODEL_CAPABILITIES");
+            } else {
+                std::env::set_var(
+                    "OPENPAW_MODEL_CAPABILITIES",
+                    if case == 3 {
+                        r#"{"openai":{"fixture-model":{"input":["text"]}}}"#
+                    } else {
+                        r#"{"openai":{"fixture-model":{"input":["text","image"]}}}"#
+                    },
+                );
+            }
+            std::env::set_var("OPENAI_API_KEY", "test-key");
+            std::env::set_var("OPENPAW_OPENAI_BASE_URL", model_url);
+            let home = tempfile::tempdir().unwrap();
+            let state = AppState::new(HostConfig {
+                home: home.path().into(),
+                provider: "openai".into(),
+                username: Some("fixture".into()),
+                password: Some("secret".into()),
+                ..Default::default()
+            });
+            let handle = state
+                .create_session(None, Some("fixture-model"), None, None)
+                .await
+                .unwrap();
+            state
+                .register_ai_pc(
+                    &handle.id,
+                    Some(crate::ai_pc::RegistrationInput {
+                        bridge_url,
+                        token: "a".repeat(64),
+                    }),
+                )
+                .await
+                .ok()
+                .unwrap();
+            let router = build_router(state);
+            let response = router.clone().oneshot(Request::builder().method("POST").uri(format!("/session/{}/message",handle.id)).header("content-type","application/json").header("authorization","Basic Zml4dHVyZTpzZWNyZXQ=").body(Body::from(r#"{"requestID":"trusted-request","parts":[{"type":"text","text":"列出窗口"}]}"#)).unwrap()).await.unwrap();
+            let status = response.status();
+            let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            match old_key {
+                Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+                None => std::env::remove_var("OPENAI_API_KEY"),
+            }
+            match old_url {
+                Some(v) => std::env::set_var("OPENPAW_OPENAI_BASE_URL", v),
+                None => std::env::remove_var("OPENPAW_OPENAI_BASE_URL"),
+            }
+            match old_capabilities {
+                Some(v) => std::env::set_var("OPENPAW_MODEL_CAPABILITIES", v),
+                None => std::env::remove_var("OPENPAW_MODEL_CAPABILITIES"),
+            }
+            model_task.abort();
+            bridge_task.abort();
+            assert_eq!(status, StatusCode::OK);
+            let calls = calls.lock().await;
+            if (2..6).contains(&case) {
+                assert_eq!(
+                    calls.len(),
+                    if case < 4 { 0 } else { 1 },
+                    "unsupported model never acquires, invalid media never ACKs"
+                );
+                let requests = model_seen.lock().await;
+                assert!(requests[1]["messages"].to_string().contains(if case < 4 {
+                    "image"
+                } else {
+                    "PNG"
+                }));
+                assert!(!requests[1]["messages"].to_string().contains("data:image"));
+                continue;
+            }
+            assert_eq!(
+                calls.len(),
+                2,
+                "one native request followed by exact parsed ACK"
+            );
+            assert_eq!(calls[0]["session_id"], handle.id);
+            assert_eq!(calls[0]["request_id"], "trusted-request");
+            assert_eq!(
+                calls[0]["args"],
+                if capture {
+                    serde_json::json!({"target_id":"native-v1"})
+                } else {
+                    args.clone()
+                }
+            );
+            assert!(calls[0]["host_turn_id"].is_string());
+            assert!(calls[0]["generation"].is_string());
+            assert_eq!(calls[1]["call"], calls[0]);
+            assert_eq!(calls[1]["delivery_id"], "delivery-fixture");
+            if capture {
+                let turn = calls[0]["host_turn_id"].as_str().unwrap();
+                for (query, expected_status) in [
+                    (String::new(), StatusCode::OK),
+                    (format!("?turnID={turn}&textOnly=true"), StatusCode::OK),
+                    ("?textOnly=true".into(), StatusCode::BAD_REQUEST),
+                    (format!("?turnID={turn}"), StatusCode::BAD_REQUEST),
+                ] {
+                    let response = router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .uri(format!("/session/{}/message{query}", handle.id))
+                                .header("authorization", "Basic Zml4dHVyZTpzZWNyZXQ=")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status(), expected_status);
+                    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                    if query.is_empty() {
+                        assert!(String::from_utf8_lossy(&body).contains(png));
+                    } else if expected_status == StatusCode::OK {
+                        let messages: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert!(!String::from_utf8_lossy(&body).contains(png));
+                        assert!(messages
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|m| m["info"]["role"] == "assistant"
+                                && m["parts"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .all(|p| p["type"] == "text")));
+                        assert!(String::from_utf8_lossy(&body).contains("已取得窗口"));
+                    }
+                }
+            }
+            let requests = model_seen.lock().await;
+            assert!(requests[0]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == tool_name));
+            let tool = requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .unwrap();
+            assert_eq!(tool["tool_call_id"], "provider-list");
+            let model_result =
+                serde_json::from_str::<serde_json::Value>(tool["content"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(model_result["result"], saved_projection);
+            assert_eq!(model_result["invocation_id"], calls[0]["invocation_id"]);
+            assert!(tool["content"].as_str().unwrap().contains("native-v1"));
+            assert!(!tool["content"].as_str().unwrap().contains(&"a".repeat(64)));
+            if capture {
+                assert!(requests[1]["messages"]
+                    .to_string()
+                    .contains(&format!("data:image/png;base64,{png}")));
+                assert!(!tool["content"].as_str().unwrap().contains(png));
+            }
         }
-        match old_url {
-            Some(v) => std::env::set_var("OPENPAW_OPENAI_BASE_URL", v),
-            None => std::env::remove_var("OPENPAW_OPENAI_BASE_URL"),
-        }
-        model_task.abort();
-        bridge_task.abort();
-        assert_eq!(status, StatusCode::OK);
-        let calls = calls.lock().await;
-        assert_eq!(
-            calls.len(),
-            2,
-            "one native request followed by exact parsed ACK"
-        );
-        assert_eq!(calls[0]["session_id"], handle.id);
-        assert_eq!(calls[0]["request_id"], "trusted-request");
-        assert!(calls[0]["host_turn_id"].is_string());
-        assert!(calls[0]["generation"].is_string());
-        assert_eq!(calls[1]["call"], calls[0]);
-        assert_eq!(calls[1]["delivery_id"], "delivery-fixture");
-        let requests = model_seen.lock().await;
-        assert!(requests[0]["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["function"]["name"] == "ai_pc_list_windows"));
-        let tool = requests[1]["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|m| m["role"] == "tool")
-            .unwrap();
-        assert_eq!(tool["tool_call_id"], "provider-list");
-        assert!(tool["content"].as_str().unwrap().contains("native-v1"));
-        assert!(!tool["content"].as_str().unwrap().contains(&"a".repeat(64)));
     }
 
     #[tokio::test]

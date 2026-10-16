@@ -223,7 +223,7 @@ CHG-2026-0028 集成保留会话原生附件安装、回看与回合结束清理
 
 ### Everypaw 实时列窗扩展（CHG-2026-0029 / 06）
 
-上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows`。当前已登记工具共 25 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称其他视觉工具已经存在。
+上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows,ai_pc_query_structure,ai_pc_capture_target,ai_pc_action_batch`。当前已登记工具共 28 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称正文或后续动作种类已经存在。
 
 `ai_pc_list_windows` 参数严格为 `{}`，声明 ReadOnly/ParallelSafe。runtime 在真实接收回合获准 running 后，从持久 admission 取得 requestID/Host turn，以原取消 token、每次执行随机 generation 和所选 provider 实际 image_input 能力安装私有上下文；退出守卫只清除自身 generation。模型输入不能填写身份。
 
@@ -238,3 +238,31 @@ Host 完整解析、校验身份/容量/活动代次后 POST `/ai-pc/ack`，正�
 取消正文为原调用，路径 `/ai-pc/cancel`。桌面在工作前建立取消 tombstone，晚到同 invocation 不执行；等待期间撤销、切换服务或停止后，实际迟到内容仅保存原调用本地证据，不生成/恢复模型结果。列窗显式保留 IPC 实际 completion：超时或 cancel 不丢弃同 ID/native generation 的真实结果；bounded acquisition 工作位保持到真实完成或进程断连。旧 background/01 路径保持原 discard 语义。Host future Drop 使用独立 64 项有界队列 try_send 补充 cancel，运行时退出或队满不保证送达；桌面原回合 Stop 是主路径。所有工具和控制均不自行重试。
 
 metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment。各 worker 持有自己的原生对象，仅共享无 COM 的 ID/active/completed authority，统一执行每上下文 8 个非空视觉回合、总计 2048 个不同 ID 的软限及最新轮保护。同轮多个附件/工具采用并集；metadata 使用 `-wv` 命名空间，控件使用 `-v`，防止跨表碰撞。Complete/Abandon 有界异步广播，不等待卡住的 provider。后续 UIA 读取窗口引用须在能力进程内延续同一 witness、创建前后复核，不能把 HWND 当永久身份或跨 apartment 传递 Rc/COM。
+
+### Everypaw 实时结构扩展（CHG-0029 / 07）
+
+`ai_pc_query_structure` 通过同一受信封装单次 POST `/ai-pc/structure`。严格模型参数为 `generation`（原生观察代次）、`target_id`、可选 `directions`（默认 all）、`offset`（u32，默认 0）、`limit`（正 u64，默认 128，桌面钳制 1024）和 `boxes`（默认 false）。模型不能指定 context/session/Host turn/权限；外层 generation 仍是 Host 执行代次。
+
+方向逗号分隔、大小写无关并去空白：parent、child/children、previous/prev、next、sibling/siblings、all、none；空集合按 all。始终含起点，offset 独立作用于每个初始关系，parent 为直接父级（offset>0 跳过）；父级沿所选 parent/sibling 继续，子级/兄弟按所选 child 继续，止于原窗口。每次读取当前对象，不承诺冻结分页，无独立默认深度。
+
+实际取得上限为 1024 节点、8 MiB、3 秒及 8192 关系遍历操作；同步 UIA 调用之间检查期限，不承诺中断 provider。紧凑模型投影限 4096 估算 tokens（utf8_bytes/4），另受既有交付字节上限约束；包含一次观察元数据、必要节点关系/状态、短正文和明确 partial/truncated，坐标仅 boxes=true 且获准时出现，不常态附每节点 PID/时间/技术属性。原始取得与精确交付副本分别保存；原引用关闭、过期、移出边界、被替换、跨上下文/旧代次时失败，不按名称/路径/裸 HWND 重绑。返回及精确 ACK 重新投影并校验当前权限；停止、超时和迟到均延用原调用归属、不重试/恢复生成。结构工具使用与列窗相同的 Host/HTTP/ACK 期限和保留实际 completion 的原生通道。
+
+### Everypaw 调用／点击批次（CHG-0029 / 10）
+
+登记头另列已实现 `ai_pc_action_batch`；其声明采用既有 `Write/NeverParallel`，沿用当前 auto/manual 工具审批。严格参数为 `{generation:"能力进程代次",steps:[{action:"invoke"|"click",target_id:"实时引用"}]}`，1–64 步，字符串 1–128 字节，不接受身份、凭据或额外字段。此阶段没有 set-text、shortcut、wait；工具声明不提前承诺它们。
+
+可信信封与精确解析 ACK 沿用上文，单次路径为 `/ai-pc/actions`，Host 等待 20 秒，响应最多 1 MiB；桌面最多等待 10 秒，native 期限 10 秒。结果投影 `{state,steps:[{index,action,target_id,state,error?}]}` 保留原顺序：completed 是实际返回成功；error 是已知失败；unknown 表示实际效果未确认；not_started 仅用于已确认没有启动的剩余步骤。工具失败仍可返回完整部分结果，Host 标记工具错误，模型自行决定下一次观察；不自动截图或查树。
+
+能力端对同一 Windows 桌面会话采用有界 FIFO：最多两个在途批次（一个执行、一个排队），每批完整串行；共享能力进程生命周期锁保证不会并存第二个本应用执行实例。读取保留各自既有有界 lane，不加入动作全局互斥。Stop、Host 取消／Drop 和桌面等待超时经独立 IPC Cancel 设置原 native 请求取消状态；未启动批次／步骤不执行，同步动作不能保证立即中断。HTTP 或生成结束不释放实际批次执行位置，只有 native 实际返回／进程确已结束后才释放。逐步进度以值形式独立回传并归档到原 invocation，迟到不能恢复生成或交给新回合。
+
+Invoke 使用原 UIA 对象的 InvokePattern，不支持时不悄悄改成点击；真实点击移动真实鼠标、尝试使原窗口到前台并发送鼠标输入，可能改变焦点和窗口前后。实时 ID 仍绑定 context/native generation/原窗口存活 witness。动作不使用冻结树路径，不跨上下文重绑，不逐步骤重新弹窗／重查信息分配规则。未知或失败动作均不自动重试、回滚或重放；原生对象不持久化为重启后可执行引用。
+
+### Everypaw 原始目标 PNG（CHG-0029 / 09）
+
+新增 `ai_pc_capture_target`，ReadOnly/ParallelSafe，严格参数 `{target_id:非空字符串≤128字节}`；登记回执的已实现工具追加此名称。可信上下文/单次调用/取消与精确 ACK 沿用06，路由为 `/ai-pc/capture`。所选模型的实际 image=false 或未声明时，Host 在原生分发前明确失败；不按模型名猜测，不转 OCR/其他 VLM/更换模型。
+
+成功响应可含 `media:[{id,mime:"image/png",data:标准Base64,filename:"target.png"}]`，截图必须恰一张，经现有 InlineMedia 验证原件再 ACK；非截图视觉工具禁止媒体。响应工程容量7 MiB供合法5 MiB原件Base64与元数据；主模型每图5 MiB、回合4张/20 MiB、请求32 MiB仍由已有媒体层执行，不缩放。工具文字只含不可变projection、来源/附件编号、实际宽高/范围和独立UIA/PNG/QPC时点；Base64只进入 ToolCallOutcome.media，由原AgentLoop送实际下一次provider请求。
+
+Everypaw 使用公开 Windows WGC HWND API、原窗口存活租约和物理坐标。子区域必须落入可验证窗口纹理；窗口无效、最小化、cloaked、无帧或几何变化明确失败，不恢复目标、不改读桌面。原件在既有screenshots目录，独立visual_png_sources记录来源，visual_tool_calls关联交付；不是后台历史截图。全局/接收服务screenshots、Restricted、原automatic grant与应用排除/未知身份在取得及返回/ACK时复核；既有四项UIA/metadata开关不充当截图授权。Picker完整presentation epoch变化后，仅留本地实际证据，不交付媒体。
+
+`GET /session/:id/message?turnID=<id>&textOnly=true` 为既有 `API-HOST-SESSION-004` 的可选窄读取扩展，仅返回指定回合assistant文字parts及原info/error；非法/缺turnID返回400，turnID不单独使用。默认完整REST、按messageID读取及公共附件投影保持兼容。Host仍先复制wire_messages完整快照再过滤，历史内存/CPU开销不保证恒定。Everypaw对任意大SSE行（不限媒体）增量丢弃到换行，单行保留≤1 MiB、总wire≤128 MiB且原180秒期限；每2秒和EOF/idle/error检查权威回合，失败回合明确失败，完成回合从窄REST恢复正文。正文/窄REST≤2 MiB，任一超限明确失败。合法同轮4张/20MiB图片不受旧8MiB累计限制；该容量并非无限历史保证，也不是图片token预算。

@@ -407,8 +407,16 @@ Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP
 
 ### Everypaw 实时列窗（CHG-0029 / 06）
 
+09在相同实际Router/provider seam中增加PNG交付、image未知/仅text前置拒绝、错误MIME/非法原件不ACK；Everypaw paired测试经真实官方Host进程/桥/IPC/隔离Recorder，以可完整解码且大于1 MiB的窗口和子区域PNG核对原件、来源、实际下一provider请求及SSE/窄REST文字恢复。Windows像素用例只读取自己创建的独立fixture窗口，检查物理区域、负坐标、遮挡/标记排除与最小化失败。实际运行结果以09验证记录为准，未运行项不作为通过证据。
+
 `http::tests::registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 经实际 Host Router、真实假 OpenAI SSE HTTP 与受控桥：检查第一个真实模型请求的工具声明、runtime 生成身份、单次 native 调用、精确 delivery ACK、第二个真实模型请求的 ToolResult/provider callID 以及不含 token。登记接口测试同时检查扩展响应头；原 current/history 和媒体透传回归保留。
 
 `ai_pc_visual::tests::cancel_and_old_generation_never_ack_or_replay_the_native_call` 使用真实 HTTP 和可控完成闸门，覆盖取消及旧 generation，检查补充取消仍携带原完整调用、无 ACK/重发、旧守卫不清理新执行。
 
+任务 10 的 `ai_pc::tests::action_batches_use_existing_write_approval_and_return_actual_partial_result_once` 经可信工具包装入口、真实 HTTP 和隔离桥替身验证动作声明沿用 Write/NeverParallel、模型不能填写身份、原调用关联、完整部分结果、精确 delivery ACK 和单次请求；工具错误保留已经完成与未开始步骤。与真实 Windows Invoke/click、桌面 HTTP＋验证 IPC 的取消／排队／迟到占位和官方 Host 进程成对测试分别记录，不把 HTTP 替身冒称实际桌面操作。10 当前定向测试 1/1、Host 全包 59+16+36=111 及 Host strict Clippy/lines 已通过，最终组装候选需重新验证。
+
 Everypaw 对应测试使用真实桌面 HTTP 桥、已验证 named-pipe IPC、隔离 SQLite 与原生替身，核对 acquired/投影/Host accepted、伪造身份/参数、cancel-before-request、撤销，以及超过原生期限后的真实 completion 只落原调用本地。独立 worker 的共享 ID authority 测试验证跨 owner 的 8 轮老化、同轮并集、总 soft limit 与最新超限轮保护。真实 Windows 窗口、Docker `host.docker.internal` 与生产所选模型属于不同集成证据；本地假模型/回环不能冒称通过。各命令实际退出码见 CHG-0029 与 Everypaw `ticket-06-verification.md`。
+
+07 增加 `ai_pc::tests::structure_tool_exposes_live_bounded_args_and_rejects_identity_fields`，验证真实登记工具的 schema/defaults/只读并行声明及模型身份字段拒绝。`http::tests::registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 复用受控 Host/model/bridge journey，核对模型选择的范围参数、可信执行身份、单次请求、精确 ACK 和第二次模型请求中的完整已交付投影。
+
+Everypaw `ticket-07-verification.md` 分开记录：真实 HTTP/受验证 IPC/Recorder 的默认值、钳制、预算、空容器折叠、文本去重、权限收窄/ACK、停止与迟到结果；自建 Windows 层级的真实 UIA 方向、分页、当前名称变化、替换/关闭失败；实际官方 Host 进程与受控模型贯通。测试仅操作自建窗口或原生替身，不外发真实用户桌面。
