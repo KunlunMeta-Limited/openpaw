@@ -1494,6 +1494,10 @@ mod tests {
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
+        for capture in [false, true] {
+        let tool_name = if capture { "ai_pc_capture_target" } else { "ai_pc_list_windows" };
+        let tool_args = if capture { r#"{"target_id":"native-v1"}"# } else { "{}" };
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLttAAAAABJRU5ErkJggg==";
         let calls = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let model_seen = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let model_calls = Arc::new(AtomicUsize::new(0));
@@ -1504,7 +1508,7 @@ mod tests {
             async move {
                 seen.lock().await.push(body);
                 let chunk = if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"provider-list","type":"function","function":{"name":"ai_pc_list_windows","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})
+                    serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"provider-list","type":"function","function":{"name":tool_name,"arguments":tool_args}}]},"finish_reason":"tool_calls"}]})
                 } else { serde_json::json!({"choices":[{"delta":{"content":"已取得窗口"},"finish_reason":"stop"}]}) };
                 ([("content-type","text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n"))
             }
@@ -1515,9 +1519,9 @@ mod tests {
             axum::serve(listener, model).await.unwrap();
         });
         let observed = calls.clone();
-        let bridge = Router::new().route("/ai-pc/windows",post(move |Json(body): Json<serde_json::Value>| {
+        let bridge = Router::new().route(if capture { "/ai-pc/capture" } else { "/ai-pc/windows" },post(move |Json(body): Json<serde_json::Value>| {
             let observed = observed.clone();
-            async move { observed.lock().await.push(body.clone()); Json(serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":{"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]}})) }
+            async move { observed.lock().await.push(body.clone()); let mut value = serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":{"kind":"untrusted_ui_data","target_id":"native-v1"}}); if capture { value["media"] = serde_json::json!([{"id":"att_fixture","mime":"image/png","data":png,"filename":"target.png"}]); } Json(value) }
         }));
         let observed = calls.clone();
         let bridge = bridge.route(
@@ -1537,6 +1541,8 @@ mod tests {
         });
         let old_key = std::env::var_os("OPENAI_API_KEY");
         let old_url = std::env::var_os("OPENPAW_OPENAI_BASE_URL");
+        let old_capabilities = std::env::var_os("OPENPAW_MODEL_CAPABILITIES");
+        std::env::set_var("OPENPAW_MODEL_CAPABILITIES", r#"{"openai":{"fixture-model":{"input":["text","image"]}}}"#);
         std::env::set_var("OPENAI_API_KEY", "test-key");
         std::env::set_var("OPENPAW_OPENAI_BASE_URL", model_url);
         let home = tempfile::tempdir().unwrap();
@@ -1573,6 +1579,7 @@ mod tests {
             Some(v) => std::env::set_var("OPENPAW_OPENAI_BASE_URL", v),
             None => std::env::remove_var("OPENPAW_OPENAI_BASE_URL"),
         }
+        match old_capabilities { Some(v) => std::env::set_var("OPENPAW_MODEL_CAPABILITIES", v), None => std::env::remove_var("OPENPAW_MODEL_CAPABILITIES") }
         model_task.abort();
         bridge_task.abort();
         assert_eq!(status, StatusCode::OK);
@@ -1593,7 +1600,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|t| t["function"]["name"] == "ai_pc_list_windows"));
+            .any(|t| t["function"]["name"] == tool_name));
         let tool = requests[1]["messages"]
             .as_array()
             .unwrap()
@@ -1603,6 +1610,8 @@ mod tests {
         assert_eq!(tool["tool_call_id"], "provider-list");
         assert!(tool["content"].as_str().unwrap().contains("native-v1"));
         assert!(!tool["content"].as_str().unwrap().contains(&"a".repeat(64)));
+        if capture { assert!(requests[1]["messages"].to_string().contains(&format!("data:image/png;base64,{png}"))); assert!(!tool["content"].as_str().unwrap().contains(png)); }
+        }
     }
 
     #[tokio::test]

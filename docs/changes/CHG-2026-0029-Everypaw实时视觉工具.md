@@ -60,6 +60,14 @@
 
 ## 执行记录
 
+### 09 实施前的具体范围补充
+
+既有规格 D15/D16 与正式09要求 PNG 经实际主模型媒体路径交付。沿用本 CHG 已登记授权：在 ai_pc.rs/ai_pc_visual.rs 实施严格 `{target_id}` 的 `ai_pc_capture_target`，受信调用 `/ai-pc/capture`，只接受单张合法原始 PNG，runtime 的实际 image=false/unknown 在原生分发前失败。媒体置于 ToolCallOutcome.media，不复制到文字投影；最大响应 7 MiB 仅用于一张合法5 MiB原件的Base64及有界元数据，沿用原件限制，不缩放。
+
+实测现有 Everypaw SSE 每行1 MiB、REST全历史2 MiB会被合法PNG附件撑破。允许 http.rs 在既有 messages 路由增加可选 `turnID` 与 `textOnly=true` 窄读取；默认路由内容和其他消费者保持原语义。窄读取只返回指定回合的 assistant text，既有 runtime 快照不改变持久化或公共投影。Everypaw SSE仅消费文字且有界丢弃超大非正文event，最终文字以该窄REST恢复。实际>1 MiB完整PNG经真实受控provider、SSE与REST验收，不以提高客户端总容量代替。
+
+09新增行为测试优先扩充已有 Router 用例及 Everypaw 成对验收。当前 Host tests 3943/4000 仅余57行，若实测超过先记录必要用例和最小预算文件范围，不以搬迁测试避计数。
+
 2026-10-16：04 完成后，在 `feature/everypaw-visual-06`（`.local/engine-visual-06`）实施 06，基于已批准集成提交 `64d601c`。本轮实际改动为表内 10 个文件（包含本记录和索引），不修改 Core、Engine、Cargo、xtask 或生产服务。新增/修改公共 Rust 项已人工核对中文说明，函数/方法保留八栏目；登记路径保持原稳定编号。
 
 ### 06 实际符号与工程选择
