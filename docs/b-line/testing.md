@@ -407,6 +407,8 @@ Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP
 
 ### Everypaw 实时列窗（CHG-0029 / 06）
 
+09在相同实际Router/provider seam中增加PNG交付、image未知/仅text前置拒绝、错误MIME/非法原件不ACK；Everypaw paired测试经真实官方Host进程/桥/IPC/隔离Recorder，以可完整解码且大于1 MiB的窗口和子区域PNG核对原件、来源、实际下一provider请求及SSE/窄REST文字恢复。Windows像素用例只读取自己创建的独立fixture窗口，检查物理区域、负坐标、遮挡/标记排除与最小化失败。实际运行结果以09验证记录为准，未运行项不作为通过证据。
+
 `http::tests::registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 经实际 Host Router、真实假 OpenAI SSE HTTP 与受控桥：检查第一个真实模型请求的工具声明、runtime 生成身份、单次 native 调用、精确 delivery ACK、第二个真实模型请求的 ToolResult/provider callID 以及不含 token。登记接口测试同时检查扩展响应头；原 current/history 和媒体透传回归保留。
 
 `ai_pc_visual::tests::cancel_and_old_generation_never_ack_or_replay_the_native_call` 使用真实 HTTP 和可控完成闸门，覆盖取消及旧 generation，检查补充取消仍携带原完整调用、无 ACK/重发、旧守卫不清理新执行。

@@ -246,3 +246,13 @@ metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment
 方向逗号分隔、大小写无关并去空白：parent、child/children、previous/prev、next、sibling/siblings、all、none；空集合按 all。始终含起点，offset 独立作用于每个初始关系，parent 为直接父级（offset>0 跳过）；父级沿所选 parent/sibling 继续，子级/兄弟按所选 child 继续，止于原窗口。每次读取当前对象，不承诺冻结分页，无独立默认深度。
 
 实际取得上限为 1024 节点、8 MiB、3 秒及 8192 关系遍历操作；同步 UIA 调用之间检查期限，不承诺中断 provider。紧凑模型投影限 4096 估算 tokens（utf8_bytes/4），另受既有交付字节上限约束；包含一次观察元数据、必要节点关系/状态、短正文和明确 partial/truncated，坐标仅 boxes=true 且获准时出现，不常态附每节点 PID/时间/技术属性。原始取得与精确交付副本分别保存；原引用关闭、过期、移出边界、被替换、跨上下文/旧代次时失败，不按名称/路径/裸 HWND 重绑。返回及精确 ACK 重新投影并校验当前权限；停止、超时和迟到均延用原调用归属、不重试/恢复生成。结构工具使用与列窗相同的 Host/HTTP/ACK 期限和保留实际 completion 的原生通道。
+
+### Everypaw 原始目标 PNG（CHG-0029 / 09）
+
+新增 `ai_pc_capture_target`，ReadOnly/ParallelSafe，严格参数 `{target_id:非空字符串≤128字节}`；登记回执的已实现工具追加此名称。可信上下文/单次调用/取消与精确 ACK 沿用06，路由为 `/ai-pc/capture`。所选模型的实际 image=false 或未声明时，Host 在原生分发前明确失败；不按模型名猜测，不转 OCR/其他 VLM/更换模型。
+
+成功响应可含 `media:[{id,mime:"image/png",data:标准Base64,filename:"target.png"}]`，截图必须恰一张，经现有 InlineMedia 验证原件再 ACK；非截图视觉工具禁止媒体。响应工程容量7 MiB供合法5 MiB原件Base64与元数据；主模型每图5 MiB、回合4张/20 MiB、请求32 MiB仍由已有媒体层执行，不缩放。工具文字只含不可变projection、来源/附件编号、实际宽高/范围和独立UIA/PNG/QPC时点；Base64只进入 ToolCallOutcome.media，由原AgentLoop送实际下一次provider请求。
+
+Everypaw 使用公开 Windows WGC HWND API、原窗口存活租约和物理坐标。子区域必须落入可验证窗口纹理；窗口无效、最小化、cloaked、无帧或几何变化明确失败，不恢复目标、不改读桌面。原件在既有screenshots目录，独立visual_png_sources记录来源，visual_tool_calls关联交付；不是后台历史截图。全局/接收服务screenshots、Restricted、原automatic grant与应用排除/未知身份在取得及返回/ACK时复核；既有四项UIA/metadata开关不充当截图授权。Picker完整presentation epoch变化后，仅留本地实际证据，不交付媒体。
+
+`GET /session/:id/message?turnID=<id>&textOnly=true` 为既有 `API-HOST-SESSION-004` 的可选窄读取扩展，仅返回指定回合assistant文字parts及原info/error；非法/缺turnID返回400，turnID不单独使用。默认完整REST、按messageID读取及公共附件投影保持兼容。Host仍先复制wire_messages完整快照再过滤，历史内存/CPU开销不保证恒定。Everypaw对任意大SSE行（不限媒体）增量丢弃到换行，单行保留≤1 MiB、总wire≤128 MiB且原180秒期限；每2秒和EOF/idle/error检查权威回合，失败回合明确失败，完成回合从窄REST恢复正文。正文/窄REST≤2 MiB，任一超限明确失败。合法同轮4张/20MiB图片不受旧8MiB累计限制；该容量并非无限历史保证，也不是图片token预算。
