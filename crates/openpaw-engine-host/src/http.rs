@@ -736,7 +736,7 @@ fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Respon
                 ("openpaw-desktop-protocol", "1"),
                 (
                     "openpaw-desktop-tools",
-                    "ai_pc_list_windows,ai_pc_query_structure,ai_pc_capture_target,ai_pc_action_batch",
+                    "ai_pc_list_windows,ai_pc_query_structure,ai_pc_read_text,ai_pc_capture_target,ai_pc_action_batch",
                 ),
             ],
         )

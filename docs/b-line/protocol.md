@@ -223,7 +223,7 @@ CHG-2026-0028 集成保留会话原生附件安装、回看与回合结束清理
 
 ### Everypaw 实时列窗扩展（CHG-2026-0029 / 06）
 
-上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows,ai_pc_query_structure,ai_pc_capture_target,ai_pc_action_batch`。当前已登记工具共 28 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不宣称正文或后续动作种类已经存在。
+上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows,ai_pc_query_structure,ai_pc_read_text,ai_pc_capture_target,ai_pc_action_batch`。当前已登记工具共 29 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不提前承诺后续动作种类。
 
 `ai_pc_list_windows` 参数严格为 `{}`，声明 ReadOnly/ParallelSafe。runtime 在真实接收回合获准 running 后，从持久 admission 取得 requestID/Host turn，以原取消 token、每次执行随机 generation 和所选 provider 实际 image_input 能力安装私有上下文；退出守卫只清除自身 generation。模型输入不能填写身份。
 
@@ -246,6 +246,14 @@ metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment
 方向逗号分隔、大小写无关并去空白：parent、child/children、previous/prev、next、sibling/siblings、all、none；空集合按 all。始终含起点，offset 独立作用于每个初始关系，parent 为直接父级（offset>0 跳过）；父级沿所选 parent/sibling 继续，子级/兄弟按所选 child 继续，止于原窗口。每次读取当前对象，不承诺冻结分页，无独立默认深度。
 
 实际取得上限为 1024 节点、8 MiB、3 秒及 8192 关系遍历操作；同步 UIA 调用之间检查期限，不承诺中断 provider。紧凑模型投影限 4096 估算 tokens（utf8_bytes/4），另受既有交付字节上限约束；包含一次观察元数据、必要节点关系/状态、短正文和明确 partial/truncated，坐标仅 boxes=true 且获准时出现，不常态附每节点 PID/时间/技术属性。原始取得与精确交付副本分别保存；原引用关闭、过期、移出边界、被替换、跨上下文/旧代次时失败，不按名称/路径/裸 HWND 重绑。返回及精确 ACK 重新投影并校验当前权限；停止、超时和迟到均延用原调用归属、不重试/恢复生成。结构工具使用与列窗相同的 Host/HTTP/ACK 期限和保留实际 completion 的原生通道。
+
+### Everypaw 实时正文分页（CHG-0029 / 08）
+
+`ai_pc_read_text` 为ReadOnly/ParallelSafe，通过同一可信调用及精确ACK单次POST `/ai-pc/text`。严格参数 `{generation,target_id,offset?,limit?}`，generation为原生代次；offset默认0、带符号UTF-16 code units，绝对值最多10,469,374；limit为正u64、默认4096，由桌面钳制16384。无媒体，无额外身份/权限字段或内部重试。
+
+每页实时读取原目标当前TextPattern，单次有界前缀probe最多10,485,760 UTF-16（独立工程上限），正offset至少4098并覆盖页后2单元边界/sentinel，负offset相对本次取得前缀末端。没有无界GetText(-1)/Value或跨页冻结全文缓存，不把TextUnit_Character移动量当UTF-16。返回 `text`、`range:{start,end,unit:"utf16_code_units"}`（半开）、`next`（末尾为null）、`length:{units,certainty:"exact"|"lower_bound"}`、请求范围、独立observation/time、partial/reason；仅取得前缀不能伪称精确全文长，负offset下界另标 `offset_basis:"bounded_prefix_end"`。显式offset进入低代理项时向前对齐，页尾收回完整scalar；limit1可返回完整pair的2单元。无效UTF-16明确失败；每页间编辑可能重叠/遗漏，不能把旧观察实时补读。
+
+模型副本另限10240估算tokens（utf8_bytes/4），且受既有更小交付字节预算约束；裁剪后range.end/next严格跟随实际发送末端，完整取得页留本地。不改为摘要或第二模型。原窗口witness/保留对象、context/native generation不重绑；text_values与当前应用规则在取得、返回及ACK复查。Stop/超时后的真实completion保留在原invocation，不能重新生成或发给新回合；本页没有新增视觉ID，不推进8轮/2048ID保留计数。期限/结果容量沿用结构工具。
 
 ### Everypaw 调用／点击批次（CHG-0029 / 10）
 

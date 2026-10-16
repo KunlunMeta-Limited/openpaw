@@ -420,3 +420,5 @@ Everypaw 对应测试使用真实桌面 HTTP 桥、已验证 named-pipe IPC、�
 07 增加 `ai_pc::tests::structure_tool_exposes_live_bounded_args_and_rejects_identity_fields`，验证真实登记工具的 schema/defaults/只读并行声明及模型身份字段拒绝。`http::tests::registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 复用受控 Host/model/bridge journey，核对模型选择的范围参数、可信执行身份、单次请求、精确 ACK 和第二次模型请求中的完整已交付投影。
 
 Everypaw `ticket-07-verification.md` 分开记录：真实 HTTP/受验证 IPC/Recorder 的默认值、钳制、预算、空容器折叠、文本去重、权限收窄/ACK、停止与迟到结果；自建 Windows 层级的真实 UIA 方向、分页、当前名称变化、替换/关闭失败；实际官方 Host 进程与受控模型贯通。测试仅操作自建窗口或原生替身，不外发真实用户桌面。
+
+08的 `ai_pc::tests::text_tool_declares_utf16_paging_and_rejects_forged_scope_before_dispatch` 经真实登记工具包装入口验证ReadOnly/ParallelSafe、4096默认、带符号有界offset和严格身份/probe字段拒绝；首红未声明工具、实现后绿。Host全包当前62+16+36=114绿。Everypaw的正文HTTP/验证IPC、原取得页/独立模型投影、当前内容变化、UTF-16/长度可信度、权限/停止/迟到原调用归属、自建Windows长EDIT及官方Host实际provider输入分别记录于 `ticket-08-verification.md`；是否通过以该记录及本CHG最终组合表为准，不以模型回答措辞代替文字/范围/投影逐值断言。
