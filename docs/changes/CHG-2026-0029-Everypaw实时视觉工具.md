@@ -60,6 +60,12 @@
 
 ## 执行记录
 
+### 11 实施前登记（2026-10-17）
+
+正式11在既有批准的 ai_pc.rs、ai_pc_visual.rs 与本表文档范围内扩展同一 `ai_pc_action_batch`，不增加工具、依赖、审批或预算。模型步骤增加 `set_text:{target_id,text}`（text显式必填、允许空字符串）、`shortcut:{target_id,key,modifiers?}`（VK名称及明确修饰键白名单，未知值整批拒绝）与 `wait:{delay_ms}`（非负 signed32、允许0）。所有步骤严格解析后才可分发任何效果；wait不接受target，输入动作仍绑定原context/native generation/窗口witness。
+
+沿用10的桌面会话FIFO、原调用证据、独立取消与未知不重放。仅动作批次的工程等待期限按已校验wait总毫秒加既有native/桌面10秒、Host20秒计算，使用u64安全求和；不把短HTTP收包期限当作wait产品上限，不扩大其他工具期限。已有悬浮问答180秒总体期限仍保留，其取消不证明同步输入已经结束。实际Windows通过自建隔离EDIT验证ValuePattern整值替换、只读/不支持、目标焦点与真实快捷键；部分SendInput可能已经生效，保留接受数量并报告unknown，不补发。
+
 ### 10 Host 局部验证（2026-10-16）
 
 动作票在 `feature/everypaw-visual-10` 复用 07 的私有 `call(name, ...)` 接缝（本分支提交 `b5428a4`），只修改已登记的七个文件：ai_pc.rs、ai_pc_visual.rs、http.rs、本记录及三份 b-line 文档。`validate` 严格验证 generation、1–64 步 invoke/click 与 target_id，拒绝额外字段；`specs` 声明 Write/NeverParallel，`DesktopTools::call/validate_input` 接通已授权路由。`ai_pc_visual::call` 将实际 error/unknown/cancelled 投影标为工具错误，保留一次请求、精确 ACK、原身份和无重试合同；登记回执只增加已实现动作工具。
