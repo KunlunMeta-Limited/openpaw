@@ -66,7 +66,29 @@
 
 新行为测试 `action_batches_use_existing_write_approval_and_return_actual_partial_result_once` 首先真实红（工具尚未声明），实现后 1/1 绿。此后 `cargo test -p openpaw-engine-host --features engine-host -- --test-threads=1` 退出 0（59+16+36=111 项），显式 Host 全目标严格 Clippy 退出 0，fmt 退出 0，`cargo run -p xtask -- lines` 退出 0（Host business6505/7000、Host外部tests3943/4000、aux11497/11500）。未修改预算、计数或依赖；新增测试位于原批准模块的自然内联边界。切换共享 target 后曾出现 0 tests 的旧分支缓存，刷新本分支源码时间并确认真实编译路径后重新完成上述红绿；旧缓存不计为通过。
 
-含本票官方 CLI 的 Everypaw 成对模型/HTTP/IPC/隔离存储验收及最终组装门禁仍待本票后续记录。桌面排队取消正在补足独立原生控制确认；不是由 Host HTTP 成功推断原生已经停止。不启动生产服务、切换 DeepSeek、push 或部署，CODEOWNER、来源 DCO、CI 及实际 Docker 仍保留未完成边界。
+上述是早期单票局部结果。后续已完成独立原生取消控制确认、真实 pipe 断连取消、丢失回执保留 unknown 与原窗口遮挡检查；这些桌面行为由 Everypaw 应用边界和自建真实 Win32 控件验证，不由 Host HTTP 成功推断原生已停止。
+
+### 10 组合后验收（2026-10-16）
+
+实现提交 `027d3aa`，合引擎主线 `d568346`（含09）得到 `846c2e3`；Everypaw 合主线 `843d326`，组合代码 `53c9a5d`。冲突按已实现能力合并：list/PNG/actions 均保留、登记头三工具、工具总数27、PNG媒体保持、动作 error/unknown/cancelled 仍是工具错误。只修改相对主线已登记七个文件，没有依赖、预算、Core／AgentLoop／审批算法或生产配置变化。Engine 实现及合并提交带 Signed-off-by，未解决既有来源 DCO／CODEOWNER／CI 门禁。
+
+| 命令／验收 | 当前实际结果 |
+| --- | --- |
+| Host `cargo test -p openpaw-engine-host --features engine-host -- --test-threads=1` | 组合后退出0，59+16+36=111；动作原始调用与部分结果、09六场景Router、取消／代次和精确ACK均通过。 |
+| `cargo test --workspace` | 合09前退出0；最终相关变化由组合后Host111、两种workspace strict Clippy和parity复核，不声称最终全workspace重跑。 |
+| `cargo clippy --workspace --all-targets -- -D warnings` 与显式 `--features engine-host` | 组合后均退出0，数组splat保留`--`，无警告放行。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 组合后3/3绿。 |
+| fmt、lines、scrub、golden、telemetry | 组合后均退出0；实际Host6573/7000、外部tests3943/4000、aux11497/11500；scrub356，telemetry284 dependencies／229 symbols。 |
+| 默认 `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，既有Windows CRLF/LF快照偏差；未修改受保护快照／检查器。 |
+| `cargo deny --version` | 退出101，未安装cargo-deny；不安装新工具，依赖审计仍需CI。 |
+| `cargo build -p openpaw-cli --features engine-host` | 组合后退出0；仅保留单文件 `openpaw-actions10.exe`，SHA256 `1392AAD06DA65707DCD38F5144CD5ED206C30412D6F4F01570D7EA700F67B437`，未部署。 |
+| Everypaw组合后 `paired_ --ignored --test-threads=1` | 3/3绿（10.94秒）：真实官方Host隔离进程、受控SSE模型、HTTP桥、验证pipe原生替身及隔离Recorder。保留原列窗、09同轮四图窗口／子区PNG；独立动作场景list→invoke有效/click失效/invoke后续→answer，真实ToolResult等于保存投影，completed/error/not_started、执行1次、无强制观察／重放、无token。 |
+| Everypaw Desktop与真实控件 | 组合后主测试87通过/8ignored、通知2通过/1ignored；真实隔离Win32 Invoke/click1/1（0.31秒），拒跨context及遮挡窗口，失败后不点击后续目标。 |
+
+共享xtask的 `env!(CARGO_MANIFEST_DIR)` 会保留编译来源路径；首次lines误返回旧09的6529。刷新本分支xtask源码时间、确认真实编译路径后，五项xtask均重新执行，上表6573为正确组合值；未改算法或预算。一次PowerShell嵌套数组错误未实际执行检查，纠正数组后才取得上表结果，不将参数错误当业务失败。
+
+桌面实际执行位仅在原生返回／进程确认结束后释放；停止、排队取消和10秒超时四场景以及控制断连／回执丢失已从真实HTTP/IPC与保存证据核对。完整红绿及Recorder分阶段验证见Everypaw `ticket-10-verification.md`。三共享target的构建／执行已全部结束并明确交07继续结构组合验证；本票只剩本地文档提交。实际Docker、管理员／多屏DPI、DeepSeek真实调用／模态、CI和部署未验证，不把回环／替身作为通过。生产DeepSeek、服务、数据卷和配置均未改变，不push／部署。
 
 
 ### 09 实施前的具体范围补充
