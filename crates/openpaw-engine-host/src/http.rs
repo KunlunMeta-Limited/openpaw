@@ -1558,12 +1558,18 @@ mod tests {
 
     #[tokio::test]
     async fn registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
-        visual_roundtrip("ai_pc_list_windows",serde_json::json!({}),"windows",serde_json::json!({"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]})).await;
+        visual_roundtrip("ai_pc_list_windows",serde_json::json!({}),"windows",serde_json::json!({"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]}), "127.0.0.1").await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn registered_native_windows_host_uses_desktop_docker_alias_without_a_proxy() {
+        visual_roundtrip("ai_pc_list_windows",serde_json::json!({}),"windows",serde_json::json!({"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]}), "host.docker.internal").await;
     }
 
     #[tokio::test]
     async fn registered_structure_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
-        visual_roundtrip("ai_pc_query_structure",serde_json::json!({"generation":"native","target_id":"native-v1","directions":"children,parent","offset":2,"limit":5000,"boxes":true}),"structure",serde_json::json!({"kind":"untrusted_ui_data","observation":"live_structure","controls":[{"id":"native-v1","name":"本次控件","box":[-10,20,40,50]}]})).await;
+        visual_roundtrip("ai_pc_query_structure",serde_json::json!({"generation":"native","target_id":"native-v1","directions":"children,parent","offset":2,"limit":5000,"boxes":true}),"structure",serde_json::json!({"kind":"untrusted_ui_data","observation":"live_structure","controls":[{"id":"native-v1","name":"本次控件","box":[-10,20,40,50]}]}), "127.0.0.1").await;
     }
 
     async fn visual_roundtrip(
@@ -1571,6 +1577,7 @@ mod tests {
         args: serde_json::Value,
         path: &str,
         projection: serde_json::Value,
+        callback_host: &str,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let _env = PROVIDER_ENV_LOCK
@@ -1645,7 +1652,10 @@ mod tests {
                 }),
             );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let bridge_url = format!("http://{}/ai-pc", listener.local_addr().unwrap());
+            let bridge_url = format!(
+                "http://{callback_host}:{}/ai-pc",
+                listener.local_addr().unwrap().port()
+            );
             let bridge_task = tokio::spawn(async move {
                 axum::serve(listener, bridge).await.unwrap();
             });
@@ -1678,18 +1688,24 @@ mod tests {
                 .create_session(None, Some("fixture-model"), None, None)
                 .await
                 .unwrap();
-            state
-                .register_ai_pc(
-                    &handle.id,
-                    Some(crate::ai_pc::RegistrationInput {
-                        bridge_url,
-                        token: "a".repeat(64),
-                    }),
+            let router = build_router(state);
+            let registered = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/session/{}/ai-pc", handle.id))
+                        .header("content-type", "application/json")
+                        .header("authorization", "Basic Zml4dHVyZTpzZWNyZXQ=")
+                        .body(Body::from(
+                            serde_json::json!({"bridge_url":bridge_url,"token":"a".repeat(64)})
+                                .to_string(),
+                        ))
+                        .unwrap(),
                 )
                 .await
-                .ok()
                 .unwrap();
-            let router = build_router(state);
+            assert_eq!(registered.status(), StatusCode::NO_CONTENT);
             let response = router.clone().oneshot(Request::builder().method("POST").uri(format!("/session/{}/message",handle.id)).header("content-type","application/json").header("authorization","Basic Zml4dHVyZTpzZWNyZXQ=").body(Body::from(r#"{"requestID":"trusted-request","parts":[{"type":"text","text":"列出窗口"}]}"#)).unwrap()).await.unwrap();
             let status = response.status();
             let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();

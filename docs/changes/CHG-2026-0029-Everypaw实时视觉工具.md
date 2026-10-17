@@ -4,6 +4,34 @@
 
 ## 统一审查窄修登记（2026-10-17）
 
+### Windows 原生 Host 回调修复授权（2026-10-17）
+
+用户在获知原生 Host 的 `host.docker.internal` 回调超时、同端口回环可达的诊断后明确回答“ok 帮我修复”。据此在 `bugfix/native-host-bridge` 登记本次窄修；不引用历史授权代替本次指示。
+
+允许修改原十文件表内的 `ai_pc.rs` 中 `RegistrationInput::checked`：先保留原 URL/令牌验证，再仅在 Windows Host 将登记的 Docker 专用别名规范为 `127.0.0.1`，保留端口、路径、Basic/Bearer、回合身份、取消和 ACK。Linux 构建保持原地址，容器从宿主机发布端口访问的行为不按客户端 endpoint 猜测。不增加网络入口、配置字段、公共协议或依赖；不修改系统 hosts、Core、CLI 或部署文件。
+
+回归沿用已确认的 Host 工具桥 seam：原 `http.rs` 真实 Router/模型/桥接测试增加 Windows 原生场景，直接 PUT 登记 Docker 别名并取得窗口结果和精确 ACK，不通过测试代理改写地址；Everypaw 的原成对 Host 应用测试去掉手工别名替换。先验证旧代码失败，再实施并回归。配套 configuration-and-connection、testing、本 CHG 和 INDEX 记录实际检查/二进制身份。用户也已要求启动并使用当前独立新版 Host；修复验证后允许仅替换该 8810 原生实例，沿用原会话目录、模型和凭据，原 Docker 服务不动。回滚使用保留的 8ec11f8 EXE 和同一会话目录；原始记录不删。
+
+#### 本次修复验证记录
+
+业务改动只有 `RegistrationInput::checked` 在严格验证后按 `cfg!(windows)` 规范别名；原显式回环和 Linux 地址路径保留。原生 Router 测试首红：20.09秒、0次取得而预期1次；修复后1/1、0.12秒，经过真实 Basic 登记、模型选择、窗口/PNG六场景、可信身份、精确ACK及下一次模型请求。Everypaw三处官方Host成对入口移除了测试地址改写，受控模型/原生替身与真实HTTP/IPC/隔离存储的9/9通过；最终制品SHA及配对证据由Everypaw `docs/delivery/desktop-capability/native-host-bridge/engine-manifest.json` 固定。
+
+| 本次实际命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 退出0。Everypaw独立manifest格式检查也退出0。 |
+| 默认及显式Host的 `cargo clippy --offline --workspace --all-targets … -- -D warnings` | 两条退出0。 |
+| `cargo test --offline --workspace -- --test-threads=1` | 正常执行环境退出0，971 passed、2项既有ignored。 |
+| `cargo test --offline --workspace --features engine-host -- --test-threads=1` | 正常执行环境退出0，1089 passed、2项既有ignored；Host63+16+36、CLI/Host parity3/3包括在内。 |
+| `cargo run --offline -p xtask -- lines` | 退出0，Host6785/7000、外部tests3943/4000、aux11497/11500，未改变预算或计数。 |
+| `cargo run --offline -p xtask -- scrub --check`、`golden`、`telemetry` | 均退出0。 |
+| `cargo run --offline -p xtask -- snapshot --check` | 退出1，保留既已证明的Windows CRLF/LF基线差异；未改快照、Core或检查器。 |
+| `cargo tree --offline -p openpaw-cli --no-default-features` | 退出0，默认CLI无axum。 |
+| `cargo build --offline -p openpaw-cli --features engine-host --bin openpaw` | 退出0，jobs1、dev/test debug0、共享唯一engine-target；独立保存制品并核对配对SHA后才替换8810。 |
+
+首次检查发现共享target嵌入已归档engine-visual-review的MANIFEST_DIR，fixture/xtask找不到文件；已保留失败日志，刷新本树源码时间并重新编译，未修改样例或复制target。沙箱Windows ACL和桌面IPC进程身份检查受限，已在正常执行环境重跑上述全量测试及成对验证通过。cargo-deny既有advisory-db只读锁限制继续保留，不重复无效探测或宣称审计通过；真实Linux Docker网络、管理员/登录重启及生产模型理解仍非本次证明范围。
+
+最终修改仅原允许表内6文件；公共受限函数中文八栏目保持，不改Core、CLI、Cargo依赖、系统hosts、Docker服务或DeepSeek配置。不推送分支。运行切换、数据保留与回滚制品身份见Everypaw `.scratch/native-host-bridge/README.md`；旧8ec11f8制品保留。
+
 按既有 implement-spec 授权，独立 `bugfix/everypaw-visual-review` 从 `65f8fdc95fa20190b710f3d98392c1bcc0de3bea` 实施审查修正：`ai_pc_visual.rs` 把 ACK 容量与精确 nonce 的解释译成中文；`http.rs` 把现有七种视觉回合测试的数字编号改为命名场景，明确取得/ACK次数、模型能力与媒体错误预期。保留真实 Router、模型与桥请求、原身份、provider callID、保存投影、PNG 原件、REST 窄读取及环境锁/恢复断言；下述注册表只统一既有内部分派，不新增公共接口。
 
 本轮实际改动仅下述三份源码、本记录和 INDEX，均在原允许表内；Core、AgentLoop、Store、traits、Cargo、CI、预算/计数器、服务和模型配置不改。新增场景类型/方法保持私有，解释使用中文。原 65f/9d 证据不覆盖，最终源码、聚合补丁/实际回放与独立二进制身份另行刷新。已记录的 Windows snapshot 差异及 cargo-deny advisory-db 只读锁仍保留，不重复无效主机诊断，也不宣称门禁全绿。

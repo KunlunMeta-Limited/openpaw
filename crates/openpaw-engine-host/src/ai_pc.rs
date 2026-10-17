@@ -46,16 +46,17 @@ pub(crate) enum RegistrationError {
 /// 功能：每个 Host 实例独立的会话登记表；重启不恢复。
 pub(crate) type Registrations = Arc<RwLock<HashMap<String, Registration>>>;
 impl RegistrationInput {
-    /// 功能：验证宿主机边界并创建无重定向的客户端。
+    /// 功能：验证宿主机边界，按 Host 平台规范回调地址并创建无重定向客户端。
     /// 参数：self 为已解析的登记请求。
     /// 返回：可放入内存表的登记记录。
     /// 错误：非法地址、令牌或客户端初始化失败返回 Invalid。
     /// 状态：不写文件或登记表。
     /// 并发与取消：同步验证，无共享状态。
-    /// 权限：只接受指定宿主机地址与固定路径。
-    /// 关联：CHG-2026-0026。
+    /// 权限：只接受指定宿主机地址与固定路径；Windows 的 Docker 别名仅指向本机回环。
+    /// 关联：CHG-2026-0026、CHG-2026-0029。
     pub(crate) fn checked(self) -> Result<Registration, RegistrationError> {
-        let url = reqwest::Url::parse(&self.bridge_url).map_err(|_| RegistrationError::Invalid)?;
+        let mut url =
+            reqwest::Url::parse(&self.bridge_url).map_err(|_| RegistrationError::Invalid)?;
         if self.bridge_url.len() > 2048
             || !matches!(url.scheme(), "http" | "https")
             || !matches!(
@@ -74,6 +75,10 @@ impl RegistrationInput {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         {
             return Err(RegistrationError::Invalid);
+        }
+        if cfg!(windows) && url.host_str() == Some("host.docker.internal") {
+            url.set_host(Some("127.0.0.1"))
+                .map_err(|_| RegistrationError::Invalid)?;
         }
         let client = reqwest::Client::builder()
             .no_proxy()

@@ -39,6 +39,8 @@
 | CHG-2026-0029 | [Everypaw 实时视觉工具](CHG-2026-0029-Everypaw实时视觉工具.md) | approved / 06列窗、07结构、08正文、09原始PNG、10调用/点击、11文字/快捷键/等待完成本地组合验收及官方Host配对7/7；Windows snapshot/cargo-deny锁路径/Docker与人工接口审阅/来源DCO/CI/部署保留 | high | 用户规格决策；Codex 实施 | 既有登记及API-HOST-SESSION-004可选窄读取扩展；五类视觉工具已实现，其余依任务图 | 允许10，当前10 |
 
 CHG-2026-0025 的文件数量为当前 diff 的 25 个实际文件，不包含原有 `.ua/`。
+
+2026-10-17：CHG-2026-0029 追加用户明确授权的 `bugfix/native-host-bridge` 窄修：Windows 原生 Host 在登记边界把 Docker 宿主机别名转为回环，Linux 保留原别名。登记、认证、工具身份和 ACK 不变；真实 Router 回归已由 0 次采集首红转为绿，成对及运行制品证据见 CHG 与 Everypaw `.scratch/native-host-bridge/README.md`。不修改系统 hosts 或原 Docker 服务。
 Q1–Q5 已确认，迁移、本地回归及 cargo-deny 0.20.2 依赖审计完成；审计经本机 7890
 代理执行，退出 0。2026-10-13 用户授权新建 `bugfix/shared-engine-store-runtime`，
 本轮以独立本地提交保存，未推送，新 CI 尚未执行；证据见 CHG-2026-0025 第 8 节。

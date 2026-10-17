@@ -169,6 +169,8 @@ Chat 工具结果保留文本和调用 ID，随后媒体 user 输入只是协议
 
 ## AI PC 专属工具连接
 
+2026-10-17 原生 Host 回调修复：桌面端继续登记 `http://host.docker.internal:PORT/ai-pc`。Windows Host 在严格校验登记地址后将该别名规范为 `127.0.0.1`，保留原端口和路径；Linux Host 保留 Docker 宿主机别名。显式回环地址不变，不根据客户端填写的 Host endpoint 猜测是否运行在容器内，不修改系统 hosts。此连接模式针对同一 Windows 主机的原生 Host 与 Docker Desktop Linux Host。现有 Basic/Bearer、会话身份、授权、取消和精确 ACK 均保留，无新配置或依赖；Host 重启后 Everypaw 在下一轮发送前重新登记。
+
 适配源码基线为 `7c8262ee84eb77508a2da200714408e5f3aa5ebe`，独立分支 `feature/ai-pc-context-tools`（CHG-2026-0026）。AI PC 自动为自身创建的空闲会话登记 Windows 临时桥接端口，Docker Desktop 使用 `host.docker.internal`。Host 必须已启用 Basic 鉴权；该前提与模型运行在本地还是云端无关，权限由桌面的接收服务配置决定。
 
 桥接凭据保存在 Host 会话登记表内存，不使用进程环境；重启后 AI PC 在下一次自己会话的问答前重新登记。旧 Host 无登记接口时 AI PC 明确提示工具不可用，已有文字问答仍可运行。

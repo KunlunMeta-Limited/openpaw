@@ -407,6 +407,8 @@ Host conversation_reliability 的 inline_media 用真实 Router 和本地假HTTP
 
 ### Everypaw 实时列窗（CHG-0029 / 06）
 
+原生 Host 地址回归 `registered_native_windows_host_uses_desktop_docker_alias_without_a_proxy`（Windows）通过真实 Basic `PUT /session/:id/ai-pc` 登记桌面原始 Docker 别名；真实受控 SSE 模型选择工具后，检查窗口/PNG结果、调用身份、单次取得、精确 ACK 和下一次模型请求。旧实现实测因 native acquisitions 为 0 而失败，修复后通过。Everypaw 官方 Host 成对用例不再手工替换桥地址，包括视觉、动作与重生成路径；本地桥直连单测仍可显式使用回环。Windows 回归不作为真实 Linux 容器网络通过的证据。
+
 09在相同实际Router/provider seam中增加PNG交付、image未知/仅text前置拒绝、错误MIME/非法原件不ACK；Everypaw paired测试经真实官方Host进程/桥/IPC/隔离Recorder，以可完整解码且大于1 MiB的窗口和子区域PNG核对原件、来源、实际下一provider请求及SSE/窄REST文字恢复。Windows像素用例只读取自己创建的独立fixture窗口，检查物理区域、负坐标、遮挡/标记排除与最小化失败。实际运行结果以09验证记录为准，未运行项不作为通过证据。
 
 `http::tests::registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` 经实际 Host Router、真实假 OpenAI SSE HTTP 与受控桥：检查第一个真实模型请求的工具声明、runtime 生成身份、单次 native 调用、精确 delivery ACK、第二个真实模型请求的 ToolResult/provider callID 以及不含 token。登记接口测试同时检查扩展响应头；原 current/history 和媒体透传回归保留。
