@@ -733,10 +733,10 @@ fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Respon
         Ok(()) => (
             StatusCode::NO_CONTENT,
             [
-                ("openpaw-desktop-protocol", "1"),
+                ("openpaw-desktop-protocol", "1".to_owned()),
                 (
                     "openpaw-desktop-tools",
-                    "ai_pc_list_windows,ai_pc_query_structure,ai_pc_read_text,ai_pc_capture_target,ai_pc_action_batch",
+                    crate::ai_pc_visual::advertised_tools(),
                 ),
             ],
         )
@@ -1525,6 +1525,37 @@ mod tests {
         );
     }
 
+    // 场景同时表达能力、媒体以及取得/ACK预期，避免数字范围隐藏分支含义。
+    #[derive(Clone, Copy, Debug)]
+    enum VisualScenario {
+        Windows,
+        Png,
+        MissingImageCapability,
+        TextOnly,
+        WrongMime,
+        InvalidPng,
+        Structure,
+    }
+    impl VisualScenario {
+        fn capture(self) -> bool {
+            !matches!(self, Self::Windows | Self::Structure)
+        }
+        fn expected_calls(self) -> (usize, usize) {
+            match self {
+                Self::MissingImageCapability | Self::TextOnly => (0, 0),
+                Self::WrongMime | Self::InvalidPng => (1, 0),
+                Self::Windows | Self::Png | Self::Structure => (1, 1),
+            }
+        }
+        fn expected_error(self) -> Option<&'static str> {
+            match self {
+                Self::MissingImageCapability | Self::TextOnly => Some("image"),
+                Self::WrongMime | Self::InvalidPng => Some("PNG"),
+                Self::Windows | Self::Png | Self::Structure => None,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack() {
         visual_roundtrip("ai_pc_list_windows",serde_json::json!({}),"windows",serde_json::json!({"kind":"untrusted_ui_data","windows":[{"id":"native-v1","app":"fixture.exe","process_id":42,"title":"本次窗口"}]})).await;
@@ -1546,12 +1577,20 @@ mod tests {
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
-        for case in if name == "ai_pc_query_structure" {
-            6..7
+        let scenarios: &[VisualScenario] = if name == "ai_pc_query_structure" {
+            &[VisualScenario::Structure]
         } else {
-            0..6
-        } {
-            let capture = (1..6).contains(&case);
+            &[
+                VisualScenario::Windows,
+                VisualScenario::Png,
+                VisualScenario::MissingImageCapability,
+                VisualScenario::TextOnly,
+                VisualScenario::WrongMime,
+                VisualScenario::InvalidPng,
+            ]
+        };
+        for &scenario in scenarios {
+            let capture = scenario.capture();
             let tool_name = if capture {
                 "ai_pc_capture_target"
             } else {
@@ -1592,7 +1631,7 @@ mod tests {
             let bridge_projection = saved_projection.clone();
             let bridge = Router::new().route(&format!("/ai-pc/{}", if capture { "capture" } else { path }),post(move |Json(body): Json<serde_json::Value>| {
             let (observed,projection) = (observed.clone(), bridge_projection.clone());
-            async move { observed.lock().await.push(body.clone()); let mut value = serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":projection}); if capture { value["media"] = serde_json::json!([{"id":"att_fixture","mime":if case==4{"image/jpeg"}else{"image/png"},"data":if case==5{"AAAA"}else{png},"filename":"target.png"}]); } Json(value) }
+            async move { observed.lock().await.push(body.clone()); let mut value = serde_json::json!({"protocol_version":1,"invocation_id":body["invocation_id"],"delivery_id":"delivery-fixture","status":"ok","projection":projection}); if capture { value["media"] = serde_json::json!([{"id":"att_fixture","mime":if matches!(scenario,VisualScenario::WrongMime){"image/jpeg"}else{"image/png"},"data":if matches!(scenario,VisualScenario::InvalidPng){"AAAA"}else{png},"filename":"target.png"}]); } Json(value) }
         }));
             let observed = calls.clone();
             let bridge = bridge.route(
@@ -1613,12 +1652,12 @@ mod tests {
             let old_key = std::env::var_os("OPENAI_API_KEY");
             let old_url = std::env::var_os("OPENPAW_OPENAI_BASE_URL");
             let old_capabilities = std::env::var_os("OPENPAW_MODEL_CAPABILITIES");
-            if case == 2 {
+            if matches!(scenario, VisualScenario::MissingImageCapability) {
                 std::env::remove_var("OPENPAW_MODEL_CAPABILITIES");
             } else {
                 std::env::set_var(
                     "OPENPAW_MODEL_CAPABILITIES",
-                    if case == 3 {
+                    if matches!(scenario, VisualScenario::TextOnly) {
                         r#"{"openai":{"fixture-model":{"input":["text"]}}}"#
                     } else {
                         r#"{"openai":{"fixture-model":{"input":["text","image"]}}}"#
@@ -1670,26 +1709,34 @@ mod tests {
             bridge_task.abort();
             assert_eq!(status, StatusCode::OK);
             let calls = calls.lock().await;
-            if (2..6).contains(&case) {
-                assert_eq!(
-                    calls.len(),
-                    if case < 4 { 0 } else { 1 },
-                    "unsupported model never acquires, invalid media never ACKs"
-                );
+            let (acquired, acknowledged) = scenario.expected_calls();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.get("args").is_some())
+                    .count(),
+                acquired,
+                "{scenario:?}: native acquisitions"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| call.get("delivery_id").is_some())
+                    .count(),
+                acknowledged,
+                "{scenario:?}: exact ACKs"
+            );
+            assert_eq!(
+                calls.len(),
+                acquired + acknowledged,
+                "{scenario:?}: no extra requests"
+            );
+            if let Some(error) = scenario.expected_error() {
                 let requests = model_seen.lock().await;
-                assert!(requests[1]["messages"].to_string().contains(if case < 4 {
-                    "image"
-                } else {
-                    "PNG"
-                }));
+                assert!(requests[1]["messages"].to_string().contains(error));
                 assert!(!requests[1]["messages"].to_string().contains("data:image"));
                 continue;
             }
-            assert_eq!(
-                calls.len(),
-                2,
-                "one native request followed by exact parsed ACK"
-            );
             assert_eq!(calls[0]["session_id"], handle.id);
             assert_eq!(calls[0]["request_id"], "trusted-request");
             assert_eq!(
