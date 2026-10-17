@@ -487,14 +487,7 @@ impl ToolExecutor for DesktopTools {
     /// 关联：CHG-2026-0028、desktop_call。
     async fn call(&self, name: &str, args: Value) -> openpaw_core::Result<ToolCallOutcome> {
         let registration = self.registration();
-        if matches!(
-            name,
-            "ai_pc_list_windows"
-                | "ai_pc_query_structure"
-                | "ai_pc_read_text"
-                | "ai_pc_capture_target"
-                | "ai_pc_action_batch"
-        ) {
+        if crate::ai_pc_visual::route_for(name).is_some() {
             return Ok(match registration {
                 Some(r) => match validate(name, &args) {
                     Ok(()) => crate::ai_pc_visual::call(name, &self.session_id, args, r)
@@ -533,16 +526,9 @@ impl ToolHostValidator for DesktopTools {
     /// 权限：桌面参数不允许自报身份、模式或凭据。
     /// 关联：CHG-2026-0028、validate。
     async fn validate_input(&self, name: &str, input: &Value) -> Result<(), String> {
-        if matches!(
-            name,
-            "ai_pc_current_context"
-                | "ai_pc_history_search"
-                | "ai_pc_list_windows"
-                | "ai_pc_query_structure"
-                | "ai_pc_read_text"
-                | "ai_pc_action_batch"
-                | "ai_pc_capture_target"
-        ) {
+        if matches!(name, "ai_pc_current_context" | "ai_pc_history_search")
+            || crate::ai_pc_visual::route_for(name).is_some()
+        {
             validate(name, input)
         } else {
             self.inner.validate_input(name, input).await

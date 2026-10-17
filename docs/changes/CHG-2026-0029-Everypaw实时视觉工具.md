@@ -2,6 +2,35 @@
 
 状态：approved / 06列窗、07结构、09原始PNG、10调用/点击批次完成本地组合验收；08/11按任务图继续，既有平台与外部门禁保留。更新：2026-10-17。
 
+## 统一审查窄修登记（2026-10-17）
+
+按既有 implement-spec 授权，独立 `bugfix/everypaw-visual-review` 从 `65f8fdc95fa20190b710f3d98392c1bcc0de3bea` 实施审查修正：`ai_pc_visual.rs` 把 ACK 容量与精确 nonce 的解释译成中文；`http.rs` 把现有七种视觉回合测试的数字编号改为命名场景，明确取得/ACK次数、模型能力与媒体错误预期。保留真实 Router、模型与桥请求、原身份、provider callID、保存投影、PNG 原件、REST 窄读取及环境锁/恢复断言；下述注册表只统一既有内部分派，不新增公共接口。
+
+本轮实际改动仅下述三份源码、本记录和 INDEX，均在原允许表内；Core、AgentLoop、Store、traits、Cargo、CI、预算/计数器、服务和模型配置不改。新增场景类型/方法保持私有，解释使用中文。原 65f/9d 证据不覆盖，最终源码、聚合补丁/实际回放与独立二进制身份另行刷新。已记录的 Windows snapshot 差异及 cargo-deny advisory-db 只读锁仍保留，不重复无效主机诊断，也不宣称门禁全绿。
+
+最终 Standards 新增一项内部重复分派判断：本轮再在原允许的 `ai_pc.rs`、`ai_pc_visual.rs`、`http.rs` 集中 Host 私有五工具 name/path 注册表。由它派生视觉工具成员判定、HTTP 路由及登记回执，保留既有名称、路径、回执顺序与响应字段；各工具严格参数校验和独立模式/等待规则继续显式保留。不向 Core/全局工具表导出，不改变协议和依赖。新增受限可见函数按八栏目中文 Rustdoc 记录；先验证 lines 预算，再执行最终相关回归/门禁。本轮文件总数调整为上述三份源码、本 CHG 和 INDEX，全部仍在原十文件允许表内。
+
+### 窄修最终本地检查
+
+原始日志位于 Everypaw 主工作区 `.local/final-review/logs/`，由独立窄修工作树实际编译/运行，jobs=1、debug=0、唯一既有 engine-target；没有复制构建缓存。命令均带已有离线依赖缓存。
+
+| 日志 | 实际命令与结果 |
+|---|---|
+| 12-engine-registry-host-routes | `cargo test --offline -p openpaw-engine-host --features engine-host registered_ -- --test-threads=1`：4项单元（含七场景封装）和2项reliability通过；早先11未带feature而0项运行，不作功能证明。 |
+| 21-engine-strict-host | `cargo clippy --offline --workspace --all-targets --features engine-host -- -D warnings`，exit0。 |
+| 22-engine-fmt | `cargo fmt --all -- --check`，exit0。 |
+| 23-engine-strict-default | `cargo clippy --offline --workspace --all-targets -- -D warnings`，exit0。 |
+| 24-engine-workspace-host | `cargo test --offline --workspace --features engine-host -- --test-threads=1`，exit0，1088 passed / 0 failed / 2 ignored；含真实CLI/Host parity。 |
+| 25-engine-workspace-default | `cargo test --offline --workspace -- --test-threads=1`，exit0，971 passed / 0 failed / 2 ignored。 |
+| 26-engine-lines | `cargo run --offline -p xtask -- lines`，exit0；Host6780/7000、Host外测3943/4000、aux11497/11500；未改预算、计数或移动测试。 |
+| 27-engine-scrub | `cargo run --offline -p xtask -- scrub --check`，exit0。 |
+| 28-engine-snapshot | `cargo run --offline -p xtask -- snapshot --check`，exit1，既有Windows CRLF/LF trait snapshot drift；未改Core或重生基线。 |
+| 29-engine-golden | `cargo run --offline -p xtask -- golden`，exit0。 |
+| 30-engine-telemetry | `cargo run --offline -p xtask -- telemetry`，exit0。 |
+| 31-engine-default-tree | `cargo tree --offline -p openpaw-cli --edges normal`，exit0；默认CLI依赖树不含axum。 |
+
+逐文件diff与原十文件允许表一致；两个新增受限函数都有完整八栏目中文Rustdoc，新增解释均中文。已有cargo-deny三种只读锁失败证据在`.local/final-review/cargo-deny-preparation.md`及原准备日志，未修改依赖与策略、不声称审计通过。最终签名提交、构建的新EXE、校验和及聚合补丁的实际index回放树由App的独立`docs/delivery/desktop-capability/review-fix/`记录，旧制品及失败保留。CODEOWNER、历史来源DCO、CI和部署仍为独立门禁。
+
 ## 授权、基线与边界
 
 用户已确认 Everypaw 的桌面能力迁移规格、17 项正式任务并明确调用 implement-spec。规格 D05/D13–D19/D22 和任务 06–11 明确要求修改官方 Host 的工具声明、可信会话调用、取消、真实结果、PNG 主模型路径及交付证据。按 AGENTS.md“已有明确用户授权覆盖该范围时记录授权后继续”，本记录登记该既有授权，不再要求用户重复批准相同范围。历史 CHG-0026/0028 不作为本次新增功能的授权。

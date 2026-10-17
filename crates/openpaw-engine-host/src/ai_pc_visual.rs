@@ -10,6 +10,38 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+const VISUAL_TOOLS: [(&str, &str); 5] = [
+    ("ai_pc_list_windows", "/ai-pc/windows"),
+    ("ai_pc_query_structure", "/ai-pc/structure"),
+    ("ai_pc_read_text", "/ai-pc/text"),
+    ("ai_pc_capture_target", "/ai-pc/capture"),
+    ("ai_pc_action_batch", "/ai-pc/actions"),
+];
+/// 功能：查询已实现视觉工具的桌面桥路由，同时供 Host 判定工具归属。
+/// 参数：name 为工具名。
+/// 返回：已实现工具的固定路由，其他名称返回 None。
+/// 错误：无。
+/// 状态：不修改登记或回合。
+/// 并发与取消：纯同步查询，无取消状态。
+/// 权限：只识别工具，不替代调用身份和参数验证。
+/// 关联：CHG-2026-0029、DesktopTools。
+pub(super) fn route_for(name: &str) -> Option<&'static str> {
+    VISUAL_TOOLS
+        .iter()
+        .find_map(|(tool, path)| (*tool == name).then_some(*path))
+}
+/// 功能：按固定顺序生成已实现视觉工具的登记回执。
+/// 参数：无。
+/// 返回：以逗号分隔的工具名称。
+/// 错误：无。
+/// 状态：不修改登记或回合。
+/// 并发与取消：纯同步读取，无取消状态。
+/// 权限：能力声明不替代桌面授权。
+/// 关联：CHG-2026-0029、API-HOST-AI-PC-REGISTER-001。
+pub(super) fn advertised_tools() -> String {
+    VISUAL_TOOLS.map(|(name, _)| name).join(",")
+}
+
 #[derive(Clone, Default)]
 /// 功能：每个可信登记独有的活动回合与有界取消队列，不向模型公开。
 pub(super) struct VisualContext {
@@ -142,14 +174,7 @@ pub(super) async fn call(
     args: Value,
     r: Registration,
 ) -> Result<ToolCallOutcome, String> {
-    let path = match name {
-        "ai_pc_list_windows" => "/ai-pc/windows",
-        "ai_pc_query_structure" => "/ai-pc/structure",
-        "ai_pc_read_text" => "/ai-pc/text",
-        "ai_pc_action_batch" => "/ai-pc/actions",
-        "ai_pc_capture_target" => "/ai-pc/capture",
-        _ => return Err("此实时桌面工具尚未实现。".into()),
-    };
+    let path = route_for(name).ok_or("此实时桌面工具尚未实现。")?;
     let active = r.visual.snapshot()?;
     let capture = name == "ai_pc_capture_target";
     if capture && !active.image {
@@ -225,8 +250,8 @@ pub(super) async fn call(
     if !accepted.status().is_success() || active.cancel.is_cancelled() {
         return Err("交付回执被拒绝或原回合已取消。".into());
     }
-    // Response size is bounded before parsing. A generic 2xx is not proof that
-    // the desktop accepted this exact nonce under its still-current policy.
+    // 解析前限制回执容量；通用 2xx 不能证明桌面端已按仍有效的策略
+    // 接受这个精确 nonce，必须继续校验 ACK 内容。
     if accepted.content_length().is_some_and(|length| length > 128) {
         return Err("交付回执格式无效。".into());
     }
