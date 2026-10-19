@@ -120,3 +120,11 @@ Docker context 为 desktop-linux；compose 项目 office-feature 的三个现有
 xtask 上限：Host 7000、Engine 8200、Host tests 4000、aux 11500，按既有 AST 规则测量；不把合文件当作预算优化，也不默许提高上限。
 
 本轮只有只读调查与此草案记录，无业务代码、合并提交、部署或运行测试。保留原容器构建并行工作。正式实现建议通过独立分支与分阶段提交隔离，回滚代码时保留用户会话及产物；持久化兼容仍遵守原 ADR/CHG。
+
+## 实施记录：功能合并阶段
+
+已创建 `integration/office-multimodal`，多模态 e125364 为代码基线。完整合入 Office 6199a7e；approval 采用共享 Engine Gate 并在 Host adapter 内聚合独立子审批；runtime 保留共享 turn_execution、完整生成消息提交与桌面外层包装。新建、恢复、Fork 共用 session_tool_host；子任务不包含桌面包装或父附件表。ToolCallOutcome / AgentEvent 媒体字段、逐模型能力及两层工具媒体上下文已适配。预算总结取得稳定消息身份并进入生成收集器。
+
+独立 Docker Rust 1.88 验证容器已建立，使用新 target volume，不改现有三服务。初次 Docker Hub token 超时，经当前命令的本机代理重试成功；未改全局配置。`cargo check --workspace --all-targets --features engine-host --locked` 退出 0；`cargo test --workspace --features engine-host --locked -- --test-threads=1` 退出 0，包含 Host 单元 97、reliability 16、HTTP 37。原有 ignored 不作功能证据。日志在仓库外 `artifacts/office-multimodal/functional-tests.log`。
+
+行数初测 Host 8842/7000、aux 11651/11500，退出 1；保留原预算和 AST 规则，不宣称门禁通过。严格 workspace Clippy（Rust 1.88）因未修改的 sandbox 等文件已有 lint 失败，日志另存；新增预算条件的布尔表达式按原副作用顺序规范化。最终迁移后继续验证并记录准确结果。

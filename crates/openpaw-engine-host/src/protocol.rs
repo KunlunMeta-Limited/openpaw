@@ -112,7 +112,7 @@ pub struct HostConfig {
     pub username: Option<String>,
     /// 功能：Basic Authentication 密码；不得进入日志和 Office 动作。
     pub password: Option<String>,
-    /// 功能：Office action Gateway 地址；None 表示丢弃投影但不影响回合。
+    /// 功能：Office action Gateway 地址；仅显式配置时启用 Office 投影和附加提示词。
     pub office_url: Option<String>,
     /// 功能：默认 provider 标识；只允许 mock、echo、anthropic、openai。
     pub provider: String,
@@ -127,10 +127,9 @@ impl Default for HostConfig {
             workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             username: std::env::var("OPENCODE_SERVER_USERNAME").ok(),
             password: std::env::var("OPENCODE_SERVER_PASSWORD").ok(),
-            office_url: Some(
-                std::env::var("OPENPAW_OFFICE_ACTIONS_URL")
-                    .unwrap_or_else(|_| "http://127.0.0.1:8765/actions".into()),
-            ),
+            office_url: std::env::var("OPENPAW_OFFICE_ACTIONS_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             provider: "mock".into(),
         }
     }

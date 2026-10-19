@@ -4,6 +4,9 @@
 //! 禁止承担：不定义 OpenCode 路由，不让 Office 失败改变 AgentLoop 结果。
 //! 关联：`REQ-B-HOST-002`、`REQ-B-HOST-006`、`REQ-B-HOST-007`。
 use crate::approval::HostApprovalManager;
+use crate::delegation::{
+    remove_persisted_delegation_state, DelegatingToolHost, DelegationContext, DelegationShared,
+};
 use crate::events;
 use crate::message_projection;
 use crate::office::OfficeDispatcher;
@@ -127,6 +130,7 @@ pub struct SessionHandle {
     session_path: PathBuf,
     pub agent: AgentLoop,
     pub approvals: Arc<HostApprovalManager>,
+    pub(crate) delegation: Arc<DelegationContext>,
     pub active: AtomicBool,
     pub workspace: PathBuf,
     session_provider: String,
@@ -472,6 +476,7 @@ pub struct AppState {
     pub office: OfficeDispatcher,
     pub global_events: broadcast::Sender<OpenCodeEvent>,
     pub(crate) scheduler: Arc<TurnScheduler>,
+    delegation_shared: Arc<DelegationShared>,
     session_slots: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     lifecycle: std::sync::Mutex<HostLifecycleState>,
     shutdown: CancellationToken,
@@ -485,6 +490,7 @@ struct SessionHandleInit {
     session_path: PathBuf,
     agent: AgentLoop,
     approvals: Arc<HostApprovalManager>,
+    delegation: Arc<DelegationContext>,
     workspace: PathBuf,
     tools: Vec<openpaw_core::ToolSpec>,
     title: String,
@@ -532,6 +538,7 @@ impl AppState {
         scheduler_config: TurnSchedulerConfig,
     ) -> Arc<Self> {
         let office = OfficeDispatcher::new(config.office_url.clone());
+        let delegation_shared = DelegationShared::from_env();
         let (global_events, _) = broadcast::channel(512);
         Arc::new(Self {
             ai_pc: crate::ai_pc::Registrations::default(),
@@ -540,6 +547,7 @@ impl AppState {
             office,
             global_events,
             scheduler: TurnScheduler::new(scheduler_config.into()),
+            delegation_shared,
             session_slots: Mutex::new(HashMap::new()),
             lifecycle: std::sync::Mutex::new(HostLifecycleState {
                 accepting_turns: true,
@@ -862,6 +870,8 @@ impl AppState {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(id);
+                self.remove_delegation_state(id, handle.as_ref());
+                self.office.remove_scope(id);
                 self.remove_session_slot(id, &slot).await;
                 Ok(true)
             }
@@ -870,6 +880,10 @@ impl AppState {
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(id);
+                if handle.is_some() {
+                    self.remove_delegation_state(id, handle.as_ref());
+                    self.office.remove_scope(id);
+                }
                 self.remove_session_slot(id, &slot).await;
                 Ok(handle.is_some())
             }
@@ -884,6 +898,46 @@ impl AppState {
                 Err(format!("删除会话文件失败：{error}"))
             }
         }
+    }
+
+    fn remove_delegation_state(&self, id: &str, handle: Option<&Arc<SessionHandle>>) {
+        let mut workspaces = HashSet::from([self.config.workspace.clone()]);
+        if let Some(handle) = handle {
+            workspaces.insert(handle.workspace.clone());
+        }
+        for workspace in workspaces {
+            if let Err(error) = remove_persisted_delegation_state(&workspace, id) {
+                tracing::warn!(%error, session_id = id, "无法删除子 Agent 委派状态");
+            }
+        }
+    }
+    // 新建、恢复和 Fork 共用组装入口；桌面只包在父会话最外层。
+    fn session_tool_host(
+        &self,
+        id: &str,
+        workspace: &std::path::Path,
+        approvals: Arc<HostApprovalManager>,
+        provider: Arc<dyn LlmProvider>,
+        model: &str,
+    ) -> (Arc<DelegationContext>, Arc<dyn openpaw_core::ToolHost>) {
+        let delegation = DelegationContext::new(
+            id.to_string(),
+            workspace.to_path_buf(),
+            self.office.clone(),
+            approvals,
+            provider,
+            model.to_string(),
+            self.delegation_shared.clone(),
+        );
+        let tool_host = crate::ai_pc::wrap(
+            Arc::new(DelegatingToolHost::new(
+                workspace.to_path_buf(),
+                delegation.clone(),
+            )),
+            id,
+            self.ai_pc.clone(),
+        );
+        (delegation, tool_host)
     }
     async fn load_existing(&self, id: &str) -> Result<Arc<SessionHandle>, SessionLoadError> {
         let path = self
@@ -905,15 +959,6 @@ impl AppState {
             });
         let workspace = absolute_workspace(session_workspace(&read.events, &self.config.workspace))
             .map_err(|_| SessionLoadError::Unavailable)?;
-        let tool_host = crate::ai_pc::wrap(
-            openpaw_tools::arc_registry(&workspace),
-            id,
-            self.ai_pc.clone(),
-        );
-        let tools = tool_host
-            .list_tools()
-            .await
-            .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
         let projection = restored_session_projection(id, &read.events)?;
         let message_presentations = projection.message_presentations;
@@ -933,6 +978,17 @@ impl AppState {
             self.global_events.clone(),
             CancellationToken::new(),
         );
+        let (delegation, tool_host) = self.session_tool_host(
+            id,
+            &workspace,
+            approvals.clone(),
+            provider.clone(),
+            &session.meta.model,
+        );
+        let tools = tool_host
+            .list_tools()
+            .await
+            .map_err(|_| SessionLoadError::Unavailable)?;
         let agent = configured_agent(
             provider,
             session.meta.model.clone(),
@@ -951,6 +1007,7 @@ impl AppState {
             session_path: path,
             agent,
             approvals,
+            delegation,
             workspace,
             tools,
             title,
@@ -1056,10 +1113,12 @@ impl AppState {
         session.meta.id = id.clone();
         let cancel = CancellationToken::new();
         let approvals = HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel);
-        let tool_host = crate::ai_pc::wrap(
-            openpaw_tools::arc_registry(&workspace),
+        let (delegation, tool_host) = self.session_tool_host(
             &id,
-            self.ai_pc.clone(),
+            &workspace,
+            approvals.clone(),
+            provider.clone(),
+            &model_name,
         );
         let tools = tool_host.list_tools().await.map_err(|e| e.to_string())?;
         let agent = configured_agent(provider, model_name, tool_host, approvals.clone())?;
@@ -1093,6 +1152,7 @@ impl AppState {
             session_path: path,
             agent,
             approvals,
+            delegation,
             workspace,
             tools,
             title: title.unwrap_or("New session").to_string(),
@@ -1117,6 +1177,7 @@ impl AppState {
             session_path,
             agent,
             approvals,
+            delegation,
             workspace,
             tools,
             title,
@@ -1140,6 +1201,7 @@ impl AppState {
             session_path,
             agent,
             approvals,
+            delegation,
             active: AtomicBool::new(false),
             workspace,
             created_at,
@@ -1378,10 +1440,12 @@ impl AppState {
                 self.global_events.clone(),
                 CancellationToken::new(),
             );
-            let tool_host = crate::ai_pc::wrap(
-                openpaw_tools::arc_registry(&source.workspace),
+            let (delegation, tool_host) = self.session_tool_host(
                 &new_id,
-                self.ai_pc.clone(),
+                &source.workspace,
+                approvals.clone(),
+                provider.clone(),
+                &model_name,
             );
             let agent =
                 configured_agent(provider, model_name.clone(), tool_host, approvals.clone())
@@ -1431,6 +1495,7 @@ impl AppState {
                 session_path: final_path,
                 agent,
                 approvals,
+                delegation,
                 workspace: source.workspace.clone(),
                 tools: source.tools.clone(),
                 title: title.clone(),
@@ -1515,6 +1580,9 @@ impl AppState {
                     .ok_or_else(|| {
                         SessionMutationError::BadRequest("messageID 不存在或已被回退隐藏".into())
                     })?;
+            handle.delegation.invalidate_results().map_err(|_| {
+                SessionMutationError::Persistence("无法可靠清除子任务结果缓存".into())
+            })?;
             let event = SessionMutationEvent::RevertStaged(SessionRevertStagedV1 {
                 message_id: revert_message_id,
             });
@@ -1788,6 +1856,56 @@ pub(crate) fn build_provider_for_model(
                         text: "reading".into(),
                     },
                     openpaw_llm::MockMode::Fixed("读取完成".into()),
+                ]),
+                "delegate" => openpaw_llm::MockProvider::scripted(vec![
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "delegate_task".into(),
+                        input: serde_json::json!({
+                            "name": "研究 Agent",
+                            "task": "整理子 Agent 端到端验证结果"
+                        }),
+                        text: "正在委派".into(),
+                    },
+                    openpaw_llm::MockMode::Fixed("子 Agent 验证结果".into()),
+                    openpaw_llm::MockMode::Fixed("主 Agent 已整合子 Agent 结果".into()),
+                ]),
+                "delegate_multi" => openpaw_llm::MockProvider::scripted(vec![
+                    openpaw_llm::MockMode::ParallelToolUse {
+                        tools: vec![
+                            (
+                                "delegate_task".into(),
+                                serde_json::json!({"name":"研究 Agent","task":"收集并整理研究结论"}),
+                            ),
+                            (
+                                "delegate_task".into(),
+                                serde_json::json!({"name":"设计 Agent","task":"形成方案结构和流程"}),
+                            ),
+                            (
+                                "delegate_task".into(),
+                                serde_json::json!({"name":"审核 Agent","task":"检查结果并给出验收结论"}),
+                            ),
+                        ],
+                        text: "正在并行委派三个子 Agent".into(),
+                    },
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "write_file".into(),
+                        input: serde_json::json!({"path":"reports/research.md","content":"研究产物"}),
+                        text: "正在写入研究产物".into(),
+                    },
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "write_file".into(),
+                        input: serde_json::json!({"path":"reports/design.md","content":"设计产物"}),
+                        text: "正在写入设计产物".into(),
+                    },
+                    openpaw_llm::MockMode::ToolUse {
+                        tool_name: "write_file".into(),
+                        input: serde_json::json!({"path":"reports/review.md","content":"审核产物"}),
+                        text: "正在写入审核产物".into(),
+                    },
+                    openpaw_llm::MockMode::Fixed("子 Agent 已完成产物".into()),
+                    openpaw_llm::MockMode::Fixed("子 Agent 已完成产物".into()),
+                    openpaw_llm::MockMode::Fixed("子 Agent 已完成产物".into()),
+                    openpaw_llm::MockMode::Fixed("主 Agent 已整合三个子 Agent 结果".into()),
                 ]),
                 "stream" => {
                     openpaw_llm::MockProvider::stream_text_delayed("streamed response", 8, 40)
@@ -2493,15 +2611,31 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         std::mem::take(&mut *previous)
     };
     let mut last_tool_role = None;
-    let mut active_tool_roles = HashMap::new();
+    let mut tool_failed = false;
+    let mut successful_artifact_count = 0usize;
+    let mut active_tools = HashMap::new();
     let mut text_parts_started = HashSet::new();
     let mut reasoning_parts_started = HashSet::new();
     let mut completed_responses = HashSet::new();
     let mut response_index = 0usize;
     let mut active_response_index = 0usize;
+    let provider = handle.delegation.limit_provider(provider);
+    handle
+        .delegation
+        .begin_turn(provider.clone(), model.clone(), turn_cancel.clone());
     handle.office.turn_started(&handle.id, &mut roles);
     handle.set_activity("thinking", None, "正在思考");
     handle.emit(events::session_status(&handle.id, "busy"));
+    let system_prompt = {
+        let prompts = [
+            handle.office.system_prompt(),
+            handle.delegation.context_prompt(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        (!prompts.is_empty()).then(|| prompts.join("\n\n"))
+    };
     let (mut generated, result) = {
         let mut session = handle.session.lock().await;
         // AgentLoop 会在 await 期间直接修改 messages、token 计数和压缩状态。
@@ -2563,11 +2697,24 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             }
             let mut sink = |event: openpaw_engine::AgentEvent| {
                 match &event {
-                    openpaw_engine::AgentEvent::ToolUseStart { name, .. } => {
+                    openpaw_engine::AgentEvent::ToolExecutionStart { name, input, .. } => {
+                        let task = crate::office::tool_activity_summary(name, input);
+                        handle.set_activity("tool", safe_activity_tool(name), &task);
+                    }
+                    openpaw_engine::AgentEvent::ToolResult { name, is_error, .. } => {
+                        if !*is_error
+                            && matches!(
+                                name.as_deref(),
+                                Some("write_file" | "edit_file" | "notebook_edit")
+                            )
+                        {
+                            successful_artifact_count = successful_artifact_count.saturating_add(1);
+                        }
+                        let task = crate::office::tool_result_activity(name.as_deref(), *is_error);
                         handle.set_activity(
-                            "tool",
-                            safe_activity_tool(name),
-                            &tool_activity_task(name),
+                            if *is_error { "tool" } else { "thinking" },
+                            name.as_deref().and_then(safe_activity_tool),
+                            task,
                         );
                     }
                     openpaw_engine::AgentEvent::MessageStart => {
@@ -2609,7 +2756,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     &event,
                     &mut roles,
                     &mut last_tool_role,
-                    &mut active_tool_roles,
+                    &mut tool_failed,
+                    &mut active_tools,
                 );
                 if !matches!(
                     event,
@@ -2653,6 +2801,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     cancel: turn_cancel.clone(),
                     provider_and_model: Some((provider, model)),
                     attachments,
+                    system: system_prompt,
                     ..Default::default()
                 },
             )
@@ -2665,15 +2814,6 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             (execution.generated_messages, result)
         }
     };
-    let reason = result
-        .as_ref()
-        .map(|reason| format!("{reason:?}"))
-        .unwrap_or_else(|error| error.to_string());
-    let cancelled = handle.cancel_requested.load(Ordering::Acquire) || turn_cancel.is_cancelled();
-    handle
-        .office
-        .turn_ended(&handle.id, &mut roles, &reason, cancelled);
-    *handle.office_working.lock().await = roles.clone();
     let snapshot = {
         let mut session = handle.session.lock().await;
         // terminal commit 与 abort 共用 turn_gate。先取得 gate 的一方决定本轮最终是
@@ -2797,6 +2937,14 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 intended_terminal
             }
         };
+        let office_completed = terminal.state == TurnState::Completed && !tool_failed;
+        handle.office.turn_ended(
+            &handle.id,
+            &mut roles,
+            last_tool_role,
+            successful_artifact_count,
+            office_completed,
+        );
         cleanup.checkpoint = None;
         cleanup.message_count_before = session.messages.len();
         let mut snapshot = handle
@@ -2824,6 +2972,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         handle.active.store(false, Ordering::Release);
         snapshot
     };
+    *handle.office_working.lock().await = roles.clone();
     drop(snapshot);
     cleanup.finish();
 }
@@ -2840,6 +2989,7 @@ fn next_fork_ordinal(home: &std::path::Path, source_id: &str) -> Result<u64, Ses
         .map_err(|_| SessionMutationError::Persistence("无法扫描会话分支序号".into()))
 }
 fn finish_turn_projection(handle: &SessionHandle) {
+    handle.approvals.abort_all();
     if let Some(outcome) = handle
         .turn_outcomes()
         .last()
@@ -2896,26 +3046,6 @@ fn finish_turn_with_outcome(
     }
     finish_turn_projection(handle);
     handle.active.store(false, Ordering::Release);
-}
-/// 将内部工具名转换为可读的中文活动提示；不暴露参数和工具结果。
-fn tool_activity_task(name: &str) -> String {
-    let label = match name {
-        "web_search" => "搜索网页",
-        "web_fetch" => "读取网页",
-        "web_extract" => "提取网页内容",
-        "read_file" => "读取文件",
-        "grep" => "搜索文件",
-        "glob" => "扫描文件",
-        "write_file" => "撰写文件",
-        "edit_file" => "修改文件",
-        "notebook_edit" => "更新笔记",
-        "bash" => "执行受控命令",
-        "todo_add" => "新增任务记录",
-        "todo_update" => "更新任务记录",
-        "todo_list" => "读取任务记录",
-        _ => "调用工具",
-    };
-    format!("正在{label}")
 }
 /// 只把已登记的工具名暴露给状态接口；未知或异常超长名称统一脱敏。
 fn safe_activity_tool(name: &str) -> Option<&str> {
@@ -3382,8 +3512,10 @@ mod tests {
     #[tokio::test]
     async fn deleted_session_cannot_be_reserved_through_a_stale_handle() {
         let home = tempfile::tempdir().expect("home");
+        let workspace = tempfile::tempdir().expect("workspace");
         let state = AppState::new(HostConfig {
             home: home.path().into(),
+            workspace: workspace.path().into(),
             office_url: None,
             ..HostConfig::default()
         });
@@ -3392,6 +3524,15 @@ mod tests {
             .await
             .expect("session");
         let id = handle.id.clone();
+        let delegation_file = workspace
+            .path()
+            .join(".openpaw")
+            .join("engine-host-delegations")
+            .join(format!("{id}.json"));
+        std::fs::create_dir_all(delegation_file.parent().expect("delegation parent"))
+            .expect("delegation directory");
+        std::fs::write(&delegation_file, r#"{"version":1,"records":[]}"#)
+            .expect("delegation fixture");
 
         assert!(state.delete_session(&id).await.expect("delete"));
         assert!(handle.is_deleting());
@@ -3402,6 +3543,7 @@ mod tests {
             .join("sessions")
             .join(format!("{id}.jsonl"))
             .exists());
+        assert!(!delegation_file.exists());
     }
 
     #[tokio::test]

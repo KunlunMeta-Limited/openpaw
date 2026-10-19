@@ -72,7 +72,9 @@ pub fn to_wire_for_turn_response(
             "message.part.delta",
             serde_json::json!({"partID":part_id(session_id, turn_id, response_index, "reasoning"),"sessionID":session_id,"messageID":message_id,"field":"text","delta":text}),
         )),
-        AgentEvent::ToolUseStart { tool_use_id, name } => Some(OpenCodeEvent::new(
+        AgentEvent::ToolUseStart {
+            tool_use_id, name, ..
+        } => Some(OpenCodeEvent::new(
             "message.part.updated",
             serde_json::json!({"part":{"id":part_id(session_id, turn_id, response_index, tool_use_id),"messageID":message_id,"sessionID":session_id,"type":"tool","callID":tool_use_id,"tool":name,"state":{"status":"running","input":{},"output":"","error":""}}}),
         )),
@@ -95,6 +97,7 @@ pub fn to_wire_for_turn_response(
             None
         }
         AgentEvent::CompactionPerformed { .. } => None,
+        AgentEvent::ToolExecutionStart { .. } => None,
         AgentEvent::TurnUsage { .. } => None,
     }
 }

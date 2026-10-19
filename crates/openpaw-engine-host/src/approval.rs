@@ -9,7 +9,8 @@
 use crate::protocol::{OpenCodeEvent, PermissionInfo};
 use openpaw_core::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use openpaw_engine::approval::{ApprovalGate, ApprovalNotice};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -18,14 +19,22 @@ use uuid::Uuid;
 pub struct HostApprovalManager {
     session_id: String,
     gate: Arc<ApprovalGate>,
+    metadata: serde_json::Value,
+    events: broadcast::Sender<OpenCodeEvent>,
+    children: Mutex<(bool, HashMap<String, Arc<HostApprovalManager>>)>,
 }
-fn info(session_id: &str, id: String, req: ApprovalRequest) -> PermissionInfo {
+fn info(
+    session_id: &str,
+    id: String,
+    req: ApprovalRequest,
+    metadata: serde_json::Value,
+) -> PermissionInfo {
     PermissionInfo {
         id,
         session_id: session_id.into(),
         permission: req.tool_name,
         patterns: vec![req.reason],
-        metadata: serde_json::json!({}),
+        metadata,
         always: Vec::new(),
         input: req.input,
     }
@@ -44,16 +53,32 @@ impl HostApprovalManager {
         global_events: broadcast::Sender<OpenCodeEvent>,
         cancelled: CancellationToken,
     ) -> Arc<Self> {
-        let session_id = session_id.into();
+        Self::with_metadata(
+            session_id.into(),
+            global_events,
+            cancelled,
+            serde_json::json!({}),
+        )
+    }
+
+    fn with_metadata(
+        session_id: String,
+        global_events: broadcast::Sender<OpenCodeEvent>,
+        cancelled: CancellationToken,
+        metadata: serde_json::Value,
+    ) -> Arc<Self> {
         let notify_session = session_id.clone();
+        let notify_metadata = metadata.clone();
+        let events = global_events.clone();
         let gate = ApprovalGate::new(
             cancelled,
             || Uuid::new_v4().simple().to_string(),
             move |notice| {
                 let event = match notice {
-                    ApprovalNotice::Asked { id, request } => {
-                        OpenCodeEvent::new("permission.asked", info(&notify_session, id, request))
-                    }
+                    ApprovalNotice::Asked { id, request } => OpenCodeEvent::new(
+                        "permission.asked",
+                        info(&notify_session, id, request, notify_metadata.clone()),
+                    ),
                     ApprovalNotice::Replied { id } => OpenCodeEvent::new(
                         "permission.replied",
                         serde_json::json!({"sessionID":notify_session,"requestID":id}),
@@ -62,7 +87,13 @@ impl HostApprovalManager {
                 let _ = global_events.send(event);
             },
         );
-        Arc::new(Self { session_id, gate })
+        Arc::new(Self {
+            session_id,
+            gate,
+            metadata,
+            events,
+            children: Mutex::new((true, HashMap::new())),
+        })
     }
     /// 功能：开启新审批代际。
     /// 参数：无。
@@ -73,6 +104,11 @@ impl HostApprovalManager {
     /// 权限：不跨 session 或重启。
     /// 关联：Host reserve_turn。
     pub fn begin_turn(&self) {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, child) in children.1.drain() {
+            child.abort_all();
+        }
+        children.0 = true;
         self.gate.begin_turn();
     }
     /// 功能：终止并清理当前审批。
@@ -84,6 +120,11 @@ impl HostApprovalManager {
     /// 权限：取消不授权。
     /// 关联：Host abort/关闭。
     pub fn abort_all(&self) {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        children.0 = false;
+        for (_, child) in children.1.drain() {
+            child.abort_all();
+        }
         self.gate.abort_all();
     }
     /// 功能：适配当前 pending 为原 PermissionInfo。
@@ -95,11 +136,20 @@ impl HostApprovalManager {
     /// 权限：HTTP 层先鉴权。
     /// 关联：GET /permission。
     pub async fn list(&self) -> Vec<PermissionInfo> {
-        self.gate
+        self.snapshot()
+    }
+    fn snapshot(&self) -> Vec<PermissionInfo> {
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<_> = self
+            .gate
             .list()
             .into_iter()
-            .map(|(id, req)| info(&self.session_id, id, req))
-            .collect()
+            .map(|(id, req)| info(&self.session_id, id, req, self.metadata.clone()))
+            .collect();
+        for child in children.1.values() {
+            out.extend(child.snapshot());
+        }
+        out
     }
     /// 功能：一次性回复权限卡片。
     /// 参数：id、决定和安全原因。
@@ -110,7 +160,7 @@ impl HostApprovalManager {
     /// 权限：只批准本次。
     /// 关联：POST /permission/:id/reply。
     pub async fn reply(&self, id: &str, approved: bool, reason: String) -> bool {
-        self.gate.reply(id, approved, false, reason)
+        self.reply_scoped(id, approved, false, reason)
     }
     /// 功能：按一次或 session 作用域回复审批。
     /// 参数：id、决定、session 授权开关、安全原因。
@@ -127,7 +177,67 @@ impl HostApprovalManager {
         remember_for_session: bool,
         reason: String,
     ) -> bool {
-        self.gate.reply(id, approved, remember_for_session, reason)
+        self.reply_scoped(id, approved, remember_for_session, reason)
+    }
+
+    fn reply_scoped(&self, id: &str, approved: bool, remember: bool, reason: String) -> bool {
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        self.gate.reply(id, approved, remember, reason.clone())
+            || children
+                .1
+                .values()
+                .any(|child| child.reply_scoped(id, approved, remember, reason.clone()))
+    }
+
+    /// 功能：为一次实际子任务登记独立审批范围。
+    /// 参数：子空间身份、显示名和当前父回合取消令牌。
+    /// 返回：持有期间有效的审批登记；父回合已终止则无。
+    /// 错误：无。
+    /// 状态：不继承父授权；登记在任务退出时移除。
+    /// 并发与取消：与父 abort 单锁线性化，不允许迟到登记。
+    /// 权限：子 always 只在本次执行内有效。
+    /// 关联：ADR-006、GET/POST permission。
+    pub(crate) fn child(
+        self: &Arc<Self>,
+        workspace: &str,
+        name: &str,
+        cancel: CancellationToken,
+    ) -> Option<ChildApprovals> {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if !children.0 || cancel.is_cancelled() {
+            return None;
+        }
+        let id = Uuid::new_v4().simple().to_string();
+        let manager = Self::with_metadata(
+            self.session_id.clone(),
+            self.events.clone(),
+            cancel.child_token(),
+            serde_json::json!({"workspaceID":workspace,"workspaceName":name,"scopeID":id}),
+        );
+        children.1.insert(id.clone(), manager.clone());
+        Some(ChildApprovals {
+            parent: self.clone(),
+            manager,
+            id,
+        })
+    }
+}
+
+/// 功能：持有一次子执行的审批登记，离开作用域即拒绝遗留请求。
+pub(crate) struct ChildApprovals {
+    parent: Arc<HostApprovalManager>,
+    pub(crate) manager: Arc<HostApprovalManager>,
+    id: String,
+}
+impl Drop for ChildApprovals {
+    fn drop(&mut self) {
+        self.parent
+            .children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .remove(&self.id);
+        self.manager.abort_all();
     }
 }
 #[async_trait::async_trait]
@@ -150,6 +260,60 @@ mod tests {
     use super::*;
     use openpaw_core::ApprovalManager;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn child_grants_are_execution_scoped_and_parent_routes_and_aborts_them() {
+        let (events, mut rx) = broadcast::channel(32);
+        let parent = HostApprovalManager::new("parent", events, CancellationToken::new());
+        parent.begin_turn();
+        let token = CancellationToken::new();
+        let child = parent.child("space", "分析", token.clone()).unwrap();
+        let waiter = {
+            let manager = child.manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .request(ApprovalRequest::new("write_file", json!({}), "write"))
+                    .await
+            })
+        };
+        let asked = rx.recv().await.unwrap();
+        assert_eq!(asked.properties["sessionID"], "parent");
+        assert_eq!(asked.properties["metadata"]["workspaceID"], "space");
+        let id = parent.list().await.pop().unwrap().id;
+        assert!(parent.reply_with_scope(&id, true, true, "ok".into()).await);
+        assert!(waiter.await.unwrap().is_approved());
+        assert!(child
+            .manager
+            .request(ApprovalRequest::new("write_file", json!({}), "write"))
+            .await
+            .is_approved());
+        let scope = asked.properties["metadata"]["scopeID"].clone();
+        drop(child);
+        assert!(
+            !token.is_cancelled(),
+            "child completion must not cancel the parent turn"
+        );
+        let child = parent.child("space", "分析", token.clone()).unwrap();
+        let waiter = {
+            let manager = child.manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .request(ApprovalRequest::new("write_file", json!({}), "write"))
+                    .await
+            })
+        };
+        loop {
+            let event = rx.recv().await.unwrap();
+            if event.event_type == "permission.asked" {
+                assert_ne!(event.properties["metadata"]["scopeID"], scope);
+                break;
+            }
+        }
+        parent.abort_all();
+        assert!(!waiter.await.unwrap().is_approved());
+        assert!(parent.list().await.is_empty());
+        assert!(parent.child("late", "late", token).is_none());
+    }
 
     #[tokio::test]
     async fn dropped_approval_waiter_removes_permission_and_closes_card() {

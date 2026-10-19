@@ -90,6 +90,36 @@ fn retryable_stream_protocol_error(error: &Error) -> bool {
         || detail.contains("tool_use json")
 }
 
+fn response_contains_dsml_tool_call(response: &openpaw_core::CompletionResponse) -> bool {
+    response.content.iter().any(|block| {
+        let ContentBlock::Text { text } = block else {
+            return false;
+        };
+        let compact = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .replace('\u{ff5c}', "|")
+            .to_ascii_lowercase();
+        compact.contains("<||dsml||tool_calls>")
+            || compact.contains("<||dsml||invoke")
+            || compact.contains("</||dsml||tool_calls>")
+    })
+}
+
+fn add_usage(left: openpaw_core::Usage, right: openpaw_core::Usage) -> openpaw_core::Usage {
+    openpaw_core::Usage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_read_tokens: left
+            .cache_read_tokens
+            .saturating_add(right.cache_read_tokens),
+        cache_creation_tokens: left
+            .cache_creation_tokens
+            .saturating_add(right.cache_creation_tokens),
+    }
+}
+
 /// The agent loop. Cheap to share (`Arc`); per-turn state lives in the
 /// [`openpaw_core::Session`] passed to [`AgentLoop::run_turn`].
 pub struct AgentLoop {
@@ -422,12 +452,23 @@ impl AgentLoop {
                 return Ok(StopReason::EndTurn);
             }
 
-            // ③ 消费预算（弹性预算由 `expand` 向 max 逐步提升）
-            if !(self.budget.expand(1) && self.budget.try_consume()) {
-                // grace 机制在最终放弃前保留最后一次迭代。
-                if !self.budget.try_grace() {
-                    return Ok(StopReason::EndTurn);
-                }
+            // ③ 先消费当前预算，再按需扩展；耗尽后仅允许一次禁用工具的最终答复。
+            // 固定预算不能调用 expand，因此必须先 try_consume，否则 `new(n)` 实际只会
+            // 运行 grace 那一次。最终答复不占工具迭代预算，也不能再次请求工具。
+            if !(self.budget.try_consume()
+                || (self.budget.expand(1) && self.budget.try_consume())
+                || self.budget.try_grace())
+            {
+                return self
+                    .finish_after_iteration_budget(
+                        session,
+                        system.as_deref(),
+                        &provider,
+                        &model,
+                        event_sink,
+                        generated,
+                    )
+                    .await;
             }
 
             // ④ 上下文压缩：只估算一次，根据结果决定是否通过单次摘要调用压缩。
@@ -631,6 +672,104 @@ impl AgentLoop {
             generated.push(tool_message.clone());
             session.messages.push(tool_message);
         }
+    }
+
+    async fn finish_after_iteration_budget(
+        &self,
+        session: &mut openpaw_core::Session,
+        system: Option<&str>,
+        provider: &Arc<dyn LlmProvider>,
+        model: &str,
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        generated: &mut Vec<Message>,
+    ) -> Result<StopReason> {
+        let instruction = "工具调用轮次已达到上限。工具现已禁用。请仅依据已有消息和工具结果给出有效最终答复，遵循用户指定的语言和输出格式，如实说明必要的限制；不得再请求或声称调用任何工具。";
+        let final_system = match system {
+            Some(value) if !value.trim().is_empty() => format!("{value}\n\n{instruction}"),
+            _ => instruction.to_string(),
+        };
+        let req = CompletionRequest {
+            model: model.to_string(),
+            system: Some(final_system),
+            messages: session.messages.clone(),
+            tools: Vec::new(),
+            max_tokens: self.max_tokens,
+            ..Default::default()
+        };
+        // 预算耗尽后的候选答复先缓冲，校验通过后才发布给 Host。部分 OpenAI
+        // 兼容模型会把工具调用退化为 DSML 正文；若边生成边转发，协议标记会被
+        // UI 当成最终答复永久保存。
+        let mut buffered_events = Vec::new();
+        let mut resp = {
+            let mut buffered_sink = |event| buffered_events.push(event);
+            self.stream_with_retry(provider, req.clone(), &mut buffered_sink)
+                .await?
+        };
+        let mut total_usage = resp.usage;
+
+        if response_contains_dsml_tool_call(&resp) {
+            let mut repair_messages = req.messages.clone();
+            repair_messages.push(Message {
+                role: openpaw_core::Role::Assistant,
+                content: resp.content,
+                ..Default::default()
+            });
+            repair_messages.push(Message::user_text(
+                "上一份候选答复错误地输出了 DSML/工具调用协议。工具已经禁用，请不要更新任务状态或输出DSML工具调用协议。现在依据已有结果给出有效最终答复，保持用户要求的格式；合法JSON、XML或代码内容可以正常输出。",
+            ));
+            let repair_req = CompletionRequest {
+                messages: repair_messages,
+                ..req
+            };
+            buffered_events.clear();
+            resp = {
+                let mut buffered_sink = |event| buffered_events.push(event);
+                self.stream_with_retry(provider, repair_req, &mut buffered_sink)
+                    .await?
+            };
+            total_usage = add_usage(total_usage, resp.usage);
+        }
+
+        let has_final_text = resp
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()));
+        if resp.stop_reason == StopReason::ToolUse
+            || !has_final_text
+            || response_contains_dsml_tool_call(&resp)
+        {
+            return Err(Error::Provider(
+                "工具循环达到迭代上限后未返回可展示的最终答复".into(),
+            ));
+        }
+
+        for event in buffered_events {
+            event_sink(event);
+        }
+
+        let usage = total_usage;
+        session.total_input_tokens = session
+            .total_input_tokens
+            .saturating_add(usage.input_tokens);
+        session.total_output_tokens = session
+            .total_output_tokens
+            .saturating_add(usage.output_tokens);
+        event_sink(AgentEvent::TurnUsage { usage });
+        {
+            let mut guard = self.token_budget_mut();
+            if let Some(tracker) = guard.as_mut() {
+                tracker.record_turn(usage.input_tokens.saturating_add(usage.output_tokens) as u64);
+            }
+        }
+        let final_message = Message {
+            role: openpaw_core::Role::Assistant,
+            content: resp.content,
+            ..Default::default()
+        }
+        .identified();
+        generated.push(final_message.clone());
+        session.messages.push(final_message);
+        Ok(resp.stop_reason)
     }
 
     /// 功能：以分类重试策略读取一次 completion 流。
@@ -998,33 +1137,34 @@ impl AgentLoop {
             let ctx = ctx.clone();
             let hook_chain = self.hook_chain.clone();
             let mut tasks = tokio::task::JoinSet::new();
-            let metadata: Vec<_> = safe
-                .into_iter()
-                .enumerate()
-                .map(|(index, (id, name, input))| {
-                    let started = Instant::now();
-                    let metadata = (id.clone(), name.clone(), started);
-                    let host = Arc::clone(&host);
-                    let ctx = ctx.clone();
-                    let hooks = hook_chain.clone();
-                    let cancel = cancel.clone();
-                    tasks.spawn(async move {
-                        let outcome = std::panic::AssertUnwindSafe(execute_prepared_cancelled(
-                            hooks.as_deref(),
-                            &*host,
-                            &name,
-                            input,
-                            &ctx,
-                            &cancel,
-                        ))
-                        .catch_unwind()
-                        .await
-                        .unwrap_or_else(|_| ToolCallOutcome::error("tool task panicked"));
-                        (index, outcome)
-                    });
-                    metadata
-                })
-                .collect();
+            let mut metadata = Vec::with_capacity(safe.len());
+            for (index, (id, name, input)) in safe.into_iter().enumerate() {
+                event_sink(AgentEvent::ToolExecutionStart {
+                    tool_use_id: id.clone(),
+                    name: name.clone(),
+                    input: observable_tool_input(&name, &input),
+                });
+                let started = Instant::now();
+                metadata.push((id.clone(), name.clone(), started));
+                let host = Arc::clone(&host);
+                let ctx = ctx.clone();
+                let hooks = hook_chain.clone();
+                let cancel = cancel.clone();
+                tasks.spawn(async move {
+                    let outcome = std::panic::AssertUnwindSafe(execute_prepared_cancelled(
+                        hooks.as_deref(),
+                        &*host,
+                        &name,
+                        input,
+                        &ctx,
+                        &cancel,
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| ToolCallOutcome::error("tool task panicked"));
+                    (index, outcome)
+                });
+            }
             let mut completed: Vec<Option<ToolCallOutcome>> =
                 (0..metadata.len()).map(|_| None).collect();
             let mut cancelled = false;
@@ -1088,6 +1228,11 @@ impl AgentLoop {
             let outcome = match response {
                 None => ToolCallOutcome::error("cancelled by user"),
                 Some(openpaw_core::ApprovalResponse::Approved) => {
+                    event_sink(AgentEvent::ToolExecutionStart {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input: observable_tool_input(&name, &input),
+                    });
                     execute_prepared_cancelled(
                         self.hook_chain.as_deref(),
                         &*self.tool_host,
@@ -1187,6 +1332,11 @@ impl AgentLoop {
                     match response {
                         None => ToolCallOutcome::error("cancelled by user"),
                         Some(openpaw_core::ApprovalResponse::Approved) => {
+                            event_sink(AgentEvent::ToolExecutionStart {
+                                tool_use_id: id.clone(),
+                                name: name.clone(),
+                                input: observable_tool_input(&name, &input),
+                            });
                             execute_prepared_cancelled(
                                 self.hook_chain.as_deref(),
                                 &*self.tool_host,
@@ -1208,6 +1358,11 @@ impl AgentLoop {
                         status: ClassifierStatus::AutoApproved {
                             reason: "guardrail allowed".into(),
                         },
+                    });
+                    event_sink(AgentEvent::ToolExecutionStart {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input: observable_tool_input(&name, &input),
                     });
                     execute_prepared_cancelled(
                         self.hook_chain.as_deref(),
@@ -1336,6 +1491,28 @@ fn tool_result_event(
         name: Some(name.to_string()),
         duration_ms,
     }
+}
+
+/// 将活动事件限制为少量白名单字段，禁止携带文件正文、替换文本、命令和任意工具负载。
+fn observable_tool_input(name: &str, input: &serde_json::Value) -> serde_json::Value {
+    const MAX_FIELD_CHARS: usize = 512;
+    let keys: &[&str] = match name {
+        "web_search" => &["query"],
+        "web_fetch" | "web_extract" => &["url"],
+        "read_file" | "write_file" | "edit_file" | "notebook_edit" => &["path"],
+        "grep" => &["pattern", "path"],
+        "glob" => &["pattern"],
+        _ => &[],
+    };
+    let mut projected = serde_json::Map::new();
+    for key in keys {
+        let Some(value) = input.get(*key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let prefix = value.chars().take(MAX_FIELD_CHARS).collect::<String>();
+        projected.insert((*key).to_string(), serde_json::Value::String(prefix));
+    }
+    serde_json::Value::Object(projected)
 }
 
 fn tool_result_block(id: &str, name: &str, outcome: &ToolCallOutcome) -> ContentBlock {
