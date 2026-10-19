@@ -254,10 +254,8 @@ impl OfficeDispatcher {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(worker);
             }
-        } else {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move { while rx.recv().await.is_some() {} });
-            }
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { while rx.recv().await.is_some() {} });
         }
         Self {
             tx,

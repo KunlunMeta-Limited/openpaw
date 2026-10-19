@@ -497,7 +497,7 @@ async fn schedule_turn(
     asynchronous: bool,
 ) -> Response {
     let text = body.text();
-    let (mut user, presentation) = match crate::input_presentation::prepare(&body) {
+    let (mut user, presentation) = match body.prepare() {
         Ok(input) => input,
         Err(error) => return media_error(error),
     };
@@ -665,7 +665,7 @@ async fn schedule_turn(
             ));
             break;
         }
-        if let Some(part) = crate::message_projection::input_part(
+        if let Some(part) = crate::protocol::projection::input_part(
             &id,
             &accepted.user_message_id,
             index,
@@ -716,7 +716,7 @@ async fn abort(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Re
 async fn register_ai_pc(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Result<Json<crate::ai_pc::RegistrationInput>, JsonRejection>,
+    body: Result<Json<crate::runtime::desktop::RegistrationInput>, JsonRejection>,
 ) -> Response {
     let Ok(Json(input)) = body else {
         return bad(StatusCode::BAD_REQUEST, "登记字段无效");
@@ -727,8 +727,8 @@ async fn register_ai_pc(
 async fn unregister_ai_pc(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     ai_pc_response(state.register_ai_pc(&id, None).await)
 }
-fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Response {
-    use crate::ai_pc::RegistrationError;
+fn ai_pc_response(result: Result<(), crate::runtime::desktop::RegistrationError>) -> Response {
+    use crate::runtime::desktop::RegistrationError;
     match result {
         Ok(()) => (
             StatusCode::NO_CONTENT,
@@ -736,7 +736,7 @@ fn ai_pc_response(result: Result<(), crate::ai_pc::RegistrationError>) -> Respon
                 ("openpaw-desktop-protocol", "1".to_owned()),
                 (
                     "openpaw-desktop-tools",
-                    crate::ai_pc_visual::advertised_tools(),
+                    crate::runtime::desktop::advertised_tools(),
                 ),
             ],
         )
@@ -996,7 +996,7 @@ fn request_fingerprint(body: &MessageRequest, provider: &str, model: &str) -> St
             );
         }
     }
-    if let Ok((message, Some(presentation))) = crate::input_presentation::prepare(body) {
+    if let Ok((message, Some(presentation))) = body.prepare() {
         let content: Vec<_> = message.content.iter().map(|block| match openpaw_core::media::block_media(block) {
             Ok(Some(media)) => serde_json::json!({"mime":media.mime,"data":media.data,"filename":media.filename}),
             _ => serde_json::to_value(block).unwrap_or_default(),

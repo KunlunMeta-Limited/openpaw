@@ -87,7 +87,7 @@ pub fn to_wire_for_turn_response(
             duration_ms,
         } => Some(OpenCodeEvent::new(
             "message.part.updated",
-            serde_json::json!({"part":{"id":part_id(session_id, turn_id, response_index, tool_use_id),"messageID":message_id,"sessionID":session_id,"type":"tool","callID":tool_use_id,"tool":name,"state":{"status":if *is_error {"error"} else {"completed"},"input":{},"output":content,"error":if *is_error {content} else {""},"durationMs":duration_ms},"attachments":crate::message_projection::attachments(media)}}),
+            serde_json::json!({"part":{"id":part_id(session_id, turn_id, response_index, tool_use_id),"messageID":message_id,"sessionID":session_id,"type":"tool","callID":tool_use_id,"tool":name,"state":{"status":if *is_error {"error"} else {"completed"},"input":{},"output":content,"error":if *is_error {content} else {""},"durationMs":duration_ms},"attachments":crate::protocol::projection::attachments(media)}}),
         )),
         AgentEvent::ClassifierStatus {
             tool_use_id,

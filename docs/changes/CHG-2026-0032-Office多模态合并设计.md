@@ -128,3 +128,9 @@ xtask 上限：Host 7000、Engine 8200、Host tests 4000、aux 11500，按既有
 独立 Docker Rust 1.88 验证容器已建立，使用新 target volume，不改现有三服务。初次 Docker Hub token 超时，经当前命令的本机代理重试成功；未改全局配置。`cargo check --workspace --all-targets --features engine-host --locked` 退出 0；`cargo test --workspace --features engine-host --locked -- --test-threads=1` 退出 0，包含 Host 单元 97、reliability 16、HTTP 37。原有 ignored 不作功能证据。日志在仓库外 `artifacts/office-multimodal/functional-tests.log`。
 
 行数初测 Host 8842/7000、aux 11651/11500，退出 1；保留原预算和 AST 规则，不宣称门禁通过。严格 workspace Clippy（Rust 1.88）因未修改的 sandbox 等文件已有 lint 失败，日志另存；新增预算条件的布尔表达式按原副作用顺序规范化。最终迁移后继续验证并记录准确结果。
+
+## 实施记录：文件收敛阶段
+
+功能合并保存为 a95f9b9 后，移除五个约定源文件。protocol.rs 内部 projection 统一消息/错误/附件/展示注解，MessageRequest::prepare 保持唯一请求准备；runtime.rs 内部 desktop 保留独立 visual 子模块与可信回合、取消、ACK seam。runtime 直接依赖 Store transcript，五个历史语义测试迁入 Store 现有 tests 内的 host_history_contract 分组。lib/http/events 路径及源码地图同步调整，不新增 desktop.rs，不改变 Core trait、Cargo 或 CI。
+
+为通过 Rust 1.88 当前 Clippy，迁移范围内同时应用纯表达式化简、折叠 else-if 和删除 TurnOptions 无效默认更新；预算条件保持 try_consume → expand/try_consume → try_grace 的副作用顺序。完整迁移后验证及审查进行中；本次提交是可审阅候选，不宣称全部门禁或真实端到端验收通过。

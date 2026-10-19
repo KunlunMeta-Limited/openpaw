@@ -5,10 +5,6 @@
 //! 关联：`DES-OPENPAW-B-2026-09-15`、`REQ-B-HOST-008`。 <!-- openpaw-scrub-allow：本仓设计/接口/测试编号，非上游任务 -->
 
 #[cfg(feature = "engine-host")]
-mod ai_pc;
-#[cfg(feature = "engine-host")]
-mod ai_pc_visual;
-#[cfg(feature = "engine-host")]
 mod approval;
 #[cfg(feature = "engine-host")]
 mod delegation;
@@ -17,17 +13,11 @@ mod events;
 #[cfg(feature = "engine-host")]
 mod http;
 #[cfg(feature = "engine-host")]
-mod input_presentation;
-#[cfg(feature = "engine-host")]
-mod message_projection;
-#[cfg(feature = "engine-host")]
 mod office;
 #[cfg(feature = "engine-host")]
 mod protocol;
 #[cfg(feature = "engine-host")]
 mod runtime;
-#[cfg(feature = "engine-host")]
-mod session_mutation;
 
 #[cfg(feature = "engine-host")]
 pub use http::{build_router, run, run_blocking, run_with_shutdown};
