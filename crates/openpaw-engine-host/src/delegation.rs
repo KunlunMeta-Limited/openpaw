@@ -1,5 +1,7 @@
 //! 功能：在 engine-host 兼容层提供真实子 Agent 委派工具。
 //! 边界：复用 OpenPaw AgentLoop 和内置工具，不修改核心 crate，也不允许子 Agent 递归委派。
+//! 禁止承担职责：不操作桌面、不递归委派、不继承或传播父会话授权。
+//! 关联设计章节：ADR-006 父子授权边界；CHG-2026-0032 Office 多模态合并设计。
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,14 +30,22 @@ const MAX_DELEGATE_TASK_CHARS: usize = 12_000;
 const MAX_DELEGATE_NAME_CHARS: usize = 40;
 const MAX_PARALLEL_SUBAGENTS: usize = 4;
 const DEFAULT_GLOBAL_SUBAGENTS: usize = 4;
-const MAX_PERSISTED_DELEGATIONS: usize = 32;
 
+/// 功能：共享父子模型请求额度及同工作区写入互斥；不持有会话授权。
 pub(crate) struct DelegationShared {
     model_slots: Arc<Semaphore>,
     workspace_write_locks: Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
 }
 
 impl DelegationShared {
+    /// 功能：创建 Host 共享模型额度与工作区锁表。
+    /// 参数：读取并校验两个既有并发环境变量。
+    /// 返回：独立共享状态 Arc。
+    /// 错误：非法值使用默认并发四。
+    /// 状态：创建空工作区锁表。
+    /// 并发与取消：各父会话共用信号量，同一规范工作区共用写锁。
+    /// 权限：只限制并发，不增加工具权限。
+    /// 关联：CHG-2026-0032。
     pub(crate) fn from_env() -> Arc<Self> {
         let slots = std::env::var("OPENPAW_ENGINE_MAX_MODEL_REQUESTS")
             .or_else(|_| std::env::var("OPENPAW_ENGINE_MAX_SUBAGENTS"))
@@ -131,6 +141,14 @@ struct PersistedDelegationRecord {
 }
 
 impl DelegationContext {
+    /// 功能：构造父会话独有的文字委派上下文。
+    /// 参数：会话、工作区、Office、父审批、模型与共享额度。
+    /// 返回：独立委派上下文 Arc。
+    /// 错误：不可读或无效快照不复用结果。
+    /// 状态：恢复空间身份与 v2 可选结果；v1 只恢复身份。
+    /// 并发与取消：模型上下文有读写锁，记录有独立同步锁。
+    /// 权限：不继承桌面登记或父上传附件；审批按子执行隔离。
+    /// 关联：ADR-006、CHG-2026-0032。
     pub(crate) fn new(
         parent_session_id: String,
         workspace: PathBuf,
@@ -165,7 +183,14 @@ impl DelegationContext {
         })
     }
 
-    /// 同一父 session 每轮执行前更新 provider/model，使子 Agent 跟随请求级覆盖值。
+    /// 功能：绑定本轮子任务所用模型与取消令牌。
+    /// 参数：本轮 provider、model、cancel。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：只替换请求级模型上下文，不修改缓存。
+    /// 并发与取消：同步写锁；子执行接收同轮取消。
+    /// 权限：不复制父审批授权或桌面身份。
+    /// 关联：runtime 回合执行与 ADR-006。
     pub(crate) fn begin_turn(
         &self,
         provider: Arc<dyn LlmProvider>,
@@ -182,6 +207,14 @@ impl DelegationContext {
         };
     }
 
+    /// 功能：为父子模型调用共用 Host 请求额度。
+    /// 参数：实际 provider。
+    /// 返回：能力透明的 provider 包装。
+    /// 错误：额度关闭时模型请求返回既有错误。
+    /// 状态：不改变模型能力或请求内容。
+    /// 并发与取消：流持有额度直到结束或被丢弃。
+    /// 权限：不增加模型或工具权限。
+    /// 关联：CHG-2026-0032。
     pub(crate) fn limit_provider(&self, provider: Arc<dyn LlmProvider>) -> Arc<dyn LlmProvider> {
         Arc::new(LimitedProvider {
             inner: provider,
@@ -460,6 +493,14 @@ impl DelegationContext {
         Ok(())
     }
 
+    /// 功能：描述当前可复用的已完成子任务。
+    /// 参数：无。
+    /// 返回：有完成结果且 Office 启用时返回提示。
+    /// 错误：无。
+    /// 状态：只读记录，不恢复失效结果。
+    /// 并发与取消：同步记录锁；不发起网络调用。
+    /// 权限：仅供主模型上下文，不向 Office 发布任务正文。
+    /// 关联：Q5 与委派缓存。
     pub(crate) fn context_prompt(&self) -> Option<String> {
         if !self.enabled {
             return None;
@@ -762,7 +803,14 @@ fn delegation_state_file(workspace: &std::path::Path, parent_session_id: &str) -
         .join(format!("{parent_session_id}.json"))
 }
 
-/// 删除会话对应的持久化委派快照；文件不存在视为已清理。
+/// 功能：删除会话私有委派快照。
+/// 参数：工作区与父会话编号。
+/// 返回：删除成功或不存在时返回空值。
+/// 错误：其他文件错误原样返回。
+/// 状态：只删除指定会话快照。
+/// 并发与取消：调用方须先结束该会话执行。
+/// 权限：不删除用户文件、journal 或产物。
+/// 关联：runtime 删除会话。
 pub(crate) fn remove_persisted_delegation_state(
     workspace: &std::path::Path,
     parent_session_id: &str,
@@ -791,7 +839,6 @@ fn load_delegations(
     state
         .records
         .into_iter()
-        .take(MAX_PERSISTED_DELEGATIONS)
         .filter(|record| {
             !record.logical_key.is_empty()
                 && record
@@ -841,7 +888,6 @@ fn persisted_delegation_state(
                 task: record.task.clone(),
                 completed: record.completed.clone(),
             })
-            .take(MAX_PERSISTED_DELEGATIONS)
             .collect(),
     }
 }
@@ -929,6 +975,14 @@ pub(crate) struct DelegatingToolHost {
 }
 
 impl DelegatingToolHost {
+    /// 功能：组合主会话内置工具与 Office 委派工具。
+    /// 参数：工作区和父会话委派上下文。
+    /// 返回：主会话工具适配器。
+    /// 错误：无。
+    /// 状态：复用同一工作区写锁。
+    /// 并发与取消：文件写操作和子任务使用同一写锁；媒体表独立。
+    /// 权限：桌面包装由 runtime 仅在主会话外层安装。
+    /// 关联：ADR-006、session_tool_host。
     pub(crate) fn new(workspace: PathBuf, context: Arc<DelegationContext>) -> Self {
         let write_lock = context.shared.workspace_write_lock(&workspace);
         Self {
@@ -1290,6 +1344,38 @@ mod tests {
             .unwrap()
             .completed
             .is_some());
+    }
+
+    #[test]
+    fn invalidation_retains_more_than_32_space_identities_after_reload() {
+        let host = test_host();
+        {
+            let mut records = host.context.delegations.lock().unwrap();
+            for index in 0..33 {
+                records.insert(
+                    format!("agent-{index}"),
+                    DelegationRecord {
+                        workspace_id: format!("parent:agent:{index}"),
+                        workspace_name: format!("agent-{index}"),
+                        task_fingerprint: format!("task-{index}"),
+                        task: format!("task-{index}"),
+                        running: false,
+                        completed: Some(CachedDelegationOutcome {
+                            content: "old".into(),
+                            structured: json!({}),
+                        }),
+                    },
+                );
+            }
+        }
+        host.context.invalidate_results().unwrap();
+        let restored = load_delegations(&host.context.state_file, "parent");
+        assert_eq!(restored.len(), 33);
+        for index in 0..33 {
+            let record = &restored[&format!("agent-{index}")];
+            assert_eq!(record.workspace_id, format!("parent:agent:{index}"));
+            assert!(record.completed.is_none());
+        }
     }
 
     #[tokio::test]

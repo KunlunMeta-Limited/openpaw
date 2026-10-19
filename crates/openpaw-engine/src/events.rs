@@ -29,8 +29,11 @@ pub enum AgentEvent {
     /// 已通过校验和审批、即将真实执行的工具调用。
     /// `input` 只保留供活动界面使用的限长白名单字段，不包含正文或命令。
     ToolExecutionStart {
+        /// 已校验并获准执行的调用编号，与后续 ToolResult 关联。
         tool_use_id: String,
+        /// 实际即将执行的工具名称，不代表执行成功。
         name: String,
+        /// 经过白名单和长度限制的展示属性，不含原始正文、命令或凭据。
         input: serde_json::Value,
     },
     ToolResult {
@@ -57,8 +60,14 @@ pub enum AgentEvent {
 }
 
 impl AgentEvent {
-    /// Structure-only event kind tag — the parity harness compares these
-    /// sequences, never message text (plan §6.2 comparison keys).
+    /// 功能：取得不包含正文的固定事件分类。
+    /// 参数：当前事件。
+    /// 返回：用于入口适配和 parity 比较的稳定分类字符串。
+    /// 错误：无。
+    /// 状态：只读，不消费事件。
+    /// 并发与取消：同步无锁。
+    /// 权限：不返回工具输入或消息正文。
+    /// 关联：共享 Engine 事件与 CLI/Host parity。
     pub fn kind(&self) -> &'static str {
         match self {
             AgentEvent::MessageStart => "message_start",

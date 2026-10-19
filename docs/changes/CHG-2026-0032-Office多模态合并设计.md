@@ -4,14 +4,14 @@ status=approved（实施已批准，验收进行中）。2026-10-19 用户对 Q1
 
 ## 用户目标与已确认事实
 
-2026-10-19，用户调用 grill-with-docs，要求设计以下分支的合并，并将 Host 中五个独立文件收敛到其他 Host 文件。第一轮已明确内部模块、实施阶段、桌面与父子授权原则；更细的运行语义仍在访谈中。
+2026-10-19，用户调用 grill-with-docs，要求设计以下分支的合并，并将 Host 中五个独立文件收敛到其他 Host 文件。经 Q1–Q11 确认内部模块、实施阶段、桌面、父子授权及缓存回退语义，随后批准实施。
 
 | 来源 | 固定提交 | 主要能力 |
 | --- | --- | --- |
 | `feature/ai-office-attached-engine_host` | `6199a7e9f1858e3f451171e86a03115db268e854` | 子 Agent 委派、多空间动画、产物登记、预算耗尽最终总结 |
 | `feature/add-multimodal-capabilities` | `e125364c066b255f6bec2775d4ca639932efb757` | 图片/音频、桌面工具、共享执行/持久化、Fork/Revert/Archive |
 
-本轮只读查询远端确认以上提交仍为当前分支头。共同基点为 `5bafcb5adb5f39cc077ea4cdb184ca69edb4b5dd`。此前 merge-tree 预演发现 approval.rs、runtime.rs、CHG INDEX 共 3 文件、16 处文本冲突；本轮未实际合并。
+本轮只读查询远端确认以上提交仍为当前分支头。共同基点为 `5bafcb5adb5f39cc077ea4cdb184ca69edb4b5dd`。此前 merge-tree 预演发现 approval.rs、runtime.rs、CHG INDEX 共 3 文件、16 处文本冲突，实际功能合并已解决并保存为 a95f9b9。
 
 技能项目初始化的四个配置及 CHG-0031 仍是工作区外待审草稿，本变更不代替该确认，也不应用初始化草稿。
 
@@ -119,7 +119,7 @@ Docker context 为 desktop-linux；compose 项目 office-feature 的三个现有
 
 xtask 上限：Host 7000、Engine 8200、Host tests 4000、aux 11500，按既有 AST 规则测量；不把合文件当作预算优化，也不默许提高上限。
 
-本轮只有只读调查与此草案记录，无业务代码、合并提交、部署或运行测试。保留原容器构建并行工作。正式实现建议通过独立分支与分阶段提交隔离，回滚代码时保留用户会话及产物；持久化兼容仍遵守原 ADR/CHG。
+初始调查阶段仅记录草案；批准后的实际实现和验证见下文。保留原容器构建并行工作。正式实现建议通过独立分支与分阶段提交隔离，回滚代码时保留用户会话及产物；持久化兼容仍遵守原 ADR/CHG。
 
 ## 实施记录：功能合并阶段
 
@@ -134,3 +134,44 @@ xtask 上限：Host 7000、Engine 8200、Host tests 4000、aux 11500，按既有
 功能合并保存为 a95f9b9 后，移除五个约定源文件。protocol.rs 内部 projection 统一消息/错误/附件/展示注解，MessageRequest::prepare 保持唯一请求准备；runtime.rs 内部 desktop 保留独立 visual 子模块与可信回合、取消、ACK seam。runtime 直接依赖 Store transcript，五个历史语义测试迁入 Store 现有 tests 内的 host_history_contract 分组。lib/http/events 路径及源码地图同步调整，不新增 desktop.rs，不改变 Core trait、Cargo 或 CI。
 
 为通过 Rust 1.88 当前 Clippy，迁移范围内同时应用纯表达式化简、折叠 else-if 和删除 TurnOptions 无效默认更新；预算条件保持 try_consume → expand/try_consume → try_grace 的副作用顺序。完整迁移后验证及审查进行中；本次提交是可审阅候选，不宣称全部门禁或真实端到端验收通过。
+
+
+## 最终范围修订与验收记录（2026-10-19）
+
+用户明确回复“不用调试everypaw”，覆盖 Q10 中的原生桥联合调试要求。本轮不再将 Everypaw 联调作为交付条件；没有进行真实模型验收，Office 页面结果明确为 mock，不将其作为真实模型委派或桌面操作证据。保留桌面登记、视觉回合、取消与媒体交付的自动化回归。
+
+功能合并 a95f9b9 与文件收敛 af52202 分开提交。审查补修包括：以命名结构表达子审批登记状态；补齐新增公共 Rustdoc；移除委派持久化仅保留 32 条的截断，保证超过 32 个子空间在失效及重启后身份不丢失；增加完整 runtime Revert 故障/成功/unrevert/重启回归。缓存失效持久化失败时不会写入 RevertStaged，成功后 unrevert 不恢复旧结果。未改变行预算与 AST 计数规则。
+
+### 检查结果
+
+完整命令、退出码及日志位于仓库外 `../artifacts/office-multimodal/checks.json`、`final-checks.json` 和同名日志；以下命令在独立 Rust 1.88 容器 `office-merge-check` 执行。
+
+| 检查命令 | 退出码及结果 |
+| --- | --- |
+| `cargo test --workspace --locked -- --test-threads=1` | 0，文件收敛后全仓默认测试通过 |
+| `cargo test --workspace --features engine-host --locked -- --test-threads=1` | 0，文件收敛后全仓 Host 测试通过 |
+| `cargo test -p openpaw-engine-host --features engine-host --locked -- --test-threads=1` | 0，最终补修后 94 单元、16 reliability、37 HTTP 全通过 |
+| `cargo test -p openpaw-store --locked` | 0，最终 Store 38 单元、3 golden、2 media_history、9 sqlite_e2e 通过 |
+| `cargo clippy -p openpaw-engine-host -p openpaw-engine -p openpaw-store --all-targets --features engine-host --no-deps -- -D warnings` | 0，最终修改涉及的 crate 严格检查通过 |
+| `cargo fmt --all -- --check` | 0，最终格式检查通过 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | 101，未修改的 sandbox 等文件已有 lint；未扩展范围修理 |
+| `cargo clippy --workspace --all-targets --features engine-host --locked -- -D warnings` | 101，未修改的 sandbox/memory 等文件已有 lint；不能宣称全仓严格检查通过 |
+| `cargo run -p xtask -- lines` | 1，最终 Host 8980/7000（超 1980）；aux 11658/11500（超 158）；Host 外部 tests 3943/4000 |
+| `cargo run -p xtask -- scrub --check` | 0 |
+| `cargo run -p xtask -- snapshot --check` | 1，本地 snapshot 含 152 个 CRLF；归一化后与 e125364 的 snapshot 字节相同，Core 与 snapshot 无代码差异。在 `/tmp/office-merge-baseline` 解出 e125364 后运行同命令退出 0：11 traits、59 types。未改受保护快照来掩盖问题 |
+| `cargo run -p xtask -- golden` | 0 |
+| `cargo run -p xtask -- telemetry` | 0 |
+| `cargo tree -p openpaw-cli --no-default-features` | 0，默认依赖树无 axum |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw --locked` | 0，最终候选二进制构建成功 |
+
+完整 workspace 测试在 af52202 后执行；最终行为补修后复跑全部 Host/Store 测试及涉及 crate 的严格 Clippy。没有把 ignored 测试计作验收证据。测试在 crate 默认目录产生的 42 个空 v2 委派快照经逐个确认均为 `records:[]`，作为本轮生成数据清理，不纳入提交。后续压缩需实际减少至少 1980 Host 业务行与 158 aux 行，不能以改上限或移动计数边界替代。
+
+### 隔离 Office 页面验证
+
+原 compose 三服务、原 volumes 和外部前端源码未修改。创建独立 `office-merge-host`、`office-merge-office`、network 与全新 named volumes；页面端口 15173、Gateway 18765、Host 18888。前端静态产物在仓库外构建，仅指定隔离 Gateway URL。最终补修二进制构建后只停止并重启隔离 Host，原服务未重启。
+
+通过浏览器创建“Office 多模态合并验收”，会话 `35744451a7a04c81a188b3b4224978c7`。首条消息收到 `mock-reply-0`；更换最终二进制并重启后，页面恢复相同会话与历史，继续发送“最终合并版本重启验证：hello again”再次收到 `mock-reply-0`，办公室场景可渲染。截图在 `../artifacts/office-multimodal/office-final.jpg`。这验证隔离 UI/Gateway/候选 Host 连接和会话恢复，不证明真实模型或原生桌面联调。
+
+### 审查与未关闭门禁
+
+Spec 审查发现的 32 条截断问题已修复并回归；Standards 审查指出的新增 Rustdoc 和匿名审批状态结构已修正。DCO 尚缺实际贡献者签署，不能替用户或来源作者代签或重写来源历史；CODEOWNER 审查及远端 CI 未完成。行数超限、全仓既有 Clippy 和本地 CRLF 快照检查未通过均保持可见，本分支为可审阅合并候选，不是全部门禁通过的发布结果。没有推送、创建 PR 或变更用户已有服务。

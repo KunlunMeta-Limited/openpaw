@@ -21,7 +21,11 @@ pub struct HostApprovalManager {
     gate: Arc<ApprovalGate>,
     metadata: serde_json::Value,
     events: broadcast::Sender<OpenCodeEvent>,
-    children: Mutex<(bool, HashMap<String, Arc<HostApprovalManager>>)>,
+    children: Mutex<ChildApprovalScopes>,
+}
+struct ChildApprovalScopes {
+    accepting: bool,
+    scopes: HashMap<String, Arc<HostApprovalManager>>,
 }
 fn info(
     session_id: &str,
@@ -92,7 +96,10 @@ impl HostApprovalManager {
             gate,
             metadata,
             events,
-            children: Mutex::new((true, HashMap::new())),
+            children: Mutex::new(ChildApprovalScopes {
+                accepting: true,
+                scopes: HashMap::new(),
+            }),
         })
     }
     /// 功能：开启新审批代际。
@@ -105,10 +112,10 @@ impl HostApprovalManager {
     /// 关联：Host reserve_turn。
     pub fn begin_turn(&self) {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        for (_, child) in children.1.drain() {
+        for (_, child) in children.scopes.drain() {
             child.abort_all();
         }
-        children.0 = true;
+        children.accepting = true;
         self.gate.begin_turn();
     }
     /// 功能：终止并清理当前审批。
@@ -121,8 +128,8 @@ impl HostApprovalManager {
     /// 关联：Host abort/关闭。
     pub fn abort_all(&self) {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        children.0 = false;
-        for (_, child) in children.1.drain() {
+        children.accepting = false;
+        for (_, child) in children.scopes.drain() {
             child.abort_all();
         }
         self.gate.abort_all();
@@ -146,7 +153,7 @@ impl HostApprovalManager {
             .into_iter()
             .map(|(id, req)| info(&self.session_id, id, req, self.metadata.clone()))
             .collect();
-        for child in children.1.values() {
+        for child in children.scopes.values() {
             out.extend(child.snapshot());
         }
         out
@@ -184,7 +191,7 @@ impl HostApprovalManager {
         let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         self.gate.reply(id, approved, remember, reason.clone())
             || children
-                .1
+                .scopes
                 .values()
                 .any(|child| child.reply_scoped(id, approved, remember, reason.clone()))
     }
@@ -204,7 +211,7 @@ impl HostApprovalManager {
         cancel: CancellationToken,
     ) -> Option<ChildApprovals> {
         let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
-        if !children.0 || cancel.is_cancelled() {
+        if !children.accepting || cancel.is_cancelled() {
             return None;
         }
         let id = Uuid::new_v4().simple().to_string();
@@ -214,7 +221,7 @@ impl HostApprovalManager {
             cancel.child_token(),
             serde_json::json!({"workspaceID":workspace,"workspaceName":name,"scopeID":id}),
         );
-        children.1.insert(id.clone(), manager.clone());
+        children.scopes.insert(id.clone(), manager.clone());
         Some(ChildApprovals {
             parent: self.clone(),
             manager,
@@ -226,6 +233,7 @@ impl HostApprovalManager {
 /// 功能：持有一次子执行的审批登记，离开作用域即拒绝遗留请求。
 pub(crate) struct ChildApprovals {
     parent: Arc<HostApprovalManager>,
+    /// 本次子执行独享的审批管理器；退出执行即清理，不复用至下次任务。
     pub(crate) manager: Arc<HostApprovalManager>,
     id: String,
 }
@@ -235,7 +243,7 @@ impl Drop for ChildApprovals {
             .children
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .1
+            .scopes
             .remove(&self.id);
         self.manager.abort_all();
     }

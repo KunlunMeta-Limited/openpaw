@@ -79,28 +79,37 @@ pub enum OfficeAction {
     /// 表示两个真实 Agent 空间之间的任务交接。
     WorkspaceHandoff {
         #[serde(rename = "fromWorkspaceId")]
+        /// 交接发起空间的稳定编号。
         from_workspace_id: String,
         #[serde(rename = "toWorkspaceId")]
+        /// 交接目标空间的稳定编号。
         to_workspace_id: String,
         #[serde(rename = "fromWorkspaceName")]
+        /// 交接发起空间的显示名称。
         from_workspace_name: String,
         #[serde(rename = "toWorkspaceName")]
+        /// 交接目标空间的显示名称。
         to_workspace_name: String,
         #[serde(rename = "sessionId")]
+        /// 动作所属的父会话编号。
         session_id: String,
         /// going、returning 或 complete。
         phase: String,
         #[serde(rename = "rosterNo", skip_serializing_if = "Option::is_none")]
+        /// 参与交接的可选 Office 名册编号。
         roster_no: Option<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        /// 交接说明，不包含凭据或完整工具输入。
         message: Option<String>,
     },
     #[serde(rename = "register_artifact")]
     /// 把已验证的工作区文件登记到所属空间，主空间登记由显式交付工具触发。
     RegisterArtifact {
         #[serde(rename = "sessionId")]
+        /// 动作所属的父会话编号。
         session_id: String,
         #[serde(rename = "workspaceId")]
+        /// 动作所属空间的稳定编号。
         workspace_id: String,
         /// 相对于 OpenPaw 工作区的路径；不包含文件正文或工具命令。
         path: String,
@@ -109,12 +118,16 @@ pub enum OfficeAction {
     /// 把子 Agent 可展示的模型正文增量或最终文本投影到所属空间。
     WorkspaceOutput {
         #[serde(rename = "sessionId")]
+        /// 动作所属的父会话编号。
         session_id: String,
         #[serde(rename = "workspaceId")]
+        /// 动作所属空间的稳定编号。
         workspace_id: String,
         #[serde(rename = "workspaceName")]
+        /// 动作所属空间的显示名称。
         workspace_name: String,
         #[serde(rename = "parentWorkspaceId", skip_serializing_if = "Option::is_none")]
+        /// 子空间所属的父空间编号；主空间省略。
         parent_workspace_id: Option<String>,
         /// `model_delta` 表示增量块，`model_final` 表示完整最终正文。
         kind: String,
@@ -122,7 +135,6 @@ pub enum OfficeAction {
         text: String,
     },
 }
-
 impl OfficeAction {
     fn session_id(&self) -> &str {
         match self {
@@ -195,6 +207,14 @@ pub(crate) struct SubagentOfficeTurn {
 }
 
 impl OfficeDispatcher {
+    /// 功能：创建只记录动作的测试分发器。
+    /// 参数：无。
+    /// 返回：分发器与动作接收端。
+    /// 错误：无。
+    /// 状态：初始化容量为 128 的空队列。
+    /// 并发与取消：接收端关闭后停止记录，不启动网络任务。
+    /// 权限：不执行网络请求或授权操作。
+    /// 关联：Office 投影与委派回归测试。
     #[cfg(test)]
     pub(crate) fn recording() -> (Self, mpsc::Receiver<OfficeAction>) {
         let (tx, rx) = mpsc::channel(128);
@@ -266,21 +286,39 @@ impl OfficeDispatcher {
         }
     }
 
+    /// 功能：查询显式 Office 开关。
+    /// 参数：无。
+    /// 返回：是否配置 Office URL。
+    /// 错误：无。
+    /// 状态：只读。
+    /// 并发与取消：同步无锁。
+    /// 权限：不按请求内容自动启用。
+    /// 关联：Q8。
     pub(crate) fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// 仅在 attached Office 模式中追加可视化指导，独立 Host/CLI 不改变默认提示词。
+    /// 功能：取得 Office 模式的可视化指导。
+    /// 参数：无。
+    /// 返回：启用时返回指导文本。
+    /// 错误：无。
+    /// 状态：不修改模型消息或持久历史。
+    /// 并发与取消：同步无锁。
+    /// 权限：不改变独立 CLI 或关闭 Office 的 Host。
+    /// 关联：Q8。
     pub(crate) fn system_prompt(&self) -> Option<String> {
         self.enabled
             .then(|| OFFICE_VISUAL_SYSTEM_PROMPT.to_string())
     }
 
-    /// 功能：复用既有动作把显式交付文件登记到主空间。
-    /// 参数：session_id为会话，path为已校验相对路径；返回：无。
-    /// 错误：队列失败只记录诊断，不影响工具或引擎终态；状态：仅写投影队列。
-    /// 并发与取消：沿用dispatcher有界队列；权限：路径校验由调用工具完成。
-    /// 关联：register_artifact工具与Gateway结构化产物恢复。
+    /// 功能：登记主空间显式交付文件。
+    /// 参数：会话身份和已校验工作区相对路径。
+    /// 返回：无。
+    /// 错误：投影失败不改变工具结果。
+    /// 状态：写入既有有界动作队列。
+    /// 并发与取消：同步尽力发送；不等待 Office 网络。
+    /// 权限：路径校验由调用工具负责，不发布文件正文。
+    /// 关联：register_artifact 与 Q8。
     pub(crate) fn register_artifact(&self, session_id: &str, path: String) {
         self.send(OfficeAction::RegisterArtifact {
             session_id: session_id.to_string(),
@@ -411,7 +449,14 @@ impl OfficeDispatcher {
         }
     }
 
-    /// 删除已结束会话的 Office scope，避免长期创建和删除会话造成内存累积。
+    /// 功能：释放已删除会话的 Office 状态。
+    /// 参数：会话或空间身份。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：清理 owner 与 scope 并阻止迟到动作。
+    /// 并发与取消：同步内部锁；不等待网络。
+    /// 权限：不删除用户文件或会话历史。
+    /// 关联：runtime 删除会话。
     pub(crate) fn remove_scope(&self, owner: &str) {
         self.removed_sessions
             .lock()
@@ -597,7 +642,14 @@ impl OfficeDispatcher {
         }
     }
 
-    /// 创建一个真实子 Agent 空间，并让主空间向该空间交接任务。
+    /// 功能：建立子空间并投影任务交接。
+    /// 参数：父会话、子空间身份及工作区。
+    /// 返回：本次子任务的投影状态。
+    /// 错误：队列失败不影响子任务。
+    /// 状态：登记 scope 并开始交接动画。
+    /// 并发与取消：同步入队；任务取消由 guard 清理。
+    /// 权限：只投影身份，不发送任务正文或凭据。
+    /// 关联：Q3、Office 子空间。
     pub(crate) fn subagent_started(
         &self,
         parent_session_id: &str,
@@ -640,7 +692,14 @@ impl OfficeDispatcher {
         turn
     }
 
-    /// 把子 Agent 的真实 AgentEvent 投影到其独立办公室空间。
+    /// 功能：投影子任务引擎活动。
+    /// 参数：父子身份、当前投影状态和引擎事件。
+    /// 返回：无。
+    /// 错误：投影失败不改变模型结果。
+    /// 状态：更新角色、文本及实际成功产物状态。
+    /// 并发与取消：同步内部状态；不等待网络。
+    /// 权限：不投影 reasoning 或媒体原件。
+    /// 关联：Q3、SubagentOfficeGuard。
     pub(crate) fn observe_subagent(
         &self,
         workspace_id: &str,
@@ -711,7 +770,14 @@ impl OfficeDispatcher {
         );
     }
 
-    /// 结束子 Agent 回合，释放角色并把结果交回父空间。
+    /// 功能：结束一次子任务动画。
+    /// 参数：父子身份、本次投影状态和是否完成。
+    /// 返回：无。
+    /// 错误：队列失败不改变结果。
+    /// 状态：交接结果并释放角色占用。
+    /// 并发与取消：同步入队；取消或 drop 按未完成处理。
+    /// 权限：不伪造工具产物或实际执行成功。
+    /// 关联：SubagentOfficeGuard、Q3。
     pub(crate) fn subagent_ended(
         &self,
         parent_session_id: &str,
@@ -840,8 +906,14 @@ fn handoff_message(role: u8) -> &'static str {
     }
 }
 
-/// 功能：为每次真实工具调用生成短状态，使连续调用能在 UI 中及时刷新。
-/// 安全：只显示截短的内容主题；路径、扩展名、完整 URL、正文和命令均不进入 UI。
+/// 功能：生成实际工具开始时的短活动文案。
+/// 参数：工具名与白名单输入。
+/// 返回：有界短文案。
+/// 错误：无。
+/// 状态：纯转换。
+/// 并发与取消：同步无锁。
+/// 权限：不展示完整路径、URL、正文或命令。
+/// 关联：ToolExecutionStart。
 pub(crate) fn tool_activity_summary(name: &str, input: &Value) -> String {
     match name {
         "web_search" => input
@@ -907,7 +979,14 @@ fn tool_activity_completion(name: &str, input: &Value) -> String {
     }
 }
 
-/// 功能：把工具结果投影为短活动状态；后续工具开始或正文事件会自然覆盖它。
+/// 功能：生成工具结果活动文案。
+/// 参数：可选工具名和是否失败。
+/// 返回：固定短文案。
+/// 错误：无。
+/// 状态：纯转换；后续活动可覆盖。
+/// 并发与取消：同步无锁。
+/// 权限：不展示工具原始结果或媒体。
+/// 关联：Office 工具事件。
 pub(crate) fn tool_result_activity(name: Option<&str>, is_error: bool) -> &'static str {
     if is_error {
         return match name {

@@ -130,6 +130,7 @@ pub struct SessionHandle {
     session_path: PathBuf,
     pub agent: AgentLoop,
     pub approvals: Arc<HostApprovalManager>,
+    /// 本会话独立的子任务身份、结果缓存和执行审批上下文。
     pub(crate) delegation: Arc<DelegationContext>,
     pub active: AtomicBool,
     pub workspace: PathBuf,
@@ -3274,6 +3275,71 @@ mod tests {
             model: "mock-1".into(),
             admission: state.scheduler.admit().expect("test turn admission"),
         }
+    }
+
+    #[tokio::test]
+    async fn staged_revert_invalidates_child_results_before_journal_and_unrevert_does_not_restore_them(
+    ) {
+        use openpaw_core::ToolExecutor;
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = HostConfig {
+            home: home.path().into(),
+            workspace: workspace.path().into(),
+            office_url: Some("http://127.0.0.1:9/actions".into()),
+            ..HostConfig::default()
+        };
+        let state = AppState::new(config.clone());
+        let handle = state
+            .create_session(Some("echo"), None, None, None)
+            .await
+            .unwrap();
+        let input = openpaw_core::Message::user_text("history").with_uuid("input");
+        append_event(&handle, &SessionEvent::Message(input.clone())).unwrap();
+        handle.session.lock().await.messages.push(input.clone());
+        handle.message_cache.write().unwrap().push(input);
+        let tools = DelegatingToolHost::new(workspace.path().into(), handle.delegation.clone());
+        let outcome = tools
+            .call(
+                "delegate_task",
+                serde_json::json!({"name":"review","task":"review files"}),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.is_error);
+        let file = workspace
+            .path()
+            .join(".openpaw/engine-host-delegations")
+            .join(format!("{}.json", handle.id));
+        let saved = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(matches!(
+            state.revert_session(&handle.id, "input").await,
+            Err(SessionMutationError::Persistence(_))
+        ));
+        assert!(state.wire_session(&handle).await.revert.is_none());
+        assert!(handle.delegation.context_prompt().is_some());
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, saved).unwrap();
+        let reverted = state.revert_session(&handle.id, "input").await.unwrap();
+        assert!(reverted.revert.is_some());
+        assert!(handle.delegation.context_prompt().is_none());
+        state.unrevert_session(&handle.id).await.unwrap();
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert!(snapshot["records"][0]["completed"].is_null());
+        assert_eq!(
+            snapshot["records"][0]["workspace_id"],
+            outcome.structured.unwrap()["workspaceId"]
+        );
+        let id = handle.id.clone();
+        drop(tools);
+        drop(handle);
+        drop(state);
+        let restored = AppState::new(config);
+        let handle = restored.get(&id).await.unwrap();
+        assert!(handle.delegation.context_prompt().is_none());
     }
 
     #[tokio::test]
