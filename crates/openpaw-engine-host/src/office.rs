@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 const MAX_SUBAGENT_OUTPUT_CHARS: usize = 20_000;
 const SUBAGENT_OUTPUT_CHUNK_CHARS: usize = 96;
-const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。对于可以独立并行完成的研究、设计、实现或审核子任务，可以调用 delegate_task 委派给真实子 Agent；简单问答、单一步骤和高度耦合的工作不要委派。当用户明确要求多 Agent、子 Agent、多空间协作，且给出了两个以上可独立执行的职责时，必须先调用 delegate_task 按职责委派，不能由主 Agent 全部代做；如果委派工具失败，最终答复必须明确说明失败，不能静默退化为单 Agent。委派前先检查职责边界并合并重复或高度重叠的子任务；同一阶段通常不超过四个子 Agent。每个逻辑子 Agent 使用稳定、唯一、能概括职责的简短中文 name，不得使用英文 slug、“Agent”后缀或编号占位名；后续补充或重试继续复用相同 name，不得用近义名称重复创建空间。调研、实现与审核应按依赖关系分阶段进行，审核只在已有可审核结果后创建。每个子 Agent 必须获得清晰、完整、可独立执行的任务说明，主 Agent 负责整合结果。工具调用之间不要发送“我将”“我先”“正在检查”等过程播报；需要继续执行时直接调用工具。每一轮结束前必须发送一条不带工具调用的最终答复，明确给出结论、未完成事项（没有则写“无”），以及本轮最终交付给用户查看或使用的真实工作区相对路径（没有则写“无”）。不要把检索脚本、临时数据、调试文件等过程文件列为最终交付物；子 Agent 的过程文件由对应子空间保留。不得用过程说明代替最终结果。回答涉及系统结构、接口关系、数据流、业务流程、角色协作、时间线、层级关系或方案比较时，只要图示能明显提升理解，就优先补充一幅简洁的 Mermaid 图。涉及真实的数量比较、阶段进度或趋势数据时，优先额外写入一个以 .chart.json 结尾的图表产物；格式为 {"type":"bar|line|area","title":"标题","subtitle":"说明","unit":"单位","categories":["分类"],"series":[{"name":"系列","data":[数值]}]}，分类与各系列数据必须等长，不得虚构数据。图表使用中文短标签、清晰标题、有限分类和必要文字说明；普通事实问答或图示无收益时不要强行生成。用户要求保存交付物时，把文档或图表写入工作区中的独立文件。"#;
+const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。可将职责清晰、可独立执行的任务通过 delegate_task 交给真实子 Agent，简单问答无需委派。当用户明确要求多 Agent、子 Agent、多空间协作且存在多个独立职责时，必须先调用 delegate_task；失败时说明原因，不能静默退化为单 Agent。按任务实际依赖安排协作，不套用固定领域角色或阶段模板。name 由你根据本次职责选择，优先使用清晰简短的中文功能名称；必要的 API、SQL 等技术标识可以保留。相同职责继续使用稳定 name，不要为近义职责重复创建空间。主 Agent 负责整合真实结果。每轮结束发送有效最终答复，严格遵循用户指定语言、格式和详略；允许纯文本、Markdown、JSON、XML等，不强制章节、文件清单或“无”占位。只有确实需要交付文件时，写入独立文件并调用 register_artifact 登记用户应查看的真实相对路径；shell或子Agent生成的成品也可登记，不登记检索脚本、临时数据和调试文件。子Agent过程文件保留在子空间。图示和图表只是可选展示能力，按用户需要选择合适格式，不因回答涉及某个主题就额外生成图表或强制使用Mermaid。可选图表文件.chart.json支持type为bar、bar3d、line、area、pie、donut、radar，以及title、categories、series[{name,data}]字段；数值必须真实、分类与系列等长，超过预览能力可交付其他通用格式。不得编造文件、工具执行或验证结果。"#;
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -96,7 +96,7 @@ pub enum OfficeAction {
         message: Option<String>,
     },
     #[serde(rename = "register_artifact")]
-    /// 把子 Agent 成功写入的工作区文件登记到所属子空间。
+    /// 把已验证的工作区文件登记到所属空间，主空间登记由显式交付工具触发。
     RegisterArtifact {
         #[serde(rename = "sessionId")]
         session_id: String,
@@ -276,6 +276,19 @@ impl OfficeDispatcher {
     pub(crate) fn system_prompt(&self) -> Option<String> {
         self.enabled
             .then(|| OFFICE_VISUAL_SYSTEM_PROMPT.to_string())
+    }
+
+    /// 功能：复用既有动作把显式交付文件登记到主空间。
+    /// 参数：session_id为会话，path为已校验相对路径；返回：无。
+    /// 错误：队列失败只记录诊断，不影响工具或引擎终态；状态：仅写投影队列。
+    /// 并发与取消：沿用dispatcher有界队列；权限：路径校验由调用工具完成。
+    /// 关联：register_artifact工具与Gateway结构化产物恢复。
+    pub(crate) fn register_artifact(&self, session_id: &str, path: String) {
+        self.send(OfficeAction::RegisterArtifact {
+            session_id: session_id.to_string(),
+            workspace_id: session_id.to_string(),
+            path,
+        });
     }
 
     fn send(&self, action: OfficeAction) {

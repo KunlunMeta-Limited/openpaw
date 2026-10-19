@@ -538,7 +538,7 @@ impl AgentLoop {
         model: &str,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<StopReason> {
-        let instruction = "工具调用轮次已达到上限。工具现已禁用。请仅依据已有消息和工具结果直接给出最终答复，明确说明完成结果、实际生成的文件相对路径及未完成事项；不得再请求或声称调用任何工具。";
+        let instruction = "工具调用轮次已达到上限。工具现已禁用。请仅依据已有消息和工具结果给出有效最终答复，遵循用户指定的语言和输出格式，如实说明必要的限制；不得再请求或声称调用任何工具。";
         let final_system = match system {
             Some(value) if !value.trim().is_empty() => format!("{value}\n\n{instruction}"),
             _ => instruction.to_string(),
@@ -570,7 +570,7 @@ impl AgentLoop {
                 ..Default::default()
             });
             repair_messages.push(Message::user_text(
-                "上一份候选答复错误地输出了 DSML/工具调用协议。工具已经禁用，请不要更新任务状态，也不要输出任何 XML、DSML、tool_calls 或 invoke 标记。现在只用自然语言给出最终结论、真实文件相对路径和未完成事项。",
+                "上一份候选答复错误地输出了 DSML/工具调用协议。工具已经禁用，请不要更新任务状态或输出DSML工具调用协议。现在依据已有结果给出有效最终答复，保持用户要求的格式；合法JSON、XML或代码内容可以正常输出。",
             ));
             let repair_req = CompletionRequest {
                 messages: repair_messages,

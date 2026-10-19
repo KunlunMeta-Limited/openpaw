@@ -141,3 +141,47 @@ async fn cancel_still_terminates_nudged_loop() {
     canceller.await.unwrap();
     assert_eq!(stop.unwrap(), StopReason::EndTurn);
 }
+
+/// 验证预算总结与协议纠正仍允许用户请求的合法结构化正文。
+#[tokio::test]
+async fn budget_summary_and_dsml_repair_preserve_json_and_xml_answers() {
+    for final_text in [
+        r#"{"ok":true,"value":42}"#,
+        "<result><value>42</value></result>",
+    ] {
+        for repair in [false, true] {
+            let mut script = vec![openpaw_llm::MockMode::ToolUse {
+                tool_name: "read_file".into(),
+                input: serde_json::json!({"path":"result.txt"}),
+                text: String::new(),
+            }];
+            if repair {
+                script.push(openpaw_llm::MockMode::Fixed("<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name=\"todo_update\"></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>".into()));
+            }
+            script.push(openpaw_llm::MockMode::Fixed(final_text.into()));
+            let provider = Arc::new(MockProvider::scripted(script));
+            let workspace = tempfile::tempdir().unwrap();
+            std::fs::write(workspace.path().join("result.txt"), "42").unwrap();
+            let agent = AgentLoop::new(provider.clone())
+                .with_tool_host(openpaw_tools::arc_registry(workspace.path()))
+                .with_budget(openpaw_core::IterationBudget::new_elastic(1, 1, 0));
+            let mut session = Session::new("mock-1", "mock");
+            session
+                .messages
+                .push(Message::user_text("按指定结构化格式返回42"));
+            let mut sink = |_| {};
+            let stop = agent
+                .run_turn(
+                    &mut session,
+                    Some("保持用户指定的输出格式".into()),
+                    &[],
+                    &mut sink,
+                )
+                .await
+                .unwrap();
+            assert_eq!(stop, StopReason::EndTurn);
+            assert_eq!(session.messages.last().unwrap().text(), final_text);
+            assert_eq!(provider.call_count(), if repair { 3 } else { 2 });
+        }
+    }
+}

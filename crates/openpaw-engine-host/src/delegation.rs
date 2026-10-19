@@ -201,7 +201,7 @@ impl DelegationContext {
             .map(str::trim)
             .is_some_and(|value| !value.is_empty());
         let requested_name = normalized_name(input.name.as_deref(), sequence)?;
-        let display_name = chinese_workspace_name(&requested_name, task);
+        let display_name = requested_name.clone();
         let requested_logical_key = logical_agent_key(&requested_name);
         let task_fingerprint = normalized_task_fingerprint(task);
         let (workspace_id, name, logical_key) = {
@@ -523,15 +523,6 @@ fn normalized_name(value: Option<&str>, sequence: u64) -> openpaw_core::Result<S
     Ok(value.to_string())
 }
 
-fn contains_cjk(value: &str) -> bool {
-    value.chars().any(|character| {
-        matches!(
-            character as u32,
-            0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff
-        )
-    })
-}
-
 fn chinese_digits(value: u64) -> String {
     const DIGITS: [char; 10] = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
     value
@@ -539,46 +530,6 @@ fn chinese_digits(value: u64) -> String {
         .bytes()
         .map(|digit| DIGITS[usize::from(digit - b'0')])
         .collect()
-}
-
-fn chinese_hash_suffix(value: &str) -> String {
-    const DIGITS: [char; 16] = [
-        '零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '甲', '乙', '丙', '丁', '戊', '己',
-    ];
-    let hash = stable_logical_hash(value);
-    (0..4)
-        .rev()
-        .map(|shift| DIGITS[((hash >> (shift * 4)) & 0xf) as usize])
-        .collect()
-}
-
-fn chinese_workspace_name(requested_name: &str, task: &str) -> String {
-    if contains_cjk(requested_name) {
-        return requested_name
-            .chars()
-            .filter(|character| {
-                !character.is_ascii_alphanumeric()
-                    && !character.is_ascii_whitespace()
-                    && !matches!(character, '_' | '-')
-            })
-            .collect();
-    }
-    let searchable = format!("{} {}", requested_name, task).to_lowercase();
-    let mappings: &[(&[&str], &str)] = &[
-        (&["audit", "review", "verify", "check", "qa", "test", "审核", "验收"], "审核验收"),
-        (&["research", "investigate", "analysis", "analyze", "调研", "研究", "分析"], "调研分析"),
-        (&["transport", "traffic", "route", "map", "geo", "交通", "路线", "地图", "地理"], "交通地理"),
-        (&["hotel", "lodging", "food", "dining", "住宿", "酒店", "餐饮", "美食"], "住宿餐饮"),
-        (&["document", "report", "visual", "文档", "报告", "可视化"], "文档整理"),
-        (&["code", "develop", "implement", "frontend", "backend", "开发", "实现", "编码"], "开发实现"),
-        (&["data", "dataset", "数据"], "数据处理"),
-        (&["plan", "design", "architect", "方案", "设计", "架构"], "方案设计"),
-    ];
-    mappings
-        .iter()
-        .find(|(keywords, _)| keywords.iter().any(|keyword| searchable.contains(keyword)))
-        .map(|(_, name)| (*name).to_string())
-        .unwrap_or_else(|| format!("协作子任务{}", chinese_hash_suffix(&searchable)))
 }
 
 fn logical_agent_key(name: &str) -> String {
@@ -791,7 +742,7 @@ fn load_delegations(
                 && record.task.chars().count() <= MAX_DELEGATE_TASK_CHARS
         })
         .map(|mut record| {
-            let workspace_name = chinese_workspace_name(&record.workspace_name, &record.task);
+            let workspace_name = record.workspace_name.trim().to_string();
             if let Some(structured) = record.completed.structured.as_object_mut() {
                 structured.insert("workspaceName".into(), json!(workspace_name.clone()));
             }
@@ -854,7 +805,7 @@ fn save_delegations(
 fn delegate_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate_task".into(),
-        description: "把一个清晰、可独立完成的子任务交给真实子 Agent，并等待其结果。委派前先合并重复或高度重叠的职责；同一逻辑 Agent 使用稳定且唯一的简短中文 name，后续工作继续复用该 name。适合并行研究、设计、实现或审核；简单任务不要调用。".into(),
+        description: "把一个清晰、可独立完成的子任务交给真实子 Agent，并等待其结果。委派前先合并重复或高度重叠的职责；同一逻辑 Agent 使用稳定且唯一的功能名称 name，优先中文并保留必要技术标识；后续相同职责复用该 name。适合独立子任务，简单任务不要调用。".into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -871,7 +822,34 @@ fn delegate_spec() -> ToolSpec {
     }
 }
 
-/// 父 Agent 使用的组合 ToolHost；除 delegate_task 外全部调用仍交给原 ToolRegistry。
+fn artifact_spec() -> ToolSpec {
+    ToolSpec {
+        name: "register_artifact".into(),
+        description: "登记本轮应交付用户查看的真实文件；临时、检索和调试文件不要登记。文件可由文件工具、shell或子Agent生成；不会修改文件，也不要求最终答复采用特定格式。".into(),
+        input_schema: json!({"type":"object","additionalProperties":false,"required":["path"],"properties":{"path":{"type":"string","minLength":1,"maxLength":1000}}}),
+        category: Some(ToolCategory::Communication),
+        concurrency: Some(ToolConcurrency::ParallelSafe),
+        ..ToolSpec::default()
+    }
+}
+
+fn artifact_path(input: &serde_json::Value) -> std::result::Result<&str, String> {
+    let path = input
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty() && path.len() <= 1000)
+        .ok_or_else(|| "path必须是1到1000字节的工作区相对路径".to_string())?;
+    if std::path::Path::new(path).is_absolute()
+        || path
+            .split(['/', '\\'])
+            .any(|part| part.is_empty() || matches!(part, "." | ".."))
+    {
+        return Err("path必须是工作区内规范相对路径".into());
+    }
+    Ok(path)
+}
+
+/// 父 Agent 使用的组合 ToolHost；委派和交付登记之外的调用全部交给原 ToolRegistry。
 pub(crate) struct DelegatingToolHost {
     builtin: WorkspaceToolHost,
     context: Arc<DelegationContext>,
@@ -893,6 +871,7 @@ impl ToolExecutor for DelegatingToolHost {
         let mut tools = self.builtin.list_tools().await?;
         if self.context.enabled {
             tools.push(delegate_spec());
+            tools.push(artifact_spec());
         }
         Ok(tools)
     }
@@ -902,6 +881,44 @@ impl ToolExecutor for DelegatingToolHost {
         name: &str,
         args: serde_json::Value,
     ) -> openpaw_core::Result<ToolCallOutcome> {
+        if name == "register_artifact" {
+            if !self.context.enabled {
+                return Ok(ToolCallOutcome::error("当前Host未启用Office产物登记"));
+            }
+            let path = match artifact_path(&args) {
+                Ok(path) => path,
+                Err(error) => return Ok(ToolCallOutcome::error(error)),
+            };
+            // 路径安全复用tools现有边界，不在Host重写文件工具。
+            let resolved = match openpaw_tools::safety::resolve(&self.context.workspace, path) {
+                Ok(path) => path,
+                Err(error) => return Ok(ToolCallOutcome::error(error.to_string())),
+            };
+            let metadata = match std::fs::metadata(&resolved) {
+                Ok(metadata) if metadata.is_file() && metadata.len() <= 8 * 1024 * 1024 => metadata,
+                _ => {
+                    return Ok(ToolCallOutcome::error(
+                        "产物必须是存在且不超过8MiB的普通文件",
+                    ))
+                }
+            };
+            let root = openpaw_tools::safety::dunce_canonicalize(&self.context.workspace)?;
+            let relative = resolved
+                .strip_prefix(&root)
+                .map_err(|_| Error::ToolHost("产物路径越界".into()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            self.context
+                .office
+                .register_artifact(&self.context.parent_session_id, relative.clone());
+            return Ok(ToolCallOutcome {
+                content: format!("已登记产物：{relative}"),
+                is_error: false,
+                structured: Some(
+                    json!({"path":relative,"size":metadata.len(),"sessionId":self.context.parent_session_id,"workspaceId":self.context.parent_session_id}),
+                ),
+            });
+        }
         if name != "delegate_task" {
             return self.builtin.call(name, args).await;
         }
@@ -929,6 +946,12 @@ impl ToolHostValidator for DelegatingToolHost {
         name: &str,
         input: &serde_json::Value,
     ) -> std::result::Result<(), String> {
+        if name == "register_artifact" {
+            if !self.context.enabled {
+                return Err("当前Host未启用Office产物登记".into());
+            }
+            return artifact_path(input).map(|_| ());
+        }
         if name == "delegate_task" {
             if !self.context.enabled {
                 return Err("当前 Host 未启用 AI Office 子 Agent 委派".into());
@@ -1155,7 +1178,7 @@ mod tests {
     async fn tool_list_adds_delegate_without_removing_builtin_tools() {
         let host = test_host();
         let tools = host.list_tools().await.unwrap();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         assert_eq!(
             tools
                 .iter()
@@ -1164,6 +1187,47 @@ mod tests {
             1
         );
         assert!(tools.iter().any(|tool| tool.name == "read_file"));
+    }
+
+    #[tokio::test]
+    async fn artifact_registration_reuses_dispatcher_and_rejects_missing_or_escaping_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("结果.json"), "{}").unwrap();
+        let (events, _) = broadcast::channel(8);
+        let approvals = HostApprovalManager::new("parent", events, CancellationToken::new());
+        let (office, mut actions) = OfficeDispatcher::recording();
+        let context = test_context(
+            "parent",
+            workspace.path().to_path_buf(),
+            office,
+            approvals,
+            Arc::new(openpaw_llm::EchoProvider::new()),
+            "echo",
+            false,
+            CancellationToken::new(),
+        );
+        let host = DelegatingToolHost::new(workspace.path().to_path_buf(), context);
+        let outcome = host
+            .call("register_artifact", json!({"path":"结果.json"}))
+            .await
+            .unwrap();
+        assert!(!outcome.is_error);
+        assert_eq!(outcome.structured.unwrap()["path"], "结果.json");
+        assert!(
+            matches!(actions.try_recv().unwrap(), crate::office::OfficeAction::RegisterArtifact { path, workspace_id, .. } if path == "结果.json" && workspace_id == "parent")
+        );
+        for path in ["../outside.json", "missing.json", "/etc/passwd"] {
+            assert!(
+                host.call("register_artifact", json!({"path":path}))
+                    .await
+                    .unwrap()
+                    .is_error
+            );
+        }
+        assert_eq!(
+            normalized_name(Some("API接口一致性审核"), 1).unwrap(),
+            "API接口一致性审核"
+        );
     }
 
     #[tokio::test]
@@ -1256,7 +1320,7 @@ mod tests {
         assert!(!outcome.is_error, "{}", outcome.content);
         assert!(outcome.content.contains("Echo: 整理测试结论"));
         let structured = outcome.structured.unwrap();
-        assert_eq!(structured["workspaceName"], "研究");
+        assert_eq!(structured["workspaceName"], "研究 Agent");
         assert_eq!(structured["parentSessionId"], "parent");
         assert_eq!(structured["status"], "completed");
         assert!(structured["workspaceId"]
@@ -1266,7 +1330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn english_delegate_names_are_exposed_as_stable_chinese_workspace_names() {
+    async fn delegate_names_preserve_model_selected_functional_labels() {
         let host = test_host();
         let audit = host
             .call(
@@ -1289,21 +1353,24 @@ mod tests {
         let second_unknown = host
             .call(
                 "delegate_task",
-                json!({"name":"beta-helper","task":"collect beta facts"}),
+                json!({"name":"beta-helper","task":"implement event streaming cancellation semantics"}),
             )
             .await
             .unwrap()
             .structured
             .unwrap();
 
-        assert_eq!(audit["workspaceName"], "审核验收");
-        assert!(contains_cjk(first_unknown["workspaceName"].as_str().unwrap()));
-        assert!(contains_cjk(second_unknown["workspaceName"].as_str().unwrap()));
-        assert_ne!(first_unknown["workspaceName"], second_unknown["workspaceName"]);
+        assert_eq!(audit["workspaceName"], "audit-review");
+        assert_eq!(first_unknown["workspaceName"], "alpha-helper");
+        assert_eq!(second_unknown["workspaceName"], "beta-helper");
+        assert_ne!(
+            first_unknown["workspaceName"],
+            second_unknown["workspaceName"]
+        );
     }
 
     #[tokio::test]
-    async fn persisted_english_workspace_names_are_migrated_when_loaded() {
+    async fn persisted_workspace_identity_and_display_name_are_preserved() {
         let workspace = tempfile::tempdir().unwrap().keep();
         let state_file = delegation_state_file(&workspace, "legacy-parent");
         save_delegations(
@@ -1330,8 +1397,7 @@ mod tests {
         )
         .unwrap();
         let (events, _) = broadcast::channel(8);
-        let approvals =
-            HostApprovalManager::new("legacy-parent", events, CancellationToken::new());
+        let approvals = HostApprovalManager::new("legacy-parent", events, CancellationToken::new());
         let context = test_context(
             "legacy-parent",
             workspace.clone(),
@@ -1344,7 +1410,10 @@ mod tests {
         );
         let host = DelegatingToolHost::new(workspace, context.clone());
 
-        assert!(context.context_prompt().unwrap().contains("name=审核验收"));
+        assert!(context
+            .context_prompt()
+            .unwrap()
+            .contains("name=audit-review"));
         let cached = host
             .call(
                 "delegate_task",
@@ -1354,7 +1423,7 @@ mod tests {
             .unwrap()
             .structured
             .unwrap();
-        assert_eq!(cached["workspaceName"], "审核验收");
+        assert_eq!(cached["workspaceName"], "audit-review");
     }
 
     #[tokio::test]
@@ -1406,7 +1475,7 @@ mod tests {
         assert!(second.content.contains("补充系统安全规范与限制说明"));
         let second = second.structured.unwrap();
         assert_eq!(first["workspaceId"], second["workspaceId"]);
-        assert_eq!(second["workspaceName"], "安全规范调研");
+        assert_eq!(second["workspaceName"], "安全规范调研 Agent");
     }
 
     #[tokio::test]
