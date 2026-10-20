@@ -18,3 +18,15 @@ serde_yml 0.0.12 / libyml 已归档且存在 RUSTSEC-2025-0068，没有安全升
 
 复用原 Store/Memory/Skill/Goal/Reflect 测试和所有原 golden（含未知字段、BOM/CRLF、写读写稳定性）。不更新 golden 来迎合新后端；实际结果见 validation.md。
 
+## D22：既有许可证与政策不一致（待 PR 审核）
+
+扫描发现两个早已进入基线的传递依赖不在 deny.toml 允许列表内。建议保留现有依赖，增加精确包版本的许可证例外，不把许可证加入全局允许列表：
+
+| 包 | 依赖来源 | 例外范围 | 交付义务 |
+|---|---|---|---|
+| option-ext 0.2.0 | dirs 5 → dirs-sys 0.4.1 | 仅该版本的 MPL-2.0 | 保留许可证和上游源码获取说明；若修改该包须按许可证提供相应源码 |
+| webpki-roots 1.0.9 | reqwest → hyper-rustls | 仅该版本的 CDLA-Permissive-2.0 | 随分发保留数据许可证全文 |
+
+完整原文保存在 third-party-licenses/，THIRD-PARTY-NOTICES.md 记录包、来源及校验值。T8 发布必须将 notices 和该目录随二进制一起分发。本 PR 不修改这两个包的源码。不为消除许可证提示重写 home 目录发现或 TLS 信任根。
+
+这是显式的政策修改提案，需审核人认可后随 T0 合入；不扩大到其他包/版本，不忽略安全公告，不降低置信度或关闭检查。若不接受该范围，应保持 PR Draft 并另行设计依赖替换，不能删除失败门禁。
