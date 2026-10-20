@@ -6,7 +6,7 @@
 //! porting work); any other hit fails the gate. A line may opt out with
 //! the inline marker `openpaw-scrub-allow`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 struct Rule {
@@ -79,10 +79,9 @@ pub fn run(root: &Path, check: bool) -> Result<()> {
     let mut hits: Vec<String> = Vec::new();
     let mut scanned = 0usize;
 
-    for path in scan_targets(root) {
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
+    for path in scan_targets(root)? {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read source {}", path.display()))?;
         scanned += 1;
         let rel = path
             .strip_prefix(root)
@@ -199,24 +198,38 @@ fn is_allowlisted(path: &Path) -> bool {
         .is_some_and(|f| f.to_string_lossy() == "devlog.md")
 }
 
-fn scan_targets(root: &Path) -> Vec<PathBuf> {
-    let skip_dirs = ["target", ".git", "node_modules"];
-    walkdir::WalkDir::new(root)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            !skip_dirs.contains(&name.as_str())
-        })
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.path().to_path_buf())
-        .filter(|p| {
-            matches!(
-                p.extension().and_then(|e| e.to_str()),
+fn scan_targets(root: &Path) -> Result<Vec<PathBuf>> {
+    // Generated dependency/build trees are not reviewable repository sources.
+    // Git also includes non-ignored untracked sources, so a new file cannot hide.
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .current_dir(root)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "cannot enumerate source files: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    for raw in output.stdout.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+        let path = root.join(std::str::from_utf8(raw)?);
+        if path.is_file()
+            && matches!(
+                path.extension().and_then(|e| e.to_str()),
                 Some("rs") | Some("md") | Some("toml") | Some("yml") | Some("yaml") | Some("json")
             )
-        })
-        .collect()
+        {
+            paths.insert(path);
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -246,6 +259,31 @@ mod tests {
             10,
             &[registered]
         ));
+    }
+    #[test]
+    fn source_enumeration_skips_ignored_but_includes_new_files() {
+        let root = std::env::temp_dir().join(format!(
+            "openpaw-scrub-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(root.join(".gitignore"), "generated/\n").unwrap();
+        std::fs::create_dir(root.join("generated")).unwrap();
+        std::fs::write(root.join("generated/ignored.rs"), "ignored").unwrap();
+        std::fs::write(root.join("new.rs"), "new").unwrap();
+        let files = scan_targets(&root).unwrap();
+        assert_eq!(files, vec![root.join("new.rs")]);
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn chinese_context_truncates_without_utf8_boundary_panic() {
