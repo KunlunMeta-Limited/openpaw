@@ -187,6 +187,11 @@ reason="需要保护"
         self.write('governance/identifiers.json',json.dumps({'ids':['REQ-OP-999']}))
         with self.assertRaisesRegex(check.Failure,'权威来源'): self.validate()
 
+    def test_crlf_chg_is_not_double_converted_in_temporary_copy(self):
+        path=self.root/self.path
+        path.write_bytes(chg().encode('utf-8').replace(b'\n',b'\r\n'))
+        self.validate()
+
     def test_framework_raw_newlines_are_part_of_hash(self):
         path=self.root/'governance/vendor/framework_governance.py'
         path.write_bytes(path.read_bytes().replace(b'\n',b'\r\n'))

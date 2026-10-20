@@ -170,7 +170,7 @@ def load_chg(reader: Reader, path: str, profile: dict, tool=None) -> tuple[dict,
         raise Failure(path + "：缺少十二节")
     with tempfile.TemporaryDirectory(prefix="openpaw-chg-") as temp:
         copy = Path(temp) / Path(path).name
-        copy.write_text(body, encoding="utf-8")
+        copy.write_text(body, encoding="utf-8", newline="\n")
         try:
             meta = tool.validate_chg(copy, profile)
         except tool.GovernanceError as error:
