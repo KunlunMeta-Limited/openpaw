@@ -20,6 +20,7 @@ jobs:
   clippy:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
@@ -34,6 +35,7 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
@@ -110,6 +112,7 @@ jobs:
       # Q3 zero telemetry (Cargo.lock dependency names + source call-site symbols)
       - run: cargo run -p xtask -- telemetry
       # Q2 dependency whitelist
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2, cargo-deny 0.20.2
         with:
           arguments: --workspace
+          rust-version: stable
