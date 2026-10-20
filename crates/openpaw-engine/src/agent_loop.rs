@@ -246,6 +246,18 @@ impl AgentLoop {
         observer: &mut dyn RunObserver,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> RunOutcome {
+        // 观察器的任何错误都是事实保存失败，不能因实现返回Timeout而误报运行预算耗尽。
+        struct Reliable<'a>(&'a mut dyn RunObserver);
+        #[async_trait::async_trait]
+        impl RunObserver for Reliable<'_> {
+            async fn record(&mut self, event: SessionEvent) -> Result<()> {
+                self.0
+                    .record(event)
+                    .await
+                    .map_err(|e| Error::Store(format!("lifecycle persistence failed: {e}")))
+            }
+        }
+        let mut observer = Reliable(observer);
         let token = context.cancel.child_token();
         {
             let mut active = self.cancel_token_mut();
@@ -292,7 +304,13 @@ impl AgentLoop {
             }
             session.cancelled = false;
             self.run_inner(
-                session, system, tools, &control, observer, event_sink, &mut usage,
+                session,
+                system,
+                tools,
+                &control,
+                &mut observer,
+                event_sink,
+                &mut usage,
             )
             .await
         });

@@ -759,3 +759,31 @@ async fn parallel_cancellation_joins_every_started_tool() {
     assert_eq!(outcome.status, RunStatus::Cancelled);
     assert_eq!(host.finished.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn observer_timeout_is_storage_failure_instead_of_run_timeout() {
+    struct TimedOutStore;
+    #[async_trait]
+    impl RunObserver for TimedOutStore {
+        async fn record(&mut self, event: SessionEvent) -> Result<()> {
+            if matches!(event, SessionEvent::Message(_)) {
+                Err(Error::Timeout("disk worker timed out".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let agent = AgentLoop::new(Arc::new(MockProvider::fixed("reply")));
+    let outcome = agent
+        .run_with_context(
+            &mut Session::new("m", "p"),
+            None,
+            &[],
+            &RunContext::default(),
+            &mut TimedOutStore,
+            &mut |_| {},
+        )
+        .await;
+    assert_eq!(outcome.status, RunStatus::Failed);
+    assert!(matches!(outcome.error, Some(Error::Store(_))));
+}
