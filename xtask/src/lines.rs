@@ -1,3 +1,7 @@
+//! 职责：统计crate业务行数，不按大小阻断提交。
+//! 输入输出：读取Rust语法，输出统计；读取/解析失败返回错误。
+//! 依赖：syn及quote、workspace路径。
+//! 禁止职责：不移动代码、不维护行数上限。
 //! `xtask lines` — informational per-crate business-line statistics.
 //!
 //! T0 removes numeric size gates. Keep the existing AST-based counter so review
@@ -10,6 +14,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 
+/// 功能：统计各crate与辅助目录的业务行数。
+/// 参数：root为workspace根目录。
+/// 返回：成功打印统计表。
+/// 错误：读取目录/文件或解析AST失败。
+/// 状态：只读源码。
+/// 并发与取消：同步短任务，无共享写入。
+/// 权限：只读当前用户能访问的源码。
+/// 关联：质量门禁行数统计规则。
 pub fn run(root: &Path) -> Result<()> {
     let crates_dir = root.join("crates");
     let mut crates: Vec<PathBuf> = std::fs::read_dir(&crates_dir)?

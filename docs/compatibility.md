@@ -33,7 +33,7 @@ convenience.
 - **MSRV floor: Rust 1.88** (`workspace.package.rust-version`, inherited by
   every crate via `rust-version.workspace = true`).
 - The toolchain channel is pinned to `stable` in `rust-toolchain.toml`
-  (currently 1.98.0). Reproducible builds are anchored by `Cargo.lock` +
+  (the installed stable version is recorded in each verification report). Reproducible builds are anchored by `Cargo.lock` +
   `--locked` rather than a hard date-version pin.
 - Policy: an MSRV bump is a **minor** release, never a patch; the floor
   only moves when a needed feature does not exist in the current floor,
@@ -73,14 +73,13 @@ changes are breaking changes (see `docs/specs/knowledge-format-1.0.md`,
 
 ## 4. Platform commitments
 
-- **Windows first.** The primary development and smoke-test platform is
-  Windows: rustls-based HTTP keeps builds self-contained, the local sandbox
-  implements Windows Restricted Token isolation, and path/platform edge
-  cases are tested on Windows first.
-- **CI matrix.** Every push/PR runs `cargo clippy --workspace` on
-  ubuntu + windows and `cargo test --workspace` on ubuntu + macos +
-  windows (`.github/workflows/ci.yml`). A platform regression in the
-  matrix is a release blocker.
+- **Linux primary, Windows native.** Linux is the main development platform;
+  Windows 10/11 x64 runs natively, without WSL or Git Bash. Process, shell,
+  path and handle behavior requires platform-specific verification.
+- **CI and release matrix.** Linux and Windows only; macOS is outside the
+  support, nightly and release scope. CI runs default/full-feature tests,
+  clippy, Host/sidecar coexistence, contracts and governance on both platforms.
+  Passing fixtures does not establish future Host runtime/browser acceptance.
 - Platform-specific behavior is quarantined behind explicit modules
   (e.g. `openpaw-sandbox/src/platform/`); unconditional platform-specific
   code paths are not accepted.

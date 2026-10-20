@@ -1,3 +1,7 @@
+//! 职责：验证引擎跨场景确定性及并行回放隔离。
+//! 输入输出：读取脚本场景，导出隔离临时目录的转录并断言。
+//! 依赖：tests/common的Provider和工具夹具。
+//! 禁止职责：不改变生产推理或共享回放输出目录。
 //! Parity harness minimal set — the E1 exit line (plan §6.2).
 //!
 //! Three scenarios: pure chat / single tool serial / two tools parallel.

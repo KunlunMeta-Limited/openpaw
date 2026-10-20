@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -65,7 +65,11 @@ jobs:
     # intermediate 1.85 floor failed on the next discovery: the rmcp
     # macro stack hard-depends on darling 0.23, which declares rustc
     # 1.88. The floor settled at 1.88 — also rmcp's own declared floor.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -96,23 +100,69 @@ jobs:
       - run: npm test
 
   quality-gates:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Q1 informational AST statistics; parse/read errors still fail.
-      - run: cargo run -p xtask -- lines
+      - run: cargo run --locked -p xtask -- lines
       # Q10 porting hygiene
-      - run: cargo run -p xtask -- scrub --check
+      - run: cargo run --locked -p xtask -- scrub --check
       # Q7 trait snapshot drift
-      - run: cargo run -p xtask -- snapshot --check
+      - run: cargo run --locked -p xtask -- snapshot --check
       # Q6 golden bidirectional read/write
-      - run: cargo run -p xtask -- golden
+      - run: cargo run --locked -p xtask -- golden
       # Q3 zero telemetry (Cargo.lock dependency names + source call-site symbols)
-      - run: cargo run -p xtask -- telemetry
+      - run: cargo run --locked -p xtask -- telemetry
+      - run: cargo run --locked -p xtask -- stability
+      - run: cargo run --locked -p xtask -- smoke-offline
       # Q2 dependency whitelist
       - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2, cargo-deny 0.20.2
         with:
           arguments: --workspace
           rust-version: stable
+
+  governance:
+    name: governance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate the exact PR head and preserve evidence
+        shell: pwsh
+        env:
+          REVIEW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPORT_ROOT: ${{ runner.temp }}/openpaw-governance-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          $base = $env:REVIEW_BASE
+          if (-not $base -or $base -match '^0+$') {
+            $base = git rev-parse "$($env:REVIEW_HEAD)^"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          python governance/verify.py --suite governance --base $base --head $env:REVIEW_HEAD --output $env:REPORT_ROOT
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: governance-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openpaw-governance-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error

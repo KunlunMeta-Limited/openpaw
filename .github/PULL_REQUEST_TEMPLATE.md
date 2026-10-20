@@ -41,3 +41,16 @@ Author approval and green CI do not approve a Tx. Start the next Tx only after
 the current PR is approved by the user/designated reviewer and merged. See
 docs/engine-host/handoff.md. Office R1 requires its own design approval.
 
+
+## CHG / requirements / design (all changes)
+
+- Main CHG / implementation authorization / REQ / DES:
+- Exact files and necessity; reused / extended / fixed / new:
+- Affected documentation and synchronized sections (or specific reasons):
+- D regression / Office Rx approved version and evidence (if applicable):
+- Full verification report, exact head or dirty hash; Linux / Windows native:
+- Reviewer decision and merge SHA: pending until real review.
+
+Initial Tx serialization applies only until T0–T8 agreed scope is accepted.
+After that, use normal CHG development and PR review. Office bugs, necessary
+extensions and new features all need explicit Rx approval before any file edit.

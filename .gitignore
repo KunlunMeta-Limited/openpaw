@@ -29,5 +29,9 @@ Thumbs.db
 /scrub_result.txt
 
 # Isolated Host contract checks (not production dependencies)
-/tests/engine-host-contracts/node_modules/
+/tests/engine-host-contracts/node_modules
 /tests/engine-host-contracts/.upstream/
+
+# Python governance caches
+__pycache__/
+*.pyc

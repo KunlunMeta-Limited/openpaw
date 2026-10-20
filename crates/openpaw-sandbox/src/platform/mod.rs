@@ -56,6 +56,14 @@ pub fn backend_name() -> &'static str {
 /// Dispatches to the platform-specific implementation. If native
 /// sandboxing is unavailable for a restricted policy, returns
 /// `SandboxError::PlatformUnavailable` (fail-closed).
+/// 功能：将命令分派到当前平台；受限后端缺失返回失败。
+/// 参数：policy为策略；command为命令；cwd为可选工作目录。
+/// 返回：命令输出、退出码和审计。
+/// 错误：平台不可用或后端执行错误。
+/// 状态：非受限策略调用普通执行，受限策略进入对应后端。
+/// 并发与取消：异步执行；各后端清理/取消能力仍须按阶段完善。
+/// 权限：必须先授权；不据统一入口推断所有策略均已落实。
+/// 关联：现有沙箱分派契约与执行能力矩阵。
 pub async fn exec_sandboxed(
     policy: &SandboxPolicy,
     command: &str,

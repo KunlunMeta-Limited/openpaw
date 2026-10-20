@@ -18,7 +18,7 @@
 | tools::meta::todo | 修复并延展 | 原模块负责原子更新、错误和读取，Host 只消费结果 | T2/T5 |
 | engine-host | 新增共享宿主与两适配器 | 当前只有说明；Run/Approval/恢复/投影属宿主缺失责任 | T3—T7 |
 | Office 原服务/场景/详情 | 复用 | 原 Fastify/SSE/SceneRuntime/detail-v1 足够常规接入 | T4/T5 |
-| Office ChatSession | 必要修改 R1 | 固定 180 秒、无 Run 标识和续接；仅 Host 无法补齐 | T6，单独批准 |
+| Office ChatSession | 复用v1；R1条件扩展 | 固定180秒/无续接是现协议边界；完整长任务体验需提案扩展 | T6基础不改Office；具体Rx批准后实施 |
 | sidecar | 原样兼容 | 演示 ask 不是执行后端，不沿用其全局串行 gate | 全程 |
 
 ## 已识别缺陷
@@ -58,7 +58,7 @@ D16（待查，未修复）：默认 workspace 一次运行中 `file_lock::tests
 | D23 | parity 确定性测试与场景测试同时写读相同 fixture 文件，可读到截断瞬间空内容 | 回放测试独立 temp 输出目录，保留确定性断言及并行场景；生产引擎不改；T0 |
 | D24 | MCP 熔断器测试假定 10ms sleep 必在 50ms 冷却前恢复，macOS 调度延迟导致假失败 | 公共方法保留真实 Instant，私有状态转换显式传时间；原断言加精确边界/新期限验证，不扩大冷却值或重试；T0 |
 
-每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D25 起登记；不把功能缺失硬当 bug。
+每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D28 起登记；不把功能缺失硬当 bug。
 
 ## 能力缺口和已知风险（不伪装已修复）
 
@@ -82,7 +82,7 @@ D16（待查，未修复）：默认 workspace 一次运行中 `file_lock::tests
 
 | Rx | 状态 | 内容与必要性 | 审批/实施 |
 |---|---|---|---|
-| R1 | 提案，待用户批准 | 长任务、刷新续接、detach/cancel、可靠停止；见 r1-chat.md | T0 提交设计；T6 两仓 PR |
+| R1 | 提案，待用户批准 | 长任务、刷新续接、detach/cancel、可靠停止；见 r1-chat.md | T0提案；若批准才纳入T6并提交两仓PR，不阻塞T6基础/T7 |
 | R2 | 本期不改 | UI 领取租约/ACK/重投；明确丢失窗口 | 后续需求再审 |
 | R3 | 本期不做 | 侧栏/富文本/新管理页，现 detail-v1 可承载 | 不建立新 UI |
 
@@ -91,3 +91,13 @@ D16（待查，未修复）：默认 workspace 一次运行中 `file_lock::tests
 PR 必须回答：现有模块能否直接复用？能否加无协议接口？为什么必须新增？数据谁权威？是否重复解析/落盘/注册？协议字段是否渗入核心？失败边界和 Windows 是否覆盖？
 
 本台账是相关调用链审核记录，不声称全仓每一行已动态验证；实际命令和结果见 validation.md。
+
+## T0 治理增量与独立缺陷
+
+| ID | 根因与修改 | 回归与归属 |
+| --- | --- | --- |
+| D25 | scrub只查每规则首个命中；登记的REQ/DES完整ID误报且首个豁免遮住同行后续非法ID。只豁免有权威来源的完整ID覆盖片段，find_iter检查所有命中 | xtask::scrub::tests::registered_identifier_does_not_hide_later_hit；T0独立逻辑提交 |
+| D27 | scrub递归遍历忽略的依赖/生成目录，在本机NTFS依赖操作中阻塞；改用Git枚举已管理及未忽略的新源码，读取错误显式失败 | xtask::scrub::tests::source_enumeration_skips_ignored_but_includes_new_files；T0独立逻辑提交 |
+| D26 | scrub诊断按字节截100可能切到中文UTF-8中间并panic；改为字符截断 | xtask::scrub::tests::chinese_context_truncates_without_utf8_boundary_panic；T0独立逻辑提交 |
+
+治理复用：固定参考framework的CHG格式/校验原型；项目适配修补严格表格、真实Git范围、保护等级、命令追踪和索引，不运行原型approve。注释复用xtask的syn/quote/doc_lines；全量执行器新增，因为现有xtask没有跨Rust/Node/Python证据汇总职责。详细限制见governance/README.md。历史macOS发现记录保留，当前CI/nightly/release仅Linux/Windows。

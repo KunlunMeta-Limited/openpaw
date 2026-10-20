@@ -37,3 +37,10 @@
 - 回退方法：
 
 进入下一阶段的条件：本 Tx 必需检查通过，当前提交由非作者明确批准，PR 已合入；跨仓 Tx 的所有必要 PR 均已合入。
+
+## CHG与阶段结束
+
+每Tx一主CHG，补REQ/DES/文档影响/准确允许文件/命令与证据；使用docs/governance/templates模板。
+T0—T8全部约定范围验收后记录初期阶段结束，取消Tx串行，后续按CHG与正常PR开发。
+Office任意文件修改先Rx人工批准；R1/R2/R4条件提案未批准时如实记未实施，不阻塞T6基础/T7。
+本轮治理交接见docs/changes/CHG-2026-0001.md与governance/README.md。

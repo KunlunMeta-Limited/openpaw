@@ -74,7 +74,7 @@ cargo +1.88.0 check --locked --workspace --all-targets --all-features
 
 ## Windows 原生 CI 和门禁
 
-本机没有 Windows 执行环境，Windows 证据来自下述原生 CI。已有 ci.yml 的 windows-latest 原生矩阵执行默认/全 feature 测试、clippy、共存构建和默认依赖树；新契约任务在 Windows 原生 Node 24.19.0 上执行同一锁文件/类型/Schema/SDK 测试。macOS 原测试覆盖保留。未运行或红灯时保持 Draft；T0 的原生编译/现有测试通过也不能代替 T2/T3/T8 的真实 Host 双平台运行验收。
+本机没有 Windows 执行环境，Windows 证据来自下述原生 CI。已有 ci.yml 的 windows-latest 原生矩阵执行默认/全 feature 测试、clippy、共存构建和默认依赖树；新契约任务在 Windows 原生 Node 24.19.0 上执行同一锁文件/类型/Schema/SDK 测试。当时保留macOS覆盖；2026-10-20按用户最新指令移除ci/nightly/release任务，当前只要求Linux/Windows。未运行或红灯时保持 Draft；T0 的原生编译/现有测试通过也不能代替 T2/T3/T8 的真实 Host 双平台运行验收。
 
 PowerShell 验证命令与上述 cargo 相同。契约包使用 `Set-Location tests/engine-host-contracts` 后执行 README 的四条 npm 命令，无 WSL/Docker/sh 依赖。T2/T3/T8 另外验证真实 Job Object、cmd、路径和进程回收，不能由 T0 feature 编译替代。
 
@@ -117,3 +117,7 @@ PR 正文负责记录最终当前 head、完整原生矩阵的结论和运行链
 修复保留 public 方法取真实 `Instant::now()`，抽取私有显式时间状态转换供测试调用。测试不再 sleep，直接验证冷却前、恰好到期、单次探测，以及失败探测建立的精确新期限。原冷却策略和公共接口不变；不延长冷却掩盖竞态、不删断言。最终以修复提交完整 CI 为准。
 
 D24 本地复验：`cargo test --locked -p openpaw-mcp --all-features` 27 个单测和 6 个 E2E 全通过；`cargo clippy --locked -p openpaw-mcp --all-targets --all-features -- -D warnings`、`cargo +1.88.0 check --locked -p openpaw-mcp --all-targets --all-features`、fmt 和 diff 检查均 exit 0。
+
+## 2026-10-20 T0工程治理补充
+
+本次是用户授权的治理实施，历史记录不代表本次提交验证。新增AGENTS、需求/设计、主CHG、模板、校验/证据工具与增量中文注释，三处workflow移除macOS，Office未修改。当前增量命令和结果见[CHG验证记录](../verification/CHG-2026-0001/验证记录.md)，平台CI以PR当前head为准。T0仍待非作者审核和合入，不能进入T1。

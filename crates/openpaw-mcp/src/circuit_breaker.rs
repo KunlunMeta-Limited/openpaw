@@ -43,6 +43,14 @@ impl CircuitBreaker {
     /// [`FAILURE_THRESHOLD`] / [`DEFAULT_COOLDOWN`]).
     ///
     /// Stability: unstable.
+    /// 功能：创建使用显式阈值/冷却时间的熔断器。
+    /// 参数：failure_threshold至少按一处理；cooldown为重新探测等待。
+    /// 返回：初始关闭的熔断器。
+    /// 错误：无。
+    /// 状态：初始化连续失败计数为零。
+    /// 并发与取消：调用方管理实例所有权，无取消。
+    /// 权限：无外部副作用或权限变化。
+    /// 关联：熔断器状态机及精确时钟边界回归。
     pub fn new(failure_threshold: u32, cooldown: Duration) -> Self {
         Self {
             state: State::Closed,
@@ -74,6 +82,14 @@ impl CircuitBreaker {
     /// elapsed transitions to HalfOpen and admits exactly one probe.
     ///
     /// Stability: unstable.
+    /// 功能：检查当前时刻是否允许调用；冷却到期只放行一次探测。
+    /// 参数：可变self为本实例状态。
+    /// 返回：可尝试时为真，否则为假。
+    /// 错误：无。
+    /// 状态：到期Open切换HalfOpen；后续探测被拒绝。
+    /// 并发与取消：独占可变借用；无异步等待或取消。
+    /// 权限：仅控制本地调用准入，不授予远端权限。
+    /// 关联：冷却边界状态机。
     pub fn can_attempt(&mut self) -> bool {
         self.can_attempt_at(Instant::now())
     }
@@ -108,6 +124,14 @@ impl CircuitBreaker {
     /// Closed → count up, trip at the threshold.
     ///
     /// Stability: unstable.
+    /// 功能：记录失败，达到阈值或半开失败时重新打开熔断器。
+    /// 参数：可变self为本实例状态。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：累计失败并按真实当前时刻设置新冷却期限。
+    /// 并发与取消：独占可变借用；无异步等待或取消。
+    /// 权限：仅更新本地状态。
+    /// 关联：熔断恢复与新冷却期限回归。
     pub fn record_failure(&mut self) {
         self.record_failure_at(Instant::now());
     }
