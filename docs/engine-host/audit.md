@@ -129,3 +129,6 @@ D01：默认模型改取Provider真实默认，显式值优先，共享llm装配
 | D33 | SSE逐网络块from_utf8_lossy会把跨块汉字改为替换字符，事实已损坏；原字节缓存至完整行再解码。阻塞中文Office产品事实，归T1 | sse::tests::utf8_network_boundaries_do_not_corrupt_chinese；独立旧基线复现/双平台待验 |
 
 相关修改按用户本轮要求整合逻辑提交，D编号、根因、回归、证据逐项保留。T2的审批输入绑定/进程树/隔离/Todo缺陷尚未实施，T1不能宣称已完成这些能力；Office未修改。
+
+
+T1/D04 Windows整改：原生CI 5a9cc0f的Store两项尾损恢复在set_len返回OS5/Access denied；append句柄只有追加写权限。本轮复用原SessionWriter，先read+write备份修复，再重开append继续写，调用方独占所有权要求不变。现有两个失败用例及备份失败无损用例均保留，准确原生日志见CHG-2026-0002验证记录，新提交重验后才能关闭该交付阻塞。

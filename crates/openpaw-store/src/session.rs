@@ -89,9 +89,11 @@ impl SessionWriter {
     /// 关联：需求/设计 REQ-OP-004；DES-OP-003。
     pub fn open_append(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
+        // Windows的仅追加句柄没有set_len所需的FILE_WRITE_DATA权限。
+        // 修复阶段用读写句柄；调用方仍须独占所有权，修复后重新打开为追加模式。
         let mut file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .open(&path)
             .map_err(|source| io_error(&path, source))?;
         let mut data = Vec::new();
@@ -109,6 +111,11 @@ impl SessionWriter {
                 .map_err(|source| io_error(&path, source))?;
             file.sync_data().map_err(|source| io_error(&path, source))?;
         }
+        drop(file);
+        let file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .map_err(|source| io_error(&path, source))?;
         Ok(Self { path, file })
     }
 
