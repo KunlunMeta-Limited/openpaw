@@ -44,7 +44,7 @@ D01—D11 状态统一为“已定位、未修复”，直到对应缺陷 PR 有
 
 | D15 | cli/tests/sidecar_e2e.rs 等待 ID 时丢弃其他响应，响应乱序后永久阻塞；子进程缺清理 | 缓存其他 ID 响应、超时诊断、Drop 回收；移除并发 RPC 按发送顺序执行的错误假设，依赖读取等待写入确认；不改生产行为 | 并发请求测试与全 feature suite | T0 |
 
-D16（待查，未修复）：默认 workspace 一次运行中 `file_lock::tests::exclusive_lock_blocks_second_acquire` 在释放后立即重获失败；全 feature、首次默认测试、单项复查与最终默认复跑均通过。没有足够证据认定生产锁实现有错，不能把重新通过标为已修复。T3 使用该锁建立资源服务前必须查明、补跨进程回归；Windows CI 同时观察。未删除测试或放宽断言。
+D16历史观察（根因尚未查明时的原始记录）：默认 workspace 一次运行中 `file_lock::tests::exclusive_lock_blocks_second_acquire` 在释放后立即重获失败；全 feature、首次默认测试、单项复查与最终默认复跑均通过。没有足够证据认定生产锁实现有错，不能把重新通过标为已修复。T3 使用该锁建立资源服务前必须查明、补跨进程回归；Windows CI 同时观察。未删除测试或放宽断言。
 
 | ID | 新发现的问题 | 处理/阶段 |
 |---|---|---|
@@ -104,3 +104,15 @@ PR 必须回答：现有模块能否直接复用？能否加无协议接口？�
 | D30 | 将既有quality-gates扩到Windows后，cargo-deny容器Action仅支持Linux，原生runner无法执行 | Linux保留固定Action；Windows从crates.io安装固定cargo-deny0.20.2原生执行相同workspace check，规则不降级；原生CI验证；T0独立逻辑提交 |
 
 治理复用：固定参考framework的CHG格式/校验原型；项目适配修补严格表格、真实Git范围、保护等级、命令追踪和索引，不运行原型approve。注释复用xtask的syn/quote/doc_lines；全量执行器新增，因为现有xtask没有跨Rust/Node/Python证据汇总职责。详细限制见governance/README.md。历史macOS发现记录保留，当前CI/nightly/release仅Linux/Windows。
+
+## D16：T0基线阻塞的确定性复现与修复
+
+2026-10-20用户要求重新审核T0、不满足继续。原来把D16留到T3与T0全量基线要求冲突，本轮提前在原sandbox::file_lock修复；不新增Host资源调度。
+
+根因机制：Unix flock属于open file description。File设置CLOEXEC也不能防止其他线程fork至exec期间临时继承该描述符；原守卫只close自身描述符，继承者仍使锁有效。用File::try_clone保留相同描述对象，在守卫drop后、继承副本关闭前立即申请新独占锁，旧实现确定性失败（WouldBlock/errno11）；证明该机制可造成历史症状，不能断言已追踪到每次历史运行的具体子进程。
+
+修复：守卫Drop先显式LOCK_UN，遇EINTR重试系统调用，再由File关闭兜底；Windows以匹配范围的UnlockFileEx显式释放，不依赖CloseHandle后的隐式清理时机。公开类型/构造签名不变，无新依赖；不暴露提前解锁API。Drop不能传播系统错误，失败后仍关闭句柄且不panic；进程被强杀时仍由OS按句柄/继承生命周期清理，不承诺不存在的跨进程取消保证。
+
+回归全部在原file_lock私有测试模块，不为目录形式扩大API：独占及共享继承描述符、原立即重获断言、独立子进程共享/独占互斥及分别释放。父进程在临时中文/空格路径持锁，子进程真实调用同一API；共享持有者未全部退出时仍阻止独占。没有sleep、放宽断言或跳过测试。
+
+Linux定向6项通过；修复前日志/tmp/openpaw-d16-before.log exit101，修复后/tmp/openpaw-d16-after.log exit0。Windows以及当前交付全量仍按最终准确提交CI核查，未通过前不关闭M0。历史失败保留，本修复以独立D16逻辑提交交审。

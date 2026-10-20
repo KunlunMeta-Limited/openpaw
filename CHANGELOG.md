@@ -14,3 +14,8 @@
 - Freeze Office/OpenCode test contracts and the T0–T8 handoff process; extend
   native platform CI and retire numeric line limits. The opt-in `engine-host`
   dependency is wired, but its runtime and protocol endpoints are not implemented.
+
+- Fix D16 advisory-lock release in the existing sandbox module: explicitly
+  unlock before closing the guard, so a Unix descriptor inherited during a
+  concurrent spawn does not prolong ownership. Keep the public API and add
+  deterministic descriptor and native cross-process ownership regressions.
