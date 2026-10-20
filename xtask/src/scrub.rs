@@ -133,8 +133,8 @@ fn classify_line(line: &str, match_start: usize) -> &'static str {
 
 fn trim_context(line: &str) -> String {
     let t = line.trim();
-    if t.len() > 100 {
-        format!("{}…", &t[..100])
+    if t.chars().count() > 100 {
+        format!("{}…", t.chars().take(100).collect::<String>())
     } else {
         t.to_string()
     }
@@ -169,4 +169,16 @@ fn scan_targets(root: &Path) -> Vec<PathBuf> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn chinese_context_truncates_without_utf8_boundary_panic() {
+        let line = "中".repeat(120);
+        let result = trim_context(&line);
+        assert_eq!(result.chars().count(), 101);
+        assert!(result.ends_with('…'));
+    }
 }
