@@ -2,7 +2,7 @@
 
 日期：2026-10-20。OpenPaw 基线 `60a531a51172d14fc3db1a8e7eb6762c2c8369d8`；开发分支 `docs/engine-host-t0`；PR **仅指向 `merge/ai-ofice-react-overagent`**。本记录随 T0 提交，准确审核提交以 PR head 为准。
 
-状态：本地验证完成，远端 CI 初轮已启动，第二轮 Windows 原生测试通过，最新依赖修复仍需远端复核；尚未获得非作者批准或合入，T0 未关闭，T1 不开始。R1 设计待单独批准，Office 未修改。
+状态：本地验证完成；下文保留各轮远端结果及失败处理。最终 CI 结论、准确审核提交和 Ready 状态以 [PR #4](https://github.com/KunlunMeta-Limited/openpaw/pull/4) 当前 head 的检查和交接正文为准，不以历史绿灯替代当前提交验证。尚未获得非作者批准或合入，T0 未关闭，T1 不开始。R1 设计待单独批准，Office 未修改。
 
 ## 已交付入口
 
@@ -46,7 +46,7 @@
 | 契约包 `npm test` | 0 | 14 passed / 0 failed / 0 skipped；真实 SDK SSE 迭代器读取 loopback fixture HTTP |
 | `git diff --check` | 0 | 无空白错误 |
 
-现有两个 ignored 是 core/sandbox 文档例子，本 PR 未新增 ignored/skip。实际 Office 浏览器、Host 服务、SDK→Host、真实 Provider、Windows 运行及发布均未在 T0 验收；分别属于后续阶段，不能把 fixtures 称为端到端交付。
+现有两个 ignored 是 core/sandbox 文档例子，本 PR 未新增 ignored/skip。实际 Office 浏览器、Host 服务、SDK→Host、真实 Provider、Windows Host 运行及发布均未在 T0 验收；分别属于后续阶段，不能把 fixtures 称为端到端交付。
 
 ## 首次失败与处理
 
@@ -74,7 +74,7 @@ cargo +1.88.0 check --locked --workspace --all-targets --all-features
 
 ## Windows 原生 CI 和门禁
 
-本机没有 Windows 执行环境，不声称已通过。已有 ci.yml 的 windows-latest 原生矩阵执行默认/全 feature 测试、clippy、共存构建和默认依赖树；新契约任务在 Windows 原生 Node 24.19.0 上执行同一锁文件/类型/Schema/SDK 测试。macOS 原测试覆盖保留。PR 创建后记录远端结果；未运行或红灯时保持 Draft，不宣称双平台验收完成。
+本机没有 Windows 执行环境，Windows 证据来自下述原生 CI。已有 ci.yml 的 windows-latest 原生矩阵执行默认/全 feature 测试、clippy、共存构建和默认依赖树；新契约任务在 Windows 原生 Node 24.19.0 上执行同一锁文件/类型/Schema/SDK 测试。macOS 原测试覆盖保留。未运行或红灯时保持 Draft；T0 的原生编译/现有测试通过也不能代替 T2/T3/T8 的真实 Host 双平台运行验收。
 
 PowerShell 验证命令与上述 cargo 相同。契约包使用 `Set-Location tests/engine-host-contracts` 后执行 README 的四条 npm 命令，无 WSL/Docker/sh 依赖。T2/T3/T8 另外验证真实 Job Object、cmd、路径和进程回收，不能由 T0 feature 编译替代。
 
@@ -103,3 +103,9 @@ Actions run [39360307473](https://github.com/KunlunMeta-Limited/openpaw/actions/
 官方 cargo-deny 0.20.2 本地完整 `--workspace check` exit 0：advisories/bans/licenses/sources 全部 ok；保留重复依赖等原 warn 政策，未忽略公告。许可证成功基于 deny.toml 中显式精确版本例外，必须作为政策变化审核，不能当成原政策自动允许。随包许可证原文保留原字节及 SHA-256，T8 需验证分发。
 
 最新提交仍须完整远端 CI，最终检查以 PR 当前 head 为准；不能用上一轮 Windows 结果替代依赖更新后的原生验证。详细本地日志为 `/tmp/openpaw-t0-deps-*.log`、`openpaw-t0-yaml-regression.log`、`openpaw-t0-parity-final.log`、`openpaw-t0-deny-final.log`。
+
+## 最终审核入口与证据口径
+
+依赖及 parity 修复后的源码 head `0778e6e` 对应 [第三轮 run 39361862245](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39361862245)。本节记录时 fmt、MSRV、quality-gates、Linux/Windows clippy 及契约矩阵已成功，workspace 测试矩阵仍在运行；这只是有时间边界的观察，不是完整成功声明。其后本次修改仅整理本文件的证据口径。
+
+PR 正文负责记录最终当前 head、完整原生矩阵的结论和运行链接；只有当前 head 全部必需检查成功才转 Ready。文档中历史提交号与运行号用于定位原始证据，不随着新提交覆盖，也不通过不断提交“已绿灯”文字制造自引用。审核时同时检查当前 head 的 CI、DCO、D21 类型迁移、D22 许可证政策、D16 后续调查约束以及非作者审核门禁。
