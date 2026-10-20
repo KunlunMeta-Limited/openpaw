@@ -9,7 +9,7 @@
 | 产物 | 定位及性质 |
 |---|---|
 | 九阶段计划、运行/审批/锁/恢复图 | master.md；替换旧任务分配，不实现后续能力 |
-| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15、D17—D24 基线修正（含 YAML 类型兼容调整和待审许可证政策），D16 待查 |
+| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15、D17—D24 基线修正（含 YAML 类型兼容调整和待审许可证政策），D16本轮提前修复，完整证据见T0核查 |
 | 契约冻结及来源哈希 | contracts/README.md、sources.json；Office 固定 21 份来源，SDK 精确版本/integrity |
 | 真实类型/Schema/SDK fixtures | ../../tests/engine-host-contracts（从仓库根定位）；14 个测试，无跳过 |
 | PR 交接规范 | handoff.md、仓库 PR 模板 |
@@ -121,3 +121,7 @@ D24 本地复验：`cargo test --locked -p openpaw-mcp --all-features` 27 个单
 ## 2026-10-20 T0工程治理补充
 
 本次是用户授权的治理实施，历史记录不代表本次提交验证。新增AGENTS、需求/设计、主CHG、模板、校验/证据工具与增量中文注释，三处workflow移除macOS，Office未修改。当前增量命令和结果见[CHG验证记录](../verification/CHG-2026-0001/验证记录.md)，平台CI以PR当前head为准。T0仍待非作者审核和合入，不能进入T1。
+
+## T0重新核查入口
+
+用户要求不满足继续，D16已提前到T0做确定性失败复现、原锁显式释放和双平台子进程回归。原记录保留，当前产物逐项核查、D01—D04复现交接与全部准确报告见[本轮T0核查](../verification/CHG-2026-0001/T0核查.md)和[CHG验证记录](../verification/CHG-2026-0001/验证记录.md)。当前PR head必须完整双平台验证后交非作者审核，不能将原语修复或T0基线通过当产品已实现。
