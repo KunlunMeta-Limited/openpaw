@@ -1,6 +1,10 @@
+//! 职责：提供Linux bwrap执行与测试诊断。
+//! 输入输出：策略和命令转为子进程输出/审计或失败。
+//! 依赖：bwrap、sh与tokio进程接口。
+//! 禁止职责：不把Landlock探测或域名环境提示描述为已落实隔离；托管取消待后续阶段。
 //! Linux sandbox implementation using Bubblewrap (bwrap).
 //!
-//! Falls back to unrestricted execution if bwrap is not installed.
+//! Restricted dispatch rejects execution if bwrap is not installed.
 //!
 //! bwrap provides namespace-based isolation:
 //! - `--unshare-all`: Unshare all namespaces (pid, net, ipc, mount, user, uts)
@@ -9,8 +13,8 @@
 //! - `--bind <dir> <dir>`: Mount directory writable
 //! - `--share-net`: Re-share network (for policies that allow network)
 //!
-//! Enhanced with Landlock/Seccomp detection, hostname isolation,
-//! and resource limits via bwrap flags.
+//! Kernel diagnostics are test-only; they do not enable Landlock enforcement.
+//! Runtime isolation is provided by bwrap.
 
 use std::path::Path;
 use std::time::Instant;
@@ -29,6 +33,15 @@ pub fn is_bwrap_available() -> bool {
 ///
 /// Landlock requires kernel >= 5.13 and the `landlock` syscall to be available.
 /// This is a best-effort check; actual enforcement depends on kernel support.
+#[cfg(test)]
+/// 功能：提供测试用内核版本探测，不证明隔离生效。
+/// 参数：无。
+/// 返回：版本至少为最低内核时为真。
+/// 错误：探测失败返回假。
+/// 状态：读取内核版本。
+/// 并发与取消：同步探测，无取消。
+/// 权限：执行uname；不改变权限。
+/// 关联：平台诊断测试；实际执行仍依赖bwrap。
 pub fn is_landlock_available() -> bool {
     // Check kernel version
     let version = get_kernel_version();
@@ -36,6 +49,7 @@ pub fn is_landlock_available() -> bool {
 }
 
 /// Get the Linux kernel version as (major, minor).
+#[cfg(test)]
 fn get_kernel_version() -> Option<(u32, u32)> {
     let output = std::process::Command::new("uname")
         .arg("-r")
@@ -47,6 +61,7 @@ fn get_kernel_version() -> Option<(u32, u32)> {
 }
 
 /// Parse a kernel version string like "5.15.0-generic" into (5, 15).
+#[cfg(test)]
 fn parse_kernel_version(version: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = version.trim().split('.').collect();
     if parts.len() < 2 {
@@ -89,6 +104,15 @@ fn which_bwrap() -> Option<std::path::PathBuf> {
 /// - /dev and /proc properly mounted
 /// - /tmp as tmpfs (prevents persistent writes)
 /// - Readonly `/sys` mount
+///
+/// 功能：用现有bwrap策略执行命令，返回完整输出和审计。
+/// 参数：policy为策略；command交给sh执行；cwd为工作目录。
+/// 返回：输出、退出码和审计；子进程非零退出保留在结果。
+/// 错误：缺bwrap、创建可写根或启动失败返回错误。
+/// 状态：可能创建可写根并执行具有副作用的命令。
+/// 并发与取消：异步等待输出，尚未提供调用级取消与进程树清理保证。
+/// 权限：调用前需批准；域名白名单仅提示，不能当严格隔离保证。
+/// 关联：沙箱平台分派和后续执行环境缺陷修复。
 pub async fn exec_bwrap(
     policy: &SandboxPolicy,
     command: &str,
@@ -135,7 +159,8 @@ pub async fn exec_bwrap(
                 args.push(root.to_string_lossy().to_string());
             } else {
                 // Create the directory if it doesn't exist
-                std::fs::create_dir_all(root).map_err(|e| {
+                // D12: borrow so error context retains the root. // openpaw-scrub-allow
+                std::fs::create_dir_all(&root).map_err(|e| {
                     SandboxError::ExecutionFailed(format!(
                         "failed to create writable root {}: {e}",
                         root.display()
@@ -214,6 +239,15 @@ pub async fn exec_bwrap(
 /// Get the list of available sandbox backends on Linux.
 ///
 /// Returns a list of backend names that are available, in order of preference.
+#[cfg(test)]
+/// 功能：返回测试探测的后端名称，不声明全部可执行。
+/// 参数：无。
+/// 返回：可探测后端名列表。
+/// 错误：探测失败对应后端不列入。
+/// 状态：读取本机工具与内核信息。
+/// 并发与取消：同步，只读，无取消。
+/// 权限：与本机诊断相同；不提升权限。
+/// 关联：平台诊断回归。
 pub fn available_backends() -> Vec<&'static str> {
     let mut backends = Vec::new();
     if is_bwrap_available() {
@@ -248,7 +282,7 @@ mod tests {
     #[test]
     fn landlock_requires_5_13() {
         // Verify our version check logic
-        assert!(is_landlock_available() || get_kernel_version().map_or(true, |v| v < (5, 13)));
+        assert!(is_landlock_available() || get_kernel_version().is_none_or(|v| v < (5, 13)));
     }
 
     #[test]

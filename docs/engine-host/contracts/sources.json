@@ -1,0 +1,118 @@
+{
+  "office": {
+    "repository": "https://github.com/KunlunMeta-Limited/ai-office-react",
+    "commit": "b221a44ce22fe08956356b5002d17df59a6a4f50",
+    "files": [
+      {
+        "path": "integration/README.md",
+        "sha256": "8bad4ddcc266bd7f24ae6860d23dc283310be2e41591ab24c52f5422039b3156",
+        "testSnapshot": false
+      },
+      {
+        "path": "integration/docs/office-integration.md",
+        "sha256": "2eeb8ebfb33b8e7f0017e299f9590067ec5f75e9c37dc24274a59c37a4c1c827",
+        "testSnapshot": false
+      },
+      {
+        "path": "integration/docs/dashboard-integration.md",
+        "sha256": "6771828585fd51ce2d47b1ddedd0bcd6a36c6a5c9a70db152053f2cd76daf516",
+        "testSnapshot": false
+      },
+      {
+        "path": "integration/docs/chat-integration.md",
+        "sha256": "8fa92dba97f18c3269f5f3883b5feda0717a6aaee94574cab196eceebec3fdbc",
+        "testSnapshot": false
+      },
+      {
+        "path": "integration/docs/message-relay.md",
+        "sha256": "923c9d0bf18f933db3737b30d0252988bbce7d6ae91bc3cbf763020ed9ab8bc9",
+        "testSnapshot": false
+      },
+      {
+        "path": "integration/clients/client.mjs",
+        "sha256": "0ec763988631c80934259e18ae75ca32a49a762f9e4cc97d2edc7396ef1d6613",
+        "testSnapshot": false
+      },
+      {
+        "path": "integration/clients/ui-client.mjs",
+        "sha256": "371e72daf2a3b9d1bba19f6d1348371f7601773b21aaea17d4a815ed29344379",
+        "testSnapshot": false
+      },
+      {
+        "path": "packages/protocol/src/schema.ts",
+        "sha256": "84b6be0552317a873ecb0a521b59c70eb2f6195733ec9fb2c0a5ea28221b8e30",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/dashboard.ts",
+        "sha256": "17a210dbb875c6f2f04d3042140a95bd4fcf387a2a84938b07aea73626d7c5a3",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/office-ui.ts",
+        "sha256": "76cb296f4653519393dcfc96e4a48359c59a78a4792316c7cac6479a03600991",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/office-integration.ts",
+        "sha256": "e8a0673b481aeeeb46fca2c0aea0d86cea2b0f4d12d58abcc63cb7486454e8c7",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/chat.ts",
+        "sha256": "1fd75cd4afc340093e9d3b724ff0e4c12dafea29de995c0d17314e6fe510faf4",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/relay.ts",
+        "sha256": "b9759f85ac98cb29ada43f614b591b78fec578ca6147b82f00d0da51b0fdabf5",
+        "testSnapshot": true
+      },
+      {
+        "path": "docs/plugin-runtime.md",
+        "sha256": "426fc9b4de161062f253d4f80740b04cd2a934e467508f0ec53f1d66662b63d5",
+        "testSnapshot": false
+      },
+      {
+        "path": "tests/README.md",
+        "sha256": "64890b84cab4f16a087b0e358d9b3187ec3e094a971bae0f3096ad4d897fdea8",
+        "testSnapshot": false
+      },
+      {
+        "path": "tests/integration-e2e/README.md",
+        "sha256": "8b0c53db047f0ad2a390269d88f1707d971354ee4e47eb74b67f93414758bbed",
+        "testSnapshot": false
+      },
+      {
+        "path": "apps/web/src/chat/ChatSession.ts",
+        "sha256": "5ffc39db291342e25aaa1b4ab8b66cfb72d9b9a0018110667031c635f4a2cd7d",
+        "testSnapshot": false
+      },
+      {
+        "path": "LICENSE",
+        "sha256": "996ff8793a1db76f7e59007d6302c87b514853de765aa40da7eb26955c54593e",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/index.ts",
+        "sha256": "dbec17e5abadc8df8dccd47090a786024ef46b030012bea9624621525a6bd987",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/map.ts",
+        "sha256": "e3e8e62de77eeed20eae22b3072db30ed6f7e629ff55bb62f5f05efe7a389a6d",
+        "testSnapshot": true
+      },
+      {
+        "path": "packages/protocol/src/spatial.ts",
+        "sha256": "db4168b59dafe8ae40347358078e948de1789a2ede88abed8e05f8dd5a97cbc4",
+        "testSnapshot": true
+      }
+    ]
+  },
+  "sdk": {
+    "package": "@opencode-ai/sdk",
+    "version": "1.18.15",
+    "integrity": "sha512-8sfo9nGiVwesAZW9Wqkvynyn7w4wYaHx1O9qOHpYL65+Bs2XUpHP3kBbZe58gjQydFgk6I74kUF7sqCiPu2arQ=="
+  }
+}

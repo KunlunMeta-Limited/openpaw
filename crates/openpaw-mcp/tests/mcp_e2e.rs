@@ -12,7 +12,7 @@ use rmcp::model::{
     Annotated, CallToolResult, Content, JsonObject, ListResourcesResult, ListToolsResult,
     RawResource, ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
 };
-use rmcp::service::RequestContext;
+use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 
@@ -124,33 +124,29 @@ fn tool(name: &str, description: &str) -> Tool {
     Tool::new(name.to_string(), description.to_string(), Arc::new(schema))
 }
 
-/// Wire a mock server and a connected client session over one duplex
-/// pair. The server task dies with the handle (abort), which is exactly
-/// how the breaker test simulates a server crash.
-async fn mock_pair(call_delay: Option<Duration>) -> (ServerSession, tokio::task::JoinHandle<()>) {
+/// Wire both handshakes concurrently and keep the actual server service.
+/// D13: aborting an outer waiter does not prove the transport stopped. // openpaw-scrub-allow
+/// Tests explicitly cancel and await the service before asserting a dead peer.
+async fn mock_pair(
+    call_delay: Option<Duration>,
+) -> (ServerSession, RunningService<RoleServer, MockServer>) {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let (client_read, client_write) = tokio::io::split(client_io);
     let (server_read, server_write) = tokio::io::split(server_io);
 
     let server = MockServer { call_delay };
-    let handle = tokio::spawn(async move {
-        let transport = AsyncRwTransport::new_server(server_read, server_write);
-        match server.serve(transport).await {
-            Ok(running) => {
-                let _ = running.waiting().await;
-            }
-            Err(e) => eprintln!("mock server failed to start: {e}"),
-        }
-    });
-
-    let session = ServerSession::connect_over_transport(
-        "mock",
-        AsyncRwTransport::new_client(client_read, client_write),
-        T,
+    let (server, session) = tokio::join!(
+        server.serve(AsyncRwTransport::new_server(server_read, server_write)),
+        ServerSession::connect_over_transport(
+            "mock",
+            AsyncRwTransport::new_client(client_read, client_write),
+            T,
+        )
+    );
+    (
+        session.expect("in-process client handshake"),
+        server.expect("in-process server handshake"),
     )
-    .await
-    .expect("in-process handshake");
-    (session, handle)
 }
 
 #[tokio::test]
@@ -160,7 +156,7 @@ async fn handshake_and_list_tools() {
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(names, vec!["echo", "fail"]);
     session.shutdown().await.unwrap();
-    handle.abort();
+    handle.cancel().await.expect("server service stopped");
 }
 
 #[tokio::test]
@@ -172,7 +168,7 @@ async fn echo_roundtrip() {
     assert!(!result.is_error.unwrap_or(false));
     assert_eq!(result.content[0].as_text().unwrap().text, "echo: hi");
     session.shutdown().await.unwrap();
-    handle.abort();
+    handle.cancel().await.expect("server service stopped");
 }
 
 #[tokio::test]
@@ -185,7 +181,7 @@ async fn tool_error_result_is_ok_transport_never_fails() {
     assert!(result.is_error.unwrap_or(false));
     // Server answered; the breaker must see a success, not a failure.
     session.shutdown().await.unwrap();
-    handle.abort();
+    handle.cancel().await.expect("server service stopped");
 }
 
 #[tokio::test]
@@ -196,7 +192,7 @@ async fn resources_list_and_read() {
     let read = session.read_resource("mock://doc/1", T).await.unwrap();
     assert_eq!(read.contents.len(), 1);
     session.shutdown().await.unwrap();
-    handle.abort();
+    handle.cancel().await.expect("server service stopped");
 }
 
 #[tokio::test]
@@ -209,7 +205,7 @@ async fn slow_tool_hits_call_timeout() {
     assert!(matches!(err, McpError::Timeout(_)), "got: {err:?}");
     assert!(err.is_retryable());
     session.shutdown().await.unwrap();
-    handle.abort();
+    handle.cancel().await.expect("server service stopped");
 }
 
 #[tokio::test]
@@ -217,8 +213,8 @@ async fn breaker_trips_on_transport_failure_then_reconnects() {
     let (session, handle) = mock_pair(None).await;
     let mut breaker = CircuitBreaker::new(3, Duration::from_millis(120));
 
-    // Crash the server: every subsequent call is a transport failure.
-    handle.abort();
+    // Stop the actual service and await transport closure before the calls.
+    handle.cancel().await.expect("server service stopped");
 
     for _ in 0..3 {
         assert!(breaker.can_attempt());
@@ -240,5 +236,5 @@ async fn breaker_trips_on_transport_failure_then_reconnects() {
     assert_eq!(breaker.state(), CircuitState::Closed);
 
     session.shutdown().await.unwrap();
-    handle.abort();
+    handle.cancel().await.expect("server service stopped");
 }

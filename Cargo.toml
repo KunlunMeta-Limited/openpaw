@@ -39,7 +39,9 @@ tracing = "0.1"
 # Serde
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yml = "0.0.12"
+# Preserve the source dependency key while replacing the archived, unsound backend.
+# Public YAML types change identity; see docs/engine-host/dependency-baseline.md.
+serde_yml = { package = "serde_norway", version = "0.9.42" }
 toml = "0.8"
 
 # Time / IDs
@@ -69,7 +71,7 @@ rmcp = { version = "1.6", default-features = false, features = ["server", "macro
 # Web tool stack (openpaw-tools web; url parsing, LRU fetch cache, query encoding, base64 data URIs)
 url = "2"
 urlencoding = "2"
-lru = "0.12"
+lru = "0.18.5"
 base64 = "0.22"
 
 # bash AST security analysis (openpaw-tools bashast; pwsh/batch grammars deferred to Phase 3)

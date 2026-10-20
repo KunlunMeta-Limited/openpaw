@@ -1,6 +1,6 @@
 [package]
 name = "openpaw-engine-host"
-description = "OpenCode-compatible public engine interface adapter (M5b, gated behind a validation checkpoint)."
+description = "Shared OpenPaw host for Office and pinned OpenCode adapters; T0 placeholder, runtime planned for T3-T7."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

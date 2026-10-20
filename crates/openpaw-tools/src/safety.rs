@@ -98,7 +98,8 @@ mod tests {
         let ws = dir.path();
         std::fs::write(ws.join("a.txt"), "x").unwrap();
         let p = resolve(ws, "a.txt").unwrap();
-        assert!(p.starts_with(ws));
+        // The returned path resolves symlinks (macOS temp roots) and Windows prefixes.
+        assert!(p.starts_with(dunce_canonicalize(ws).unwrap()));
     }
 
     #[test]
@@ -114,7 +115,8 @@ mod tests {
         let ws = dir.path();
         std::fs::create_dir(ws.join("sub")).unwrap();
         let p = resolve(ws, "sub/new.txt").unwrap();
-        assert!(p.starts_with(ws));
+        // The returned path resolves symlinks (macOS temp roots) and Windows prefixes.
+        assert!(p.starts_with(dunce_canonicalize(ws).unwrap()));
         assert!(p.ends_with("new.txt"));
     }
 

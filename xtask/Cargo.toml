@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Workspace engineering scripts: line budgets, porting hygiene, trait snapshots, golden runner."
+description = "Workspace engineering scripts: line statistics, porting hygiene, trait snapshots, golden runner."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

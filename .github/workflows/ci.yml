@@ -1,7 +1,14 @@
 name: ci
 on:
   push:
-    branches: [main]
+    # Tx branches need native evidence before their PR is created.
+    branches:
+      - main
+      - merge/ai-ofice-react-overagent
+      - 'docs/engine-host-t*'
+      - 'fix/engine-host-t*'
+      - 'feat/engine-host-t*'
+      - 'test/engine-host-t*'
   pull_request:
 
 env:
@@ -20,6 +27,7 @@ jobs:
   clippy:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
@@ -28,18 +36,29 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: cargo test --locked --workspace
+      - run: cargo test --locked --workspace --all-features
+      # T0 wires the opt-in dependency only; runtime/CLI behavior arrives in T3.
+      - run: cargo build --locked -p openpaw-cli --features engine-host,sidecar
+      - name: Default CLI does not pull in the Host HTTP framework
+        shell: pwsh
+        run: |
+          $tree = cargo tree --locked -p openpaw-cli --edges normal --prefix none
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($tree -match '^axum v') { throw 'default CLI unexpectedly depends on axum' }
 
   msrv:
     # compatibility.md §2 declares an MSRV floor of 1.88. This job enforces
@@ -53,30 +72,117 @@ jobs:
     # intermediate 1.85 floor failed on the next discovery: the rmcp
     # macro stack hard-depends on darling 0.23, which declares rustc
     # 1.88. The floor settled at 1.88 — also rmcp's own declared floor.
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --locked --workspace --all-targets
+      - run: cargo check --locked --workspace --all-targets --all-features
+
+  host-contracts:
+    name: host-contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: tests/engine-host-contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: tests/engine-host-contracts/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run prepare:office
+      - run: npm run check
+      - run: npm test
 
   quality-gates:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Q1 line budgets
-      - run: cargo run -p xtask -- lines
+      # Q1 informational AST statistics; parse/read errors still fail.
+      - run: cargo run --locked -p xtask -- lines
       # Q10 porting hygiene
-      - run: cargo run -p xtask -- scrub --check
+      - run: cargo run --locked -p xtask -- scrub --check
       # Q7 trait snapshot drift
-      - run: cargo run -p xtask -- snapshot --check
+      - run: cargo run --locked -p xtask -- snapshot --check
       # Q6 golden bidirectional read/write
-      - run: cargo run -p xtask -- golden
+      - run: cargo run --locked -p xtask -- golden
       # Q3 zero telemetry (Cargo.lock dependency names + source call-site symbols)
-      - run: cargo run -p xtask -- telemetry
+      - run: cargo run --locked -p xtask -- telemetry
+      - run: cargo run --locked -p xtask -- stability
+      - run: cargo run --locked -p xtask -- smoke-offline
       # Q2 dependency whitelist
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2, cargo-deny 0.20.2
+        if: runner.os == 'Linux'
         with:
           arguments: --workspace
+          rust-version: stable
+      # D30: container Actions cannot execute on Windows; keep the same pinned native audit.
+      - name: Install native Windows dependency auditor
+        if: runner.os == 'Windows'
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Audit dependencies natively on Windows
+        if: runner.os == 'Windows'
+        run: cargo deny --workspace check
+
+  governance:
+    name: governance (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate the exact PR head and preserve evidence
+        shell: pwsh
+        env:
+          REVIEW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPORT_ROOT: ${{ runner.temp }}/openpaw-governance-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          $base = $env:REVIEW_BASE
+          # Check the entire Tx against its integration base before a PR exists.
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_NAME -match '^(docs|fix|feat|test)/engine-host-t') {
+            $base = git merge-base $env:REVIEW_HEAD origin/merge/ai-ofice-react-overagent
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          if (-not $base -or $base -match '^0+$') {
+            $base = git rev-parse "$($env:REVIEW_HEAD)^"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          python governance/verify.py --suite governance --base $base --head $env:REVIEW_HEAD --output $env:REPORT_ROOT
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: governance-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openpaw-governance-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error

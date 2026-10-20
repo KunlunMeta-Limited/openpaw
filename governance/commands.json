@@ -1,0 +1,451 @@
+{
+  "schema": "openpaw/commands/v1",
+  "commands": [
+    {
+      "id": "TEST-FMT",
+      "argv": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-RUST-DEFAULT",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--workspace"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-RUST-ALL",
+      "argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--workspace",
+        "--all-features"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-CLIPPY-DEFAULT",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-CLIPPY-ALL",
+      "argv": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-FEATURES",
+      "argv": [
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "openpaw-cli",
+        "--features",
+        "engine-host,sidecar"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-MSRV-DEFAULT",
+      "argv": [
+        "cargo",
+        "+1.88.0",
+        "check",
+        "--locked",
+        "--workspace",
+        "--all-targets"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-MSRV-ALL",
+      "argv": [
+        "cargo",
+        "+1.88.0",
+        "check",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--all-features"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-DEFAULT-TREE",
+      "argv": [
+        "cargo",
+        "tree",
+        "--locked",
+        "-p",
+        "openpaw-cli",
+        "--edges",
+        "normal",
+        "--prefix",
+        "none"
+      ],
+      "suite": "rust",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "reject_stdout_prefix": "axum v"
+    },
+    {
+      "id": "TEST-QUALITY-LINES",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "lines"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-QUALITY-SCRUB",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "scrub",
+        "--check"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-QUALITY-SNAPSHOT",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "snapshot",
+        "--check"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-QUALITY-GOLDEN",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "golden"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-QUALITY-TELEMETRY",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "telemetry"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-QUALITY-STABILITY",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "stability"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-QUALITY-SMOKE",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "smoke-offline"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-DENY",
+      "argv": [
+        "cargo",
+        "deny",
+        "--workspace",
+        "check"
+      ],
+      "suite": "quality",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-CONTRACT-PREPARE",
+      "argv": [
+        "npm",
+        "run",
+        "prepare:office"
+      ],
+      "suite": "contracts",
+      "cwd": "tests/engine-host-contracts",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-CONTRACT-TYPES",
+      "argv": [
+        "npm",
+        "run",
+        "check"
+      ],
+      "suite": "contracts",
+      "cwd": "tests/engine-host-contracts",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-CONTRACTS",
+      "argv": [
+        "npm",
+        "test"
+      ],
+      "suite": "contracts",
+      "cwd": "tests/engine-host-contracts",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-GOV",
+      "argv": [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "governance/tests",
+        "-v"
+      ],
+      "suite": "governance",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-GOV-VALIDATE",
+      "argv": [
+        "{python}",
+        "governance/check.py",
+        "validate"
+      ],
+      "suite": "governance",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-GOV-INDEX",
+      "argv": [
+        "{python}",
+        "governance/check.py",
+        "index",
+        "--check"
+      ],
+      "suite": "governance",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-GOV-TRACE",
+      "argv": [
+        "{python}",
+        "governance/check.py",
+        "trace",
+        "--check"
+      ],
+      "suite": "governance",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-COMMENTS",
+      "argv": [
+        "cargo",
+        "run",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "comments",
+        "--base",
+        "{base}",
+        "--head",
+        "{head}"
+      ],
+      "suite": "governance",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    },
+    {
+      "id": "TEST-GOV-DIFF",
+      "argv": [
+        "{python}",
+        "governance/check.py",
+        "pr-check",
+        "--base",
+        "{base}",
+        "--head",
+        "{head}"
+      ],
+      "suite": "governance",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
+    }
+  ]
+}

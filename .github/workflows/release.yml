@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest, macos-latest]
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +51,6 @@ jobs:
           case "$RUNNER_OS" in
             Windows) platform="windows-x86_64"; ext="zip"; bin="openpaw.exe" ;;
             Linux)   platform="linux-x86_64";   ext="tar.gz"; bin="openpaw" ;;
-            macOS)   platform="macos-aarch64";  ext="tar.gz"; bin="openpaw" ;;
           esac
           echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
           echo "RELEASE_VERSION=${version}" >> "$GITHUB_ENV"

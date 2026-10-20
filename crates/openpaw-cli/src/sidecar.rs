@@ -55,11 +55,15 @@ use std::future::Future;
 /// The MCP sidecar server handler. Holds the OpenPaw home root; every tool
 /// derives its store from it, matching the CLI domain rules.
 ///
-/// Tool calls are serialized through an internal gate: the MCP protocol
-/// permits a client to issue requests concurrently, and unordered execution
-/// would let a `memory_get` observe the store before an in-flight
-/// `memory_set` finishes writing. Local, single-user, file-backed tools —
-/// strict ordering costs nothing and makes call semantics predictable.
+/// Tool calls are mutually exclusive through an internal gate, preventing
+/// reads during a write. Concurrent JSON-RPC requests have no wire-order
+/// guarantee: a client must await a write response before a dependent read.
+/// 用途：现有MCP sidecar的离线处理器，不是Host运行服务。
+/// 字段：home定位数据根，gate串行保护一次工具调用。
+/// 来源去向：CLI创建，MCP传输调用处理方法。
+/// 约束：请求间不保证发送顺序；依赖写入的读取必须等待响应。
+/// 稳定性：现有sidecar入口保持兼容。
+/// 关联：sidecar并发响应与依赖读取回归。
 pub struct SidecarServer {
     home: PathBuf,
     gate: tokio::sync::Mutex<()>,

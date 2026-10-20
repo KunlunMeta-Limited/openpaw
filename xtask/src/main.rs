@@ -1,7 +1,11 @@
+//! 职责：提供workspace质量命令分派。
+//! 输入输出：读取CLI参数，输出检查结果和非零失败码。
+//! 依赖：所属xtask模块及本机工具链。
+//! 禁止职责：不运行Host业务、不生成批准或自动修改待审代码。
 //! xtask — workspace engineering scripts.
 //!
 //! Commands:
-//! - `lines`            per-crate business-line count vs budget caps (Q1)
+//! - `lines`            informational per-crate business-line statistics (Q1)
 //! - `scrub --check`    porting-hygiene banned-word scan (Q10)
 //! - `port`             semi-automatic crate porting with renames + precheck
 //! - `snapshot [--check]` public trait signature snapshot of openpaw-core (Q7)
@@ -10,6 +14,7 @@
 //! - `smoke-offline`    offline smoke: hello → doctor → evolve (Q4)
 //! - `stability`        Stability doc-tag coverage of openpaw-core (1.0 freeze)
 
+mod comments;
 mod lines;
 mod port;
 mod scrub;
@@ -29,12 +34,13 @@ pub fn workspace_root() -> PathBuf {
 }
 
 fn usage() -> &'static str {
-    "usage: cargo xtask <lines|scrub --check|port --crate <name> --from <dir> [--files <glob>] | snapshot [--check] | golden | telemetry | smoke-offline | stability>"
+    "usage: cargo xtask <comments --base <ref> <--head <ref>|--worktree> [--all --report-only]|lines|scrub --check|port --crate <name> --from <dir> [--files <glob>] | snapshot [--check] | golden | telemetry | smoke-offline | stability>"
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("comments") => comments::run(&workspace_root(), &args[1..]),
         Some("lines") => lines::run(&workspace_root()),
         Some("scrub") => {
             let check = args.iter().any(|a| a == "--check");

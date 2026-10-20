@@ -7,8 +7,11 @@
 //! pattern as `chat_e2e.rs`) are enough to exercise the protocol surface —
 //! initialize → capabilities → tools/list → tools/call round-trips.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 use rmcp::serde_json::{json, Value};
 
@@ -16,7 +19,8 @@ use rmcp::serde_json::{json, Value};
 struct SidecarProc {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    frames: Receiver<Value>,
+    pending: HashMap<i64, Value>,
 }
 
 impl SidecarProc {
@@ -33,10 +37,23 @@ impl SidecarProc {
             .expect("spawn openpaw --sidecar");
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+        let (tx, frames) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines() {
+                let Ok(line) = line else { break };
+                let Ok(frame) = rmcp::serde_json::from_str(&line) else {
+                    break;
+                };
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             child,
             stdin: Some(stdin),
-            stdout,
+            frames,
+            pending: HashMap::new(),
         }
     }
 
@@ -49,22 +66,25 @@ impl SidecarProc {
 
     /// Read one newline-delimited JSON-RPC frame from stdout.
     fn recv(&mut self) -> Value {
-        let mut line = String::new();
-        let n = self
-            .stdout
-            .read_line(&mut line)
-            .expect("read frame from sidecar stdout");
-        assert!(n > 0, "sidecar closed stdout before the expected frame");
-        rmcp::serde_json::from_str(line.trim()).expect("sidecar frame is valid JSON")
+        self.frames
+            .recv_timeout(Duration::from_secs(30))
+            .expect("sidecar must return a valid frame within 30 seconds")
     }
 
     /// Frames until the response with `id` arrives (defensive skip of
     /// anything else the server might emit first).
     fn recv_response(&mut self, id: i64) -> Value {
+        if let Some(frame) = self.pending.remove(&id) {
+            return frame;
+        }
         loop {
             let frame = self.recv();
             if frame.get("id").and_then(Value::as_i64) == Some(id) {
                 return frame;
+            }
+            // Response order is not guaranteed; retain other calls' frames.
+            if let Some(other_id) = frame.get("id").and_then(Value::as_i64) {
+                self.pending.insert(other_id, frame);
             }
         }
     }
@@ -103,6 +123,14 @@ impl SidecarProc {
         self.child
             .wait()
             .expect("wait for the sidecar process to exit")
+    }
+}
+
+impl Drop for SidecarProc {
+    fn drop(&mut self) {
+        // A timeout/assertion must not leak the child or its pipe-reader thread.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -232,7 +260,7 @@ fn sidecar_stdio_initialize_tools_list_and_tool_roundtrips() {
 }
 
 #[test]
-fn sidecar_concurrent_calls_serialize_set_before_get() {
+fn sidecar_concurrent_calls_preserve_responses_and_committed_writes() {
     let home = tempfile::tempdir().unwrap();
     let mut proc = SidecarProc::spawn(home.path());
 
@@ -240,9 +268,8 @@ fn sidecar_concurrent_calls_serialize_set_before_get() {
     let _ = proc.result_of(0);
     proc.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
 
-    // Write both frames back-to-back before draining any response: the
-    // server may dispatch them concurrently, and an unordered get would
-    // observe the store before the in-flight set finishes writing.
+    // Concurrent JSON-RPC requests have no dependency ordering. Exercise
+    // both responses, then issue dependent reads after the write acknowledgments.
     proc.send(tools_call_frame(
         1,
         "memory_set",
@@ -250,17 +277,20 @@ fn sidecar_concurrent_calls_serialize_set_before_get() {
     ));
     proc.send(tools_call_frame(
         2,
-        "memory_get",
-        json!({"id": "race-note"}),
+        "memory_set",
+        json!({"id": "other-note", "content": "independent concurrent write"}),
     ));
 
     let saved = proc.tool_text(1);
     assert!(saved.contains("race-note"), "memory_set said: {saved}");
-    let text = proc.tool_text(2);
-    assert!(
-        text.contains("gate orders concurrent calls"),
-        "concurrent memory_get lost the write: {text}"
-    );
+    assert!(proc.tool_text(2).contains("other-note"));
+    for (id, note, expected) in [
+        (3, "race-note", "gate orders concurrent calls"),
+        (4, "other-note", "independent concurrent write"),
+    ] {
+        proc.send(tools_call_frame(id, "memory_get", json!({"id": note})));
+        assert!(proc.tool_text(id).contains(expected));
+    }
 
     let status = proc.finish();
     assert!(status.success(), "sidecar exited with {status}");

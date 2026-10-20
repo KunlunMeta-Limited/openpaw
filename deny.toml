@@ -12,6 +12,12 @@ no-default-features = false
 version = 2
 allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.93
+# Explicit existing-dependency policy changes, reviewed with dependency-baseline.md and the notices.
+# Keep each exception version-scoped; upgrades require renewed license review.
+exceptions = [
+    { crate = "option-ext@=0.2.0", allow = ["MPL-2.0"] },
+    { crate = "webpki-roots@=1.0.9", allow = ["CDLA-Permissive-2.0"] },
+]
 
 [bans]
 multiple-versions = "warn"

@@ -402,11 +402,19 @@ pub fn assert_expectations(sc: &Scenario, t: &ParityTranscript) {
     }
 }
 
-/// Export the transcript fixture (JSON) under `tests/parity/fixtures/` and
+/// Export the transcript fixture (JSON) under the supplied output directory and
 /// return its path. Fixtures are the cross-repo parity evidence committed
 /// to the repo (plan §6.2: "证据以 JSON 转录 fixture 形式导出入库"); the
 /// upstream side replays the same script and compares structure keys.
-pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
+/// 功能：导出可比较的回放转录到调用方专用目录。
+/// 参数：t为转录；dir为当前测试独占的输出目录。
+/// 返回：写出的JSON路径。
+/// 错误：目录创建或写入失败会使测试panic。
+/// 状态：创建目录并写入当前场景fixture。
+/// 并发与取消：调用方隔离目录，不能同时覆盖同名场景；无取消。
+/// 权限：仅测试临时目录写入。
+/// 关联：确定性回放与并行测试隔离。
+pub fn export_fixture(t: &ParityTranscript, dir: &std::path::Path) -> PathBuf {
     let fixture = serde_json::json!({
         "schema": "openpaw-parity-transcript/1",
         "scenario": t.scenario,
@@ -420,8 +428,7 @@ pub fn export_fixture(t: &ParityTranscript) -> PathBuf {
             "event_kinds": turn.event_kinds,
         })).collect::<Vec<_>>(),
     });
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/parity/fixtures");
-    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    std::fs::create_dir_all(dir).expect("create fixture dir");
     let path = dir.join(format!("{}.json", t.scenario));
     std::fs::write(&path, serde_json::to_string_pretty(&fixture).unwrap()).expect("write fixture");
     path
