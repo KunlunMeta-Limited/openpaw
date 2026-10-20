@@ -47,10 +47,35 @@ fn rules() -> Vec<Rule> {
 
 const ALLOW_MARKER: &str = "openpaw-scrub-allow";
 
+/// 功能：扫描移植遗留标识，精确登记的项目编号仅豁免对应匹配片段。
+/// 参数：root为仓库根；check为失败门禁或只报告模式。
+/// 返回：无命中时成功；报告模式输出所有命中。
+/// 错误：登记表读取失败返回错误；check模式有命中则进程非零退出。
+/// 状态：只读源码及编号登记表。
+/// 并发与取消：同步扫描，无共享写入。
+/// 权限：不执行目标代码，不改变文件。
+/// 关联：移植清理规则与治理编号登记校验。
 pub fn run(root: &Path, check: bool) -> Result<()> {
     // Build the rule list once: compiling all four regexes per scanned
     // line made the gate take minutes on this repo size.
     let rule_list = rules();
+    let registered: Vec<String> = if root.join("governance/identifiers.json").exists() {
+        let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
+            root.join("governance/identifiers.json"),
+        )?)?;
+        document["ids"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("registered ids must be an array"))?
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("registered id must be a string"))
+            })
+            .collect::<Result<_>>()?
+    } else {
+        Vec::new()
+    };
     let mut hits: Vec<String> = Vec::new();
     let mut scanned = 0usize;
 
@@ -71,7 +96,7 @@ pub fn run(root: &Path, check: bool) -> Result<()> {
                 continue;
             }
             for rule in &rule_list {
-                if let Some(m) = rule.re.find(line) {
+                for m in rule.re.find_iter(line) {
                     // Task-ID filter: `Q10`/`P3` style (no hyphen, Q/P
                     // prefix) is this plan's own numbering, not an upstream
                     // task ID.
@@ -82,13 +107,21 @@ pub fn run(root: &Path, check: bool) -> Result<()> {
                     {
                         continue;
                     }
+                    // Only the complete registered identifier exempts this span;
+                    // a later unrelated hit on the same line must still fail.
+                    if rule.name == "internal_task_id"
+                        && registered_span(line, m.start(), m.end(), &registered)
+                    {
+                        continue;
+                    }
                     let kind = classify_line(line, m.start());
                     if allowlisted {
                         // Docs may discuss the port; still surface for awareness.
                         continue;
                     }
                     hits.push(format!(
-                        "{rel}:{line_no}: [{}:{}] {}",
+                        "{rel}:{}: [{}:{}] {}",
+                        line_no + 1,
                         rule.name,
                         kind,
                         trim_context(line)
@@ -129,6 +162,21 @@ fn classify_line(line: &str, match_start: usize) -> &'static str {
     } else {
         "code"
     }
+}
+
+fn registered_span(line: &str, start: usize, end: usize, ids: &[String]) -> bool {
+    ids.iter().any(|id| {
+        line.match_indices(id).any(|(offset, _)| {
+            let boundary = |c: char| c.is_ascii_alphanumeric() || c == '-';
+            offset <= start
+                && offset + id.len() >= end
+                && !line[..offset].chars().next_back().is_some_and(boundary)
+                && !line[offset + id.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(boundary)
+        })
+    })
 }
 
 fn trim_context(line: &str) -> String {
@@ -174,6 +222,31 @@ fn scan_targets(root: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registered_identifier_does_not_hide_later_hit() {
+        let registered = format!("REQ-OP-{:03}", 1);
+        let banned = format!("Z{}", 55);
+        let line = format!("{registered} {banned}");
+        let rule = rules()
+            .into_iter()
+            .find(|r| r.name == "internal_task_id")
+            .unwrap();
+        let hits: Vec<_> = rule
+            .re
+            .find_iter(&line)
+            .filter(|m| {
+                !registered_span(&line, m.start(), m.end(), std::slice::from_ref(&registered))
+            })
+            .collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].as_str(), banned);
+        assert!(!registered_span(
+            &format!("X{registered}"),
+            5,
+            10,
+            &[registered]
+        ));
+    }
     #[test]
     fn chinese_context_truncates_without_utf8_boundary_panic() {
         let line = "中".repeat(120);
