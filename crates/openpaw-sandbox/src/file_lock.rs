@@ -40,7 +40,7 @@ use std::path::Path;
 /// 来源去向：由try_lock_exclusive或try_lock_shared产生，退出作用域释放。
 /// 约束：守卫不可克隆，不暴露文件；Unix继承的描述符不应延长守卫所有权。
 /// 稳定性：保留已有公开类型与构造函数；内部释放细节可按平台修正。
-/// 关联：REQ-OP-002；DES-OP-006；D16。
+/// 关联：兼容基线REQ-OP-002、共享资源设计DES-OP-006及缺陷D16。
 pub struct FileLockGuard {
     _file: File,
 }
@@ -52,7 +52,7 @@ pub struct FileLockGuard {
 /// 状态：可能创建锁文件，文件保留不代表仍被锁定。
 /// 并发与取消：不同进程/句柄的共享与独占均被阻止；不等待，无异步取消点。
 /// 权限：不扩大路径权限；建议锁仅约束遵守同一协议的参与方。
-/// 关联：REQ-OP-002；DES-OP-006；D16。
+/// 关联：兼容基线REQ-OP-002、共享资源设计DES-OP-006及缺陷D16。
 pub fn try_lock_exclusive(path: &Path) -> io::Result<FileLockGuard> {
     let file = open_lock_file(path)?;
     lock_inner(&file, /* exclusive */ true)?;
@@ -66,7 +66,7 @@ pub fn try_lock_exclusive(path: &Path) -> io::Result<FileLockGuard> {
 /// 状态：可能创建锁文件；共享锁必须全部释放才能取得独占锁。
 /// 并发与取消：允许独立共享持有者并存；不等待，无异步取消点。
 /// 权限：不扩大路径权限；不阻止未遵守建议锁的外部写入。
-/// 关联：REQ-OP-002；DES-OP-006；D16。
+/// 关联：兼容基线REQ-OP-002、共享资源设计DES-OP-006及缺陷D16。
 pub fn try_lock_shared(path: &Path) -> io::Result<FileLockGuard> {
     let file = open_lock_file(path)?;
     lock_inner(&file, /* exclusive */ false)?;
