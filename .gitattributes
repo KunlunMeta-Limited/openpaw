@@ -5,3 +5,6 @@
 
 # Framework provenance uses a raw SHA-256 snapshot.
 /governance/vendor/framework_governance.py -text
+
+# API snapshot is compared byte-for-byte by xtask; preserve it on Windows.
+/openpaw-core.api.json -text

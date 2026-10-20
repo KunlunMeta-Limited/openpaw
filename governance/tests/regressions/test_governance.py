@@ -44,6 +44,22 @@ def chg(files=None, status='评审中（review）', risk='严重（critical）',
 
 
 class GovernanceTests(unittest.TestCase):
+    def test_api_snapshot_survives_windows_style_checkout(self):
+        # 使用真正的Git检出而非比较配置字符串；CRLF不能制造接口漂移。
+        with tempfile.TemporaryDirectory(prefix='openpaw-snapshot-eol-') as temp:
+            root=Path(temp)
+            def git(*args):
+                return subprocess.run(['git','-C',str(root),*args],check=True,capture_output=True)
+            git('init','-q')
+            original=(ROOT/'openpaw-core.api.json').read_bytes()
+            (root/'openpaw-core.api.json').write_bytes(original)
+            (root/'.gitattributes').write_bytes((ROOT/'.gitattributes').read_bytes())
+            git('add','.gitattributes','openpaw-core.api.json')
+            output=root/'checkout'
+            output.mkdir()
+            git('-c','core.autocrlf=true','checkout-index','--all','--prefix='+output.as_posix()+'/')
+            self.assertEqual((output/'openpaw-core.api.json').read_bytes(),original)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='openpaw-governance-test-')
         self.addCleanup(self.temp.cleanup)
