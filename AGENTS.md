@@ -42,4 +42,6 @@ python governance/verify.py --suite all --output <仓库外证据目录>
 
 当前实现/精确行为见 governance/README.md。工作区尚未提交时可用 comments/pr-check 的 --worktree；该模式包括用户未提交改动，越界必须报告，不能偷偷忽略。提交前只暂存本 CHG 授权文件。
 
+初期按 docs/engine-host/master.md 第14节先核查本Tx里程碑及Office文档→方案→代码/测试证据，必需项和双平台验证全部满足才创建PR（含Draft）。先push Tx开发分支取得原生CI，不为触发CI先开PR；已有T0 #4保留Draft迭代，不能以旧PR绕过核查。主CHG记录核查版本/结论，技术核查不是人工批准。PR批准并合入后同步master里程碑、主CHG及交接的实际PR/审核/合入记录，才标已完成。
+
 初期每 Tx 独立 PR，目标 merge/ai-ofice-react-overagent；上一 Tx 当前提交获批并合入才开始下一 Tx，等待只处理当前 PR。T0—T8 全部约定范围验收后登记阶段结束，转 CHG 持续开发，取消 Tx 串行要求，正常 PR/文档/测试/Rx 规则保留。CI 通过不代替非作者审核。使用 DCO Signed-off-by，禁止自动合入和强推。

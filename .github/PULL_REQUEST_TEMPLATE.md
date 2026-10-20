@@ -21,7 +21,12 @@
 
 ## Engine Host Tx handoff (required for T0–T8)
 
-- Tx / integration base / previous approved-and-merged PR:
+- Tx / milestone M / integration base / previous approved-and-merged PR:
+- Pre-PR milestone audit: checked revision/content hash, each required output, Linux/Windows evidence, unresolved items and conclusion (master §14.3):
+- Pinned Office document/Schema section → master implementation anchor → actual code/test/evidence:
+- [ ] Required milestone outputs and pre-PR native checks passed before this PR was created (existing T0 #4 records its Draft revision history separately)
+- Milestone state: pending / implementing / blocked / PR review / approved awaiting merge / completed; PR creation is not completion.
+- After approval and merge: master §14 milestone row, main CHG history, real approved commit/merge SHA/date and handoff are synchronized. Pending events stay pending.
 - Outputs and behavior before/after:
 - Reused / extended / fixed / new; why new code is necessary:
 - Defect IDs / Office Rx approval and linked cross-repository PR:

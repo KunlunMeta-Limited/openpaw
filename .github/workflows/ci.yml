@@ -1,7 +1,14 @@
 name: ci
 on:
   push:
-    branches: [main, merge/ai-ofice-react-overagent]
+    # Tx branches need native evidence before their PR is created.
+    branches:
+      - main
+      - merge/ai-ofice-react-overagent
+      - 'docs/engine-host-t*'
+      - 'fix/engine-host-t*'
+      - 'feat/engine-host-t*'
+      - 'test/engine-host-t*'
   pull_request:
 
 env:
@@ -162,6 +169,11 @@ jobs:
           REPORT_ROOT: ${{ runner.temp }}/openpaw-governance-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           $base = $env:REVIEW_BASE
+          # Check the entire Tx against its integration base before a PR exists.
+          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_NAME -match '^(docs|fix|feat|test)/engine-host-t') {
+            $base = git merge-base $env:REVIEW_HEAD origin/merge/ai-ofice-react-overagent
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           if (-not $base -or $base -match '^0+$') {
             $base = git rev-parse "$($env:REVIEW_HEAD)^"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
