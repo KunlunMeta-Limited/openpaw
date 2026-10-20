@@ -21,7 +21,9 @@ def execute(argv, cwd, log, timeout):
     started = time.monotonic()
     with log.with_suffix('.stdout.log').open('wb') as out, log.with_suffix('.stderr.log').open('wb') as err:
         try:
-            process = subprocess.Popen(argv, cwd=cwd, stdout=out, stderr=err, start_new_session=os.name != 'nt')
+            # Windows runner的管道默认可能是CP1252；Python子命令也必须能输出中文。
+            child_env = dict(os.environ, PYTHONUTF8='1', PYTHONIOENCODING='utf-8')
+            process = subprocess.Popen(argv, cwd=cwd, stdout=out, stderr=err, env=child_env, start_new_session=os.name != 'nt')
             try:
                 code = process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -105,6 +107,10 @@ def metadata(root):
 
 
 def main():
+    # 显式覆盖重定向管道的系统编码，避免中文进度在检查开始前崩溃。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--suite', choices=['all','rust','quality','contracts','governance'], default='all')
     parser.add_argument('--output', type=Path, required=True)

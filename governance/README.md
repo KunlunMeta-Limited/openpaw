@@ -16,7 +16,7 @@ cargo run --locked -p xtask -- comments --base <集成提交> --head HEAD
 python governance/verify.py --suite all --base <集成提交> --head HEAD --output <仓库外新目录>
 ~~~
 
-Python3.11+标准库，无新Python运行依赖。Rust stable/MSRV1.88、Node24.19.0、cargo-deny0.20.2和锁定npm依赖先按测试规范准备。commands.json是命令单一注册源；套件rust/quality/contracts/governance/all。脚本使用argv且不经shell，保存每步退出码/时长/stdout/stderr/版本/工作树摘要；超时记124，缺命令记127。失败仍保存报告并执行其余命令，全部完成且源摘要不变才通过；报告目录已存在则拒绝覆盖。源码含密钥时不得把日志/报告公开，工具不收集完整环境。验证工具不是运行服务的取消实现。
+Python3.11+标准库，无新Python运行依赖。Rust stable/MSRV1.88、Node24.19.0、cargo-deny0.20.2和锁定npm依赖先按测试规范准备。commands.json是命令单一注册源；套件rust/quality/contracts/governance/all。脚本使用argv且不经shell，保存每步退出码/时长/stdout/stderr/版本/工作树摘要；超时记124，缺命令记127。失败仍保存报告并执行其余命令，全部完成且源摘要不变才通过；报告目录已存在则拒绝覆盖。源码含密钥时不得把日志/报告公开，工具不收集完整环境。验证器显式使用UTF-8输出，并向Python子命令传递UTF-8模式，避免Windows重定向管道的CP1252编码失败；其他工具的原始日志仍原字节保存。验证工具不是运行服务的取消实现。
 
 pr-check直接读取固定head Git对象，校验该版本CHG/文件操作/保护声明与真实base→head diff；工作区脏文件不能改变已提交检查结果。--worktree显式包括未跟踪文件和所有本地改动，越界即失败。恰好一主CHG，历史CHG不能删除/重命名；本仓profile不允许Office混入。重命名登记两端；必改缺失与新增越界失败；条件项未用输出清单。比较base/head更严格保护等级与风险。允许表只接受准确路径，不接受全仓通配。
 

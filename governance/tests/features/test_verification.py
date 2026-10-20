@@ -1,5 +1,6 @@
 """验证执行器功能测试：运行真实子进程并检查失败记录。"""
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,20 @@ class RunnerTests(unittest.TestCase):
             result=verify.run_one({'id':'TREE','argv':[sys.executable,'-c',"print('axum v1')"], 'cwd':'.','reject_stdout_prefix':'axum v'},root,root,10,{})
             self.assertEqual(result['exit_code'],1)
             with self.assertRaises(ValueError): verify.run_one({'id':'X','argv':[], 'cwd':'..'},root,root,10,{})
+
+    def test_redirected_legacy_encoding_and_child_chinese_output(self):
+        # 在Linux也重现Windows的CP1252管道；验证入口和真实Python子命令两端。
+        with tempfile.TemporaryDirectory(prefix='openpaw-encoding-') as temp:
+            output=Path(temp)/'existing'
+            output.mkdir()
+            env=dict(os.environ,PYTHONIOENCODING='cp1252',PYTHONUTF8='0')
+            result=subprocess.run([sys.executable,str(ROOT/'governance/verify.py'),
+                '--output',str(output),'--timeout','0'],capture_output=True,env=env)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('timeout必须大于零',result.stderr.decode('utf-8'))
+            result=verify.execute([sys.executable,'-c',"print('中文验证')"],Path(temp),Path(temp)/'child',10)
+            self.assertEqual(result['exit_code'],0)
+            self.assertEqual((Path(temp)/'child.stdout.log').read_bytes(),'中文验证\n'.encode('utf-8') if os.name != 'nt' else '中文验证\r\n'.encode('utf-8'))
 
     def test_no_overwrite_existing_report(self):
         with tempfile.TemporaryDirectory(prefix='openpaw-report-') as temp:
