@@ -73,9 +73,9 @@ pub async fn exec_sandboxed(
             return linux::exec_bwrap(policy, command, cwd).await;
         }
         // Fail closed: cannot enforce a restricted policy without bwrap
-        return Err(SandboxError::PlatformUnavailable(
+        Err(SandboxError::PlatformUnavailable(
             "bwrap not found on Linux; cannot enforce restricted sandbox policy".to_string(),
-        ));
+        ))
     }
 
     #[cfg(target_os = "macos")]
@@ -84,14 +84,14 @@ pub async fn exec_sandboxed(
             return macos::exec_seatbelt(policy, command, cwd).await;
         }
         // Fail closed: cannot enforce a restricted policy without sandbox-exec
-        return Err(SandboxError::PlatformUnavailable(
+        Err(SandboxError::PlatformUnavailable(
             "sandbox-exec not found on macOS; cannot enforce restricted sandbox policy".to_string(),
-        ));
+        ))
     }
 
     #[cfg(target_os = "windows")]
     {
-        return windows::exec_restricted(policy, command, cwd).await;
+        windows::exec_restricted(policy, command, cwd).await
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

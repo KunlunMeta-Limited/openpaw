@@ -9,8 +9,8 @@
 //! - `--bind <dir> <dir>`: Mount directory writable
 //! - `--share-net`: Re-share network (for policies that allow network)
 //!
-//! Enhanced with Landlock/Seccomp detection, hostname isolation,
-//! and resource limits via bwrap flags.
+//! Kernel diagnostics are test-only; they do not enable Landlock enforcement.
+//! Runtime isolation is provided by bwrap.
 
 use std::path::Path;
 use std::time::Instant;
@@ -29,6 +29,7 @@ pub fn is_bwrap_available() -> bool {
 ///
 /// Landlock requires kernel >= 5.13 and the `landlock` syscall to be available.
 /// This is a best-effort check; actual enforcement depends on kernel support.
+#[cfg(test)]
 pub fn is_landlock_available() -> bool {
     // Check kernel version
     let version = get_kernel_version();
@@ -36,6 +37,7 @@ pub fn is_landlock_available() -> bool {
 }
 
 /// Get the Linux kernel version as (major, minor).
+#[cfg(test)]
 fn get_kernel_version() -> Option<(u32, u32)> {
     let output = std::process::Command::new("uname")
         .arg("-r")
@@ -47,6 +49,7 @@ fn get_kernel_version() -> Option<(u32, u32)> {
 }
 
 /// Parse a kernel version string like "5.15.0-generic" into (5, 15).
+#[cfg(test)]
 fn parse_kernel_version(version: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = version.trim().split('.').collect();
     if parts.len() < 2 {
@@ -215,6 +218,7 @@ pub async fn exec_bwrap(
 /// Get the list of available sandbox backends on Linux.
 ///
 /// Returns a list of backend names that are available, in order of preference.
+#[cfg(test)]
 pub fn available_backends() -> Vec<&'static str> {
     let mut backends = Vec::new();
     if is_bwrap_available() {
@@ -249,7 +253,7 @@ mod tests {
     #[test]
     fn landlock_requires_5_13() {
         // Verify our version check logic
-        assert!(is_landlock_available() || get_kernel_version().map_or(true, |v| v < (5, 13)));
+        assert!(is_landlock_available() || get_kernel_version().is_none_or(|v| v < (5, 13)));
     }
 
     #[test]
