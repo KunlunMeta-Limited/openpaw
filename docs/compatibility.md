@@ -92,14 +92,14 @@ The commitments above are enforced by CI, not by trust. Gate inventory
 
 | Gate | What it asserts |
 |---|---|
-| Q1 `xtask lines` | per-crate business-line budgets (AST-counted). |
+| Q1 `xtask lines` | informational per-crate business-line statistics (AST-counted); no size caps. |
 | Q2 `cargo-deny` | dependency whitelist / banned dependencies. |
 | Q3 `xtask telemetry` | zero telemetry: dependency names + source symbols. |
 | Q4 `xtask smoke-offline` | offline smoke: hello → doctor → evolve end-to-end. |
 | Q5 reflect assertions | reflect artifacts always carry `unverified: true` (100% ratio over persisted stores). |
 | Q6 `xtask golden` | golden bidirectional read/write for frontmatter + session JSONL + D8 schema samples. |
 | Q7 `xtask snapshot --check` | public trait signature snapshot of `openpaw-core`; drift is a red build. |
-| Q8 build/scale budgets | cold build < 5 min, onboarding success rate, ≤ 50k core lines. |
+| Q8 build/scale budgets | cold build < 5 min and onboarding success rate; numeric line limits retired by Host T0. |
 | Q9 human-alignment assertions | `requires_human_alignment` defaults to `true` and overrides must preserve it. |
 | Q10 `xtask scrub --check` | porting hygiene: banned identifiers / task-id patterns / internal doc names, zero hits. |
 

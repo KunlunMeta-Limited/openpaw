@@ -101,7 +101,7 @@ Verify your build the way CI does:
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-cargo run -p xtask -- lines        # per-crate line budgets
+cargo run -p xtask -- lines        # informational AST line statistics
 cargo run -p xtask -- golden       # knowledge-format round-trips
 ```
 
@@ -279,9 +279,8 @@ The 12 subcommands (plus the informational `sidecar` and the global
 
 ## Quality gates
 
-CI enforces ten gates, including: line-budget ceilings per crate asserted
-via AST parsing (currently 29,262 total business lines of the 50,000
-core-nine budget), a dependency whitelist, a zero-telemetry symbol scan,
+CI retains AST-based line statistics for review, without numeric size caps.
+The other gates include a dependency whitelist, a zero-telemetry symbol scan,
 an offline smoke test, golden-file round-trips, trait-snapshot checks, a
 cold-build time budget, human-alignment invariants, and a
 secrets/internal-terms scrub.
@@ -294,8 +293,9 @@ secrets/internal-terms scrub.
   markdown files with YAML frontmatter you can read, edit, and sync.
 - **Human alignment is non-negotiable** — every knowledge-writing policy
   must keep `requires_human_alignment() == true`; CI enforces it.
-- **Small core** — the workspace carries a hard line budget per crate
-  (core nine total: 50,000 business lines), asserted in CI.
+- **Reuse the core** — keep protocol adapters in the Host and reuse existing
+  engine, tools and storage. Review responsibilities and dependencies rather
+  than file or crate line counts.
 
 ## License
 

@@ -1,7 +1,7 @@
 //! xtask — workspace engineering scripts.
 //!
 //! Commands:
-//! - `lines`            per-crate business-line count vs budget caps (Q1)
+//! - `lines`            informational per-crate business-line statistics (Q1)
 //! - `scrub --check`    porting-hygiene banned-word scan (Q10)
 //! - `port`             semi-automatic crate porting with renames + precheck
 //! - `snapshot [--check]` public trait signature snapshot of openpaw-core (Q7)

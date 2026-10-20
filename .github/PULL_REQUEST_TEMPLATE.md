@@ -4,10 +4,10 @@
 
 ## Self-check list
 
-- [ ] `cargo test --workspace` green
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` clean
+- [ ] `cargo test --locked --workspace` and relevant feature tests recorded
+- [ ] `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` clean
 - [ ] `cargo fmt --all -- --check` clean
-- [ ] `cargo xtask lines` — budgets respected (no per-crate cap exceeded)
+- [ ] `cargo run -p xtask -- lines` — informational statistics attached (no size cap)
 - [ ] `cargo xtask scrub --check` — no banned words
 - [ ] `cargo xtask stability` — all public items still tagged
 - [ ] `cargo xtask smoke-offline` — offline path still green
@@ -18,4 +18,26 @@
 ## Change type
 
 <!-- Post-M6: bugfix / feature (additive) / docs / RFC-required (breaking or MSRV) -->
+
+## Engine Host Tx handoff (required for T0–T8)
+
+- Tx / integration base / previous approved-and-merged PR:
+- Outputs and behavior before/after:
+- Reused / extended / fixed / new; why new code is necessary:
+- Defect IDs / Office Rx approval and linked cross-repository PR:
+- Public interface / contract / data migration and rollback:
+
+| OS and toolchain | Command | Exit code | Evidence / not run and why |
+| --- | --- | --- | --- |
+| Linux | | | |
+| Windows native | | | |
+
+- [ ] Contract/type, build, unit, runtime and browser results are distinguished
+- [ ] Missing or skipped required checks are not reported as passing
+- [ ] Next Tx interfaces, fixtures and remaining blockers are documented
+- Reviewer / approved commit / merge SHA: pending until explicitly reviewed
+
+Author approval and green CI do not approve a Tx. Start the next Tx only after
+the current PR is approved by the user/designated reviewer and merged. See
+docs/engine-host/handoff.md. Office R1 requires its own design approval.
 

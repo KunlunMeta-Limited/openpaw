@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, merge/ai-ofice-react-overagent]
   pull_request:
 
 env:
@@ -28,7 +28,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     runs-on: ${{ matrix.os }}
@@ -39,7 +40,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: cargo test --locked --workspace
+      - run: cargo test --locked --workspace --all-features
+      # T0 wires the opt-in dependency only; runtime/CLI behavior arrives in T3.
+      - run: cargo build --locked -p openpaw-cli --features engine-host,sidecar
+      - name: Default CLI does not pull in the Host HTTP framework
+        shell: pwsh
+        run: |
+          $tree = cargo tree --locked -p openpaw-cli --edges normal --prefix none
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($tree -match '^axum v') { throw 'default CLI unexpectedly depends on axum' }
 
   msrv:
     # compatibility.md §2 declares an MSRV floor of 1.88. This job enforces
@@ -58,7 +68,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --locked --workspace --all-targets
+      - run: cargo check --locked --workspace --all-targets --all-features
+
+  host-contracts:
+    name: host-contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: tests/engine-host-contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+          cache-dependency-path: tests/engine-host-contracts/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run prepare:office
+      - run: npm run check
+      - run: npm test
 
   quality-gates:
     runs-on: ubuntu-latest
@@ -66,7 +99,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Q1 line budgets
+      # Q1 informational AST statistics; parse/read errors still fail.
       - run: cargo run -p xtask -- lines
       # Q10 porting hygiene
       - run: cargo run -p xtask -- scrub --check

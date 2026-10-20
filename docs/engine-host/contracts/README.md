@@ -1,0 +1,89 @@
+# 冻结的接入契约
+
+本目录与 tests/engine-host-contracts 同时审核。sources.json 固定 Office 提交、文档/Schema/示例/测试入口 SHA-256，以及 SDK 包版本/integrity。锁文件只用于测试，不把 Node 或 SDK 引入 Host 生产依赖。
+
+Office 原仓不能匿名下载。upstream-office 是九个原始协议 Schema 与 LICENSE 的只读测试快照，非 Host 实现或手写替代 Schema。默认准备流程验证快照哈希、无网络；传 --office-source 时从固定 git commit 校验全部 21 份来源并刷新测试快照，不读取工作区未提交改动。升级先审源码/契约，再同步 commit、哈希和 fixtures，不手改快照。
+
+## Office：v1 官方服务
+
+Host → POST /api/pawoffice/messages，Bearer 仅服务端持有。外部消息包括 capabilities、initialize、snapshot、read、decision.request、ui.next/respond；场景走 teamId+command 现有 v2。Host 不向 Office 发送旧 actions gateway 格式。
+
+| 规则 | 必须实现的语义 |
+|---|---|
+| JSON | 任意深度无 null，无 __proto__，最大嵌套 64；严格字段 |
+| 容量 | messages 请求 65536 UTF-8 字节；员工≤200、任务≤1000、事件≤500；缓存≤100办公室/8MiB |
+| 快照 | schemaVersion 1.0，seq 1..9007199254740991，每办公室持久递增；完整替换，省略字段按默认清空 |
+| 重试 | 同 seq 同规范化内容重同步，不改时间；同 seq 异内容 409；旧 seq ignored |
+| 确认 | 200/applied 是浏览器逻辑确认；202/cached 仅缓存（离线或等待容量满）；请求失败可能已经缓存 |
+| 恢复 | Office Fastify 状态内存存储，重启必须重新初始化；read 不是宿主账本 |
+| 菜单 | 默认60秒，最多300秒；仅在线展示，超时/断开不批准；Host 审批 ID 与 display ID 分离 |
+| UI领取 | 全局单 poller，最多等30秒；领取即删除投递资格，无 ACK/租约/requeue，可能丢失一次操作 |
+| 详情 | detail-v1，标题160、说明4000、字段≤30（label100/value2000）、按钮≤8；纯文本、分页，不新建侧栏 |
+| 场景 | 命令唯一 ID、batch≤32；HTTP 200不等于动画执行确认，离线临时动画不回放 |
+| 交接 | task.assigned 稳定事件可自动访问，不再额外重复 visit |
+| 状态 | queued/running/blocked/completed/failed；取消/中断映射 failed 并给原因；进度未知 -1，不伪测CPU/内存 |
+| 白板 | task-board-v1 最多3步骤；前端平滑进度不是业务真实进度 |
+
+NDJSON 请求：version=1.0、teamId、conversationId、messages；事件 status(thinking/streaming)、delta(text)、done、error(message)。不擅加 runId/cursor 到严格 v1 事件。
+
+输入≤4000、回复≤50000，历史最多10轮且≤100000，行≤32000，delta≤16000；浏览器相关逻辑按 JS UTF-16。当前固定 Zod 的 max(string) 按 Unicode code point，不能把 Schema 通过当成浏览器长度也通过：Host 使用更保守的 UTF-16 分片/总长度保证两者。请求总时限180秒，心跳不重置。v1断开取消，刷新原实现标停止。空输出/错误不发正常 done。
+
+Fixtures 验证 Schema 的规范化、引用关系、数量/字段、场景绑定、无null/深度、响应形状。seq 冲突/缓存/浏览器应用等运行语义要在 T4 真服务测试，不能靠本阶段 fixtures 声称通过。
+
+## OpenCode：SDK 1.18.15 真实 v1
+
+从 @opencode-ai/sdk 根导入，不使用 ./v2。T0 用真实 SDK 构造请求并用真实迭代器解析 loopback fixture SSE；T7 换为真实 Host，不写平行协议服务冒充实现。
+
+| 旧 master-plan 内容 | 冻结的真实 v1 |
+|---|---|
+| permission.asked | permission.updated，properties 为 Permission |
+| POST /permission/:id/reply，reply 字段 | POST /session/{id}/permissions/{permissionID}，body.response once/always/reject，200 boolean |
+| permission.replied 的 requestID | sessionID、permissionID、response |
+| message.part.delta | message.part.updated，properties.part 与可选 delta |
+| session.created/updated 平铺 | properties.info: Session |
+| global SSE 与普通事件同体 | /global/event 返回 {directory,payload:Event}；/event 直接 Event |
+| 简化 Session | id/projectID/directory/title/version/time，必填按 SDK |
+| 简化 message | user 含 agent/model；assistant 含 parentID、model/provider、mode、path、cost、tokens |
+| running tool 不带 time | 每种 tool state 按 SDK 必填 input/time/output/title/metadata |
+| provider 只有 id/name | all/default/connected，模型能力、limit、options 等完整类型 |
+| 未配置 Provider 也 connected | 仅实际可用项 connected |
+| 未支持写接口假204 | 501 + 明确结构错误，SDK throwOnError 走失败 |
+| 忽略非文本 part | 首期拒绝400，不能静默丢内容 |
+
+| 方法/路径 | 成功结果 |
+|---|---|
+| GET /global/health | {healthy:true}，宿主发现端点，不宣称 SDK 有此方法 |
+| POST /session | Session，接受 title |
+| GET /session | Session[] |
+| GET /session/:id | Session |
+| GET /session/:id/message | {info:Message,parts:Part[]}[] |
+| GET /session/:id/todo | Todo[]，来自真实 Todo 查询，空数据才 [] |
+| GET /session/status | sessionID→busy/idle 状态，终态不继续 busy |
+| POST /session/:id/prompt_async | 持久化接受后204 |
+| POST /session/:id/abort | 200 boolean，取消幂等；状态仍需等清理 |
+| POST /session/:id/permissions/:permissionID | 200 boolean |
+| GET /provider | 完整 ProviderListResponse |
+| GET /event | data: Event 加空行 |
+| GET /global/event | data: GlobalEvent 加空行 |
+| GET /api/event | 仅保留旧 attached 兼容别名，映射 /event，同一订阅服务 |
+| GET /config、/mcp | {}，本期只读降级 |
+| GET /command、/project、/agent、/find/file | []，明确能力不支持 |
+| POST command/shell/fork/revert/summarize | 501，不执行、不造成功 |
+| v2 路径 | 404 |
+
+错误：400 非法/不支持输入或模型；401 Basic；403 工作区未授权；404资源不存在；409 active冲突；503运行容量；501不支持操作。错误字段按 SDK 可表达的 name/data 形状，T7 实测具体失败提示，不能依赖客户端对空204抛错。
+
+Basic：OPENCODE_SERVER_USERNAME/PASSWORD 都无仅loopback关认证，只配一个启动失败，两者都有保护所有 OpenCode 路由。Office 协议鉴权独立，不把 Basic 密码放浏览器。
+
+attached：OPENWORK_OPENCODE_BASE_URL、OPENWORK_OPENCODE_USERNAME/PASSWORD 供未来 OpenWork server 使用；不 managed spawn。监听127.0.0.1:0，精确stdout一条就绪标记：
+    opencode server listening on http://127.0.0.1:<port>
+
+目录：x-opencode-directory > query.directory > 默认，白名单根+Session固定归属。SDK GET 会将目录转 query，POST 目录 header 是 encodeURIComponent 结果；只按 SDK 实际编码解码一次再作路径校验，不接受双解码绕过。
+
+SSE：session/message先声明再 part；permission.updated 可重同步同ID；成功回复后 permission.replied；终态 status idle/session.idle。未知成本/usage按实际未测口径表示，不伪造真实模型计费。全局事件必须用正确目录包装。
+
+always 首期与 once 等价，只批准本次调用，不建立永久规则；这是明确的兼容限制。SSE断开不取消，重连查询快照/状态/待审批，不发明 v2 event。SDK v1 SSE 内部使用 global fetch 而非 config.fetch，T0 使用真实本地HTTP fixture 避免错误 transport mock 产生“通过”。
+
+## R1/R2/R3 与升级
+
+R1 见 r1-chat.md，单独批准；R2/R3 本期不改。协议升级必须先更新此文档、来源锁、正反例及评审，再修改 Host。不能让 Office 无null规则污染 OpenCode DTO，不能因 SDK 类型变化改核心协议。

@@ -18,9 +18,9 @@ Or use `git commit -s`.
 
 - **No telemetry, ever.** PRs adding network calls must pass the network
   audit review; the binary must stay fully functional offline.
-- **Line budgets are hard limits.** Per-crate budgets are asserted in CI
-  (`cargo xtask lines`). If your change exceeds a budget, the review
-  conversation is about what to remove, not about raising the cap.
+- **Line counts are informational.** `cargo xtask lines` reports AST-based
+  statistics without numeric caps. Review reuse, responsibilities, dependency
+  direction and tests; do not move or duplicate code to satisfy a size metric.
 - **`unsafe` is forbidden** workspace-wide, with a single crate-level
   exemption: `openpaw-sandbox`, whose OS-FFI backends (restricted tokens,
   job objects) are the only sanctioned `unsafe` (every block carries a

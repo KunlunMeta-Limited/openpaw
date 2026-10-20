@@ -13,12 +13,15 @@ path = "src/main.rs"
 
 [features]
 default = []
-# MCP sidecar server (rmcp); single-line budget ≤2,000 (plan section 3.9)
+# MCP sidecar server (rmcp).
 sidecar = ["dep:rmcp"]
+# T0 only wires the opt-in build surface; the Host command is delivered in T3.
+engine-host = ["dep:openpaw-engine-host", "openpaw-engine-host/engine-host"]
 
 [dependencies]
 openpaw-core.workspace = true
 openpaw-engine.workspace = true
+openpaw-engine-host = { workspace = true, optional = true }
 openpaw-goal-ledger.workspace = true
 openpaw-llm.workspace = true
 openpaw-memory.workspace = true

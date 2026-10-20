@@ -1,9 +1,8 @@
-//! `xtask lines` — per-crate business-line counting vs budget caps (Q1).
+//! `xtask lines` — informational per-crate business-line statistics.
 //!
-//! Counts business lines with a syn AST: total file lines minus lines
-//! belonging to `#[cfg(test)]` items (recursively). `tests/` directories
-//! count toward the shared "tests and helpers" budget. Regex or
-//! brace-counting is deliberately not used (string literals break them).
+//! T0 removes numeric size gates. Keep the existing AST-based counter so review
+//! can see growth without encouraging duplicate modules or moving compatibility
+//! code into core crates to satisfy a cap. Parse/read errors still fail.
 
 use anyhow::Result;
 use quote::ToTokens;
@@ -11,108 +10,61 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 
-/// Per-crate business-line caps (engineering plan section 1.3, v1.2).
-const CRATE_CAPS: &[(&str, usize)] = &[
-    ("openpaw-core", 5_000),
-    ("openpaw-engine", 8_200),
-    ("openpaw-llm", 5_200),
-    ("openpaw-tools", 14_000),
-    ("openpaw-mcp", 2_400),
-    ("openpaw-store", 2_000),
-    ("openpaw-memory", 7_400),
-    ("openpaw-plugins", 1_300),
-    ("openpaw-cli", 4_500),
-    ("openpaw-reflect-lite", 3_000),
-    ("openpaw-engine-host", 2_000),
-    ("openpaw-goal-ledger", 2_000),
-    // Local sandbox (plan section 3.4 budget lives in the tools domain; the
-    // crate is standalone for the crate-level unsafe allowance, D-9).
-    ("openpaw-sandbox", 4_500),
-];
-
-/// Shared budget for xtask + all test directories ("tests and helpers").
-const AUX_CAP: usize = 10_000;
-
 pub fn run(root: &Path) -> Result<()> {
     let crates_dir = root.join("crates");
+    let mut crates: Vec<PathBuf> = std::fs::read_dir(&crates_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<_>>()?;
+    crates.retain(|path| path.join("Cargo.toml").is_file());
+    crates.sort();
+
     let mut total_business = 0usize;
-    let mut violations = Vec::new();
-    let mut rows: Vec<(String, usize, usize)> = Vec::new(); // name, business, cap
-
-    for (name, cap) in CRATE_CAPS {
-        let src = crates_dir.join(name).join("src");
-        let business = count_business_lines(&src)?;
-        total_business += business;
-        rows.push((name.to_string(), business, *cap));
-        if business > *cap {
-            violations.push(format!(
-                "{name}: {business} business lines exceed cap {cap}"
-            ));
-        }
-    }
-
-    // Aux budget: xtask src + every crate's tests/ directory.
     let mut aux = count_business_lines(&root.join("xtask/src"))?;
-    for entry in std::fs::read_dir(&crates_dir)? {
-        let entry = entry?;
-        let tests = entry.path().join("tests");
-        if tests.is_dir() {
-            aux += raw_line_count_dir(&tests)?;
-        }
+    println!("{:<28}{:>12}", "crate", "business");
+    for path in crates {
+        let name = path
+            .file_name()
+            .expect("crate path has a name")
+            .to_string_lossy();
+        let business = count_business_lines(&path.join("src"))?;
+        total_business += business;
+        aux += raw_line_count_dir(&path.join("tests"))?;
+        println!("{name:<28}{business:>12}");
     }
-    if aux > AUX_CAP {
-        violations.push(format!("aux (tests+xtask): {aux} exceeds cap {AUX_CAP}"));
-    }
-
-    println!(
-        "{:<24}{:>10}{:>10}{:>10}",
-        "crate", "business", "cap", "headroom"
-    );
-    for (name, business, cap) in &rows {
-        let headroom = cap.saturating_sub(*business);
-        let flag = if business > cap { " !OVER" } else { "" };
-        println!("{name:<24}{business:>10}{cap:>10}{headroom:>10}{flag}");
-    }
-    println!("{:<24}{:>10}{:>10}", "core nine total budget", "50000", "—");
-    println!("{:<24}{:>10}{:>10}", "aux (tests+xtask)", aux, AUX_CAP);
-    println!("{:<24}{:>10}", "TOTAL business", total_business);
-
-    if violations.is_empty() {
-        println!("lines: all budgets respected");
-        Ok(())
-    } else {
-        for v in &violations {
-            eprintln!("VIOLATION: {v}");
-        }
-        std::process::exit(1);
-    }
+    println!("{:<28}{:>12}", "tests + xtask", aux);
+    println!("{:<28}{:>12}", "TOTAL business", total_business);
+    println!("lines: informational only; no file or crate size limits");
+    Ok(())
 }
 
-/// Walk `src/`, parse each .rs file, subtract cfg(test) item lines.
 fn count_business_lines(src: &Path) -> Result<usize> {
     if !src.is_dir() {
         return Ok(0);
     }
     let mut total = 0usize;
-    for path in rust_files(src) {
+    for path in rust_files(src)? {
         total += count_business_lines_file(&path)?;
     }
     Ok(total)
 }
 
-fn rust_files(dir: &Path) -> Vec<PathBuf> {
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.path().to_path_buf())
-        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
-        .collect()
+fn rust_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.try_exists()? {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in walkdir::WalkDir::new(dir) {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.path().extension().is_some_and(|e| e == "rs") {
+            paths.push(entry.into_path());
+        }
+    }
+    Ok(paths)
 }
 
 fn raw_line_count_dir(dir: &Path) -> Result<usize> {
     let mut total = 0usize;
-    for path in rust_files(dir) {
+    for path in rust_files(dir)? {
         total += std::fs::read_to_string(&path)?.lines().count();
     }
     Ok(total)

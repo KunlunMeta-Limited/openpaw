@@ -1038,6 +1038,7 @@ dependencies = [
  "clap",
  "openpaw-core",
  "openpaw-engine",
+ "openpaw-engine-host",
  "openpaw-goal-ledger",
  "openpaw-llm",
  "openpaw-memory",
