@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -40,6 +41,24 @@ def execute(argv, cwd, log, timeout):
             err.write(str(error).encode('utf-8'))
             code = 127
     return {'argv': argv, 'exit_code': code, 'seconds': round(time.monotonic()-started, 3)}
+
+
+def validate_registry(commands):
+    """验证日志标识、套件与argv，避免重复编号覆盖证据或目录越界。"""
+    seen=set()
+    if not commands:
+        raise ValueError('命令注册表为空')
+    for command in commands:
+        identifier=command['id']
+        if not re.fullmatch(r'TEST-[A-Z0-9-]+',identifier) or identifier in seen:
+            raise ValueError('命令编号不合法或重复')
+        seen.add(identifier)
+        if command['suite'] not in {'rust','quality','contracts','governance'}:
+            raise ValueError('未知验证套件')
+        if not isinstance(command['argv'],list) or not command['argv'] or not all(isinstance(a,str) and a for a in command['argv']):
+            raise ValueError('argv必须是非空字符串数组')
+        if command['platforms'] != ['linux','windows']:
+            raise ValueError('必须明确双平台')
 
 
 def run_one(command, root, output, timeout, substitutions):
@@ -102,12 +121,13 @@ def main():
     before = metadata(ROOT)
     report = {'schema':'openpaw/verification/v1', 'started_at':dt.datetime.now(dt.timezone.utc).isoformat(),
               'metadata':before,'suite':args.suite,'base':args.base,'head':args.head,'results':[], 'complete':False}
-    registry = json.loads((ROOT/'governance/commands.json').read_text(encoding='utf-8'))['commands']
-    selected = [c for c in registry if args.suite in ['all', c['suite']]]
-    if not selected:
-        raise ValueError('套件没有注册命令')
-    current = 'windows' if os.name == 'nt' else 'linux' if sys.platform.startswith('linux') else 'unsupported'
     try:
+        registry = json.loads((ROOT/'governance/commands.json').read_text(encoding='utf-8'))['commands']
+        validate_registry(registry)
+        selected = [c for c in registry if args.suite in ['all', c['suite']]]
+        if not selected:
+            raise ValueError('套件没有注册命令')
+        current = 'windows' if os.name == 'nt' else 'linux' if sys.platform.startswith('linux') else 'unsupported'
         for command in selected:
             if current not in command['platforms']:
                 raise ValueError('本机不在验证平台中：' + current)

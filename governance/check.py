@@ -63,7 +63,7 @@ class Reader:
         resolved = (self.root / path).resolve()
         if not resolved.is_relative_to(self.root):
             raise Failure("文件链接越出仓库：" + path)
-        return resolved.read_text(encoding="utf-8")
+        return resolved.read_bytes().decode("utf-8")
 
     def files(self) -> list[str]:
         if self._paths is not None:

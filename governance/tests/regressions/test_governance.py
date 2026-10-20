@@ -187,6 +187,11 @@ reason="需要保护"
         self.write('governance/identifiers.json',json.dumps({'ids':['REQ-OP-999']}))
         with self.assertRaisesRegex(check.Failure,'权威来源'): self.validate()
 
+    def test_framework_raw_newlines_are_part_of_hash(self):
+        path=self.root/'governance/vendor/framework_governance.py'
+        path.write_bytes(path.read_bytes().replace(b'\n',b'\r\n'))
+        with self.assertRaisesRegex(check.Failure,'哈希'):self.validate()
+
     def test_framework_hash_and_generated_index_trace_drift(self):
         valid = self.validate()
         generated=check.index_text(valid)

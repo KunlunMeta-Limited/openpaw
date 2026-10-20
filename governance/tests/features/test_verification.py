@@ -10,6 +10,12 @@ import verify
 import check
 
 class RunnerTests(unittest.TestCase):
+    def test_registry_cannot_overwrite_or_escape_evidence(self):
+        command={'id':'TEST-ONE','argv':['python','-V'],'suite':'governance','platforms':['linux','windows']}
+        verify.validate_registry([command])
+        for commands in [[command,command],[dict(command,id='../escape')],[dict(command,argv='echo pass')],[]]:
+            with self.assertRaises(ValueError):verify.validate_registry(commands)
+
     def test_real_exit_missing_command_timeout_and_dependency_guard(self):
         with tempfile.TemporaryDirectory(prefix='openpaw-runner-') as temp:
             root=Path(temp)
