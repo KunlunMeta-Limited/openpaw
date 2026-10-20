@@ -121,7 +121,7 @@ sequenceDiagram
 
 ### T0：基线、契约、复用台账与门禁
 
-**目标：**冻结源码事实和协议，不提前实现后续功能。D12—D15 是新发现的构建/测试/lint 基线阻塞，在 T0 各独立最小修复，不引入业务功能。
+**目标：**冻结源码事实和协议，不提前实现后续功能。D12—D15、D17—D23 是新发现的构建/测试/lint/依赖基线阻塞，在 T0 各独立最小修复，不引入业务功能。
 
 **实施方法：**
 - 更新本总计划，建立 audit、contracts、R1、validation、handoff。
@@ -129,6 +129,7 @@ sequenceDiagram
 - SDK 固定精确版本、lockfile 与完整类型 fixtures，验证 SDK 自身构造的路由及事件形状。
 - 扩展现有 CI 的 feature、Linux/Windows、MSRV、sidecar 共存和契约检查；CLI 仅增加 opt-in 依赖连线，不暴露未实现命令。
 - lines 改统计，更新 PR 模板；准备 Rust stable、MSRV 1.88、Node 24。
+- 依赖审计失败逐项修复并独立提交；YAML 公开类型调整和精确许可证例外见 dependency-baseline.md，须显式审核。
 
 **产物：**总计划与九卡；复用矩阵；D/R 台账；两协议请求/响应/流/错误 fixtures；运行/审批/锁/恢复状态；CI 和验证报告；待审 R1。
 
@@ -274,6 +275,7 @@ sequenceDiagram
 - 双平台真实 Office、Host、固定 SDK 同旅程；并行读写/审批/取消。
 - Host 崩溃、Office 重启、刷新/断线/磁盘错误/损坏；同 Run 多视角事实一致。
 - Linux/PowerShell 启动脚本共用配置；本机/同源代理示例，密钥不进 VITE_*。
+- 发布包附带 THIRD-PARTY-NOTICES.md 和 third-party-licenses/ 原文，检查来源与版本一致（D22）。
 - 回归 CLI/sidecar/default/v1；新问题编号，不加新功能；至少一轮真实 Provider，自动化使用确定性替身。
 
 **产物：**双平台报告与重跑入口；启动/关闭/备份/恢复/回退；最终能力与 D/R 台账；构建/版本/校验值；集成→main 最终 PR。

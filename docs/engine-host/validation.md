@@ -2,14 +2,14 @@
 
 日期：2026-10-20。OpenPaw 基线 `60a531a51172d14fc3db1a8e7eb6762c2c8369d8`；开发分支 `docs/engine-host-t0`；PR **仅指向 `merge/ai-ofice-react-overagent`**。本记录随 T0 提交，准确审核提交以 PR head 为准。
 
-状态：本地验证完成，远端 CI 初轮已启动，Windows 快照换行校验等问题修复中；尚未获得非作者批准或合入，T0 未关闭，T1 不开始。R1 设计待单独批准，Office 未修改。
+状态：本地验证完成，远端 CI 初轮已启动，第二轮 Windows 原生测试通过，最新依赖修复仍需远端复核；尚未获得非作者批准或合入，T0 未关闭，T1 不开始。R1 设计待单独批准，Office 未修改。
 
 ## 已交付入口
 
 | 产物 | 定位及性质 |
 |---|---|
 | 九阶段计划、运行/审批/锁/恢复图 | master.md；替换旧任务分配，不实现后续能力 |
-| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15、D17—D19 最小基线修正，D16 待查 |
+| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15、D17—D23 基线修正（含 YAML 类型兼容调整和待审许可证政策），D16 待查 |
 | 契约冻结及来源哈希 | contracts/README.md、sources.json；Office 固定 21 份来源，SDK 精确版本/integrity |
 | 真实类型/Schema/SDK fixtures | ../../tests/engine-host-contracts（从仓库根定位）；14 个测试，无跳过 |
 | PR 交接规范 | handoff.md、仓库 PR 模板 |
@@ -82,7 +82,7 @@ PowerShell 验证命令与上述 cargo 相同。契约包使用 `Set-Location te
 
 T1 输入：固定基线、audit.md D01—D04 的源码复现点、contracts 的正反例、默认 feature/旧接口兼容要求，以及同一 CI 和交接模板。T1 应补真实 Provider HTTP 请求捕获、各阶段取消、工具配对/压缩/损坏数据/写入失败回归；目前均未实现。
 
-T0 不改变数据格式、公开 core trait 或默认 CLI 命令，无数据迁移。回退为撤销本 Tx 的明确提交；不会删除会话/Office 数据。作者不自批、不合入。用户/指定审核人批准当前提交并合入集成分支后，才能开始 T1；R1 仍独立待审。
+T0 不改变数据格式、公开 core trait 或默认 CLI 命令，无数据迁移。D21 更换 YAML 后端，公开 Mapping/Error 类型身份变化，需要 Rust 下游同步依赖；详见 dependency-baseline.md 和 CHANGELOG.md，不能声明所有公开类型完全兼容。回退为撤销本 Tx 的明确提交；不会删除会话/Office 数据。作者不自批、不合入。用户/指定审核人批准当前提交并合入集成分支后，才能开始 T1；R1 仍独立待审。
 
 ## 远端初轮记录
 
@@ -93,3 +93,13 @@ PR #4 / Actions run 39359489541：Linux 契约通过；Windows 在 prepare:offic
 同轮 fmt、MSRV 和 Linux/Windows clippy 均通过；Linux/Windows workspace 测试因 macOS 失败被原 matrix fail-fast 取消，不能计作通过。quality-gates 的 RustSec 数据库含 CVSS 4.0，旧 cargo-deny-action v1 不能解析（D19）；升级官方 v2 固定提交（cargo-deny 0.20.2），完整保留 deny.toml 检查，等待新轮。
 
 本地补充验证：D18 四个 safety 单测通过；D17 在 ext4 临时 checkout 设置 core.autocrlf=true，全部 10 个原始快照（9 个 Schema 及 LICENSE）哈希匹配，未对验证输入做换行归一化。原生 Windows 结果仍以新 CI 为准。
+
+## 第二轮与依赖修复复验
+
+Actions run [39360307473](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39360307473)，对应 head 79335d3：Windows 原生 default/all-feature workspace tests、共存 build、默认依赖树均成功（12m14s）；macOS 测试、两平台 clippy/契约、fmt 和 MSRV 通过。Linux 默认测试通过，全 feature parity 的并发共享文件读到空内容（D23）；已隔离 replay 输出目录，保留原断言。quality 扫描工具已能正常读取公告库，发现原 lru/rustls/serde_yml 公告及既有许可证政策冲突，逐项独立提交修复（D20—D22）。本轮整体失败，不作为最终成功。
+
+依赖修复后 Linux 本地复验（Rust 1.99.1/1.88.0，ext4 target）：默认测试 891 passed，全 feature 903 passed，均 exit 0；既有 2 个 ignored 不变。全 feature clippy 初次因 D23 新 helper 的多余借用失败，修正后 exit 0；MSRV all-targets/all-features check exit 0。YAML 相关 Store/Memory/Goal/Reflect 和原 golden 均通过，未改 golden。原 core trait 无变化，YAML 公共类型迁移见专项说明。
+
+官方 cargo-deny 0.20.2 本地完整 `--workspace check` exit 0：advisories/bans/licenses/sources 全部 ok；保留重复依赖等原 warn 政策，未忽略公告。许可证成功基于 deny.toml 中显式精确版本例外，必须作为政策变化审核，不能当成原政策自动允许。随包许可证原文保留原字节及 SHA-256，T8 需验证分发。
+
+最新提交仍须完整远端 CI，最终检查以 PR 当前 head 为准；不能用上一轮 Windows 结果替代依赖更新后的原生验证。详细本地日志为 `/tmp/openpaw-t0-deps-*.log`、`openpaw-t0-yaml-regression.log`、`openpaw-t0-parity-final.log`、`openpaw-t0-deny-final.log`。

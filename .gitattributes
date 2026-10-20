@@ -1,2 +1,4 @@
 # Preserve the exact pinned Office bytes on Windows too; do not normalize hashes.
 /tests/engine-host-contracts/upstream-office/** -text
+# License notices carry original-source SHA-256 values as well.
+/third-party-licenses/** -text

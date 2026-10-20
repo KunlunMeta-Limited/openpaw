@@ -51,9 +51,13 @@ D16（待查，未修复）：默认 workspace 一次运行中 `file_lock::tests
 | D17 | T0 原始 Office 快照在 Windows checkout 被转换为 CRLF，哈希不同 | .gitattributes 仅该测试目录 -text，保留原始字节校验；T0 |
 | D18 | tools safety 测试把返回的 canonical 路径同非 canonical temp 根比较，macOS /var 链接失败 | 断言 canonical 根，保留越界/祖先校验；生产安全逻辑不改；T0 |
 
-| D19 | 原 cargo-deny-action v1 不能读取现有 RustSec 公告 CVSS 4.0，扫描在加载数据库时失败 | 升级官方 v2（cargo-deny 0.20.2），固定提交；保留 deny.toml 和完整检查，不忽略公告；T0 |
+| D19 | 原 cargo-deny-action v1 不能读取现有 RustSec 公告 CVSS 4.0，扫描在加载数据库时失败 | 升级官方 v2（cargo-deny 0.20.2），固定提交；不忽略公告；T0 |
+| D20 | lru 0.12.5 与 rustls 0.23.43 命中实际公告 | lru 0.18.5、rustls 0.23.46；原缓存/HTTP 实现复用，MSRV 和全量回归；T0 |
+| D21 | serde_yml 0.0.12 命中 RUSTSEC-2025-0068、已归档且无安全升级 | package alias 替换为维护分支 serde_norway 0.9.42，原 golden 不变；公开 YAML 类型身份变化见 dependency-baseline.md 和 CHANGELOG；T0 |
+| D22 | 既有 option-ext/webpki-roots 许可证与 deny.toml 政策不一致 | 精确版本例外作为明确待审提案，附原文/源码来源/校验，发布必须携带；不扩大全局列表，不关闭扫描；T0 |
+| D23 | parity 确定性测试与场景测试同时写读相同 fixture 文件，可读到截断瞬间空内容 | 回放测试独立 temp 输出目录，保留确定性断言及并行场景；生产引擎不改；T0 |
 
-每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D20 起登记；不把功能缺失硬当 bug。
+每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D24 起登记；不把功能缺失硬当 bug。
 
 ## 能力缺口和已知风险（不伪装已修复）
 

@@ -1,7 +1,7 @@
 # Third-party license notices
 
 This supplement covers the two version-scoped license exceptions proposed in
-`deny.toml` (D22). It is not an exhaustive dependency inventory. Retain upstream
+`deny.toml`. It is not an exhaustive dependency inventory. Retain upstream
 notices for all dependencies; distribution review must use the final lockfile.
 
 Distribute this file and `third-party-licenses/` with every released binary or
