@@ -2,14 +2,14 @@
 
 日期：2026-10-20。OpenPaw 基线 `60a531a51172d14fc3db1a8e7eb6762c2c8369d8`；开发分支 `docs/engine-host-t0`；PR **仅指向 `merge/ai-ofice-react-overagent`**。本记录随 T0 提交，准确审核提交以 PR head 为准。
 
-状态：本地验证完成，远端原生 Windows/其他 CI 待运行；尚未获得非作者批准或合入，T0 未关闭，T1 不开始。R1 设计待单独批准，Office 未修改。
+状态：本地验证完成，远端 CI 初轮已启动，Windows 快照换行校验等问题修复中；尚未获得非作者批准或合入，T0 未关闭，T1 不开始。R1 设计待单独批准，Office 未修改。
 
 ## 已交付入口
 
 | 产物 | 定位及性质 |
 |---|---|
 | 九阶段计划、运行/审批/锁/恢复图 | master.md；替换旧任务分配，不实现后续能力 |
-| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15 最小基线修正，D16 待查 |
+| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15、D17—D19 最小基线修正，D16 待查 |
 | 契约冻结及来源哈希 | contracts/README.md、sources.json；Office 固定 21 份来源，SDK 精确版本/integrity |
 | 真实类型/Schema/SDK fixtures | ../../tests/engine-host-contracts（从仓库根定位）；14 个测试，无跳过 |
 | PR 交接规范 | handoff.md、仓库 PR 模板 |
@@ -83,3 +83,13 @@ PowerShell 验证命令与上述 cargo 相同。契约包使用 `Set-Location te
 T1 输入：固定基线、audit.md D01—D04 的源码复现点、contracts 的正反例、默认 feature/旧接口兼容要求，以及同一 CI 和交接模板。T1 应补真实 Provider HTTP 请求捕获、各阶段取消、工具配对/压缩/损坏数据/写入失败回归；目前均未实现。
 
 T0 不改变数据格式、公开 core trait 或默认 CLI 命令，无数据迁移。回退为撤销本 Tx 的明确提交；不会删除会话/Office 数据。作者不自批、不合入。用户/指定审核人批准当前提交并合入集成分支后，才能开始 T1；R1 仍独立待审。
+
+## 远端初轮记录
+
+PR #4 / Actions run 39359489541：Linux 契约通过；Windows 在 prepare:office 报原始 Schema 哈希不同。Git Windows checkout 的换行转换改变固定快照字节，新增 .gitattributes 对测试快照禁用转换，保留哈希校验严格度；待新提交复跑。其他平台状态继续核对，不能将本轮计为通过。
+
+同轮 macOS 默认测试两项 safety 断言失败（D18）：生产路径已 canonicalize，测试仍与未解析 /var 符号链接的 temp 根比较。仅修测试比较根的规范化，不放宽范围校验；Windows 也适用。CI test/clippy matrix 禁用 fail-fast，以便一平台失败时其他平台仍产出原生结果。
+
+同轮 fmt、MSRV 和 Linux/Windows clippy 均通过；Linux/Windows workspace 测试因 macOS 失败被原 matrix fail-fast 取消，不能计作通过。quality-gates 的 RustSec 数据库含 CVSS 4.0，旧 cargo-deny-action v1 不能解析（D19）；升级官方 v2 固定提交（cargo-deny 0.20.2），完整保留 deny.toml 检查，等待新轮。
+
+本地补充验证：D18 四个 safety 单测通过；D17 在 ext4 临时 checkout 设置 core.autocrlf=true，全部 10 个原始快照（9 个 Schema 及 LICENSE）哈希匹配，未对验证输入做换行归一化。原生 Windows 结果仍以新 CI 为准。

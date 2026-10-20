@@ -46,7 +46,14 @@ D01—D11 状态统一为“已定位、未修复”，直到对应缺陷 PR 有
 
 D16（待查，未修复）：默认 workspace 一次运行中 `file_lock::tests::exclusive_lock_blocks_second_acquire` 在释放后立即重获失败；全 feature、首次默认测试、单项复查与最终默认复跑均通过。没有足够证据认定生产锁实现有错，不能把重新通过标为已修复。T3 使用该锁建立资源服务前必须查明、补跨进程回归；Windows CI 同时观察。未删除测试或放宽断言。
 
-每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D17 起登记；不把功能缺失硬当 bug。
+| ID | 新发现的问题 | 处理/阶段 |
+|---|---|---|
+| D17 | T0 原始 Office 快照在 Windows checkout 被转换为 CRLF，哈希不同 | .gitattributes 仅该测试目录 -text，保留原始字节校验；T0 |
+| D18 | tools safety 测试把返回的 canonical 路径同非 canonical temp 根比较，macOS /var 链接失败 | 断言 canonical 根，保留越界/祖先校验；生产安全逻辑不改；T0 |
+
+| D19 | 原 cargo-deny-action v1 不能读取现有 RustSec 公告 CVSS 4.0，扫描在加载数据库时失败 | 升级官方 v2（cargo-deny 0.20.2），固定提交；保留 deny.toml 和完整检查，不忽略公告；T0 |
+
+每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D20 起登记；不把功能缺失硬当 bug。
 
 ## 能力缺口和已知风险（不伪装已修复）
 
