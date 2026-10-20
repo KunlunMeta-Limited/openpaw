@@ -39,8 +39,8 @@ enum State {
 }
 
 impl CircuitBreaker {
-    /// Build a breaker with explicit tuning (tests use small values;
-    /// production uses [`FAILURE_THRESHOLD`] / [`DEFAULT_COOLDOWN`]).
+    /// Build a breaker with explicit tuning (production uses
+    /// [`FAILURE_THRESHOLD`] / [`DEFAULT_COOLDOWN`]).
     ///
     /// Stability: unstable.
     pub fn new(failure_threshold: u32, cooldown: Duration) -> Self {
@@ -75,10 +75,16 @@ impl CircuitBreaker {
     ///
     /// Stability: unstable.
     pub fn can_attempt(&mut self) -> bool {
+        self.can_attempt_at(Instant::now())
+    }
+
+    // Keep transition time explicit so cooldown boundaries can be tested without
+    // assuming the OS schedules a sleeping test within a particular time window.
+    fn can_attempt_at(&mut self, now: Instant) -> bool {
         match self.state {
             State::Closed => true,
             State::Open { until } => {
-                if Instant::now() >= until {
+                if now >= until {
                     self.state = State::HalfOpen;
                     true
                 } else {
@@ -103,17 +109,21 @@ impl CircuitBreaker {
     ///
     /// Stability: unstable.
     pub fn record_failure(&mut self) {
+        self.record_failure_at(Instant::now());
+    }
+
+    fn record_failure_at(&mut self, now: Instant) {
         match self.state {
             State::HalfOpen => {
                 self.state = State::Open {
-                    until: Instant::now() + self.cooldown,
+                    until: now + self.cooldown,
                 };
             }
             State::Closed | State::Open { .. } => {
                 self.consecutive_failures += 1;
                 if self.consecutive_failures >= self.failure_threshold {
                     self.state = State::Open {
-                        until: Instant::now() + self.cooldown,
+                        until: now + self.cooldown,
                     };
                 }
             }
@@ -149,25 +159,27 @@ mod tests {
     #[test]
     fn closed_admits_until_threshold_trips() {
         let mut b = breaker();
+        let now = Instant::now();
         assert_eq!(b.state(), CircuitState::Closed);
-        assert!(b.can_attempt());
-        b.record_failure();
-        b.record_failure();
+        assert!(b.can_attempt_at(now));
+        b.record_failure_at(now);
+        b.record_failure_at(now);
         assert_eq!(b.state(), CircuitState::Closed, "below threshold");
-        b.record_failure();
+        b.record_failure_at(now);
         assert_eq!(b.state(), CircuitState::Open, "tripped at threshold");
-        assert!(!b.can_attempt(), "open rejects");
+        assert!(!b.can_attempt_at(now), "open rejects");
     }
 
     #[test]
     fn success_resets_consecutive_count() {
         let mut b = breaker();
-        b.record_failure();
-        b.record_failure();
+        let now = Instant::now();
+        b.record_failure_at(now);
+        b.record_failure_at(now);
         b.record_success();
         assert_eq!(b.state(), CircuitState::Closed);
-        b.record_failure();
-        b.record_failure();
+        b.record_failure_at(now);
+        b.record_failure_at(now);
         assert_eq!(
             b.state(),
             CircuitState::Closed,
@@ -178,45 +190,61 @@ mod tests {
     #[test]
     fn open_transitions_to_half_open_after_cooldown() {
         let mut b = breaker();
+        let now = Instant::now();
         for _ in 0..3 {
-            b.record_failure();
+            b.record_failure_at(now);
         }
         assert_eq!(b.state(), CircuitState::Open);
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(b.can_attempt(), "cooldown elapsed admits one probe");
+        assert!(!b.can_attempt_at(now + Duration::from_millis(49)));
+        assert!(
+            b.can_attempt_at(now + b.cooldown),
+            "cooldown boundary admits one probe"
+        );
         assert_eq!(b.state(), CircuitState::HalfOpen);
-        assert!(!b.can_attempt(), "half open admits exactly one probe");
+        assert!(
+            !b.can_attempt_at(now + b.cooldown),
+            "half open admits exactly one probe"
+        );
     }
 
     #[test]
     fn half_open_probe_success_closes() {
         let mut b = breaker();
+        let now = Instant::now();
         for _ in 0..3 {
-            b.record_failure();
+            b.record_failure_at(now);
         }
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(b.can_attempt());
+        let now = now + b.cooldown;
+        assert!(b.can_attempt_at(now));
         b.record_success();
         assert_eq!(b.state(), CircuitState::Closed);
-        assert!(b.can_attempt(), "closed admits again");
+        assert!(b.can_attempt_at(now), "closed admits again");
         assert_eq!(b.consecutive_failures, 0);
     }
 
     #[test]
     fn half_open_probe_failure_reopens_with_fresh_cooldown() {
         let mut b = breaker();
+        let now = Instant::now();
         for _ in 0..3 {
-            b.record_failure();
+            b.record_failure_at(now);
         }
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(b.can_attempt());
-        b.record_failure();
+        let now = now + b.cooldown;
+        assert!(b.can_attempt_at(now));
+        b.record_failure_at(now);
         assert_eq!(b.state(), CircuitState::Open, "failed probe reopens");
-        assert!(!b.can_attempt(), "fresh cooldown starts");
-        // A shorter sleep than the fresh cooldown must stay rejected even
-        // though the original cooldown has long elapsed.
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(!b.can_attempt());
+        assert!(!b.can_attempt_at(now), "fresh cooldown starts");
+        assert_eq!(
+            b.state,
+            State::Open {
+                until: now + b.cooldown
+            },
+            "failed probe establishes a fresh deadline"
+        );
+        // The original deadline has elapsed; only the new deadline admits a probe.
+        assert!(!b.can_attempt_at(now + Duration::from_millis(49)));
+        assert!(b.can_attempt_at(now + b.cooldown));
+        assert!(!b.can_attempt_at(now + b.cooldown), "one probe only");
     }
 
     #[test]

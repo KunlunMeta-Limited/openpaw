@@ -9,7 +9,7 @@
 | 产物 | 定位及性质 |
 |---|---|
 | 九阶段计划、运行/审批/锁/恢复图 | master.md；替换旧任务分配，不实现后续能力 |
-| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15、D17—D23 基线修正（含 YAML 类型兼容调整和待审许可证政策），D16 待查 |
+| 复用和缺陷/Office 修改台账 | audit.md；D01—D11 留 T1/T2，D12—D15、D17—D24 基线修正（含 YAML 类型兼容调整和待审许可证政策），D16 待查 |
 | 契约冻结及来源哈希 | contracts/README.md、sources.json；Office 固定 21 份来源，SDK 精确版本/integrity |
 | 真实类型/Schema/SDK fixtures | ../../tests/engine-host-contracts（从仓库根定位）；14 个测试，无跳过 |
 | PR 交接规范 | handoff.md、仓库 PR 模板 |
@@ -109,3 +109,11 @@ Actions run [39360307473](https://github.com/KunlunMeta-Limited/openpaw/actions/
 依赖及 parity 修复后的源码 head `0778e6e` 对应 [第三轮 run 39361862245](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39361862245)。本节记录时 fmt、MSRV、quality-gates、Linux/Windows clippy 及契约矩阵已成功，workspace 测试矩阵仍在运行；这只是有时间边界的观察，不是完整成功声明。其后本次修改仅整理本文件的证据口径。
 
 PR 正文负责记录最终当前 head、完整原生矩阵的结论和运行链接；只有当前 head 全部必需检查成功才转 Ready。文档中历史提交号与运行号用于定位原始证据，不随着新提交覆盖，也不通过不断提交“已绿灯”文字制造自引用。审核时同时检查当前 head 的 CI、DCO、D21 类型迁移、D22 许可证政策、D16 后续调查约束以及非作者审核门禁。
+
+## 文档提交复验发现的计时测试缺陷
+
+第三轮源码 head `0778e6e` 的 10 项检查随后全部成功。仅文档提交 `4e73da8` 的 [第四轮 run 39362604364](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39362604364) 在 macOS 默认测试暴露 D24：`half_open_probe_failure_reopens_with_fresh_cooldown` 的 10ms sleep 实际超过 50ms 冷却，导致到期后的拒绝断言失败。这是测试依赖 OS 调度时间上限，不能靠反复重跑将本轮算通过。
+
+修复保留 public 方法取真实 `Instant::now()`，抽取私有显式时间状态转换供测试调用。测试不再 sleep，直接验证冷却前、恰好到期、单次探测，以及失败探测建立的精确新期限。原冷却策略和公共接口不变；不延长冷却掩盖竞态、不删断言。最终以修复提交完整 CI 为准。
+
+D24 本地复验：`cargo test --locked -p openpaw-mcp --all-features` 27 个单测和 6 个 E2E 全通过；`cargo clippy --locked -p openpaw-mcp --all-targets --all-features -- -D warnings`、`cargo +1.88.0 check --locked -p openpaw-mcp --all-targets --all-features`、fmt 和 diff 检查均 exit 0。
