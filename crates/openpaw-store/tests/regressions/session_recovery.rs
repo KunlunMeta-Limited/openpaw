@@ -132,3 +132,18 @@ fn torn_utf8_tail_and_repeated_repair_preserve_unique_backups() {
     assert_eq!(SessionReader::read(&path).unwrap().events.len(), 3);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
 }
+
+#[test]
+fn backup_creation_failure_does_not_truncate_original() {
+    let dir = tempfile::tempdir().unwrap();
+    // ext4和Windows NTFS均限制单个文件名为255字符；原名合法，备份后缀使创建失败。
+    // 不依赖管理员可绕过的只读权限，也不为故障注入扩展生产API。
+    let path = dir.path().join(format!("{}.jsonl", "s".repeat(245)));
+    let meta = serde_json::to_string(&SessionEvent::Meta(SessionMeta::new("m", "p"))).unwrap();
+    let original = format!("{meta}\n{{\"type\":");
+    std::fs::write(&path, &original).unwrap();
+    assert!(SessionWriter::open_append(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(SessionReader::read(&path).unwrap().torn_tail_lines, 1);
+}

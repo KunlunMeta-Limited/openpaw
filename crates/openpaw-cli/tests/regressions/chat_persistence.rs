@@ -31,6 +31,8 @@ fn server(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<Value>
                     other => panic!("CLI未发出预期请求: {other:?}"),
                 }
             };
+            // Windows会继承监听socket的非阻塞模式；请求体读取必须阻塞且有界超时。
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(3)))
                 .unwrap();
