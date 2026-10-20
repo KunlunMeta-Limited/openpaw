@@ -1,0 +1,2 @@
+# Preserve the exact pinned Office bytes on Windows too; do not normalize hashes.
+/tests/engine-host-contracts/upstream-office/** -text

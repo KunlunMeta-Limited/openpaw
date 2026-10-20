@@ -15,3 +15,6 @@ node prepare-office.mjs --office-source /absolute/path/to/ai-office-react
 Change the pinned commit, review its protocol, and update hashes together before
 a future schema upgrade. Default prepare verifies every stored source hash and
 fails on missing/changed files, without cross-repository credentials or network.
+
+Root .gitattributes disables checkout EOL conversion for this snapshot. Hashes
+cover original bytes on Windows and Unix; do not normalize during verification.
