@@ -123,9 +123,17 @@ jobs:
       - run: cargo run --locked -p xtask -- smoke-offline
       # Q2 dependency whitelist
       - uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902 # v2, cargo-deny 0.20.2
+        if: runner.os == 'Linux'
         with:
           arguments: --workspace
           rust-version: stable
+      # D30: container Actions cannot execute on Windows; keep the same pinned native audit.
+      - name: Install native Windows dependency auditor
+        if: runner.os == 'Windows'
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Audit dependencies natively on Windows
+        if: runner.os == 'Windows'
+        run: cargo deny --workspace check
 
   governance:
     name: governance (${{ matrix.os }})

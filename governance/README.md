@@ -29,3 +29,5 @@ comments复用syn/quote/doc_lines，对变化的声明节点检查中文栏目�
 没有approve命令。review/in-progress/verified可以表达已获实施授权的开发和验证进度，不等于PR批准；approved/closed还要求批准字段及平台PR引用，closed要合入SHA。引用存在不等于身份/审核已认证，真实非作者针对当前提交的审核仍以GitHub与用户指令为准，作者不能自批。原型的宽松CLI和自动批准入口均不暴露给项目流程。平台required checks/CODEOWNERS需真实账号和仓库管理员设置，尚未配置不能宣称已生效。
 
 T0—T8一阶段一主CHG、一PR，上一PR审核合入才继续；初期全部约定范围验收后正常CHG开发，取消Tx串行。届时人工登记profile.initial_tx_phase=false及阶段验收证据，normal_target_branch切换普通主分支规则；配置自身L4审核，工具不会自动结束阶段。Office任何文件改动先Rx并经人工明确批准。当前T0只实现工程基线，不实现Host业务、不修改Office、不自动合入。
+
+CI依赖审计：Linux复用固定cargo-deny Action；其容器只支持Linux，Windows通过crates.io原生安装固定cargo-deny0.20.2并执行相同cargo deny --workspace check。双平台都实际扫描，不以条件跳过代替通过。

@@ -58,7 +58,7 @@ D16（待查，未修复）：默认 workspace 一次运行中 `file_lock::tests
 | D23 | parity 确定性测试与场景测试同时写读相同 fixture 文件，可读到截断瞬间空内容 | 回放测试独立 temp 输出目录，保留确定性断言及并行场景；生产引擎不改；T0 |
 | D24 | MCP 熔断器测试假定 10ms sleep 必在 50ms 冷却前恢复，macOS 调度延迟导致假失败 | 公共方法保留真实 Instant，私有状态转换显式传时间；原断言加精确边界/新期限验证，不扩大冷却值或重试；T0 |
 
-每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D30 起登记；不把功能缺失硬当 bug。
+每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D31 起登记；不把功能缺失硬当 bug。
 
 ## 能力缺口和已知风险（不伪装已修复）
 
@@ -105,3 +105,5 @@ PR 必须回答：现有模块能否直接复用？能否加无协议接口？�
 | D29 | Windows原生CI的CP1252重定向管道无法打印验证器中文进度，检查开始前崩溃 | 验证器显式UTF-8输出并设置Python子进程UTF-8；治理真实子进程回归；T0独立逻辑提交 |
 
 | D28 | Windows自动换行将openpaw-core.api.json改成CRLF，xtask严格比较报假漂移 | 仅该快照-text；真实Git core.autocrlf=true检出字节回归，不改快照或放宽接口断言；T0独立逻辑提交 |
+
+| D30 | 将既有quality-gates扩到Windows后，cargo-deny容器Action仅支持Linux，原生runner无法执行 | Linux保留固定Action；Windows从crates.io安装固定cargo-deny0.20.2原生执行相同workspace check，规则不降级；原生CI验证；T0独立逻辑提交 |
