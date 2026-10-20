@@ -97,13 +97,10 @@ PR 必须回答：现有模块能否直接复用？能否加无协议接口？�
 | ID | 根因与修改 | 回归与归属 |
 | --- | --- | --- |
 | D25 | scrub只查每规则首个命中；登记的REQ/DES完整ID误报且首个豁免遮住同行后续非法ID。只豁免有权威来源的完整ID覆盖片段，find_iter检查所有命中 | xtask::scrub::tests::registered_identifier_does_not_hide_later_hit；T0独立逻辑提交 |
-| D27 | scrub递归遍历忽略的依赖/生成目录，在本机NTFS依赖操作中阻塞；改用Git枚举已管理及未忽略的新源码，读取错误显式失败 | xtask::scrub::tests::source_enumeration_skips_ignored_but_includes_new_files；T0独立逻辑提交 |
 | D26 | scrub诊断按字节截100可能切到中文UTF-8中间并panic；改为字符截断 | xtask::scrub::tests::chinese_context_truncates_without_utf8_boundary_panic；T0独立逻辑提交 |
+| D27 | scrub递归遍历忽略的依赖/生成目录，在本机NTFS依赖操作中阻塞；改用Git枚举已管理及未忽略的新源码，读取错误显式失败 | xtask::scrub::tests::source_enumeration_skips_ignored_but_includes_new_files；T0独立逻辑提交 |
+| D28 | Windows自动换行将openpaw-core.api.json改成CRLF，xtask严格比较报假漂移 | 仅该快照-text；真实Git core.autocrlf=true检出字节回归，不改快照或放宽接口断言；T0独立逻辑提交 |
+| D29 | Windows原生CI的CP1252重定向管道无法打印验证器中文进度，检查开始前崩溃 | 验证器显式UTF-8输出并设置Python子进程UTF-8；治理真实子进程回归；T0独立逻辑提交 |
+| D30 | 将既有quality-gates扩到Windows后，cargo-deny容器Action仅支持Linux，原生runner无法执行 | Linux保留固定Action；Windows从crates.io安装固定cargo-deny0.20.2原生执行相同workspace check，规则不降级；原生CI验证；T0独立逻辑提交 |
 
 治理复用：固定参考framework的CHG格式/校验原型；项目适配修补严格表格、真实Git范围、保护等级、命令追踪和索引，不运行原型approve。注释复用xtask的syn/quote/doc_lines；全量执行器新增，因为现有xtask没有跨Rust/Node/Python证据汇总职责。详细限制见governance/README.md。历史macOS发现记录保留，当前CI/nightly/release仅Linux/Windows。
-
-| D29 | Windows原生CI的CP1252重定向管道无法打印验证器中文进度，检查开始前崩溃 | 验证器显式UTF-8输出并设置Python子进程UTF-8；治理真实子进程回归；T0独立逻辑提交 |
-
-| D28 | Windows自动换行将openpaw-core.api.json改成CRLF，xtask严格比较报假漂移 | 仅该快照-text；真实Git core.autocrlf=true检出字节回归，不改快照或放宽接口断言；T0独立逻辑提交 |
-
-| D30 | 将既有quality-gates扩到Windows后，cargo-deny容器Action仅支持Linux，原生runner无法执行 | Linux保留固定Action；Windows从crates.io安装固定cargo-deny0.20.2原生执行相同workspace check，规则不降级；原生CI验证；T0独立逻辑提交 |
