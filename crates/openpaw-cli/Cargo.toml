@@ -32,9 +32,15 @@ rmcp = { workspace = true, optional = true }
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "chat_persistence_regressions"
+path = "tests/regressions/chat_persistence.rs"

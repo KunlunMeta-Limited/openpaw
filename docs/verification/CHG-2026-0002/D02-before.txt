@@ -1,0 +1,38 @@
+   Compiling ring v0.17.14
+   Compiling openpaw-store v0.1.0 (/media/cheng/新加卷/workSpace/Office/openpaw/crates/openpaw-store)
+   Compiling rustls v0.23.46
+   Compiling rustls-webpki v0.103.15
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling openpaw-llm v0.1.0 (/media/cheng/新加卷/workSpace/Office/openpaw/crates/openpaw-llm)
+   Compiling openpaw-tools v0.1.0 (/media/cheng/新加卷/workSpace/Office/openpaw/crates/openpaw-tools)
+   Compiling openpaw-engine v0.1.0 (/media/cheng/新加卷/workSpace/Office/openpaw/crates/openpaw-engine)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.46s
+     Running tests/regressions/lifecycle.rs (/home/cheng/.cache/openpaw-t0/target/debug/deps/lifecycle_regressions-abbbb033ce0971fc)
+
+running 2 tests
+test externally_cancelled_turn_is_not_normal_completion ... FAILED
+test configured_idle_timeout_is_effective ... FAILED
+
+failures:
+
+---- externally_cancelled_turn_is_not_normal_completion stdout ----
+
+thread 'externally_cancelled_turn_is_not_normal_completion' (3619896) panicked at crates/openpaw-engine/tests/regressions/lifecycle.rs:15:5:
+外部取消不能被覆盖，也不能当作正常完成
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- configured_idle_timeout_is_effective stdout ----
+
+thread 'configured_idle_timeout_is_effective' (3619895) panicked at crates/openpaw-engine/tests/regressions/lifecycle.rs:38:5:
+配置的等待超时没有生效
+
+
+failures:
+    configured_idle_timeout_is_effective
+    externally_cancelled_turn_is_not_normal_completion
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+error: test failed, to rerun pass `-p openpaw-engine --test lifecycle_regressions`

@@ -116,3 +116,16 @@ PR 必须回答：现有模块能否直接复用？能否加无协议接口？�
 回归全部在原file_lock私有测试模块，不为目录形式扩大API：独占及共享继承描述符、原立即重获断言、独立子进程共享/独占互斥及分别释放。父进程在临时中文/空格路径持锁，子进程真实调用同一API；共享持有者未全部退出时仍阻止独占。没有sleep、放宽断言或跳过测试。
 
 Linux定向6项通过；修复前日志/tmp/openpaw-d16-before.log exit101，修复后/tmp/openpaw-d16-after.log exit0。Windows以及当前交付全量仍按最终准确提交CI核查，未通过前不关闭M0。历史失败保留，本修复以独立D16逻辑提交交审。
+
+
+## T1修复与新增阻塞缺陷（CHG-2026-0002）
+
+D01：默认模型改取Provider真实默认，显式值优先，共享llm装配供CLI/Host复用；引擎请求与真实OpenAiProvider HTTP捕获分别验收。D02：外部父token不被覆盖，独立运行上下文及四终态，取消覆盖建连/流/退避/压缩/前置校验/分类/审批；工具通知取消后等待清理，迭代预算不再假正常结束。D03：RunObserver顺序等待JSONL保存完整消息、call ID、usage和终态，压缩快照恢复取代长度切片；写失败停止并禁止副作用自动重试。D04：共享字节扫描，先完整唯一备份再截尾，中间损坏拒绝，合法尾补换行。
+
+| ID | 发现、原因及本阶段必要性 | 回归定位与状态 |
+|---|---|---|
+| D31 | OpenAI/Anthropic在缺少协议结束标记时仍从EOF合成Final，导致假完成；工具JSON组装失败不能降为空对象。阻塞REQ-OP-003可靠终态，归T1 | CLI真实HTTP断流红→绿；llm mock_server_contract::truncated_streams_are_errors_for_both_network_providers；完整双平台待验 |
+| D32 | OpenAI只向显示流发送文本，Final.content仅含tool_calls，CLI回复与账本丢文字。阻塞REQ-OP-004消息一致性，归T1 | CLI真实HTTP输出断言红→绿；llm::openai_streaming_text_contract检查Final.text；完整双平台待验 |
+| D33 | SSE逐网络块from_utf8_lossy会把跨块汉字改为替换字符，事实已损坏；原字节缓存至完整行再解码。阻塞中文Office产品事实，归T1 | sse::tests::utf8_network_boundaries_do_not_corrupt_chinese；独立旧基线复现/双平台待验 |
+
+相关修改按用户本轮要求整合逻辑提交，D编号、根因、回归、证据逐项保留。T2的审批输入绑定/进程树/隔离/Todo缺陷尚未实施，T1不能宣称已完成这些能力；Office未修改。

@@ -243,26 +243,50 @@ pub fn create_compact_boundary_message(
     }
 }
 
-/// Single-summary compaction: protect the head, summarize the middle via
-/// one LLM call, keep the recent tail. Returns the number of compacted
-/// messages (0 = nothing to do).
+/// 功能：复用单次摘要压缩上下文，保留旧入口返回数量。
+/// 参数：provider为模型、session为上下文、opts为保留策略。
+/// 返回：被压缩的消息数量；无可压缩内容为零。
+/// 错误：摘要请求失败返回诊断。
+/// 状态：成功后替换Session上下文；不持久化原始事实。
+/// 并发与取消：持有Session独占借用；宿主用Run接口管理取消及可靠保存。
+/// 权限：不执行工具。
+/// 关联：需求/设计 REQ-OP-004；DES-OP-003。
 pub async fn compact_session(
     provider: &dyn LlmProvider,
     session: &mut Session,
     opts: &CompactOptions,
 ) -> Result<usize> {
+    compact_session_report(provider, session, opts, provider.default_model())
+        .await
+        .map(|(count, _)| count)
+}
+
+/// 功能：在既有压缩实现中返回真实摘要用量。
+/// 参数：provider、session、opts同旧入口，model为本Run有效模型。
+/// 返回：压缩数量与Provider报告的用量。
+/// 错误：摘要请求失败，不自动重试副作用。
+/// 状态：仅成功响应后同步修改模型上下文。
+/// 并发与取消：调用方可在请求等待时取消，完成后需保存快照。
+/// 权限：不改变工具权限。
+/// 关联：需求/设计 REQ-OP-003、REQ-OP-004；DES-OP-002、DES-OP-003。
+pub(crate) async fn compact_session_report(
+    provider: &dyn LlmProvider,
+    session: &mut Session,
+    opts: &CompactOptions,
+    model: &str,
+) -> Result<(usize, openpaw_core::Usage)> {
     let keep_count = opts.keep_recent_pairs * 2;
     let protect_count = opts.protect_head_pairs * 2;
 
     if session.messages.len() <= keep_count + protect_count {
-        return Ok(0);
+        return Ok((0, openpaw_core::Usage::default()));
     }
 
     let protected_head: Vec<Message> = session.messages[..protect_count].to_vec();
     let raw_remaining_end = session.messages.len().saturating_sub(keep_count);
     let remaining_end = adjust_index_to_preserve_tool_pairs(&session.messages, raw_remaining_end);
     if remaining_end <= protect_count {
-        return Ok(0);
+        return Ok((0, openpaw_core::Usage::default()));
     }
 
     let old_messages: Vec<Message> = session.messages[protect_count..remaining_end].to_vec();
@@ -272,7 +296,7 @@ pub async fn compact_session(
 
     let transcript = format_for_summary(&old_messages);
     let req = CompletionRequest {
-        model: provider.default_model().to_string(),
+        model: model.to_owned(),
         system: Some(COMPACTION_SYSTEM.to_string()),
         messages: vec![Message::user_text(transcript)],
         max_tokens: 2048,
@@ -321,7 +345,7 @@ pub async fn compact_session(
     }
     session.messages.extend(recent);
 
-    Ok(compacted_count)
+    Ok((compacted_count, resp.usage))
 }
 
 #[cfg(test)]

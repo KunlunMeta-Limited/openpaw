@@ -443,32 +443,25 @@ async fn mid_turn_cancel_stops_the_stream() {
     let stop = l.run_turn(&mut session, None, &[], &mut sink).await;
     canceller.await.unwrap();
 
-    assert_eq!(stop.unwrap(), StopReason::EndTurn);
+    assert!(matches!(stop, Err(openpaw_core::Error::Cancelled)));
     // Exactly one provider attempt — the in-flight stream was cancelled.
     assert_eq!(p.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn cancel_token_resets_between_turns() {
-    // Upstream cancel-reset semantics: run_turn resets the token at entry,
-    // so a cancelled token carried in from a previous turn must not poison
-    // this turn.
+async fn external_parent_cancellation_remains_effective_between_turns() {
+    // D02：外部父token是调用方的持续取消范围，不能被引擎覆盖。
     let p = Arc::new(MockProvider::counter("r-"));
     let token = CancellationToken::new();
     token.cancel();
-    let l = AgentLoop::new(p).with_cancel_token(token);
+    let l = AgentLoop::new(p.clone()).with_cancel_token(token);
     let mut session = Session::new("mock-1", "mock");
-    session.messages.push(Message::user_text("a"));
-
-    let (stop1, _) = run_simple(&l, &mut session, &[]).await;
-    assert_eq!(stop1.unwrap(), StopReason::EndTurn);
-    // The turn ran normally despite the pre-cancelled token.
-    assert_eq!(session.messages.last().unwrap().text(), "r-0");
-
-    session.messages.push(Message::user_text("b"));
-    let (stop2, _) = run_simple(&l, &mut session, &[]).await;
-    assert_eq!(stop2.unwrap(), StopReason::EndTurn);
-    assert_eq!(session.messages.last().unwrap().text(), "r-1");
+    for input in ["a", "b"] {
+        session.messages.push(Message::user_text(input));
+        let (result, _) = run_simple(&l, &mut session, &[]).await;
+        assert!(matches!(result, Err(openpaw_core::Error::Cancelled)));
+    }
+    assert_eq!(p.call_count(), 0);
 }
 
 #[tokio::test]
@@ -488,7 +481,7 @@ async fn budget_exhaustion_ends_turn_gracefully() {
     session.messages.push(Message::user_text("go"));
 
     let (stop, _) = run_simple(&l, &mut session, &[]).await;
-    assert_eq!(stop.unwrap(), StopReason::EndTurn);
+    assert!(matches!(stop, Err(openpaw_core::Error::BudgetExhausted(_))));
     // A handful of iterations ran, then the budget (2 + 1 grace) ended it.
     assert!(session.messages.len() < 12, "budget must bound the loop");
 }

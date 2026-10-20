@@ -62,6 +62,7 @@
     {
       "methods": [
         "async fn call (& self , name : & str , args : serde_json :: Value) -> Result < ToolCallOutcome >",
+        "async fn call_cancellable (& self , name : & str , args : serde_json :: Value , cancel : tokio_util :: sync :: CancellationToken ,) -> Result < ToolCallOutcome >",
         "async fn list_tools (& self) -> Result < Vec < ToolSpec > >"
       ],
       "name": "ToolExecutor"

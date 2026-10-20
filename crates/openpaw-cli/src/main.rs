@@ -36,10 +36,14 @@ fn main() {
     let code = match cli.command {
         Some(Command::Hello) => hello::run(),
         Some(Command::Chat {
+            model,
+            base_url,
             provider,
             workspace,
             home,
         }) => chat::run(chat::ChatArgs {
+            model,
+            base_url,
             provider,
             workspace,
             home,

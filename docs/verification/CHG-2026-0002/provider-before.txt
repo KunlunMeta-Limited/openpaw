@@ -1,0 +1,30 @@
+   Compiling openpaw-cli v0.1.0 (/media/cheng/新加卷/workSpace/Office/openpaw/crates/openpaw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running tests/regressions/chat_persistence.rs (/home/cheng/.cache/openpaw-t0/target/debug/deps/chat_persistence_regressions-9f92a49344976d63)
+
+running 3 tests
+test invalid_model_and_embedded_credentials_fail_before_connecting ... ok
+test actual_http_requests_use_default_and_explicit_model ... FAILED
+test tool_results_and_call_ids_survive_later_provider_failure ... FAILED
+
+failures:
+
+---- actual_http_requests_use_default_and_explicit_model stdout ----
+
+thread 'actual_http_requests_use_default_and_explicit_model' (3632686) panicked at crates/openpaw-cli/tests/regressions/chat_persistence.rs:69:9:
+真实流文本必须进入CLI和最终消息
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tool_results_and_call_ids_survive_later_provider_failure stdout ----
+
+thread 'tool_results_and_call_ids_survive_later_provider_failure' (3632688) panicked at crates/openpaw-cli/tests/regressions/chat_persistence.rs:85:5:
+assertion failed: !output.status.success()
+
+
+failures:
+    actual_http_requests_use_default_and_explicit_model
+    tool_results_and_call_ids_survive_later_provider_failure
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p openpaw-cli --test chat_persistence_regressions`

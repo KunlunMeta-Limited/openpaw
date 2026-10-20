@@ -14,11 +14,15 @@ pub struct Frame {
     pub data: serde_json::Value,
 }
 
-/// Incremental SSE decoder over raw bytes: buffers partial lines, splits
-/// `event:`/`data:` fields, and emits a frame per blank line.
+/// 用途：增量解码SSE
+/// 字段：原始字节缓冲和当前帧
+/// 来源去向：HTTP字节流到Provider
+/// 约束：保留跨块UTF-8边界
+/// 稳定性：签名不变
+/// 关联：需求/设计 REQ-OP-003、REQ-OP-004。
 #[derive(Default)]
 pub struct SseDecoder {
-    line_buf: String,
+    line_buf: Vec<u8>,
     event: String,
     data: String,
 }
@@ -28,13 +32,20 @@ impl SseDecoder {
         Self::default()
     }
 
-    /// Feed raw bytes; returns completed frames in order.
+    /// 功能：缓存原始字节并按完整行解码SSE。
+    /// 参数：bytes为任意网络分块，可截在UTF-8字符中间。
+    /// 返回：本次完整帧的顺序列表。
+    /// 错误：非法JSON产生Null帧，由Provider明确拒绝。
+    /// 状态：保留未完成行，避免分块解码替换中文。
+    /// 并发与取消：独占可变借用，无异步等待。
+    /// 权限：不执行工具或输出密钥。
+    /// 关联：需求/设计 REQ-OP-003、REQ-OP-004；DES-OP-002。
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Frame> {
-        let chunk = String::from_utf8_lossy(bytes);
-        self.line_buf.push_str(&chunk);
+        self.line_buf.extend_from_slice(bytes);
         let mut frames = Vec::new();
-        while let Some(pos) = self.line_buf.find('\n') {
-            let line: String = self.line_buf.drain(..=pos).collect();
+        while let Some(pos) = self.line_buf.iter().position(|b| *b == b'\n') {
+            let bytes: Vec<u8> = self.line_buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&bytes);
             let line = line.trim_end_matches('\n').trim_end_matches('\r');
             if line.is_empty() {
                 if let Some(frame) = self.take_frame() {
@@ -55,12 +66,20 @@ impl SseDecoder {
         frames
     }
 
-    /// Flush at stream end (a final frame without a trailing blank line).
+    /// 功能：流结束后冲刷最后一帧，不代表模型正常完成。
+    /// 参数：无。
+    /// 返回：最后完整JSON帧或Null诊断帧。
+    /// 错误：终态是否完整由Provider验证。
+    /// 状态：清空剩余字节与帧缓冲。
+    /// 并发与取消：独占可变借用，无等待。
+    /// 权限：无。
+    /// 关联：需求/设计 REQ-OP-003；DES-OP-002。
     pub fn finish(&mut self) -> Vec<Frame> {
         let mut frames = Vec::new();
-        if !self.line_buf.trim().is_empty() {
+        if !self.line_buf.iter().all(u8::is_ascii_whitespace) {
             // Process the dangling line, then try to emit.
             let tail = std::mem::take(&mut self.line_buf);
+            let tail = String::from_utf8_lossy(&tail);
             let line = tail.trim_end();
             if let Some(rest) = line.strip_prefix("data:") {
                 self.data.push_str(rest.trim_start());
@@ -77,7 +96,11 @@ impl SseDecoder {
             self.event.clear();
             return None;
         }
-        let data = serde_json::from_str(&self.data).unwrap_or(serde_json::Value::Null);
+        let data = if self.data == "[DONE]" {
+            serde_json::Value::String(self.data.clone())
+        } else {
+            serde_json::from_str(&self.data).unwrap_or(serde_json::Value::Null)
+        };
         let frame = Frame {
             event: std::mem::take(&mut self.event),
             data,
@@ -127,12 +150,25 @@ impl AnthropicStreamAssembler {
     }
 
     /// Feed one decoded frame; returns the events it produces.
+    /// 功能：将完整SSE帧映射为Anthropic流事件。
+    /// 参数：frame为已解码帧。
+    /// 返回：本帧产生的顺序事件或错误。
+    /// 错误：坏JSON/服务端错误返回错误事件。
+    /// 状态：累计内容、用量和message_stop终态。
+    /// 并发与取消：独占可变借用，无等待。
+    /// 权限：不执行工具。
+    /// 关联：需求REQ-OP-003、REQ-OP-004。
     pub fn absorb(&mut self, frame: &Frame) -> Vec<openpaw_core::Result<StreamEvent>> {
         let mut out: Vec<openpaw_core::Result<StreamEvent>> = Vec::new();
         if self.finished {
             return out;
         }
         let v = &frame.data;
+        if v.is_null() {
+            return vec![Err(openpaw_core::Error::Provider(
+                "malformed Anthropic SSE JSON".into(),
+            ))];
+        }
         // `data.type` is trusted over `event:` (proxy tolerance).
         let ty = v
             .get("type")
@@ -302,8 +338,20 @@ impl AnthropicStreamAssembler {
         out
     }
 
-    /// Assemble the final response from the accumulated blocks.
+    /// 功能：仅在收到message_stop后组装最终响应。
+    /// 参数：无。
+    /// 返回：完整内容、停止原因及真实用量。
+    /// 错误：断流未结束、工具JSON损坏均返回Provider错误。
+    /// 状态：只读组装，不将EOF伪装为正常完成。
+    /// 并发与取消：无等待；宿主负责流取消。
+    /// 权限：不执行工具。
+    /// 关联：需求/设计 REQ-OP-003、REQ-OP-004；DES-OP-002。
     pub fn finalize(&self) -> openpaw_core::Result<CompletionResponseShape> {
+        if !self.finished {
+            return Err(openpaw_core::Error::Provider(
+                "Anthropic stream ended without message_stop".into(),
+            ));
+        }
         let mut content = Vec::new();
         for block in &self.blocks {
             match block {
@@ -438,5 +486,17 @@ mod tests {
             ContentBlock::ToolUse { ref name, ref input, .. }
                 if name == "read_file" && input["path"] == json!("a.rs")
         ));
+    }
+    #[test]
+    fn utf8_network_boundaries_do_not_corrupt_chinese() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"中文内容\"}}]}\n\n";
+        let mut decoder = SseDecoder::new();
+        let mut frames = Vec::new();
+        // 每个字节一个网络块，跨汉字边界仍必须保留原文。
+        for byte in payload.as_bytes() {
+            frames.extend(decoder.feed(&[*byte]));
+        }
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].data["choices"][0]["delta"]["content"], "中文内容");
     }
 }

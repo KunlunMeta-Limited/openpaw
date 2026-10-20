@@ -5,7 +5,12 @@
 
 use thiserror::Error;
 
-/// Unified error type for the whole agent stack.
+/// 用途：统一引擎错误
+/// 字段：各错误变体
+/// 来源去向：核心到调用方
+/// 约束：取消与超时不代表成功
+/// 稳定性：允许新增变体
+/// 关联：需求/设计 REQ-OP-003。
 ///
 /// Stability: stable.
 #[derive(Debug, Error)]
@@ -30,6 +35,15 @@ pub enum Error {
 
     #[error("server error: {status} {message}")]
     ServerError { status: u16, message: String },
+
+    /// 用途：明确表示运行已取消
+    /// 变体：无
+    /// 来源去向：引擎到调用方
+    /// 约束：不代表正常结束
+    /// 稳定性：新增
+    /// 关联：需求/设计 REQ-OP-003。
+    #[error("run cancelled")]
+    Cancelled,
 
     #[error("timeout: {0}")]
     Timeout(String),

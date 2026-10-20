@@ -8,17 +8,40 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use openpaw_core::{Session, SessionEvent};
-use openpaw_engine::{AgentEvent, AgentLoop};
+use openpaw_engine::{AgentEvent, AgentLoop, RunContext, RunObserver};
 
 const EXIT_WORDS: [&str; 4] = ["exit", "quit", "/exit", "/quit"];
 
+/// 用途：交互聊天装配参数
+/// 字段：Provider、模型、端点、工作区和数据根
+/// 来源去向：CLI到引擎
+/// 约束：密钥只从服务端环境读取
+/// 稳定性：新增可选项
+/// 关联：需求/设计 REQ-OP-003。
 #[derive(Debug, clap::Args)]
 pub struct ChatArgs {
     /// Offline provider: `mock` (counter replies) or `echo`. Real network
     /// providers plug into this seam as they land.
     #[arg(long, default_value = "mock")]
     pub provider: String,
+    /// 用途：显式覆盖Provider默认模型
+    /// 字段：可选名称
+    /// 来源去向：CLI到共享装配
+    /// 约束：非空
+    /// 稳定性：新增
+    /// 关联：需求/设计 REQ-OP-003。
+    #[arg(long)]
+    pub model: Option<String>,
+    /// 用途：已授权Provider端点
+    /// 字段：可选URL
+    /// 来源去向：CLI到Provider
+    /// 约束：不包含密钥
+    /// 稳定性：新增
+    /// 关联：需求/设计 DES-OP-002。
+    #[arg(long)]
+    pub base_url: Option<String>,
     /// Workspace the tool host operates in (default: current directory).
     #[arg(long)]
     pub workspace: Option<PathBuf>,
@@ -28,46 +51,42 @@ pub struct ChatArgs {
     pub home: Option<PathBuf>,
 }
 
+/// 功能：用共享Provider装配、原引擎与可靠JSONL观察器运行聊天。
+/// 参数：args为已解析的CLI配置。
+/// 返回：成功为0，配置、运行或持久化失败为1。
+/// 错误：错误写stderr；存储失败不自动重试工具。
+/// 状态：保存完整用户/assistant/工具链/usage/终态，SQLite失败仅警告。
+/// 并发与取消：每轮独立上下文，关键磁盘写通过spawn_blocking等待完成。
+/// 权限：工具沿用现有工作区检查；不增加Office权限。
+/// 关联：需求/设计 REQ-OP-003、REQ-OP-004；DES-OP-002、DES-OP-003。
 pub fn run(args: ChatArgs) -> i32 {
     let workspace = args
         .workspace
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let provider: Arc<dyn openpaw_core::LlmProvider> = match args.provider.as_str() {
-        "echo" => Arc::new(openpaw_llm::EchoProvider::new()),
-        "mock" => Arc::new(openpaw_llm::MockProvider::counter("mock-reply-")),
-        "anthropic" => match std::env::var("ANTHROPIC_API_KEY") {
-            Ok(key) if !key.is_empty() => {
-                Arc::new(openpaw_llm::AnthropicProvider::new(key, "claude-sonnet-4"))
-            }
-            _ => {
-                eprintln!(
-                    "error: ANTHROPIC_API_KEY is not set\nwhy: the anthropic provider reads its key from the environment (keys never touch disk).\nnext: export ANTHROPIC_API_KEY and re-run."
-                );
-                return 1;
-            }
-        },
-        "openai" => match std::env::var("OPENAI_API_KEY") {
-            Ok(key) if !key.is_empty() => Arc::new(openpaw_llm::OpenAiProvider::new(key, "gpt-4o")),
-            _ => {
-                eprintln!(
-                    "error: OPENAI_API_KEY is not set\nwhy: the openai provider reads its key from the environment (keys never touch disk).\nnext: export OPENAI_API_KEY and re-run."
-                );
-                return 1;
-            }
-        },
-        other => {
-            eprintln!(
-                "error: unknown provider `{other}`\nwhy: chat supports `mock`, `echo`, `anthropic`, and `openai`.\nnext: re-run with one of those via `--provider`."
-            );
+    let key_name = match args.provider.as_str() {
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        _ => None,
+    };
+    let key = key_name.and_then(|name| std::env::var(name).ok());
+    let (provider, model) = match openpaw_llm::assemble_provider(
+        &args.provider,
+        args.model.as_deref(),
+        key,
+        args.base_url.as_deref(),
+    ) {
+        Ok(assembled) => assembled,
+        Err(e) => {
+            eprintln!("error: {e}\nwhy: provider configuration is not usable.\nnext: check --provider, --model and the provider API key environment variable.");
             return 1;
         }
     };
 
     let tool_host = openpaw_tools::arc_registry(&workspace);
 
-    let mut session = Session::new(provider.default_model(), provider.name());
+    let mut session = Session::new(&model, provider.name());
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -80,8 +99,16 @@ pub fn run(args: ChatArgs) -> i32 {
     // calls; the ToolHost (moved into the agent below) executes them.
     // Offline providers (mock/echo) ignore the declaration and keep their
     // deterministic replies. Fetch once — the registry is static per run.
-    let specs = rt.block_on(tool_host.list_tools()).unwrap_or_default();
-    let agent = AgentLoop::new(provider.clone()).with_tool_host(tool_host);
+    let specs = match rt.block_on(tool_host.list_tools()) {
+        Ok(specs) => specs,
+        Err(e) => {
+            eprintln!("error: cannot list tools: {e}");
+            return 1;
+        }
+    };
+    let agent = AgentLoop::new(provider.clone())
+        .with_model(model)
+        .with_tool_host(tool_host);
 
     // Session transcript: <home>/sessions/<id>.jsonl (plain files).
     let home = args.home.clone().unwrap_or_else(openpaw_core::openpaw_home);
@@ -105,7 +132,7 @@ pub fn run(args: ChatArgs) -> i32 {
     // coverage, so every write below is warned and ignored.
     let db_path = home.join("index.db");
     let session_db = match openpaw_store::sqlite::SessionDb::open(&db_path) {
-        Ok(db) => Some(db),
+        Ok(db) => Some(Arc::new(db)),
         Err(e) => {
             eprintln!(
                 "warn: session index disabled (cannot open {}: {e})",
@@ -119,6 +146,13 @@ pub fn run(args: ChatArgs) -> i32 {
             eprintln!("warn: failed to index session meta: {e}");
         }
     }
+
+    let mut transcript = Transcript {
+        writer: Arc::new(Mutex::new(writer)),
+        db: session_db,
+        session_id: session.meta.id.clone(),
+        seq: 1,
+    };
 
     let interactive = std::io::stdin().is_terminal();
     if interactive {
@@ -144,19 +178,11 @@ pub fn run(args: ChatArgs) -> i32 {
         }
 
         let user_msg = openpaw_core::Message::user_text(trimmed.to_string());
-        let pre_len = session.messages.len();
-        session.messages.push(user_msg.clone());
-        let _ = writer.append(&SessionEvent::Message(user_msg.clone()));
-        if let Some(db) = &session_db {
-            if let Err(e) =
-                db.index_event(&session.meta.id, pre_len, &SessionEvent::Message(user_msg))
-            {
-                eprintln!("warn: failed to index message: {e}");
-            }
-            if let Err(e) = db.touch_session(&session.meta.id) {
-                eprintln!("warn: failed to update session activity: {e}");
-            }
+        if let Err(e) = rt.block_on(transcript.record(SessionEvent::Message(user_msg.clone()))) {
+            eprintln!("error: cannot persist user message: {e}");
+            return 1;
         }
+        session.messages.push(user_msg);
 
         let log: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_log = Arc::clone(&log);
@@ -164,36 +190,19 @@ pub fn run(args: ChatArgs) -> i32 {
             sink_log.lock().unwrap_or_else(|e| e.into_inner()).push(ev);
         };
 
-        let stop = match rt.block_on(agent.run_turn(&mut session, None, &specs, &mut sink)) {
-            Ok(stop) => stop,
-            Err(e) => {
-                // Three-segment error shape: what / why / next step.
-                eprintln!("error: {e}");
-                eprintln!("why: the agent loop failed during this turn.");
-                eprintln!("next: re-run the message; if it persists, report the error above.");
-                return 1;
-            }
-        };
-
-        // Persist the new messages and print a compact turn summary.
-        // The user message was already appended (and indexed) when it was
-        // entered above — appending it again here would duplicate the event
-        // in the transcript. Only this turn's produced messages land here.
-        for (i, msg) in session.messages[pre_len..].iter().enumerate() {
-            if matches!(msg.role, openpaw_core::Role::User) {
-                continue;
-            }
-            let _ = writer.append(&SessionEvent::Message(msg.clone()));
-            if let Some(db) = &session_db {
-                if let Err(e) = db.index_event(
-                    &session.meta.id,
-                    pre_len + i,
-                    &SessionEvent::Message(msg.clone()),
-                ) {
-                    eprintln!("warn: failed to index message: {e}");
-                }
-            }
+        let outcome = rt.block_on(agent.run_with_context(
+            &mut session,
+            None,
+            &specs,
+            &RunContext::default(),
+            &mut transcript,
+            &mut sink,
+        ));
+        if let Some(e) = outcome.error {
+            eprintln!("error: {e}\nwhy: the agent loop or transcript persistence failed during this turn.\nnext: inspect the saved session before retrying; tools may already have performed side effects.");
+            return 1;
         }
+
         let events = log.lock().unwrap_or_else(|e| e.into_inner());
         for ev in events.iter() {
             if let AgentEvent::ToolResult {
@@ -203,12 +212,6 @@ pub fn run(args: ChatArgs) -> i32 {
                 ..
             } = ev
             {
-                let _ = writer.append(&SessionEvent::ToolCallComplete {
-                    call_id: String::new(),
-                    tool_name: name.clone().unwrap_or_default(),
-                    success: !*is_error,
-                    duration_ms: None,
-                });
                 if interactive {
                     let mark = if *is_error { "!" } else { "·" };
                     let preview: String = content.chars().take(80).collect();
@@ -234,11 +237,41 @@ pub fn run(args: ChatArgs) -> i32 {
             writeln!(out, "{reply}").ok();
         }
         let _ = out.flush();
-        let _ = stop; // end_turn/tool_use both simply continue to the next prompt
     }
 
     if interactive {
         println!("bye. session saved to {}", transcript_path.display());
     }
     0
+}
+
+// JSONL是事实来源；同步磁盘写在专用阻塞任务内完成，异步观察边界等待结果。
+// SQLite失败只警告，不能使已成功的JSONL事实丢失或重新执行工具。
+struct Transcript {
+    writer: Arc<Mutex<openpaw_store::SessionWriter>>,
+    db: Option<Arc<openpaw_store::SessionDb>>,
+    session_id: String,
+    seq: usize,
+}
+#[async_trait]
+impl RunObserver for Transcript {
+    async fn record(&mut self, event: SessionEvent) -> openpaw_core::Result<()> {
+        let writer = self.writer.clone();
+        let db = self.db.clone();
+        let session_id = self.session_id.clone();
+        let seq = self.seq;
+        tokio::task::spawn_blocking(move || -> openpaw_core::Result<()> {
+            writer.lock().map_err(|_| openpaw_core::Error::Store("transcript writer poisoned".into()))?
+                .append(&event).map_err(|e| openpaw_core::Error::Store(e.to_string()))?;
+            if let Some(db) = db {
+                if let Err(e) = db.index_event(&session_id, seq, &event) { eprintln!("warn: failed to index event: {e}"); }
+                if matches!(&event, SessionEvent::Message(msg) if msg.role == openpaw_core::Role::User && msg.content.iter().any(|block| matches!(block, openpaw_core::ContentBlock::Text { .. }))) {
+                    if let Err(e) = db.touch_session(&session_id) { eprintln!("warn: failed to update session activity: {e}"); }
+                }
+            }
+            Ok(())
+        }).await.map_err(|e| openpaw_core::Error::Store(format!("transcript task failed: {e}")))??;
+        self.seq += 1;
+        Ok(())
+    }
 }

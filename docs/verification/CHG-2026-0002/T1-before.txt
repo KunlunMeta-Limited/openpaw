@@ -1,0 +1,116 @@
+   Compiling openpaw-core v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-core)
+   Compiling openpaw-store v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-store)
+   Compiling openpaw-llm v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-llm)
+   Compiling openpaw-sandbox v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-sandbox)
+   Compiling openpaw-plugins v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-plugins)
+   Compiling openpaw-memory v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-memory)
+   Compiling openpaw-goal-ledger v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-goal-ledger)
+   Compiling openpaw-tools v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-tools)
+   Compiling openpaw-engine v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-engine)
+   Compiling openpaw-reflect-lite v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-reflect-lite)
+   Compiling openpaw-cli v0.1.0 (/tmp/openpaw-t1-before-20261020/crates/openpaw-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.58s
+     Running tests/t1_before.rs (/home/cheng/.cache/openpaw-t0/target/debug/deps/t1_before-ce1efd30a3cf741b)
+
+running 1 test
+test successful_tool_turn_persists_user_result_and_matching_ids ... FAILED
+
+failures:
+
+---- successful_tool_turn_persists_user_result_and_matching_ids stdout ----
+
+thread 'successful_tool_turn_persists_user_result_and_matching_ids' (3642884) panicked at crates/openpaw-cli/tests/t1_before.rs:124:5:
+成功工具的User/tool_result不能按角色过滤
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    successful_tool_turn_persists_user_result_and_matching_ids
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p openpaw-cli --test t1_before`
+     Running tests/t1_before.rs (/home/cheng/.cache/openpaw-t0/target/debug/deps/t1_before-7ca7eb1d62d74e1f)
+
+running 1 test
+test actual_engine_request_uses_provider_default ... FAILED
+
+failures:
+
+---- actual_engine_request_uses_provider_default stdout ----
+
+thread 'actual_engine_request_uses_provider_default' (3642921) panicked at crates/openpaw-engine/tests/t1_before.rs:11:3:
+assertion `left == right` failed: 不能发送占位模型
+  left: "openpaw-default"
+ right: "real-default"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    actual_engine_request_uses_provider_default
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p openpaw-engine --test t1_before`
+     Running tests/mock_server_contract.rs (/home/cheng/.cache/openpaw-t0/target/debug/deps/mock_server_contract-355059c177132da7)
+
+running 8 tests
+test openai_non_streaming_tool_calls_contract ... ok
+test openai_request_body_carries_function_tools ... ok
+test anthropic_non_streaming_contract ... ok
+test openai_rate_limit_classified ... ok
+test anthropic_auth_error_classified ... ok
+test truncated_streams_are_errors_for_both_network_providers ... FAILED
+test anthropic_streaming_tool_use_contract ... ok
+test openai_streaming_text_contract ... FAILED
+
+failures:
+
+---- truncated_streams_are_errors_for_both_network_providers stdout ----
+
+thread 'truncated_streams_are_errors_for_both_network_providers' (3642930) panicked at crates/openpaw-llm/tests/mock_server_contract.rs:263:5:
+assertion failed: events.iter().any(Result::is_err)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- openai_streaming_text_contract stdout ----
+
+thread 'openai_streaming_text_contract' (3642929) panicked at crates/openpaw-llm/tests/mock_server_contract.rs:217:13:
+assertion `left == right` failed: 最终响应与流文本必须相同
+  left: ""
+ right: "Hello"
+
+
+failures:
+    openai_streaming_text_contract
+    truncated_streams_are_errors_for_both_network_providers
+
+test result: FAILED. 6 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p openpaw-llm --test mock_server_contract`
+     Running tests/t1_utf8_before.rs (/home/cheng/.cache/openpaw-t0/target/debug/deps/t1_utf8_before-f5320b2eadd88a87)
+
+running 1 test
+test split_chinese_is_preserved ... FAILED
+
+failures:
+
+---- split_chinese_is_preserved stdout ----
+
+thread 'split_chinese_is_preserved' (3642940) panicked at crates/openpaw-llm/tests/t1_utf8_before.rs:7:2:
+assertion `left == right` failed
+  left: String("������")
+ right: "中文"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    split_chinese_is_preserved
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p openpaw-llm --test t1_utf8_before`
+error: 4 targets failed:
+    `-p openpaw-cli --test t1_before`
+    `-p openpaw-engine --test t1_before`
+    `-p openpaw-llm --test mock_server_contract`
+    `-p openpaw-llm --test t1_utf8_before`

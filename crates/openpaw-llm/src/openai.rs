@@ -294,6 +294,9 @@ impl LlmProvider for OpenAiProvider {
                             finished = true;
                         }
                         None => {
+                            for frame in decoder.finish() {
+                                state.absorb(&frame, &mut queue);
+                            }
                             state.finish(&mut queue);
                             finished = true;
                         }
@@ -326,6 +329,8 @@ impl LlmProvider for OpenAiProvider {
 /// finish (OpenAI has no per-tool block lifecycle).
 #[derive(Default)]
 struct OpenAiStreamState {
+    text: String,
+    finalized: bool,
     tool_calls: std::collections::BTreeMap<usize, (String, String, String)>, // id, name, args
     usage: Usage,
     stop_reason: Option<StopReason>,
@@ -339,6 +344,11 @@ impl OpenAiStreamState {
     ) {
         let data = &frame.data;
         if data.as_str() == Some("[DONE]") {
+            self.finish(queue);
+            return;
+        }
+        if data.is_null() {
+            queue.push_back(Err(Error::Provider("malformed OpenAI SSE JSON".into())));
             return;
         }
         if let Some(u) = data.get("usage") {
@@ -350,6 +360,7 @@ impl OpenAiStreamState {
         let delta = choice.get("delta").cloned().unwrap_or(json!({}));
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
+                self.text.push_str(text);
                 queue.push_back(Ok(StreamEvent::TextDelta {
                     index: 0,
                     text: text.to_string(),
@@ -394,6 +405,17 @@ impl OpenAiStreamState {
         &mut self,
         queue: &mut std::collections::VecDeque<openpaw_core::Result<StreamEvent>>,
     ) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        // EOF不是成功终态；未收到finish_reason不能把部分文本或工具输入当完整响应。
+        if self.stop_reason.is_none() {
+            queue.push_back(Err(Error::Provider(
+                "OpenAI stream ended without finish_reason".into(),
+            )));
+            return;
+        }
         // Assemble accumulated tool_call fragments: emit a ToolUseStart per
         // call, and the Final response carries the assembled blocks.
         let calls: Vec<(usize, String, String, String)> = std::mem::take(&mut self.tool_calls)
@@ -401,8 +423,21 @@ impl OpenAiStreamState {
             .map(|(idx, (id, name, args))| (idx, id, name, args))
             .collect();
         let mut final_content: Vec<ContentBlock> = Vec::new();
+        if !self.text.is_empty() {
+            final_content.push(ContentBlock::Text {
+                text: self.text.clone(),
+            });
+        }
         for (idx, id, name, args) in &calls {
-            let input: serde_json::Value = serde_json::from_str(args).unwrap_or(json!({}));
+            let input: serde_json::Value = match serde_json::from_str(args) {
+                Ok(input) => input,
+                Err(_) => {
+                    queue.push_back(Err(Error::Provider(
+                        "invalid OpenAI streamed tool arguments".into(),
+                    )));
+                    return;
+                }
+            };
             final_content.push(ContentBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),

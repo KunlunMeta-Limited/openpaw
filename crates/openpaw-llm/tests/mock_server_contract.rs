@@ -214,6 +214,7 @@ async fn openai_streaming_text_contract() {
     match events.last() {
         Some(StreamEvent::Final(resp)) => {
             assert_eq!(resp.stop_reason, openpaw_core::StopReason::EndTurn);
+            assert_eq!(resp.text(), "Hello", "最终响应与流文本必须相同");
         }
         other => panic!("expected Final, got {other:?}"),
     }
@@ -249,4 +250,29 @@ async fn openai_request_body_carries_function_tools() {
     req.tools = vec![ToolSpec::new("grep", "search")];
     let resp = p.complete(req).await.unwrap();
     assert_eq!(resp.stop_reason, openpaw_core::StopReason::EndTurn);
+}
+
+#[tokio::test]
+async fn truncated_streams_are_errors_for_both_network_providers() {
+    use futures::StreamExt;
+    let addr = spawn_mock(vec![http_sse(&[
+        r#"data: {"choices":[{"delta":{"content":"partial"}}]}"#,
+    ])]);
+    let p = OpenAiProvider::new("sk-test", "gpt-4o").with_base_url(format!("http://{addr}"));
+    let events: Vec<_> = p.stream(req("gpt-4o")).await.unwrap().collect().await;
+    assert!(events.iter().any(Result::is_err));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Ok(StreamEvent::Final(_)))));
+
+    let addr = spawn_mock(vec![http_sse(&[
+        r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
+        r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"partial"}}"#,
+    ])]);
+    let p = AnthropicProvider::new("sk-test", "m").with_base_url(format!("http://{addr}"));
+    let events: Vec<_> = p.stream(req("m")).await.unwrap().collect().await;
+    assert!(events.iter().any(Result::is_err));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Ok(StreamEvent::Final(_)))));
 }
