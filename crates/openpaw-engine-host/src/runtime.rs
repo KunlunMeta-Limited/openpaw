@@ -2213,7 +2213,7 @@ impl AppState {
                 if child.parent_id != parent || read.transcript.mutation.archived.is_some_and(|value|value>0) {continue;}
                 if match child.parent_message_id.as_deref() {
                     Some(input)=>!inputs.contains(input),
-                    None=>!parent_read.transcript.messages[..visible].iter().any(|message|message.content.iter().any(|block|matches!(block,openpaw_core::ContentBlock::ToolResult{content,..} if content.contains(&id)))),
+                    None=>!parent_read.transcript.messages[..visible].iter().any(|message|message.content.iter().any(|block|matches!(block,openpaw_core::ContentBlock::ToolResult{content,name:Some(name),..} if name=="delegate_task" && content.contains(&format!("task_id={id}，status="))))),
                 } {continue;}
                 if std::fs::canonicalize(session_workspace(&read.events,&workspace)).ok().as_ref() != Some(&workspace) {continue;}
                 children.push(serde_json::json!({"task_id":id,"name":child.name}));
@@ -2276,7 +2276,7 @@ fn visible_child_origin(parent: &SessionHandle, child_id: &str, child: &ChildSes
     match &child.parent_message_id {
         Some(input)=>messages[..visible].iter().any(|message|message.uuid.as_ref()==Some(input)),
         // 旧关系没有来源字段，只能在仍可见的真实委派结果中证明，不依赖名称缓存。
-        None=>messages[..visible].iter().any(|message|message.content.iter().any(|block| matches!(block,openpaw_core::ContentBlock::ToolResult{content,..} if content.contains(child_id)))),
+        None=>messages[..visible].iter().any(|message|message.content.iter().any(|block| matches!(block,openpaw_core::ContentBlock::ToolResult{content,name:Some(name),..} if name=="delegate_task" && content.contains(&format!("task_id={child_id}，status="))))),
     }
 }
 fn absolute_workspace(path: PathBuf) -> Result<PathBuf, String> {
