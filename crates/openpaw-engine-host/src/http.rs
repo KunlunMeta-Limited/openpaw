@@ -2524,6 +2524,257 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cold_employee_four_views_do_not_require_a_prior_session_read() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let mut fixture = main_fixture("delegate-inspect", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派读取 README 并汇报"))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let employee = fixture.child_employee().await;
+        assert!(
+            fixture
+                .state
+                .shutdown_gracefully(Duration::from_secs(2))
+                .await
+        );
+        let calls = fixture.model_seen.lock().await.len();
+        let mut state = AppState::new(fixture.state.config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            &fixture.state.config.home,
+            &fixture.state.config.workspace,
+            Some(
+                std::env::var("OPENPAW_OPENAI_BASE_URL")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .into(),
+            ),
+        );
+        state.office.attach_main(&state.main_office);
+        fixture.app = build_router(state.clone());
+        fixture.state = state;
+        let mut current = "cold-open".to_string();
+        let mut content=fixture.ui(serde_json::json!({"id":current,"teamId":fixture.team,"action":"employee.inspect","employeeId":employee["id"]})).await;
+        assert!(content.to_string().contains("会话编号"), "{content}");
+        for label in ["消息", "工具", "状态", "刷新"] {
+            let next = format!("cold-{label}");
+            content = fixture.button(&current, &next, &content, label).await;
+            assert!(content.to_string().contains("会话编号"), "{content}");
+            current = next;
+        }
+        assert_eq!(fixture.model_seen.lock().await.len(), calls);
+    }
+
+    #[tokio::test]
+    async fn reverted_child_origin_cannot_resume_and_fork_never_inherits_child_authority() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-resume", "confirm").await;
+        async fn json(
+            app: &Router,
+            method: &str,
+            path: String,
+            body: serde_json::Value,
+        ) -> serde_json::Value {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            serde_json::from_slice(&to_bytes(response.into_body(), 500_000).await.unwrap()).unwrap()
+        }
+        let parent = json(
+            &fixture.app,
+            "POST",
+            "/session".into(),
+            serde_json::json!({}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        json(&fixture.app,"POST",format!("/session/{parent}/message"),serde_json::json!({"text":serde_json::json!({"task":"读取首轮秘密","name":"worker"}).to_string()})).await;
+        let sessions = json(
+            &fixture.app,
+            "GET",
+            "/session".into(),
+            serde_json::json!({}),
+        )
+        .await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["parentID"] == parent)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let history = json(
+            &fixture.app,
+            "GET",
+            format!("/session/{parent}/message"),
+            serde_json::json!({}),
+        )
+        .await;
+        let origin = history[0]["info"]["id"].as_str().unwrap();
+        json(
+            &fixture.app,
+            "POST",
+            format!("/session/{parent}/revert"),
+            serde_json::json!({"messageID":origin}),
+        )
+        .await;
+        let count = fixture.model_seen.lock().await.len();
+        json(&fixture.app,"POST",format!("/session/{parent}/message"),serde_json::json!({"text":serde_json::json!({"task":"continue","task_id":child}).to_string()})).await;
+        let requests = fixture.model_seen.lock().await;
+        assert!(
+            requests[count..].iter().all(|request| request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "delegate_task")),
+            "hidden child must not execute"
+        );
+        assert!(
+            requests[count..]
+                .iter()
+                .any(|request| request["messages"].to_string().contains("父会话可见历史")),
+            "must explain detached relation"
+        );
+        drop(requests);
+        let fork = json(
+            &fixture.app,
+            "POST",
+            format!("/session/{parent}/fork"),
+            serde_json::json!({}),
+        )
+        .await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let count = fixture.model_seen.lock().await.len();
+        json(&fixture.app,"POST",format!("/session/{fork}/message"),serde_json::json!({"text":serde_json::json!({"task":"continue","task_id":child}).to_string()})).await;
+        assert!(fixture.model_seen.lock().await[count..]
+            .iter()
+            .all(|request| request["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["function"]["name"] == "delegate_task")));
+        assert!(
+            json(
+                &fixture.app,
+                "GET",
+                format!("/session/{child}/message"),
+                serde_json::json!({})
+            )
+            .await
+            .as_array()
+            .unwrap()
+            .len()
+                > 1
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_snapshot_remains_readonly_with_explicit_missing_history_and_unchanged_bytes() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let mut fixture = main_fixture("tools", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("读取 README"))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let sessions = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sessions: serde_json::Value =
+            serde_json::from_slice(&to_bytes(sessions.into_body(), 200_000).await.unwrap())
+                .unwrap();
+        let parent = sessions[0]["id"].as_str().unwrap();
+        let employee = format!("{parent}:agent:legacy");
+        let directory = fixture
+            .workspace
+            .path()
+            .join(".openpaw/engine-host-delegations");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{parent}.json"));
+        let bytes=serde_json::to_vec(&serde_json::json!({"version":2,"records":[{"logical_key":"legacy","workspace_id":employee,"workspace_name":"历史员工","task_fingerprint":"old","task":"旧任务已完成","completed":{"content":"真实旧结果","structured":{"path":"legacy.txt"}}}]})).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(fixture.workspace.path().join("legacy.txt"), "kept artifact").unwrap();
+        assert!(
+            fixture
+                .state
+                .shutdown_gracefully(Duration::from_secs(2))
+                .await
+        );
+        let calls = fixture.model_seen.lock().await.len();
+        let mut state = AppState::new(fixture.state.config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            &fixture.state.config.home,
+            &fixture.state.config.workspace,
+            Some(
+                std::env::var("OPENPAW_OPENAI_BASE_URL")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .into(),
+            ),
+        );
+        state.office.attach_main(&state.main_office);
+        fixture.app = build_router(state.clone());
+        fixture.state = state;
+        let mut current = "legacy-open".to_string();
+        let mut content=fixture.ui(serde_json::json!({"id":current,"teamId":fixture.team,"action":"employee.inspect","employeeId":employee})).await;
+        assert!(content.to_string().contains("完整历史未保存"), "{content}");
+        assert!(content.to_string().contains("旧任务已完成"));
+        for label in ["消息", "工具", "状态", "刷新"] {
+            let next = format!("legacy-{label}");
+            content = fixture.button(&current, &next, &content, label).await;
+            assert!(content.to_string().contains("完整历史未保存"), "{content}");
+            if label == "消息" {
+                assert!(content.to_string().contains("真实旧结果"));
+            }
+            current = next;
+        }
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert_eq!(fixture.model_seen.lock().await.len(), calls);
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("legacy.txt")).unwrap(),
+            "kept artifact"
+        );
+    }
+
+    #[tokio::test]
     async fn employee_inspect_returns_real_child_readonly_overview_without_execution() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))

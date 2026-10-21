@@ -299,6 +299,7 @@ impl DelegationContext {
                     parent_id: self.parent_session_id.clone(),
                     workspace_id,
                     name,
+                    parent_message_id: None,
                 },
                 self.workspace.clone(),
                 task.to_string(),
@@ -524,6 +525,21 @@ fn load_delegations(
             )
         })
         .collect()
+}
+
+/// 功能：读取旧临时子执行中确实保存的任务和最终结果。
+/// 参数：workspace 为可信工作目录，parent 为已登记父身份。
+/// 返回：保留旧展示编号的可证实事实，不提供可执行 task_id。
+/// 错误：旧文件缺失或格式不支持时返回空，不清空源文件。
+/// 状态：只读；完整历史缺失须由使用方明确标注。
+/// 并发与取消：同步读取旧小快照，不写盘、不执行工具。
+/// 权限：仅访问由父会话编号派生的既有快照。
+/// 关联：CHG-2026-0040、ADR-0002。
+pub(crate) fn legacy_records(workspace: &std::path::Path, parent: &str) -> Vec<serde_json::Value> {
+    let mut records:Vec<_>=load_delegations(&delegation_state_file(workspace,parent),parent).into_values()
+        .map(|record|json!({"id":record.workspace_id,"name":record.workspace_name,"task":record.task,"result":record.completed.map(|value|value.content)})).collect();
+    records.sort_by_key(|record| record["id"].as_str().unwrap_or("").to_string());
+    records
 }
 
 fn persisted_delegation_state(

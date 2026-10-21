@@ -1169,7 +1169,7 @@ pub fn session_title_with_presentation(
 
 /// 功能：把可见 assistant 回退边界规范化为触发同一回合的 user 消息边界。
 /// 参数：session、可见消息、回合结果和客户端请求的消息编号。
-/// 返回：权威游标及前缀；真实或已验证失败 assistant 归到触发输入，未知边界返回 None。
+/// 返回：权威游标及前缀；真实或已验证失败、取消 assistant 归到触发输入，未知边界返回 None。
 /// 错误：无；无有效回合关联且找不到此前真实用户输入时保留原 assistant 边界。
 /// 状态：纯读取，不修改消息、回合结果或持久化投影。
 /// 并发与取消：调用方提供稳定快照，同步无锁，不可取消。
@@ -1186,7 +1186,7 @@ pub fn normalize_revert_boundary(
         return turn_outcomes
             .iter()
             .find(|turn| {
-                turn.state == TurnState::Failed
+                matches!(turn.state, TurnState::Failed | TurnState::Cancelled)
                     && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
             })
             .and_then(|turn| {
@@ -1227,7 +1227,7 @@ pub fn normalize_revert_boundary(
         .or(Some(original))
 }
 
-/// 功能：将已经验证存在的失败占位边界映射为真实历史前缀。
+/// 功能：将已经验证存在的失败或取消尝试边界映射为真实历史前缀。
 /// 参数：session_id、messages、outcomes 为稳定快照，message_id 为公共错误消息编号。
 /// 返回：该失败回合真实消息之后、下一用户回合之前的位置；不可验证时返回 None。
 /// 错误：无。
@@ -1242,7 +1242,7 @@ pub fn failed_message_prefix_len(
     message_id: &str,
 ) -> Option<usize> {
     let turn = outcomes.iter().find(|turn| {
-        turn.state == TurnState::Failed
+        matches!(turn.state, TurnState::Failed | TurnState::Cancelled)
             && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
     })?;
     let start = visible_prefix_len(session_id, messages, &turn.user_message_id)?;

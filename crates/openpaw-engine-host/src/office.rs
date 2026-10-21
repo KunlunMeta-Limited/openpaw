@@ -68,6 +68,7 @@ pub(crate) struct MainOffice {
     projection_rx: Mutex<Option<mpsc::Receiver<MainProjection>>>,
     sessions: Mutex<HashMap<String, std::sync::Weak<crate::runtime::SessionHandle>>>,
     details: Mutex<detail::Details>,
+    runtime: Mutex<std::sync::Weak<crate::runtime::AppState>>,
 }
 
 struct MainProjection {
@@ -115,6 +116,7 @@ impl MainOffice {
             projection_rx: Mutex::new(Some(projection_rx)),
             sessions: Mutex::new(HashMap::new()),
             details: Mutex::new(detail::Details::default()),
+            runtime: Mutex::new(std::sync::Weak::new()),
         });
         if let Err(error) = this.register(workspace) {
             *this.records.lock().unwrap_or_else(|e| e.into_inner()) = Err(error);
@@ -140,6 +142,18 @@ impl MainOffice {
             .insert(handle.id.clone(), Arc::downgrade(handle));
     }
 
+    /// 功能：关联只读员工冷加载所需的原运行时。
+    /// 参数：runtime 为当前 Host 的共享状态。
+    /// 返回：无。
+    /// 错误：锁中毒时恢复弱引用槽。
+    /// 状态：只保存弱引用，不创建会话或执行。
+    /// 并发与取消：短同步锁，不形成循环所有权。
+    /// 权限：只允许后续已验证员工使用原会话加载入口。
+    /// 关联：CHG-2026-0040、ADR-003。
+    pub(crate) fn bind_runtime(&self, runtime: &Arc<crate::runtime::AppState>) {
+        *self.runtime.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(runtime);
+    }
+
     fn recover(&self, home: &Path) -> Result<(), String> {
         let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let records = guard.as_mut().map_err(|error| error.clone())?;
@@ -163,6 +177,30 @@ impl MainOffice {
                 revision = revision.max(fact["seq"].as_u64().ok_or("办公室事实版本损坏")?);
                 record.snapshot["employees"] = fact["employees"].clone();
                 record.snapshot["tasks"] = fact["tasks"].clone();
+            }
+            let employees = record.snapshot["employees"]
+                .as_array_mut()
+                .ok_or("办公室人员记录损坏")?;
+            for (_id, child) in
+                crate::runtime::restored_office_children(home, session, &record.workspace)
+            {
+                if employees.len() < 200
+                    && !employees
+                        .iter()
+                        .any(|employee| employee["id"] == child.workspace_id)
+                {
+                    // 已存在的人物绑定不变；恢复缺失列表项也不借用其他员工人物。
+                    employees.push(serde_json::json!({"id":child.workspace_id,"name":child.name,"role":"子 Agent","sceneActorId":"","online":false}));
+                }
+            }
+            for legacy in crate::delegation::legacy_records(&record.workspace, session) {
+                if employees.len() < 200
+                    && !employees
+                        .iter()
+                        .any(|employee| employee["id"] == legacy["id"])
+                {
+                    employees.push(serde_json::json!({"id":legacy["id"],"name":legacy["name"],"role":"历史子 Agent（完整历史未保存）","sceneActorId":"","online":false}));
+                }
             }
             record.child_tasks.clear();
             record.snapshot["events"] = serde_json::json!([]);
@@ -791,6 +829,7 @@ impl MainOffice {
                             };
                             let content = match action["action"].as_str() {
                                 Some("actor.inspect" | "employee.inspect" | "dialog.action") => {
+                                    office.prepare_detail(team, action).await;
                                     office.inspect(team, action)
                                 }
                                 _ => {
