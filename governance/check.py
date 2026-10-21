@@ -176,12 +176,27 @@ def approval_fields(parsed: dict) -> dict:
     return result
 
 
+def normalized_markdown(value: str) -> str:
+    """表格对齐/CRLF不改变方案；代码块及说明正文保持原意，不放宽实际字段。"""
+    result, fence = [], False
+    for line in value.replace("\r\n", "\n").splitlines():
+        if line.strip().startswith(("~~~", chr(96) * 3)):
+            fence = not fence
+        if not fence and line.strip().startswith("|"):
+            row = cells(line)
+            result.append("TABLE-SEPARATOR" if all(re.fullmatch(r":?-{3,}:?", c) for c in row)
+                          else json.dumps(row, ensure_ascii=False))
+        else:
+            result.append(line)
+    return "\n".join(result)
+
+
 def plan_digest(body: str) -> str:
     """绑定实质方案，忽略审批事实/履历及CRLF，不忽略方法、权限与测试。"""
     parsed = tables(body)
     approval = approval_fields(parsed)
     sections = re.split(r"(?m)^## ", body.replace("\r\n", "\n"))
-    plan = [section.strip() for section in sections[1:]
+    plan = [normalized_markdown(section.strip()) for section in sections[1:]
             if re.match(r"(?:[2-9]|10|11)\. ", section)]
     value = {"fields": {k: approval.get(k, "") for k in PLAN_KEYS}, "sections": plan,
              "introduction": sections[0].strip()}
@@ -461,12 +476,6 @@ def historical_update(before: str, after: str, explanation: bool) -> None:
     """补登只动审批/追加履历；获批说明迁移可改原因及新增方法列，不能改历史范围。"""
     old, new = sections(before), sections(after)
     old_tables, new_tables = tables(before), tables(after)
-    def normalized(value):
-        # 用户对表格的列宽/分隔符排版不改变保护语义，CRLF同理。
-        return "\n".join(json.dumps(cells(line), ensure_ascii=False) if line.strip().startswith("|")
-                         and not all(re.fullmatch(r":?-{3,}:?", c) for c in cells(line))
-                         else "TABLE-SEPARATOR" if line.strip().startswith("|") else line
-                         for line in value.splitlines())
     for key in old:
         if key.startswith(("## 1.", "## 12.")) or explanation and key.startswith("## 4."):
             continue
@@ -479,7 +488,7 @@ def historical_update(before: str, after: str, explanation: bool) -> None:
             right = "\n".join(line for line in new.get(key, "").splitlines() if not line.strip().startswith("|"))
         else:
             left, right = old[key], new.get(key, "")
-        if normalized(left) != normalized(right):
+        if normalized_markdown(left) != normalized_markdown(right):
             raise Failure("历史维护改变受保护章节：" + key)
     if old.get("## 12. 验证和审批记录", "") not in new.get("## 12. 验证和审批记录", ""):
         raise Failure("历史维护删除原验证/审批履历")

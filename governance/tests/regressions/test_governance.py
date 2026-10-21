@@ -214,6 +214,9 @@ reason="需要保护"
         with self.assertRaisesRegex(check.Failure,'实质变化'):self.pr_check(self.base,None,'implementation')
         self.write(self.path,original+'\n补登技术事实，不改方案。\n')
         self.pr_check(self.base,None,'implementation')
+        # 排版与换行不等于实质方案变化，方法文本变化仍由上面的反例拒绝。
+        self.write(self.path,original.replace('| --- | --- |','| ------ | ------- |').replace('\n','\r\n'))
+        self.pr_check(self.base,None,'implementation')
         self.write(self.path,original.replace('实施中（in-progress）','不存在（fake）'))
         with self.assertRaises(check.Failure):self.validate()
 
