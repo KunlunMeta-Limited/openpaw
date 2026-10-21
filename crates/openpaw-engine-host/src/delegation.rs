@@ -318,6 +318,10 @@ impl DelegationContext {
     /// 关联：Q5、staged Revert。
     pub(crate) fn invalidate_results(&self) -> std::io::Result<()> {
         let mut records = self.delegations.lock().unwrap_or_else(|e| e.into_inner());
+        // 新持久子会话不使用旧答案缓存；不要为正常 Revert 新建空的旧格式快照。
+        if records.is_empty() {
+            return Ok(());
+        }
         let mut snapshot = persisted_delegation_state(&records);
         for record in &mut snapshot.records {
             record.completed = None;
