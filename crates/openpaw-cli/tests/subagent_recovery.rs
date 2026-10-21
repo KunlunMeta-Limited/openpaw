@@ -207,7 +207,13 @@ fn killed_host_keeps_child_unknown_once_without_reexecuting_tools_or_replaying_a
         .unwrap()
         .to_string();
     host.0.kill().unwrap();
-    host.0.wait().unwrap();
+    let killed = host.0.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(
+        killed.signal(),
+        Some(9),
+        "fixture must stop the Host process by SIGKILL"
+    );
     let release = workspace.path().join("release");
     let release_writer = std::thread::spawn(move || {
         let _ = std::fs::write(release, b"release");
@@ -267,6 +273,10 @@ fn killed_host_keeps_child_unknown_once_without_reexecuting_tools_or_replaying_a
     assert_eq!(
         request(port, "GET", &format!("/session/{child}/message"), ""),
         continued
+    );
+    println!(
+        "T07 crash evidence: {}",
+        serde_json::json!({"parentID":parent,"childID":child,"killSignal":killed.signal(),"restarts":2,"recoveryDisposition":"unknown","providerCallsBeforeRecovery":count,"providerCallsAfterReadonlyRecovery":count,"actionsBeforeRecovery":action_count,"actionsAfterReadonlyRecovery":action_count,"sameChildContinued":true,"parentDeletePreservedChild":true,"effect":"actual-side-effect"})
     );
     stop.store(true, Ordering::Release);
     server.join().unwrap();
