@@ -372,6 +372,9 @@ impl MainOffice {
         self: &Arc<Self>,
         parent: &str,
     ) -> Result<Option<MainChildReservation>, String> {
+        if self.url.is_none() {
+            return Ok(None);
+        }
         let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let records = guard.as_mut().map_err(|error| error.clone())?;
         let directory_bytes = serde_json::to_vec(&serde_json::json!({"type":"offices.initialize","offices":records.values().map(|record|record.snapshot.clone()).collect::<Vec<_>>()})).map_err(|_|"办公室目录编码失败")?.len();

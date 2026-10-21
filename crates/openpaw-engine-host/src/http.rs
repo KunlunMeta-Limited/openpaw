@@ -1843,8 +1843,8 @@ mod tests {
                     } else {serde_json::json!({"choices":[{"delta":{"content":if parent {"parent integrated"} else {"本轮任务已完成"}},"finish_reason":"stop"}]})};
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
-                if scenario == "recover" && parent && tools == 0 { gate.notified().await; }
-                let call = if (scenario.starts_with("delegate") || scenario == "recover") && parent && tools == 0 {
+                if (scenario == "recover" && parent || scenario == "recover-registered" && !parent) && tools == 0 { gate.notified().await; }
+                let call = if (scenario.starts_with("delegate") || scenario.starts_with("recover")) && parent && tools == 0 {
                     Some(("delegate_task",serde_json::json!({"name":"资料检索","task":if scenario == "delegate-repeat" {
                         format!("读取 README.md 并汇报：{}", messages[latest]["content"].as_str().unwrap_or(""))
                     }else{"读取 README.md 并汇报".into()}})))
@@ -4382,7 +4382,7 @@ Path('exclusive').rmdir()
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
-        let fixture = main_fixture("recover", "confirm").await;
+        let fixture = main_fixture("recover-registered", "confirm").await;
         let response = fixture
             .app
             .clone()
@@ -4390,6 +4390,14 @@ Path('exclusive').rmdir()
             .await
             .unwrap();
         let registry = fixture.home.path().join("offices/registry.json");
+        // 新身份必须在执行前可靠登记；本例故障注入改在真实子回合开始后，仍验证后续投影失败不改变引擎结果。
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.model_seen.lock().await.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let checkpoint = std::fs::read(&registry).unwrap();
         // 模拟事实已提交而业务投影发布失败。保留绑定检查点，不改会话历史。
         std::fs::remove_file(&registry).unwrap();
