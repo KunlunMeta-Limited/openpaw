@@ -15,6 +15,8 @@ use reqwest::{Client, Url};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+mod detail;
+
 const MAX_SUBAGENT_OUTPUT_CHARS: usize = 20_000;
 const SUBAGENT_OUTPUT_CHUNK_CHARS: usize = 96;
 
@@ -65,6 +67,7 @@ pub(crate) struct MainOffice {
     projection_tx: mpsc::Sender<MainProjection>,
     projection_rx: Mutex<Option<mpsc::Receiver<MainProjection>>>,
     sessions: Mutex<HashMap<String, std::sync::Weak<crate::runtime::SessionHandle>>>,
+    details: Mutex<detail::Details>,
 }
 
 struct MainProjection {
@@ -77,115 +80,6 @@ struct MainProjection {
 }
 
 impl MainOffice {
-    fn inspect(&self, team: &str, action: &Value) -> Value {
-        let unavailable = |description: &str| serde_json::json!({"template":"detail-v1","title":"员工详情","description":description,"fields":[],"actions":[]});
-        let Ok(record) = self.record(team) else {
-            return unavailable("办公室不存在，未启动任何工作。");
-        };
-        let employee = record.snapshot["employees"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|employee| {
-                if action["action"] == "actor.inspect" {
-                    action["actorId"]
-                        .as_str()
-                        .is_some_and(|actor| !actor.is_empty() && employee["sceneActorId"] == actor)
-                } else {
-                    employee["id"] == action["employeeId"]
-                }
-            });
-        let Some(employee) = employee else {
-            return unavailable("该人物尚未绑定实际 Agent，没有可查看的工作记录。");
-        };
-        let employee_id = employee["id"].as_str().unwrap_or("");
-        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        let handle = sessions
-            .values()
-            .filter_map(std::sync::Weak::upgrade)
-            .find(|handle| {
-                handle.workspace == record.workspace
-                    && (handle.id == employee_id
-                        || handle.child.as_ref().is_some_and(|child| {
-                            Some(child.parent_id.as_str()) == record.session.as_deref()
-                                && child.workspace_id == employee_id
-                        }))
-            });
-        let Some(handle) = handle else {
-            return unavailable("该员工尚无已加载的持久会话记录；未生成或重放工作。");
-        };
-        let truncate = |text: String, maximum: usize| {
-            let mut used = 0;
-            text.chars()
-                .take_while(|character| {
-                    used += character.len_utf16();
-                    used <= maximum
-                })
-                .collect::<String>()
-        };
-        let history = handle.wire_messages();
-        let last_input = history
-            .iter()
-            .rev()
-            .find(|message| message["info"]["role"] == "user")
-            .map(|message| {
-                message["parts"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|part| part["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let recent = history
-            .iter()
-            .rev()
-            .take(3)
-            .rev()
-            .map(|message| {
-                let role = message["info"]["role"].as_str().unwrap_or("消息");
-                let text = message["parts"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|part| part["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("{role}: {text}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let tools = history
-            .iter()
-            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
-            .filter(|part| part["type"] == "tool")
-            .rev()
-            .take(3)
-            .map(|part| {
-                format!(
-                    "{} [{}] callID={}\n输入：{}\n结果：{}",
-                    part["tool"].as_str().unwrap_or("工具"),
-                    part["state"]["status"].as_str().unwrap_or("unknown"),
-                    part["callID"].as_str().unwrap_or(""),
-                    part["state"]["input"],
-                    part["state"]["output"]
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let state = handle
-            .turn_outcomes()
-            .last()
-            .map(|turn| format!("{:?}", turn.state))
-            .unwrap_or_else(|| "尚未执行".into());
-        serde_json::json!({"template":"detail-v1","title":format!("{} · 只读详情", employee["name"].as_str().unwrap_or("Agent")),
-            "description":"实际会话记录的一页概览；查看不会发起对话或执行工具。",
-            "fields":[{"label":"会话编号","value":handle.id},{"label":"任务","value":truncate(last_input,2000)},
-                {"label":"状态 / 更新时间","value":format!("{} / {}",state,handle.updated_at.load(std::sync::atomic::Ordering::Acquire))},
-                {"label":"最近消息","value":truncate(recent,2000)},{"label":"最近工具","value":truncate(tools,2000)}],"actions":[]})
-    }
-
     /// 功能：加载办公室目录或为配置的工作目录创建稳定身份。
     /// 参数：home、workspace 和可选受控 gateway 地址。
     /// 返回：共享目录，加载失败保留错误并拒绝聊天。
@@ -220,6 +114,7 @@ impl MainOffice {
             projection_tx,
             projection_rx: Mutex::new(Some(projection_rx)),
             sessions: Mutex::new(HashMap::new()),
+            details: Mutex::new(detail::Details::default()),
         });
         if let Err(error) = this.register(workspace) {
             *this.records.lock().unwrap_or_else(|e| e.into_inner()) = Err(error);
@@ -880,6 +775,7 @@ impl MainOffice {
                 let Some(office) = weak.upgrade() else {
                     break;
                 };
+                office.expire_details();
                 let result = tokio::select! {
                     _ = shutdown.cancelled() => break,
                     result = office.message(serde_json::json!({"type":"ui.next","timeoutMs":1000}),Duration::from_secs(3)) => result,
@@ -894,7 +790,7 @@ impl MainOffice {
                                 continue;
                             };
                             let content = match action["action"].as_str() {
-                                Some("actor.inspect" | "employee.inspect") => {
+                                Some("actor.inspect" | "employee.inspect" | "dialog.action") => {
                                     office.inspect(team, action)
                                 }
                                 _ => {

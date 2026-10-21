@@ -99,6 +99,8 @@ struct DelegateTaskInput {
     task: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    task_id: Option<String>,
 }
 
 struct ProviderModel {
@@ -292,6 +294,7 @@ impl DelegationContext {
             .ok_or_else(|| Error::ToolHost("委派运行时不可用，未启动子任务".into()))?;
         runtime
             .run_delegated(
+                input.task_id,
                 crate::runtime::ChildSession {
                     parent_id: self.parent_session_id.clone(),
                     workspace_id,
@@ -333,16 +336,27 @@ impl DelegationContext {
         Ok(())
     }
 
-    /// 功能：描述当前可复用的已完成子任务。
+    /// 功能：向父模型列出明确可续办的真实子会话身份。
     /// 参数：无。
-    /// 返回：有完成结果且 Office 启用时返回提示。
+    /// 返回：本父工作区存在未归档子会话时返回 ID 与显示名提示。
     /// 错误：无。
-    /// 状态：只读记录，不恢复失效结果。
-    /// 并发与取消：同步记录锁；不发起网络调用。
-    /// 权限：仅供主模型上下文，不向 Office 发布任务正文。
-    /// 关联：Q5 与委派缓存。
-    pub(crate) fn context_prompt(&self) -> Option<String> {
-        None
+    /// 状态：只读统一会话目录，不读取旧答案缓存、不启动执行。
+    /// 并发与取消：目录扫描使用阻塞任务；不持有回合锁或网络连接。
+    /// 权限：只列出可信父关系与同目录的子身份。
+    /// 关联：CHG-2026-0035、明确 task_id 续办。
+    pub(crate) async fn context_prompt(&self) -> Option<String> {
+        if !self.enabled {
+            return None;
+        }
+        let runtime = self
+            .shared
+            .runtime
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()?;
+        runtime
+            .child_context(&self.parent_session_id, &self.workspace)
+            .await
     }
 }
 
@@ -563,14 +577,15 @@ fn save_delegations(
 fn delegate_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate_task".into(),
-        description: "把一个清晰、可独立完成的子任务交给真实子 Agent，并等待其结果。委派前先合并重复或高度重叠的职责；name 仅用于显示，优先中文并保留必要技术标识；每次新委派创建独立子身份，不按名称或旧答案复用。适合独立子任务，简单任务不要调用。".into(),
+        description: "把清晰独立的子任务交给真实子 Agent 并等待结果。继续已有员工必须传上次结果或员工清单中的真实 task_id，保留其自己的工作历史；不传 task_id 始终创建新身份，即使 name 或 task 相同。name 仅用于新员工显示，优先中文；不能传 workspaceId 代替 task_id。简单任务不要调用。".into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["task"],
             "properties": {
                 "task": { "type": "string", "minLength": 1, "maxLength": MAX_DELEGATE_TASK_CHARS },
-                "name": { "type": "string", "minLength": 1, "maxLength": MAX_DELEGATE_NAME_CHARS }
+                "name": { "type": "string", "minLength": 1, "maxLength": MAX_DELEGATE_NAME_CHARS },
+                "task_id": { "type": "string", "minLength": 1, "maxLength": 128 }
             }
         }),
         category: Some(ToolCategory::Communication),
@@ -1223,8 +1238,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn legacy_workspace_identity_and_missing_transcript_are_preserved_without_reuse() {
+    #[tokio::test]
+    async fn legacy_workspace_identity_and_missing_transcript_are_preserved_without_reuse() {
         let host = test_host();
         save_delegations(
             &host.context.state_file,
@@ -1251,7 +1266,12 @@ mod tests {
             "可证实的旧结果"
         );
         assert!(
-            host.context.context_prompt().is_none(),
+            !host
+                .context
+                .context_prompt()
+                .await
+                .unwrap_or_default()
+                .contains("可证实的旧结果"),
             "旧答案不得冒充持久子历史"
         );
     }
