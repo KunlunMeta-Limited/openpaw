@@ -1769,13 +1769,13 @@ mod tests {
                     },
                     Some("decision.request") => {
                         if choice == "pending" || choice == "child-pending" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") { std::future::pending::<()>().await; }
-                        let chosen = if choice == "child-pending" {"confirm"}else{choice};
+                        let chosen = if matches!(choice,"child-pending"|"child-timeout") {"confirm"}else{choice};
                         serde_json::json!({"teamId":body["teamId"],"decisionId":body["decision"]["id"],"choiceId":chosen,
                             "label":if chosen == "confirm" {"允许本次"} else {"拒绝"}})
                     },
                     _ => serde_json::json!({"forwarded":1}),
                 };
-                Json(serde_json::json!({"code":200,"msg":"OK","data":data}))
+                Json(serde_json::json!({"code":if choice=="child-timeout" && body["type"]=="decision.request" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") {408}else{200},"msg":"OK","data":data}))
             }
         })).route("/v1/chat/completions",post(move |Json(body):Json<serde_json::Value>| {
             let seen = models.clone();
@@ -1797,6 +1797,31 @@ mod tests {
                     let tasks: Vec<serde_json::Value> = serde_json::from_str(messages[latest]["content"].as_str().unwrap()).unwrap();
                     let calls = tasks.into_iter().enumerate().map(|(index,args)|serde_json::json!({"index":index,"id":format!("capacity-{index}"),"type":"function","function":{"name":"delegate_task","arguments":args.to_string()}})).collect::<Vec<_>>();
                     let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+                    return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
+                }
+                if scenario == "delegate-concurrent" || scenario == "delegate-cancel" {
+                    let task = messages[latest]["content"].as_str().unwrap_or("");
+                    if !parent && tools == 0 && task == "hold-model" { gate.notified().await; }
+                    let calls = if parent && tools == 0 {
+                        serde_json::from_str::<Vec<serde_json::Value>>(task).unwrap().into_iter().enumerate().map(|(index,args)|serde_json::json!({"index":index,"id":format!("delegate-{index}"),"type":"function","function":{"name":"delegate_task","arguments":args.to_string()}})).collect::<Vec<_>>()
+                    } else if !parent && tools == 0 && matches!(task,"alpha"|"beta") {
+                        let command = format!("python3 lock-test.py {task}");
+                        vec![serde_json::json!({"index":0,"id":"locked-command","type":"function","function":{"name":"bash","arguments":serde_json::json!({"command":command}).to_string()}})]
+                    } else { Vec::new() };
+                    let chunk = if calls.is_empty() {serde_json::json!({"choices":[{"delta":{"content":"concurrent turn completed"},"finish_reason":"stop"}]})}
+                    else {serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})};
+                    return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
+                }
+                if scenario == "delegate-single-approval" {
+                    let task = messages[latest]["content"].as_str().unwrap_or("");
+                    let call = if parent && tools == 0 {
+                        Some(("delegate_task",serde_json::from_str::<serde_json::Value>(task).unwrap()))
+                    } else if !parent && tools < 2 {
+                        Some(("write_file",serde_json::json!({"path":format!("{task}-{tools}.txt"),"content":"single-call-authorized"})))
+                    } else { None };
+                    let chunk = if let Some((name,args)) = call {
+                        serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call-{tools}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
+                    } else {serde_json::json!({"choices":[{"delta":{"content":if parent {"parent integrated"} else {"child handled decisions"}},"finish_reason":"stop"}]})};
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
                 if scenario == "delegate-child-fail" && !parent && tools > 0 {
@@ -1824,7 +1849,8 @@ mod tests {
                         format!("读取 README.md 并汇报：{}", messages[latest]["content"].as_str().unwrap_or(""))
                     }else{"读取 README.md 并汇报".into()}})))
                 } else if tools < if scenario == "tools" {2} else {1} {
-                    Some(if scenario == "write" || scenario == "delegate-write" {("write_file",serde_json::json!({"path":"approved.txt","content":"approved once"}))}
+                    Some(if scenario == "delegate-long" {("sleep",serde_json::json!({"duration_ms":300000}))}
+                        else if scenario == "write" || scenario == "delegate-write" {("write_file",serde_json::json!({"path":"approved.txt","content":"approved once"}))}
                         else {("read_file",serde_json::json!({"path":"README.md"}))})
                 } else { None };
                 let chunk = if let Some((name,args)) = call {
@@ -1843,10 +1869,21 @@ mod tests {
             ("OPENPAW_OPENAI_BASE_URL", format!("http://{address}/v1")),
             ("OPENPAW_OPENAI_MODEL", "fixture-model".into()),
             ("OPENPAW_MAIN_API_KEY", "fixture-gateway-key".into()),
-            ("OPENPAW_ENGINE_MAX_MODEL_REQUESTS", "1".into()),
+            (
+                "OPENPAW_ENGINE_MAX_MODEL_REQUESTS",
+                if matches!(scenario, "delegate-concurrent" | "delegate-cancel") {
+                    "2"
+                } else {
+                    "1"
+                }
+                .into(),
+            ),
             (
                 "OPENPAW_ENGINE_PERMISSIONS",
-                if scenario == "write" || scenario == "delegate-write" {
+                if scenario == "write"
+                    || scenario == "delegate-write"
+                    || scenario == "delegate-single-approval"
+                {
                     "manual"
                 } else {
                     "auto"
@@ -1870,7 +1907,12 @@ mod tests {
             provider: "openai".into(),
             ..Default::default()
         };
-        let mut state = AppState::new_with_turn_limits(config.clone(), 1, 0).unwrap();
+        let mut state = AppState::new_with_turn_limits(
+            config.clone(),
+            if scenario == "delegate-cancel" { 2 } else { 1 },
+            0,
+        )
+        .unwrap();
         Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
             &config.home,
             &config.workspace,
@@ -2331,6 +2373,619 @@ mod tests {
         } else {
             serde_json::from_slice(&bytes).unwrap()
         }
+    }
+
+    async fn next_child_permission(app: &Router, owner: Option<&str>) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let pending =
+                    child_test_json(app, "GET", "/permission", serde_json::json!({})).await;
+                if let Some(permission) = pending.as_array().unwrap().iter().find(|permission| {
+                    permission["metadata"]["parentSessionID"].is_string()
+                        && owner.is_none_or(|owner| permission["sessionID"] == owner)
+                }) {
+                    return permission.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("子工具必须逐次请求授权，不能复用 always")
+    }
+
+    #[tokio::test]
+    async fn child_turns_parallelize_but_share_write_lock_and_reject_same_child_races() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-concurrent", "confirm").await;
+        std::fs::write(
+            fixture.workspace.path().join("lock-test.py"),
+            r#"from pathlib import Path
+import sys, time
+name = sys.argv[1]
+try:
+    Path('exclusive').mkdir()
+except FileExistsError:
+    Path('collision').touch()
+    raise
+with open('sequence','a') as log: log.write(name+':start\n')
+Path(name+'.started').touch()
+while not Path('release-'+name).exists(): time.sleep(0.01)
+with open('sequence','a') as log: log.write(name+':end\n')
+Path('exclusive').rmdir()
+"#,
+        )
+        .unwrap();
+        let parent = child_test_json(&fixture.app, "POST", "/session", serde_json::json!({})).await
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let app = fixture.app.clone();
+        let path = format!("/session/{parent}/message");
+        let task = tokio::spawn(async move {
+            child_test_json(&app,"POST",&path,serde_json::json!({"text":serde_json::json!([{"task":"alpha","name":"甲"},{"task":"beta","name":"乙"}]).to_string()})).await
+        });
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                let status = child_test_json(
+                    &fixture.app,
+                    "GET",
+                    "/session/status",
+                    serde_json::json!({}),
+                )
+                .await;
+                let active_tools = status
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .filter(|value| value["activity"]["tool"] == "bash")
+                    .count();
+                if active_tools == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("不同子应同时进入实际工具执行，父只占一份全局额度");
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let children: Vec<_> = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|child| child["parentID"] == parent)
+            .cloned()
+            .collect();
+        assert_eq!(children.len(), 2);
+        let started = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let started: Vec<_> = ["alpha", "beta"]
+                    .into_iter()
+                    .filter(|name| {
+                        fixture
+                            .workspace
+                            .path()
+                            .join(format!("{name}.started"))
+                            .exists()
+                    })
+                    .collect();
+                if !started.is_empty() {
+                    break started;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            started.len(),
+            1,
+            "两个 ToolExecutionStart 之后仍只有一个 bash 能进入写锁"
+        );
+        for name in ["alpha", "beta"] {
+            std::fs::write(fixture.workspace.path().join(format!("release-{name}")), "").unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!fixture.workspace.path().join("collision").exists());
+        let sequence = std::fs::read_to_string(fixture.workspace.path().join("sequence")).unwrap();
+        assert!(
+            sequence == "alpha:start\nalpha:end\nbeta:start\nbeta:end\n"
+                || sequence == "beta:start\nbeta:end\nalpha:start\nalpha:end\n"
+        );
+        let child = children[0]["id"].as_str().unwrap();
+        let app = fixture.app.clone();
+        let path = format!("/session/{parent}/message");
+        let target = child.to_string();
+        let task = tokio::spawn(async move {
+            child_test_json(&app,"POST",&path,serde_json::json!({"text":serde_json::json!([{"task":"hold-model","task_id":target},{"task":"hold-model","task_id":target}]).to_string()})).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = fixture.model_seen.lock().await;
+                let started = requests.iter().any(|request| {
+                    !request["tools"].to_string().contains("delegate_task")
+                        && request["messages"].to_string().contains("hold-model")
+                });
+                drop(requests);
+                if started {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let public = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/session/{child}/prompt_async"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"must be busy"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::CONFLICT);
+        fixture.release_model.notify_one();
+        tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let turns = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{child}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(turns.as_array().unwrap().len(), 2, "两次并发续办只接受一次");
+        assert!(turns
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|turn| turn["state"] == "completed"));
+        let history = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{parent}/message"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(history.to_string().contains("正在执行"));
+        assert_eq!(
+            child_test_json(
+                &fixture.app,
+                "GET",
+                "/session/status",
+                serde_json::json!({})
+            )
+            .await,
+            serde_json::json!({})
+        );
+        eprintln!(
+            "T05 concurrency evidence: {}",
+            serde_json::json!({"parentID":parent,"children":children,"serializedWrites":sequence,"sameChildTurns":turns,"publicBusy":409,"globalParentLimit":1,"modelLimit":2})
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_abort_joins_own_child_terminal_and_leaves_other_parent_running() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-cancel", "confirm").await;
+        let mut parents = Vec::new();
+        let mut tasks = Vec::new();
+        for name in ["first", "other"] {
+            let parent = child_test_json(&fixture.app, "POST", "/session", serde_json::json!({}))
+                .await["id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let app = fixture.app.clone();
+            let path = format!("/session/{parent}/message");
+            tasks.push(tokio::spawn(async move {child_test_json(&app,"POST",&path,serde_json::json!({"text":serde_json::json!([{"task":"hold-model","name":name}]).to_string()})).await}));
+            parents.push(parent);
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let requests = fixture.model_seen.lock().await;
+                let held = requests
+                    .iter()
+                    .filter(|request| {
+                        !request["tools"].to_string().contains("delegate_task")
+                            && request["messages"].to_string().contains("hold-model")
+                    })
+                    .count();
+                drop(requests);
+                if held == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["parentID"] == parents[0])
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let other_child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["parentID"] == parents[1])
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &format!("/session/{}/abort", parents[0]),
+            serde_json::json!({}),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), tasks.remove(0))
+            .await
+            .unwrap()
+            .unwrap();
+        let stopped = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{child}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(stopped[0]["state"], "cancelled");
+        assert!(stopped[0]["completedAt"].is_number());
+        let active = child_test_json(
+            &fixture.app,
+            "GET",
+            "/session/status",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(active.get(child).is_none());
+        assert_eq!(active[&parents[1]]["type"], "busy");
+        assert_eq!(active[other_child]["type"], "busy");
+        fixture.release_model.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(3), tasks.remove(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child_test_json(
+                &fixture.app,
+                "GET",
+                &format!("/session/{other_child}/turns"),
+                serde_json::json!({})
+            )
+            .await[0]["state"],
+            "completed"
+        );
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &format!("/session/{}/message", parents[0]),
+            serde_json::json!({"text":"[]"}),
+        )
+        .await;
+        assert_eq!(
+            child_test_json(
+                &fixture.app,
+                "GET",
+                "/session/status",
+                serde_json::json!({})
+            )
+            .await,
+            serde_json::json!({})
+        );
+        eprintln!(
+            "T05 cancellation evidence: {}",
+            serde_json::json!({"stoppedParent":parents[0],"stoppedChild":child,"childTerminal":stopped,"unrelatedParent":parents[1],"unrelatedChild":other_child,"otherFinished":true,"cancelledParentCanRunAgain":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_child_approvals_remain_single_call_for_old_always_clients() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-single-approval", "child-pending").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat(&serde_json::json!({"name":"李研","task":"first"}).to_string()))
+            .await
+            .unwrap();
+        let first = next_child_permission(&fixture.app, None).await;
+        let child = first["sessionID"].as_str().unwrap();
+        let reply = |id: &str| format!("/permission/{id}/reply");
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &reply(first["id"].as_str().unwrap()),
+            serde_json::json!({"reply":"always"}),
+        )
+        .await;
+        let second = next_child_permission(&fixture.app, Some(child)).await;
+        assert_ne!(first["id"], second["id"]);
+        assert!(fixture.workspace.path().join("first-0.txt").exists());
+        assert!(!fixture.workspace.path().join("first-1.txt").exists());
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &reply(second["id"].as_str().unwrap()),
+            serde_json::json!({"reply":"reject"}),
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            to_bytes(response.into_body(), 200_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!fixture.workspace.path().join("first-1.txt").exists());
+        // 同一真实 child 经公开入口继续执行，仍必须重新批准，不能继承先前 always。
+        let app = fixture.app.clone();
+        let child_path = format!("/session/{child}/message");
+        let running = tokio::spawn(async move {
+            child_test_json(
+                &app,
+                "POST",
+                &child_path,
+                serde_json::json!({"text":"public"}),
+            )
+            .await
+        });
+        let third = next_child_permission(&fixture.app, Some(child)).await;
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &reply(third["id"].as_str().unwrap()),
+            serde_json::json!({"reply":"once"}),
+        )
+        .await;
+        let fourth = next_child_permission(&fixture.app, Some(child)).await;
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &reply(fourth["id"].as_str().unwrap()),
+            serde_json::json!({"reply":"reject"}),
+        )
+        .await;
+        running.await.unwrap();
+        assert!(fixture.workspace.path().join("public-0.txt").exists());
+        assert!(!fixture.workspace.path().join("public-1.txt").exists());
+        let parent = first["metadata"]["parentSessionID"].as_str().unwrap();
+        let app = fixture.app.clone();
+        let path = format!("/session/{parent}/message");
+        let target = child.to_string();
+        let delegated = tokio::spawn(async move {
+            child_test_json(&app,"POST",&path,serde_json::json!({"text":serde_json::json!({"task":"resumed","task_id":target}).to_string()})).await
+        });
+        let parent_permission = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let items =
+                    child_test_json(&fixture.app, "GET", "/permission", serde_json::json!({}))
+                        .await;
+                if let Some(item) = items
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["sessionID"] == parent)
+                {
+                    break item.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &reply(parent_permission["id"].as_str().unwrap()),
+            serde_json::json!({"reply":"always"}),
+        )
+        .await;
+        let fifth = next_child_permission(&fixture.app, Some(child)).await;
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &reply(fifth["id"].as_str().unwrap()),
+            serde_json::json!({"reply":"once"}),
+        )
+        .await;
+        let sixth = next_child_permission(&fixture.app, Some(child)).await;
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &reply(sixth["id"].as_str().unwrap()),
+            serde_json::json!({"reply":"reject"}),
+        )
+        .await;
+        delegated.await.unwrap();
+        assert!(fixture.workspace.path().join("resumed-0.txt").exists());
+        assert!(!fixture.workspace.path().join("resumed-1.txt").exists());
+        for used in [&first, &second, &third, &fourth, &fifth, &sixth] {
+            let stale = fixture
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(reply(used["id"].as_str().unwrap()))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"reply":"once"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+        }
+        eprintln!(
+            "T05 single-call evidence: {}",
+            serde_json::json!({"childID":child,"cards":[first,second,third,fourth,fifth,sixth],"allowed":["first-0.txt","public-0.txt","resumed-0.txt"],"rejected":["first-1.txt","public-1.txt","resumed-1.txt"],"lateReplies":404})
+        );
+    }
+
+    #[tokio::test]
+    async fn child_gateway_timeout_denies_the_actual_tool_without_side_effects() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-write", "child-timeout").await;
+        // 父 delegate 本次批准，子卡片由外部 gateway 明确返回超时。
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("请写入文件"))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            to_bytes(response.into_body(), 200_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!fixture.workspace.path().join("approved.txt").exists());
+        let decisions = fixture
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|message| message["type"] == "decision.request")
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2, "必须实际进入子工具的超时审批");
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["parentID"].is_string())
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let history = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{child}/message"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(history.to_string().contains("denied by user"));
+        assert_eq!(
+            child_test_json(&fixture.app, "GET", "/permission", serde_json::json!({})).await,
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "实际等待 main 既有 180 秒期限；独立集成验收运行"]
+    async fn original_main_deadline_cancels_sleeping_child_and_joins_durable_terminal() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-long", "confirm").await;
+        let started = std::time::Instant::now();
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("安排子 Agent 等待，验证原始超时取消"))
+            .await
+            .unwrap();
+        let body = tokio::time::timeout(
+            Duration::from_secs(185),
+            to_bytes(response.into_body(), 200_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("error"));
+        assert!(started.elapsed() >= Duration::from_secs(179));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = child_test_json(
+                    &fixture.app,
+                    "GET",
+                    "/session/status",
+                    serde_json::json!({}),
+                )
+                .await;
+                if status == serde_json::json!({}) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let parent = fixture
+            .state
+            .main_office
+            .record(&fixture.team)
+            .unwrap()
+            .session
+            .unwrap();
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["parentID"] == parent)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let child_turns = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{child}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        let parent_turns = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{parent}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(child_turns[0]["state"], "cancelled");
+        assert_eq!(parent_turns[0]["state"], "cancelled");
+        assert!(
+            child_turns[0]["completedAt"].as_i64().unwrap()
+                <= parent_turns[0]["completedAt"].as_i64().unwrap()
+        );
+        eprintln!(
+            "T05 original timeout evidence: {}",
+            serde_json::json!({"elapsedSeconds":started.elapsed().as_secs(),"parentID":parent,"childID":child,"parentTurns":parent_turns,"childTurns":child_turns,"originalDeadlineSeconds":180})
+        );
     }
 
     #[tokio::test]
@@ -3659,6 +4314,19 @@ mod tests {
         })
         .await
         .unwrap();
+        let child_turns = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{owner}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            child_turns[0]["state"], "cancelled",
+            "父终态发布前，子执行必须保存取消终态"
+        );
+        assert!(child_turns[0]["completedAt"].is_number());
+        assert!(!owner_handle.is_active(), "子不是仅被清掉人物状态");
         let response = fixture
             .app
             .clone()
