@@ -1799,6 +1799,9 @@ mod tests {
                     let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
+                if scenario == "delegate-child-fail" && !parent && tools > 0 {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
                 if scenario == "delegate-resume" || scenario == "delegate-capacity" {
                     let task = messages[latest]["content"].as_str().unwrap_or("");
                     let call = if parent && tools == 0 {
@@ -3046,6 +3049,66 @@ mod tests {
             fixture.model_seen.lock().await.len(),
             4,
             "只读查看不得调用模型或工具"
+        );
+    }
+
+    #[tokio::test]
+    async fn employee_details_keep_failed_child_tool_facts_without_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-child-fail", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派读取文件，失败时保留真实过程"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let child = fixture.child_employee().await;
+        let models = fixture.model_seen.lock().await.len();
+        assert_eq!(models, 4, "子模型读完文件后失败，父模型接收失败汇总");
+        let overview = fixture.ui(serde_json::json!({"id":"failed-open","teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        let session = overview["fields"][0]["value"].as_str().unwrap();
+        let tools = fixture
+            .button("failed-open", "failed-tools", &overview, "工具")
+            .await;
+        assert_eq!(tools["fields"][0]["value"], session);
+        let text = tools["fields"].to_string();
+        for expected in [
+            "callID=call-0",
+            "read_file",
+            "README.md",
+            "actual tool content",
+            "completed",
+        ] {
+            assert!(
+                text.contains(expected),
+                "员工详情缺少已发生事实：{expected}"
+            );
+        }
+        assert_eq!(
+            text.matches("callID=call-0").count(),
+            1,
+            "真实调用只展示一次"
+        );
+        let status = fixture
+            .button("failed-tools", "failed-status", &tools, "状态")
+            .await;
+        assert!(
+            status["fields"].to_string().contains("failed"),
+            "不能把已完成工具当作成功回合"
+        );
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            models,
+            "只读查看不产生模型或工具调用"
+        );
+        eprintln!(
+            "T06 employee evidence: {}",
+            serde_json::json!({"employeeID":child["id"],"sessionID":session,"tool":"read_file","callID":"call-0","turnState":"failed","toolDisposition":"completed","readonlyModelRequests":0})
         );
     }
 

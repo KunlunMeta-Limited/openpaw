@@ -103,6 +103,33 @@
         },
         "error": {
           "$ref": "#/$defs/error"
+        },
+        "execution": {
+          "properties": {
+            "state": {
+              "enum": [
+                "queued",
+                "running",
+                "completed",
+                "failed",
+                "cancelled"
+              ]
+            },
+            "incomplete": {
+              "type": "boolean"
+            },
+            "turnID": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "turnID",
+            "state",
+            "incomplete"
+          ],
+          "additionalProperties": false,
+          "type": "object"
         }
       }
     },
@@ -189,6 +216,9 @@
                   "properties": {
                     "attachments": {
                       "$ref": "#/$defs/toolAttachments"
+                    },
+                    "state": {
+                      "$ref": "#/$defs/toolExecutionState"
                     }
                   }
                 }
@@ -460,6 +490,27 @@
         },
         "additionalProperties": true
       }
+    },
+    "toolExecutionState": {
+      "properties": {
+        "disposition": {
+          "enum": [
+            "completed",
+            "error",
+            "denied",
+            "cancelled",
+            "unknown"
+          ]
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "error"
+          ]
+        }
+      },
+      "type": "object"
     }
   }
 }
