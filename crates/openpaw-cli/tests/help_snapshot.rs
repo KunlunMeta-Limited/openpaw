@@ -18,10 +18,8 @@ fn sub_help(name: &str) -> String {
     String::from_utf8(buf).expect("help text is utf-8")
 }
 
-/// The managed top-level subcommands (all except the bare root). The
-/// `sidecar` entry is feature-gated exactly like the CLI surface.
-#[cfg(not(feature = "sidecar"))]
-const SUBCOMMANDS: [&str; 12] = [
+// 默认十二个入口固定；可选项与CLI使用相同feature，四种组合都精确核对，不能只检查下限。
+const SUBCOMMANDS: &[&str] = &[
     "hello",
     "chat",
     "session",
@@ -34,26 +32,14 @@ const SUBCOMMANDS: [&str; 12] = [
     "tool",
     "completions",
     "init",
-];
-#[cfg(feature = "sidecar")]
-const SUBCOMMANDS: [&str; 13] = [
-    "hello",
-    "chat",
-    "session",
-    "memory",
-    "evolve",
-    "doctor",
-    "goal",
-    "config",
-    "model",
-    "tool",
-    "completions",
-    "init",
+    #[cfg(feature = "engine-host")]
+    "engine-host",
+    #[cfg(feature = "sidecar")]
     "sidecar",
 ];
 
 #[test]
-fn root_help_lists_all_twelve_subcommands_and_version() {
+fn root_help_lists_enabled_subcommands_and_version() {
     let mut cmd = Cli::command();
     let mut buf = Vec::new();
     cmd.write_help(&mut buf).expect("write root help");
@@ -80,16 +66,20 @@ fn root_help_lists_all_twelve_subcommands_and_version() {
 }
 
 #[test]
-fn top_level_subcommand_count_is_twelve() {
+fn top_level_subcommands_match_exact_feature_surface() {
     let mut cmd: Command = Cli::command();
     cmd.build();
-    // clap injects a built-in `help` subcommand; the managed surface is
-    // the twelve names above.
+    // clap的内建help不属于业务入口；默认十二项加每个已启用可选入口。
     let managed: Vec<&str> = cmd
         .get_subcommands()
         .map(|c| c.get_name())
         .filter(|n| *n != "help")
         .collect();
+    assert_eq!(
+        SUBCOMMANDS.len(),
+        12 + usize::from(cfg!(feature = "engine-host")) + usize::from(cfg!(feature = "sidecar")),
+        "默认十二项不能因增加可选命令而改变"
+    );
     assert_eq!(
         managed.len(),
         SUBCOMMANDS.len(),
@@ -98,7 +88,7 @@ fn top_level_subcommand_count_is_twelve() {
     );
     for name in SUBCOMMANDS {
         assert!(
-            managed.contains(&name),
+            managed.contains(name),
             "subcommand `{name}` is missing from: {managed:?}"
         );
     }
@@ -133,9 +123,21 @@ fn each_subcommand_help_carries_key_names() {
             );
         }
     }
+    #[cfg(feature = "engine-host")]
+    {
+        let help = sub_help("engine-host");
+        for key in ["--config", "--port"] {
+            assert!(
+                help.contains(key),
+                "`openpaw engine-host` help must contain `{key}`:\n{help}"
+            );
+        }
+    }
     assert_eq!(
         cases.len(),
-        SUBCOMMANDS.len() - if cfg!(feature = "sidecar") { 1 } else { 0 },
+        SUBCOMMANDS.len()
+            - usize::from(cfg!(feature = "sidecar"))
+            - usize::from(cfg!(feature = "engine-host")),
         "the snapshot table must cover every non-gated subcommand"
     );
     for (name, keys) in cases {

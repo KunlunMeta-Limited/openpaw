@@ -560,6 +560,117 @@ async fn h10_configuration_scope_and_root_aliases() {
 }
 
 #[tokio::test]
+async fn h02_simultaneous_submissions_and_same_slot_different_conversation_conflict() {
+    let base = tempfile::tempdir().unwrap();
+    let host = Host::with_provider(config(base.path()), Arc::new(Slow))
+        .await
+        .unwrap();
+    let s = scope(1);
+    let b = host.open_session(s.clone()).await.unwrap();
+    let (left, right) = tokio::join!(
+        host.submit_run(&s, &b.session_id, "first".into()),
+        host.submit_run(&s, &b.session_id, "second".into()),
+    );
+    let (run, conflict) = match (left, right) {
+        (Ok(run), Err(error)) | (Err(error), Ok(run)) => (run, error),
+        _ => panic!("同一会话并发提交只能接受一次"),
+    };
+    assert_eq!(conflict.kind, "session_busy");
+    let mut other = s.clone();
+    other.conversation_id = "different-conversation".into();
+    let b2 = host.open_session(other.clone()).await.unwrap();
+    assert_eq!(
+        host.submit_run(&other, &b2.session_id, "same office".into())
+            .await
+            .unwrap_err()
+            .kind,
+        "slot_busy"
+    );
+    host.cancel_run(&s, &run.run_id).await.unwrap();
+    host.wait_idle().await;
+    // 终态后同槽名额可再次使用，不把冲突预留永久留在注册表。
+    let next = host
+        .submit_run(&other, &b2.session_id, "after release".into())
+        .await
+        .unwrap();
+    host.cancel_run(&other, &next.run_id).await.unwrap();
+    host.wait_idle().await;
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn h10_real_directory_alias_and_escape_link_are_checked() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cfg = config(base.path());
+    let root = cfg.roots["project"].clone();
+    let outside = base.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("private.txt"), "outside content").unwrap();
+    let alias = base.path().join("root-alias");
+    let escape = root.join("escape");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // 目录junction不要求管理员或开发者模式；此处验证真实重解析点而非字符串大小写。
+        for (link, target) in [(&alias, &root), (&escape, &outside)] {
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "junction创建失败：{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let upper = root.to_string_lossy().to_uppercase();
+        assert!(same_file::is_same_file(&root, std::path::Path::new(&upper)).unwrap());
+        cfg.roots.insert("case-alias".into(), upper.into());
+    }
+    cfg.roots.insert("alias".into(), alias);
+    cfg.slots.insert("office-2".into(), "alias".into());
+    let host = Host::start(cfg).await.unwrap();
+    let s = scope(1);
+    let b = host.open_session(s.clone()).await.unwrap();
+    let result = host
+        .query(
+            &s,
+            QueryRequest {
+                session_id: b.session_id.clone(),
+                kind: QueryKind::File {
+                    path: "escape/private.txt".into(),
+                },
+                offset: 0,
+                limit: 0,
+            },
+        )
+        .await;
+    assert!(result.is_err(), "链接不可绕过授权根");
+    assert_eq!(
+        host.query(
+            &scope(2),
+            QueryRequest {
+                session_id: b.session_id,
+                kind: QueryKind::History,
+                offset: 0,
+                limit: 0,
+            }
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        "scope_denied"
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn h08_storage_failure_latches_failed_and_no_tool_side_effect() {
     let base = tempfile::tempdir().unwrap();
     let cfg = config(base.path());
@@ -624,4 +735,48 @@ async fn h08_terminal_storage_failure_is_not_reported_as_success() {
         "storage_unavailable"
     );
     host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn h08_acceptance_failure_does_not_start_tools_or_replay_input() {
+    let base = tempfile::tempdir().unwrap();
+    let cfg = config(base.path());
+    let root = cfg.roots["project"].clone();
+    let host = Host::with_provider(cfg.clone(), writer()).await.unwrap();
+    let s = scope(1);
+    let b = host.open_session(s.clone()).await.unwrap();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_accept BEFORE UPDATE ON host_runs WHEN json_extract(NEW.data,'$.state')='accepted' BEGIN SELECT RAISE(FAIL,'test accept failure'); END;").unwrap();
+    assert_eq!(
+        host.submit_run(&s, &b.session_id, "must not start".into())
+            .await
+            .unwrap_err()
+            .kind,
+        "storage_unavailable"
+    );
+    tokio::time::timeout(Duration::from_secs(1), host.wait_idle())
+        .await
+        .unwrap();
+    assert!(!root.join("report.txt").exists());
+    assert!(host.pending_approvals(&s).await.unwrap().is_empty());
+    let (before, _) = host.snapshot_and_subscribe(&s).await.unwrap();
+    assert_eq!(before.runs.len(), 1);
+    assert_eq!(before.runs[0].state, RunState::Failed);
+    db.execute_batch("DROP TRIGGER reject_accept").unwrap();
+    drop(db);
+    host.shutdown().await.unwrap();
+    let reopened = Host::start(cfg).await.unwrap();
+    let (after, _) = reopened.snapshot_and_subscribe(&s).await.unwrap();
+    assert_eq!(after.runs[0].state, RunState::Failed);
+    assert!(!root.join("report.txt").exists());
+    let session = reopened.get_session(&s, &b.session_id).await.unwrap();
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .filter(|m| m.role == openpaw_core::Role::User)
+            .count(),
+        1
+    );
+    reopened.shutdown().await.unwrap();
 }

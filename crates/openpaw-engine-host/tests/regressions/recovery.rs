@@ -79,6 +79,12 @@ fn child_fixture() {
         return;
     };
     let base = std::path::PathBuf::from(std::env::var_os("OPENPAW_T3_FIXTURE_BASE").unwrap());
+    if mode == "host-shell-cancel" || mode == "host-shell-shutdown" {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(host_shell_fixture(&base, mode.ends_with("cancel")));
+        return;
+    }
     if mode == "lock-exclusive" || mode == "lock-shared" {
         let cfg = config(&base);
         let meta = cfg.roots["project"].join(".openpaw");
@@ -153,6 +159,203 @@ fn child_fixture() {
             let _ = rx.recv().await;
         }
     });
+}
+
+async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
+    let mut cfg = config(base);
+    cfg.tools = vec!["bash".into()];
+    cfg.api_key_env = Some("OPENPAW_T3_MODEL_SECRET".into());
+    cfg.basic_username_env = Some("OPENPAW_T3_BASIC_USER".into());
+    cfg.basic_password_env = Some("OPENPAW_T3_BASIC_SECRET".into());
+    let root = cfg.roots["project"].clone();
+    std::fs::write(root.join("t3-host-worker-marker"), "isolated fixture").unwrap();
+    let command = format!(
+        "\"{}\" --exact host_tool_worker --nocapture",
+        std::env::current_exe().unwrap().display()
+    );
+    let provider = Arc::new(MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "bash".into(),
+            input: json!({"command":command}),
+            text: "proposed shell".into(),
+        },
+        MockMode::Fixed("done".into()),
+    ]));
+    let host = Host::with_provider(cfg.clone(), provider).await.unwrap();
+    let b = host.open_session(scope()).await.unwrap();
+    let run = host
+        .submit_run(&scope(), &b.session_id, "run approved fixture".into())
+        .await
+        .unwrap();
+    let a = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope()).await.unwrap();
+            if let Some(a) = snapshot.pending_approvals.into_iter().next() {
+                break a;
+            }
+            rx.recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!root.join("worker.pid").exists(), "批准前不能创建进程");
+    host.decide_approval(&scope(), &a.approval_id, a.revision, a.binding, true)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !root.join("worker-ready").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let view = host.get_run(&scope(), &run.run_id).await.unwrap();
+    assert_eq!(view.tools[0].state, "running");
+    let lock_path = root.join(".openpaw/engine-host-resource.lock");
+    assert_eq!(
+        openpaw_sandbox::file_lock::try_lock_exclusive(&lock_path)
+            .err()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    if cancel {
+        assert_eq!(
+            host.cancel_run(&scope(), &run.run_id).await.unwrap().state,
+            RunState::Cancelling
+        );
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        assert_eq!(
+            host.get_run(&scope(), &run.run_id).await.unwrap().state,
+            RunState::Cancelled
+        );
+    } else {
+        tokio::time::timeout(Duration::from_secs(10), host.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    // 冲突锁只能在工具实际退出、结果已保存后取得；不能仅凭取消请求释放。
+    let guard = openpaw_sandbox::file_lock::try_lock_exclusive(&lock_path).unwrap();
+    for file in ["worker.pid", "grandchild.pid"] {
+        let pid = std::fs::read_to_string(root.join(file))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert!(!host_test_process_running(pid), "Host返回后仍残留进程{pid}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("secret-check")).unwrap(),
+        "isolated"
+    );
+    drop(guard);
+    if cancel {
+        let (snapshot, _) = host.snapshot_and_subscribe(&scope()).await.unwrap();
+        let history = host.get_session(&scope(), &b.session_id).await.unwrap();
+        let displayed = format!(
+            "{}{}",
+            serde_json::to_string(&snapshot).unwrap(),
+            serde_json::to_string(&history).unwrap()
+        );
+        for secret in ["T3-test-model-value", "T3-test-basic-value"] {
+            assert!(!displayed.contains(secret));
+        }
+        host.shutdown().await.unwrap();
+    }
+    // 即使旧Host克隆仍存在，关闭确认后数据目录也必须可重新独占。
+    let reopened = Host::start(cfg).await.unwrap();
+    assert_eq!(
+        reopened.get_run(&scope(), &run.run_id).await.unwrap().state,
+        RunState::Cancelled
+    );
+    reopened.shutdown().await.unwrap();
+}
+
+#[test]
+fn h10_h11_host_shell_credentials_tree_cleanup_and_resource_release() {
+    for mode in ["host-shell-cancel", "host-shell-shutdown"] {
+        let base = tempfile::tempdir().unwrap();
+        let log_path = base.path().join("fixture.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let mut process = Child(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child_fixture", "--nocapture"])
+                .env("OPENPAW_T3_FIXTURE", mode)
+                .env("OPENPAW_T3_FIXTURE_BASE", base.path())
+                .env("OPENPAW_T3_MODEL_SECRET", "T3-test-model-value")
+                .env("OPENPAW_T3_BASIC_USER", "T3-test-user")
+                .env("OPENPAW_T3_BASIC_SECRET", "T3-test-basic-value")
+                .stdout(Stdio::from(log.try_clone().unwrap()))
+                .stderr(Stdio::from(log))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "Host进程验收超时");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = std::fs::read_to_string(log_path).unwrap();
+        for secret in ["T3-test-model-value", "T3-test-basic-value"] {
+            assert!(!output.contains(secret));
+        }
+        assert!(status.success(), "Host原生进程测试失败：{output}");
+    }
+}
+
+#[test]
+fn host_tool_worker() {
+    if !std::path::Path::new("t3-host-worker-marker").exists() {
+        return;
+    }
+    for name in [
+        "OPENPAW_T3_MODEL_SECRET",
+        "OPENPAW_T3_BASIC_USER",
+        "OPENPAW_T3_BASIC_SECRET",
+    ] {
+        assert!(std::env::var_os(name).is_none(), "工具环境不可继承凭据");
+    }
+    std::fs::write("secret-check", "isolated").unwrap();
+    let mut child = Child(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host_tool_grandchild", "--nocapture"])
+            .spawn()
+            .unwrap(),
+    );
+    std::fs::write("worker.pid", std::process::id().to_string()).unwrap();
+    std::fs::write("grandchild.pid", child.0.id().to_string()).unwrap();
+    std::fs::write("worker-ready", "ready").unwrap();
+    child.0.wait().unwrap();
+}
+#[test]
+fn host_tool_grandchild() {
+    if !std::path::Path::new("t3-host-worker-marker").exists() {
+        return;
+    }
+    loop {
+        std::thread::park();
+    }
+}
+#[cfg(target_os = "linux")]
+fn host_test_process_running(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => !stat.rsplit_once(") ").unwrap().1.starts_with('Z'),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("无法核查测试进程：{e}"),
+    }
+}
+#[cfg(windows)]
+fn host_test_process_running(pid: u32) -> bool {
+    // 仅检查测试自身的数字PID；不增加另一套生产进程管理或Windows依赖。
+    let result = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command",
+        &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 3 }}")]).status().unwrap();
+    assert!(result.code() == Some(0) || result.code() == Some(3));
+    result.success()
 }
 #[tokio::test]
 async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval() {
