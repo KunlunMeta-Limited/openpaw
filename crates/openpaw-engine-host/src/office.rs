@@ -39,6 +39,9 @@ pub(crate) struct MainOfficeRecord {
     pub(crate) snapshot: Value,
     #[serde(default)]
     child_tasks: std::collections::BTreeMap<String, String>,
+    // 人物工作状态是活动展示，不作为恢复后仍在执行的依据。
+    #[serde(skip)]
+    presentations: std::collections::BTreeMap<String, (String, String)>,
 }
 
 /// 功能：管理 main 的持久办公室目录、七消息与有界展示投影。
@@ -295,6 +298,7 @@ impl MainOffice {
                 session: None,
                 snapshot,
                 child_tasks: std::collections::BTreeMap::new(),
+                presentations: std::collections::BTreeMap::new(),
             },
         );
         self.save(&next)?;
@@ -540,6 +544,101 @@ impl MainOffice {
         Ok(())
     }
 
+    async fn restore_presentations(&self) -> Result<(), String> {
+        let current = {
+            let guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            let records = guard.as_ref().map_err(Clone::clone)?;
+            records
+                .iter()
+                .map(|(team, record)| {
+                    (
+                        team.clone(),
+                        record.session.clone(),
+                        record.snapshot.clone(),
+                        record.presentations.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (team, session, snapshot, actors) in current {
+            let handle = session.as_ref().and_then(|session| {
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(session)
+                    .and_then(std::sync::Weak::upgrade)
+            });
+            let Some(handle) = handle.filter(|handle| handle.is_active()) else {
+                continue;
+            };
+            let cancel = handle.main_cancel_token();
+            let commands = actors
+                .into_iter()
+                .map(|(actor, (status, title))| Self::command(&team, &actor, &status, &title, 1))
+                .collect();
+            self.publish_commands(&MainProjection {
+                team,
+                snapshot,
+                commands,
+                cancel,
+                allow_cancelled: false,
+                expires: tokio::time::Instant::now() + Duration::from_secs(2),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn publish_commands(&self, projection: &MainProjection) -> Result<(), String> {
+        if projection.commands.is_empty() {
+            return Ok(());
+        }
+        let work = async {
+            // 展示版本由原页面和 Host 共同推进，不能把业务 seq 当作人物版本。
+            let (_, scene) = self
+                .message(
+                    serde_json::json!({"type":"office.read","teamId":projection.team}),
+                    Duration::from_secs(1),
+                )
+                .await?;
+            let mut revisions = scene["scene"]["actors"]
+                .as_array()
+                .ok_or("main 人物状态不可读")?
+                .iter()
+                .filter_map(|actor| {
+                    Some((
+                        actor["id"].as_str()?.to_string(),
+                        actor["presentation"]["sourceRevision"].as_u64()?,
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            for original in &projection.commands {
+                let mut command = original.clone();
+                if command["type"] == "actor.presentation.set" {
+                    let revision = revisions
+                        .get_mut(command["actorId"].as_str().unwrap_or(""))
+                        .ok_or("main 人物不存在")?;
+                    *revision = revision
+                        .checked_add(1)
+                        .filter(|revision| *revision <= 9_007_199_254_740_991)
+                        .ok_or("main 人物版本耗尽")?;
+                    command["sourceRevision"] = Value::from(*revision);
+                }
+                self.message(
+                    serde_json::json!({"teamId":projection.team,"command":command}),
+                    Duration::from_secs(1),
+                )
+                .await?;
+            }
+            Ok(())
+        };
+        tokio::select! { biased;
+            _ = projection.cancel.cancelled(), if !projection.allow_cancelled => Ok(()),
+            _ = tokio::time::sleep_until(projection.expires) => Ok(()),
+            result = work => result,
+        }
+    }
+
     /// 功能：启动办公室当前状态同步及原 UI 操作领取，单个 Host 只启动一次。
     /// 参数：shutdown 为 Host 关闭令牌。
     /// 返回：无。
@@ -599,20 +698,7 @@ impl MainOffice {
                             && data["status"] == "applied"
                             && tokio::time::Instant::now() <= projection.expires
                         {
-                            for command in projection.commands {
-                                if projection.cancel.is_cancelled() && !projection.allow_cancelled {
-                                    break;
-                                }
-                                let request = office.message(
-                                    serde_json::json!({"teamId":projection.team,"command":command}),
-                                    Duration::from_secs(1),
-                                );
-                                tokio::select! { biased;
-                                    _ = projection.cancel.cancelled(), if !projection.allow_cancelled => break,
-                                    _ = tokio::time::sleep_until(projection.expires) => break,
-                                    result = request => { result?; },
-                                }
-                            }
+                            office.publish_commands(&projection).await?;
                         }
                         return Ok(());
                     }
@@ -633,9 +719,38 @@ impl MainOffice {
                     // 离线恢复只发送当前状态。交接事件超过投影期限后以新版本清除，
                     // 避免 gateway 重启后把历史事件当成一次新的拜访。
                     office.clear_transient_events()?;
-                    let (status, _) = office.message(serde_json::json!({"type":"offices.initialize","offices":office.directory()?}),Duration::from_secs(3)).await?;
+                    let snapshots = office.directory()?;
+                    let (_, remote) = office
+                        .message(
+                            serde_json::json!({"type":"office.read"}),
+                            Duration::from_secs(2),
+                        )
+                        .await?;
+                    let ready = remote["offices"].as_array().is_some_and(|offices| {
+                        snapshots.iter().all(|snapshot| {
+                            offices.iter().any(|entry| {
+                                entry["id"] == snapshot["workspace"]["id"]
+                                    && entry["seq"] == snapshot["seq"]
+                                    && entry["runtimeReady"] == true
+                            })
+                        })
+                    });
+                    let status = if ready {
+                        200
+                    } else {
+                        office.message(serde_json::json!({"type":"offices.initialize","offices":snapshots}),Duration::from_secs(3)).await?.0
+                    };
                     if !matches!(status, 200 | 202) {
                         return Err("main 初始化被拒绝".into());
+                    }
+                    if status == 200 {
+                        // 完整快照会按任务重算人物状态。对仍真实活动的回合重新提交
+                        // 当前思考/工具状态；只恢复状态，不重播交接或重新启动执行。
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            office.restore_presentations(),
+                        )
+                        .await;
                     }
                     office
                         .message(
@@ -716,7 +831,27 @@ impl MainOffice {
             }
             record.snapshot["seq"] = Value::from(seq + 1);
             record.snapshot["events"] = serde_json::json!([]);
-            let commands = change(team, record);
+            let mut commands = change(team, record);
+            for command in &commands {
+                if command["type"] == "actor.presentation.set" {
+                    if let (Some(actor), Some(status), Some(title)) = (
+                        command["actorId"].as_str(),
+                        command["status"].as_str(),
+                        command["title"].as_str(),
+                    ) {
+                        record
+                            .presentations
+                            .insert(actor.into(), (status.into(), title.into()));
+                    }
+                }
+            }
+            for (actor, (status, title)) in &record.presentations {
+                if !commands.iter().any(|command| {
+                    command["type"] == "actor.presentation.set" && command["actorId"] == *actor
+                }) {
+                    commands.push(Self::command(team, actor, status, title, seq + 1));
+                }
+            }
             let allow_cancelled = record.snapshot["events"]
                 .as_array()
                 .is_some_and(|events| events.is_empty())
@@ -1359,7 +1494,14 @@ impl OfficeDispatcher {
         }
     }
 
-    /// 清理指定 session 仍持有的全部角色；用于 abort、panic 或任务被外部终止后的兜底路径。
+    /// 功能：清理指定会话持有的角色及 main 当前人物状态。
+    /// 参数：owner 为原会话稳定身份。
+    /// 返回：无。
+    /// 错误：展示投影或持久化失败只记录安全日志，不改变回合终态。
+    /// 状态：释放 feature 角色占用，main 人物回到 idle，不声明子任务成功。
+    /// 并发与取消：同步短锁；main 事实由原 writer 串行提交，不等待网络。
+    /// 权限：只清理原会话所属人员，不清理其他办公室。
+    /// 关联：CHG-2026-0033、T1-09、T1-10。
     pub fn clear_owner(&self, owner: &str) {
         if let Some(main) = self.main() {
             main.finish(owner);

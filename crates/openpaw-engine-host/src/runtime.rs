@@ -239,7 +239,13 @@ impl SessionHandle {
             .cloned()
     }
     /// 功能：取消当前回合以及相关审批等待。
-    /// 并发与取消：与 reserve_turn 在同一 gate 下线性化，避免取消丢失。
+    /// 参数：无。
+    /// 返回：无；终态通过原会话事件观察。
+    /// 错误：无返回错误；展示持久化失败只记录安全日志。
+    /// 状态：取消执行、父子审批，并提交 main 的取消展示事实。
+    /// 并发与取消：与 reserve_turn 在同一 gate 下线性化；不等待网络，事实写入使用原 writer 短锁。
+    /// 权限：沿用原 Host 鉴权和会话边界，不回滚已执行工具副作用。
+    /// 关联：CHG-2026-0033、T1-09、T1-15。
     pub async fn abort(&self) {
         // 让 abort 与 reserve_turn 线性化。只有持有此 gate 时才替换令牌，
         // 因此取消不会先命中旧令牌、随后又被新回合覆盖。
@@ -1157,8 +1163,8 @@ impl AppState {
         }
         let workspace =
             absolute_workspace(workspace.unwrap_or_else(|| self.config.workspace.clone()))?;
-        if self.main_office.url.is_some() {
-            self.main_office.register(&workspace)?;
+        if self.main_office.url.is_some() && self.main_office.register(&workspace).is_err() {
+            tracing::warn!("main 办公室登记未完成，不影响原会话入口");
         }
         let id = Uuid::new_v4().simple().to_string();
         let mut session = Session::new(model_name.clone(), provider.name());
@@ -3148,7 +3154,7 @@ pub(crate) fn latest_main_fact(
     if !valid_session_id(session) {
         return Err("办公室会话身份无效".into());
     }
-    let read = SessionReader::read(&home.join("sessions").join(format!("{session}.jsonl")))
+    let read = SessionReader::read(home.join("sessions").join(format!("{session}.jsonl")))
         .map_err(|_| "办公室会话历史不可读")?;
     Ok(read.events.iter().rev().find_map(|event| match event {
         SessionEvent::Unknown(value) if value["type"] == "main_office_fact_v1" => {

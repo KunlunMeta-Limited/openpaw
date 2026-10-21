@@ -406,7 +406,7 @@ fn main_history(handle: &SessionHandle) -> Vec<MainChatMessage> {
     while history.len() > 20
         || history
             .iter()
-            .map(|message| message.content.chars().count())
+            .map(|message| message.content.encode_utf16().count())
             .sum::<usize>()
             > 100_000
     {
@@ -445,11 +445,11 @@ async fn main_chat(
     }
     let latest = body.messages.pop().expect("validated input");
     if latest.content.trim().is_empty()
-        || latest.content.chars().count() > 4000
+        || latest.content.encode_utf16().count() > 4000
         || body
             .messages
             .iter()
-            .map(|message| message.content.chars().count())
+            .map(|message| message.content.encode_utf16().count())
             .sum::<usize>()
             > 100_000
     {
@@ -549,7 +549,7 @@ async fn main_chat(
     let stream = futures::stream::unfold(stream, |mut stream| async move {
         loop {
             if let Some(event) = stream.pending.pop_front() {
-                let line = format!("{}\n", event);
+                let line = format!("{event}\n");
                 return Some((Ok::<_, Infallible>(line), stream));
             }
             if stream.terminal {
@@ -567,14 +567,28 @@ async fn main_chat(
                             .is_some_and(|id| id == prefix || id.starts_with(&format!("{prefix}_")))
                     {
                         if let Some(text) = event.properties["delta"].as_str() {
-                            stream.characters += text.chars().count();
+                            stream.characters += text.encode_utf16().count();
                             if stream.characters > 50_000 {
                                 stream.fail("回复超出长度限制");
                                 continue;
                             }
-                            let chars: Vec<_> = text.chars().collect();
-                            for chunk in chars.chunks(2000) {
-                                stream.pending.push_back(serde_json::json!({"type":"delta","text":chunk.iter().collect::<String>()}));
+                            let mut chunk = String::new();
+                            let mut units = 0;
+                            for character in text.chars() {
+                                if units + character.len_utf16() > 2000 {
+                                    stream.pending.push_back(
+                                        serde_json::json!({"type":"delta","text":chunk}),
+                                    );
+                                    chunk = String::new();
+                                    units = 0;
+                                }
+                                chunk.push(character);
+                                units += character.len_utf16();
+                            }
+                            if !chunk.is_empty() {
+                                stream
+                                    .pending
+                                    .push_back(serde_json::json!({"type":"delta","text":chunk}));
                             }
                         }
                     }
@@ -1661,6 +1675,13 @@ mod tests {
                 seen.lock().await.push(body.clone());
                 let data = match body["type"].as_str() {
                     Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":{},"responses":{"success":{},"error":{}}}),
+                    Some("office.read") if body["teamId"].is_string() => {
+                        let messages = seen.lock().await;
+                        let snapshot = messages.iter().rev().find(|message| message["type"] == "office.snapshot" && message["teamId"] == body["teamId"]).unwrap()["snapshot"].clone();
+                        let actors = ["office-lead","code-agent","file-agent","app-agent","review-agent","data-agent"].into_iter().map(|id|
+                            serde_json::json!({"id":id,"presentation":{"sourceRevision":0}})).collect::<Vec<_>>();
+                        serde_json::json!({"snapshot":snapshot,"scene":{"actors":actors},"pendingDecisions":[]})
+                    },
                     Some("offices.initialize"|"office.read") => serde_json::json!({"offices":[],"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}}),
                     Some("office.snapshot") => serde_json::json!({"teamId":body["teamId"],"seq":body["snapshot"]["seq"],"status":"applied"}),
                     Some("ui.next") => { tokio::time::sleep(Duration::from_millis(20)).await; serde_json::json!({"actions":[]}) },
@@ -1679,19 +1700,30 @@ mod tests {
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
-                let tools = body["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "tool").count();
+                if body["stream"] != true {
+                    return Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"Compacted fixture conversation."},"finish_reason":"stop"}]})).into_response();
+                }
+                if !body["tools"].is_array() {
+                    let chunk = serde_json::json!({"choices":[{"delta":{"content":"Compacted fixture conversation."},"finish_reason":"stop"}]});
+                    return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
+                }
+                let messages = body["messages"].as_array().unwrap();
+                let latest = messages.iter().rposition(|message|message["role"] == "user").unwrap_or(0);
+                let tools = messages[latest..].iter().filter(|message| message["role"] == "tool").count();
                 let parent = body["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "delegate_task");
                 if scenario == "recover" && parent && tools == 0 { gate.notified().await; }
                 let call = if (scenario.starts_with("delegate") || scenario == "recover") && parent && tools == 0 {
-                    Some(("delegate_task",serde_json::json!({"name":"资料检索","task":"读取 README.md 并汇报"})))
+                    Some(("delegate_task",serde_json::json!({"name":"资料检索","task":if scenario == "delegate-repeat" {
+                        format!("读取 README.md 并汇报：{}", messages[latest]["content"].as_str().unwrap_or(""))
+                    }else{"读取 README.md 并汇报".into()}})))
                 } else if tools < if scenario == "tools" {2} else {1} {
                     Some(if scenario == "write" || scenario == "delegate-write" {("write_file",serde_json::json!({"path":"approved.txt","content":"approved once"}))}
                         else {("read_file",serde_json::json!({"path":"README.md"}))})
                 } else { None };
                 let chunk = if let Some((name,args)) = call {
                     serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call-{tools}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
-                } else { serde_json::json!({"choices":[{"delta":{"content":if parent {"parent integrated"}else{"tool results integrated"}},"finish_reason":"stop"}]}) };
-                ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+                } else { serde_json::json!({"choices":[{"delta":{"content":if scenario == "emoji" {"😀".repeat(20_000)}else if parent {"parent integrated".into()}else{"tool results integrated".into()}},"finish_reason":"stop"}]}) };
+                ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response()
             }
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1753,6 +1785,91 @@ mod tests {
             servers,
             env,
             release_model,
+        }
+    }
+
+    #[tokio::test]
+    async fn main_broken_registry_does_not_block_existing_openwork_session_entry() {
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let config = HostConfig {
+            home: home.path().into(),
+            workspace: workspace.path().into(),
+            provider: "echo".into(),
+            ..Default::default()
+        };
+        let mut state = AppState::new(config.clone());
+        std::fs::write(
+            home.path().join("offices/registry.json"),
+            b"broken registry",
+        )
+        .unwrap();
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            &config.home,
+            &config.workspace,
+            Some("http://127.0.0.1:1".into()),
+        );
+        let session = state
+            .create_session(Some("echo"), None, None, None)
+            .await
+            .unwrap();
+        assert!(session.message_cache.read().unwrap().is_empty());
+        assert!(state.main_office.directory().is_err());
+        assert_eq!(
+            std::fs::read(home.path().join("offices/registry.json")).unwrap(),
+            b"broken registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_unicode_replies_follow_original_browser_history_and_delta_limits() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("emoji", "confirm").await;
+        let mut history = Vec::<serde_json::Value>::new();
+        for turn in 0..4 {
+            if turn == 3 {
+                history.drain(..2);
+            }
+            history.push(serde_json::json!({"role":"user","content":format!("question {turn}")}));
+            let request = Request::builder().method("POST").uri("/api/chat").header("content-type","application/json")
+                .body(Body::from(serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":"unicode","messages":history}).to_string())).unwrap();
+            let response = fixture.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 200_000).await.unwrap();
+            let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let session_id = fixture
+                .state
+                .main_office
+                .record(&fixture.team)
+                .unwrap()
+                .session
+                .unwrap();
+            let outcomes = fixture
+                .state
+                .get_typed(&session_id)
+                .await
+                .unwrap()
+                .turn_outcomes();
+            assert_eq!(
+                events.last().unwrap()["type"],
+                "done",
+                "turn {turn}, outcomes {outcomes:?}"
+            );
+            let mut answer = String::new();
+            for event in events.iter().filter(|event| event["type"] == "delta") {
+                let text = event["text"].as_str().unwrap();
+                assert!(text.encode_utf16().count() <= 2000);
+                answer.push_str(text);
+            }
+            assert_eq!(answer.encode_utf16().count(), 40_000);
+            history.push(serde_json::json!({"role":"assistant","content":answer}));
         }
     }
 
@@ -1847,6 +1964,69 @@ mod tests {
             .any(|message| message["command"]["capability"] == "office.visit"
                 && message["command"]["participants"][1]["entityId"] == "office-lead"));
         assert_eq!(fixture.model_seen.lock().await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn main_distinct_delegations_each_handoff_once_but_cached_result_has_no_new_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-repeat", "confirm").await;
+        let mut history = Vec::<serde_json::Value>::new();
+        for text in ["task-a", "task-b", "task-b"] {
+            history.push(serde_json::json!({"role":"user","content":text}));
+            let request = Request::builder().method("POST").uri("/api/chat").header("content-type","application/json")
+                .body(Body::from(serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":"fixture","messages":history}).to_string())).unwrap();
+            let response = fixture.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 200_000).await.unwrap();
+            let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(events.last().unwrap()["type"], "done");
+            let answer: String = events
+                .iter()
+                .filter(|event| event["type"] == "delta")
+                .map(|event| event["text"].as_str().unwrap())
+                .collect();
+            history.push(serde_json::json!({"role":"assistant","content":answer}));
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        let record = fixture.state.main_office.record(&fixture.team).unwrap();
+        assert_eq!(record.snapshot["tasks"].as_array().unwrap().len(), 2);
+        assert_eq!(record.snapshot["employees"].as_array().unwrap().len(), 2);
+        let seen = fixture.seen.lock().await;
+        let events: Vec<_> = seen
+            .iter()
+            .flat_map(|message| {
+                message["snapshot"]["events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["kind"] == "task.assigned")
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| event["kind"] == "note"
+            && event["summary"]
+                .as_str()
+                .unwrap()
+                .contains("未启动新子执行")));
+        assert_eq!(
+            seen.iter()
+                .filter(|message| message["command"]["capability"] == "office.visit")
+                .count(),
+            2
+        );
+        assert_eq!(fixture.model_seen.lock().await.len(), 10);
     }
 
     #[tokio::test]
