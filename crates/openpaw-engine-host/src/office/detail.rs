@@ -73,6 +73,67 @@ fn fields(label: &str, text: String, output: &mut Vec<Value>) {
 }
 
 impl MainOffice {
+    /// 功能：在现有员工查看请求前懒加载真实会话。
+    /// 参数：team 与 action 为已从 gateway 收到的查看请求。
+    /// 返回：无；读取失败仍由只读详情明确说明。
+    /// 错误：办公室、员工或记录不可用时不加载其他身份。
+    /// 状态：只恢复历史和策略，不恢复执行、授权或动作。
+    /// 并发与取消：不跨 await 持同步锁，复用 runtime 的独立会话加载槽。
+    /// 权限：先验证已登记员工，再将 ID 交原 get_typed；不接受任意路径。
+    /// 关联：CHG-2026-0040、ADR-003。
+    pub(super) async fn prepare_detail(&self, team: &str, action: &Value) {
+        let Ok(record) = self.record(team) else {
+            return;
+        };
+        let employee = if action["action"] == "dialog.action" {
+            self.details
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get(action["interactionId"].as_str().unwrap_or(""))
+                .filter(|cursor| cursor.snapshot.team == team)
+                .map(|cursor| cursor.snapshot.employee.clone())
+        } else {
+            record.snapshot["employees"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|employee| {
+                    if action["action"] == "actor.inspect" {
+                        action["actorId"]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty() && employee["sceneActorId"] == id)
+                    } else {
+                        employee["id"] == action["employeeId"]
+                    }
+                })
+                .and_then(|employee| employee["id"].as_str())
+                .map(str::to_string)
+        };
+        let Some(employee) = employee else { return };
+        if self.detail_session(team, &employee).is_some() {
+            return;
+        }
+        let runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        let Some(runtime) = runtime else { return };
+        if let Ok(handle) = runtime.get_typed(&employee).await {
+            if handle.workspace == record.workspace {
+                return;
+            }
+        }
+        // 兼容空间别名只在可信父关系和同一实际目录下解析。
+        let Some(parent) = record.session else { return };
+        if let Some(id) = runtime
+            .child_id_for_workspace(&parent, &record.workspace, &employee)
+            .await
+        {
+            let _ = runtime.get_typed(&id).await;
+        }
+    }
     /// 功能：回收已过期的只读详情快照。
     /// 参数：无。
     /// 返回：无。
@@ -118,9 +179,11 @@ impl MainOffice {
         let record = self
             .record(team)
             .map_err(|_| unavailable("办公室不存在，未启动任何工作。"))?;
-        let handle = self
-            .detail_session(team, employee)
-            .ok_or_else(|| unavailable("该员工尚无已加载的持久会话记录；未生成或重放工作。"))?;
+        let Some(handle) = self.detail_session(team, employee) else {
+            return self
+                .legacy_snapshot(team, employee)
+                .ok_or_else(|| unavailable("该员工尚无可读取的持久会话记录；未生成或重放工作。"));
+        };
         let name = record.snapshot["employees"]
             .as_array()
             .into_iter()
@@ -207,6 +270,54 @@ impl MainOffice {
         }))
     }
 
+    fn legacy_snapshot(&self, team: &str, employee: &str) -> Option<Arc<Snapshot>> {
+        let record = self.record(team).ok()?;
+        if !record.snapshot["employees"]
+            .as_array()?
+            .iter()
+            .any(|item| item["id"] == employee)
+        {
+            return None;
+        }
+        let parent = record.session.as_deref()?;
+        let legacy = crate::delegation::legacy_records(&record.workspace, parent)
+            .into_iter()
+            .find(|item| item["id"] == employee)?;
+        let missing="完整历史未保存：仅保留旧快照中的身份、任务和可证实结果；不代表完整会话，不能按旧身份继续执行。";
+        let mut views: [Vec<Value>; 4] = Default::default();
+        fields(
+            "旧任务",
+            format!("{missing}\n{}", legacy["task"].as_str().unwrap_or("")),
+            &mut views[0],
+        );
+        fields(
+            "旧结果",
+            format!(
+                "{missing}\n{}",
+                legacy["result"].as_str().unwrap_or("未保存最终结果")
+            ),
+            &mut views[1],
+        );
+        fields(
+            "工具记录",
+            format!("{missing}\n没有可核实的逐项工具记录。"),
+            &mut views[2],
+        );
+        fields(
+            "旧状态",
+            format!("{missing}\n离线；未恢复审批、执行或历史动作。"),
+            &mut views[3],
+        );
+        Some(Arc::new(Snapshot {
+            team: team.into(),
+            employee: employee.into(),
+            session: employee.into(),
+            name: legacy["name"].as_str().unwrap_or("历史员工").into(),
+            captured: chrono::Utc::now().to_rfc3339(),
+            views,
+        }))
+    }
+
     /// 功能：处理员工查看及纯只读详情按钮。
     /// 参数：team 为办公室编号，action 为当前 ui.next 请求。
     /// 返回：符合现有容量限制的 detail-v1 内容。
@@ -240,6 +351,9 @@ impl MainOffice {
             if self
                 .detail_session(team, &cursor.snapshot.employee)
                 .is_none_or(|handle| handle.id != cursor.snapshot.session)
+                && self
+                    .legacy_snapshot(team, &cursor.snapshot.employee)
+                    .is_none_or(|snapshot| snapshot.session != cursor.snapshot.session)
             {
                 return unavailable("员工会话绑定已失效，请重新点击员工。");
             }

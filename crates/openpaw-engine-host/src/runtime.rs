@@ -130,6 +130,9 @@ pub(crate) struct ChildSession {
     pub(crate) workspace_id: String,
     /// 员工显示名，不作为身份查找依据。
     pub(crate) name: String,
+    /// 创建委派的父输入；可见历史隐藏它后不得续办，旧版本缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_message_id: Option<String>,
 }
 /// 功能：保存单个 session 的运行时资源和并发状态。
 /// 并发与取消：`turn_gate` 线性化 reserve/abort/delete；取消同时通知 AgentLoop 和审批管理器。
@@ -623,6 +626,7 @@ impl AppState {
     /// 关联：CHG-2026-0034。
     pub(crate) fn bind_delegation_runtime(self: &Arc<Self>) {
         self.delegation_shared.bind_runtime(self);
+        self.main_office.bind_runtime(self);
     }
 
     /// 功能：通过普通接收、执行及 writer 完成一次前台子委派。
@@ -637,7 +641,7 @@ impl AppState {
     pub(crate) fn run_delegated(
         self: &Arc<Self>,
         task_id: Option<String>,
-        child: ChildSession,
+        mut child: ChildSession,
         workspace: PathBuf,
         task: String,
         provider: Arc<dyn LlmProvider>,
@@ -647,6 +651,10 @@ impl AppState {
     ) -> futures::future::BoxFuture<'static, Result<openpaw_core::ToolCallOutcome, String>> {
         let state = self.clone();
         Box::pin(async move {
+            let parent = state
+                .get_typed(&child.parent_id)
+                .await
+                .map_err(|_| "父会话不存在或不可读".to_string())?;
             let handle = if let Some(id) = task_id {
                 let handle = state
                     .get_typed(&id)
@@ -655,6 +663,9 @@ impl AppState {
                 let existing = handle.child.as_ref().ok_or("task_id 不是可续办子会话")?;
                 if existing.parent_id != child.parent_id {
                     return Err("task_id 不属于当前父会话".into());
+                }
+                if !visible_child_origin(&parent, &id, existing) {
+                    return Err("task_id 的创建委派已不在父会话可见历史中，不能恢复执行".into());
                 }
                 if std::fs::canonicalize(&handle.workspace)
                     .ok()
@@ -666,6 +677,12 @@ impl AppState {
                 handle
             } else {
                 let reservation = state.main_office.reserve_child(&child.parent_id)?;
+                child.parent_message_id = parent
+                    .current_turn
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|turn| turn.outcome.user_message_id.clone());
                 let handle = state
                     .create_session_from_provider(
                         provider.clone(),
@@ -1287,11 +1304,12 @@ impl AppState {
             .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
         let projection = restored_session_projection(id, &read.events)?;
-        let execution_attempts = projection.execution_attempts;
+        let mut execution_attempts = projection.execution_attempts;
         let message_presentations = projection.message_presentations;
         let messages = projection.messages;
         let mut turn_outcomes = projection.turn_outcomes;
         let turn_errors = projection.turn_errors;
+        recover_unknown_tools(&mut execution_attempts, &mut writer)?;
         recover_hanging_outcomes(&mut turn_outcomes, &mut writer)?;
         let request_admissions = projection.request_admissions;
         let mutation = projection.mutation;
@@ -1794,7 +1812,8 @@ impl AppState {
                             .iter()
                             .any(|message| {
                                 message["info"]["id"] == message_id
-                                    && message["info"]["error"].is_object()
+                                    && (message["info"]["error"].is_object()
+                                        || message["info"]["execution"]["incomplete"] == true)
                             })
                             .then(|| {
                                 failed_message_prefix_len(
@@ -1967,7 +1986,9 @@ impl AppState {
                     })?;
             if visible_prefix_len(id, &messages[..visible_len], message_id).is_none()
                 && !handle.wire_messages().iter().any(|message| {
-                    message["info"]["id"] == message_id && message["info"]["error"].is_object()
+                    message["info"]["id"] == message_id
+                        && (message["info"]["error"].is_object()
+                            || message["info"]["execution"]["incomplete"] == true)
                 })
             {
                 return Err(SessionMutationError::BadRequest(
@@ -2183,16 +2204,79 @@ impl AppState {
         let workspace = std::fs::canonicalize(workspace).ok()?;
         tokio::task::spawn_blocking(move || {
             let mut children = Vec::new();
+            let parent_read=openpaw_store::catalog::read(&home,&parent).ok()?;
+            let visible=staged_visible_len(&parent,&parent_read.transcript.messages,parent_read.transcript.mutation.revert_message_id.as_deref())?;
+            let inputs:HashSet<_>=parent_read.transcript.messages[..visible].iter().filter_map(|message|message.uuid.as_deref()).collect();
             for id in openpaw_store::catalog::discover(&home).ok()? {
                 let Ok(read) = openpaw_store::catalog::read(&home,&id) else {continue};
                 let Some(child) = session_child(&read.events) else {continue};
                 if child.parent_id != parent || read.transcript.mutation.archived.is_some_and(|value|value>0) {continue;}
+                if match child.parent_message_id.as_deref() {
+                    Some(input)=>!inputs.contains(input),
+                    None=>!parent_read.transcript.messages[..visible].iter().any(|message|message.content.iter().any(|block|matches!(block,openpaw_core::ContentBlock::ToolResult{content,name:Some(name),..} if name=="delegate_task" && content.contains(&format!("task_id={id}，status="))))),
+                } {continue;}
                 if std::fs::canonicalize(session_workspace(&read.events,&workspace)).ok().as_ref() != Some(&workspace) {continue;}
                 children.push(serde_json::json!({"task_id":id,"name":child.name}));
             }
             children.sort_by_key(|child|child["task_id"].as_str().unwrap_or("").to_string());
             (!children.is_empty()).then(||format!("可继续工作的真实子员工如下；继续时明确传 task_id。name 仅展示，不传 task_id 会新建员工，不会读取旧答案缓存：{}",serde_json::Value::Array(children)))
         }).await.ok().flatten()
+    }
+
+    /// 功能：将已登记员工兼容空间解析为真实子会话身份。
+    /// 参数：parent、workspace、alias 来自可信办公室登记。
+    /// 返回：仅返回父关系及规范目录匹配的既有身份。
+    /// 错误：不可读数据返回无，不创建替代会话。
+    /// 状态：只读，不恢复执行或审批。
+    /// 并发与取消：磁盘扫描在线程池运行，无跨 await 锁。
+    /// 权限：只匹配指定父会话和工作区，不接受外部文件路径。
+    /// 关联：CHG-2026-0040。
+    pub(crate) async fn child_id_for_workspace(
+        &self,
+        parent: &str,
+        workspace: &std::path::Path,
+        alias: &str,
+    ) -> Option<String> {
+        let home = self.config.home.clone();
+        let parent = parent.to_string();
+        let alias = alias.to_string();
+        let workspace = std::fs::canonicalize(workspace).ok()?;
+        tokio::task::spawn_blocking(move || {
+            openpaw_store::catalog::discover(&home)
+                .ok()?
+                .into_iter()
+                .find(|id| {
+                    let Ok(read) = openpaw_store::catalog::read(&home, id) else {
+                        return false;
+                    };
+                    session_child(&read.events).is_some_and(|child| {
+                        child.parent_id == parent && child.workspace_id == alias
+                    }) && std::fs::canonicalize(session_workspace(&read.events, &workspace))
+                        .ok()
+                        .as_ref()
+                        == Some(&workspace)
+                })
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+fn visible_child_origin(parent: &SessionHandle, child_id: &str, child: &ChildSession) -> bool {
+    let messages = parent
+        .message_cache
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let mutation = parent.mutation.read().unwrap_or_else(|e| e.into_inner());
+    let Some(visible) =
+        staged_visible_len(&parent.id, &messages, mutation.revert_message_id.as_deref())
+    else {
+        return false;
+    };
+    match &child.parent_message_id {
+        Some(input)=>messages[..visible].iter().any(|message|message.uuid.as_ref()==Some(input)),
+        // 旧关系没有来源字段，只能在仍可见的真实委派结果中证明，不依赖名称缓存。
+        None=>messages[..visible].iter().any(|message|message.content.iter().any(|block| matches!(block,openpaw_core::ContentBlock::ToolResult{content,name:Some(name),..} if name=="delegate_task" && content.contains(&format!("task_id={child_id}，status="))))),
     }
 }
 fn absolute_workspace(path: PathBuf) -> Result<PathBuf, String> {
@@ -2222,6 +2306,43 @@ fn session_child(events: &[SessionEvent]) -> Option<ChildSession> {
         }
         _ => None,
     })
+}
+
+/// 功能：从普通会话持久记录恢复办公室既有子员工的身份。
+/// 参数：home 为统一存储根，parent 与 workspace 为可信办公室绑定。
+/// 返回：经父关系和规范目录核验的稳定子身份，按真实 ID 排序。
+/// 错误：单项不可读时不伪造；目录不可用时返回空。
+/// 状态：只读 metadata，不加载执行、授权或动作。
+/// 并发与取消：启动同步扫描，无运行回合并发，不持 writer。
+/// 权限：不创建新身份，不扩大可续关系或人物容量。
+/// 关联：CHG-2026-0040、ADR-003。
+pub(crate) fn restored_office_children(
+    home: &std::path::Path,
+    parent: &str,
+    workspace: &std::path::Path,
+) -> Vec<(String, ChildSession)> {
+    let Ok(workspace) = std::fs::canonicalize(workspace) else {
+        return Vec::new();
+    };
+    let mut children = Vec::new();
+    for id in openpaw_store::catalog::discover(home).unwrap_or_default() {
+        let Ok(read) = openpaw_store::catalog::read(home, &id) else {
+            continue;
+        };
+        let Some(child) = session_child(&read.events) else {
+            continue;
+        };
+        if child.parent_id == parent
+            && std::fs::canonicalize(session_workspace(&read.events, &workspace))
+                .ok()
+                .as_ref()
+                == Some(&workspace)
+        {
+            children.push((id, child));
+        }
+    }
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+    children
 }
 fn valid_session_id(id: &str) -> bool {
     !id.is_empty()
@@ -2443,9 +2564,70 @@ fn classify_session_error(error: SessionError) -> SessionLoadError {
 }
 fn recover_orphaned_turns_in_file(path: &std::path::Path) -> Result<usize, SessionLoadError> {
     let read = journal::read_repaired(path).map_err(classify_session_error)?;
-    let mut outcomes = restored_session_projection(&read.meta.id, &read.events)?.turn_outcomes;
+    let mut projection = restored_session_projection(&read.meta.id, &read.events)?;
     let mut writer = SessionWriter::open_append(path).map_err(classify_session_error)?;
-    recover_hanging_outcomes(&mut outcomes, &mut writer)
+    recover_unknown_tools(&mut projection.execution_attempts, &mut writer)?;
+    recover_hanging_outcomes(&mut projection.turn_outcomes, &mut writer)
+}
+fn recover_unknown_tools(
+    attempts: &mut Vec<openpaw_store::execution_attempts::ExecutionAttemptV1>,
+    writer: &mut SessionWriter,
+) -> Result<(), SessionLoadError> {
+    let pending: Vec<_> = attempts
+        .iter()
+        .filter(|record| record.kind == "response")
+        .flat_map(|record| {
+            record.payload["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|block| {
+                    let call = block["id"].as_str()?;
+                    let name = block["name"].as_str()?;
+                    (!attempts.iter().any(|result| {
+                        result.turn_id == record.turn_id
+                            && result.response_index == record.response_index
+                            && result.kind == "tool_result"
+                            && result.payload["call_id"] == call
+                    }))
+                    .then(|| {
+                        (
+                            record.turn_id.clone(),
+                            record.response_index,
+                            call.to_string(),
+                            name.to_string(),
+                        )
+                    })
+                })
+        })
+        .collect();
+    for (turn_id, response_index, call, name) in pending {
+        let sequence = attempts
+            .iter()
+            .filter(|r| r.turn_id == turn_id)
+            .map(|r| r.sequence)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let record = openpaw_store::execution_attempts::ExecutionAttemptV1 {
+            turn_id,
+            sequence,
+            response_index,
+            occurred_at: chrono::Utc::now().timestamp_millis(),
+            kind: "tool_result".into(),
+            payload: serde_json::json!({"call_id":call,"name":name,"outcome":openpaw_core::ToolCallOutcome::error("Host 重启后无法确认工具结果；可能已经产生副作用，未自动重试。"),"disposition":"unknown","duration_ms":0}),
+        };
+        openpaw_store::execution_attempts::validate(attempts, &record)
+            .map_err(|_| SessionLoadError::Corrupt)?;
+        writer
+            .append(&openpaw_store::transcript::encode(
+                &record,
+                "execution_attempt_v1",
+            ))
+            .map_err(classify_session_error)?;
+        attempts.push(record);
+    }
+    Ok(())
 }
 fn recover_hanging_outcomes(
     outcomes: &mut Vec<TurnOutcome>,
