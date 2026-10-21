@@ -665,6 +665,7 @@ impl AppState {
                 }
                 handle
             } else {
+                let reservation = state.main_office.reserve_child(&child.parent_id)?;
                 let handle = state
                     .create_session_from_provider(
                         provider.clone(),
@@ -674,6 +675,9 @@ impl AppState {
                         Some(child.clone()),
                     )
                     .await?;
+                if let Some(reservation) = reservation {
+                    reservation.commit(&handle.id, &child.workspace_id, &child.name)?;
+                }
                 handle.emit(events::session_changed(
                     "session.created",
                     &wire_session_snapshot(&handle),
