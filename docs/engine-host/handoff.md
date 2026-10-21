@@ -107,3 +107,9 @@ T4应直接Rust调用上述接口，按Office固定Schema新增自己的DTO/NDJS
 ## T3 PR状态（2026-10-21）
 
 共同[PR #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)已创建，目标merge/ai-ofice-react-overagent，来源feat/engine-host-t3；创建head `b5a2c2a2a44902139ad27cf6f2cd9a2b8859e27d`。0004/0001交付验收已通过，平台非作者审核与合入尚未发生，T4仍不开始。CI平台账单未启动、本地交付门禁不能表示Windows暂缓两种情况分列于0004最新记录，不自改规则或伪填通过。PR元数据登记版本仍执行完整验证，后续获批并合入后再同步真实merge及M3完成。
+
+## T3实际合入与T4待审方案（2026-10-21）
+
+前述各段保留当时状态，当前以此补登为准：#7已合入，head825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52，GitHub mergedAt=2026-10-21T11:16:12Z。用户已确认PR完成；API无独立Review，不编造Approve。0001/0004交付验收保持4263529，合入head另已Linux完整26/26复验；Windows本轮暂缓、未验证，支持和T8目标保留。
+
+下一阶段[0005第4/9/10节](../changes/CHG-2026-0005.md)提供准确文件范围、聊天/业务两通道方案、模型配置和O01—O10产品验收。当前只是提案待审，没有Office聊天代码或新配置段；原/health和Host::submit_run可用，/office/chat仍404。现场Office独立协议验证与Host smoke均有仓库外证据，但不是T4真实对话验收。

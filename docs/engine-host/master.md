@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-状态：T0—T2已获用户确认审核并实际合入；T2 PR #6合入3a159a4，Windows原生验证本轮暂缓、仍待补验。T3主CHG-2026-0004 r1及0001 r3已获用户批准并进入实施；0004第二次修订已获用户批准，帮助测试四组合及Host补充专项通过，Linux准确实现head完整26/26，Windows待核实、M3未验收，随T3共同交付。T4—T8未开始。修订日期：2026-10-21。
+状态：T0—T3本轮批准范围已实际合入。T3 PR #7合入d11b944；0004 r2/0001 r3用户交付验收已通过，Windows按本轮明确安排暂缓、未验证。T4具体提案CHG-2026-0005 r1待审核，未实施；T5—T8未开始。独立Office演示和Host健康运行不等于已接通对话。修订日期：2026-10-21。
 
 本文件同时服务人工评审和 coding agent：先明确真实协议、用户行为与系统边界，再定义实现方法、产物、测试和 PR 交接。下文均是待实施要求；不能将设计、fixture 通过或 feature 连线描述为功能已交付。用户提供的 master-plan 仅作为参考材料。
 
@@ -27,7 +27,7 @@
 | 对象 | 固定基线 | 用途与状态 |
 |---|---|---|
 | OpenPaw 初始审核 | 60a531a51172d14fc3db1a8e7eb6762c2c8369d8 | 引擎、Provider、工具、存储可复用；Host 当时只有占位说明 |
-| OpenPaw 当前集成基线 | ac1b58285fb6c73dce6363ce88fe62100199bb73 | T0 #4、T1 #5已合入；T2从该基线开发；当前状态见14.1，不以工作区文档代替提交验证 |
+| OpenPaw 当前集成基线 | d11b944073ea3c3bc8cf3dac308e435647e6ee52 | T0 #4、T1 #5、T2 #6、T3 #7已合入；Windows待验和用户本轮安排保留，当前状态见14.1 |
 | Office | b221a44ce22fe08956356b5002d17df59a6a4f50 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
 | OpenCode SDK | @opencode-ai/sdk 1.18.15 | 精确版本、integrity、lockfile 和真实 v1 类型 |
 | 集成分支 | merge/ai-ofice-react-overagent | OpenPaw Tx PR 的目标分支，保留现有 ofice 拼写 |
@@ -85,7 +85,7 @@ audit/r1-chat/handoff 已同步为条件提案；达到扩展体验需要修改�
 | 断网或重启后继续使用 | 保留真实记录和最新任务；未完 Run 说明中断；Office恢复最新完整快照 | JSONL/Host恢复 + initialize/snapshot/read；T3/T6 | 不自动重放工具；v1不能接回原生成，重试属于新的用户请求 |
 | 点击任务的开始/暂停/完成/改派 | 返回准确的能力说明与可用操作建议 | ui.next + detail-v1；T5 | 首期不实现旧 Run 重放、可恢复暂停、手动伪完成、执行所有权迁移；按钮不是已支持命令 |
 
-里程碑状态及PR追踪统一见[第14节](#milestones)，当前T0—T2本轮范围已完成、T3实施/验证中；[第14.2节](#protocol-checklist)给出Tx到官方文档/实施章节/验收证据的核查表。
+里程碑状态及PR追踪统一见[第14节](#milestones)，当前T0—T3本轮批准范围已合入，Windows待补；T4具体方案待审；[第14.2节](#protocol-checklist)给出Tx到官方文档/实施章节/验收证据的核查表。
 
 基础版的“能展示”要求 T4 和 T5 的两条用户旅程都通过，T6 加固故障恢复，T8 完成原生双平台交付。T7 是另一客户端的 SDK 兼容工作，不是 Office 产品闭环的前提。不能以“聊天通了”或“可以播放演示动画”替代 T5 的产品验收。
 
@@ -772,6 +772,8 @@ approved不是无条件执行通行证；取消、输入变化、权限变化或
 
 **执行导航：**[通用约束](#office-common)、[四操作及响应](#office-operations)、[启动恢复](#office-boot)、[聊天全部细则](#office-chat)、[完整快照/seq](#office-snapshot)、[真实任务投影](#office-projection)、[里程碑M4](#milestone-m4)。逐项对照S1/S2/S3/S4/S5。
 
+**具体实施审核单：**[CHG-2026-0005](../changes/CHG-2026-0005.md)第4节逐文件、第9节协议/配置/恢复方案、第10节O01—O10验收。当前提案待审，尚未接通聊天；Office“业务已连接”不代表模型已连接。
+
 **真实场景/用途：**完成第1.4节步骤1—2：打开办公室，提问读取项目并追问，聊天有真实回答，同时任务、白板和功能人物有依据。影响对话、办公室目录、工作状态、气泡、白板与历史绑定。关联REQ-OP-010/011/012；不改Office，不开放写工具。
 
 **协议安排：**独立POST /office/chat严格使用S4 v1；Host另用官方messages的capabilities/initialize/snapshot/read。快照schemaVersion=1.0，场景协议2.0，chat version=1.0三者不混用。此时先依靠Office原有sceneBridge呈现工作/任务状态；主动发言与交接全面验收在T5。
@@ -1051,8 +1053,8 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 | M0 / T0 | 产品/协议/工程治理可直接指导后续开发 | [T0任务卡](#tx-t0)；官方Schema/SDK、治理、完整双平台基线；[提PR前核查](#milestone-gate) | 已完成：用户于2026-10-20会话确认审核通过，PR已合入 | [OpenPaw #4](https://github.com/KunlunMeta-Limited/openpaw/pull/4)，合入76e2ee2f5881afd5daab13cca3ca3460a561f023；GitHub无独立Review，审核证据为用户会话确认；[逐项核查](../verification/CHG-2026-0001/T0核查.md)、[验证记录](../verification/CHG-2026-0001/验证记录.md) |
 | M1 / T1 | 正确模型、可信停止和完整历史可复用 | [T1任务卡](#tx-t1)；D01—D04回归、真实Provider请求捕获、存储/取消边界、CLI兼容 | 已完成：用户2026-10-21确认T1审核通过；PR #5已合入 | [OpenPaw #5](https://github.com/KunlunMeta-Limited/openpaw/pull/5)，最终head 383d0922eba3d069794015e1f280668a690c482c；合入ac1b58285fb6c73dce6363ce88fe62100199bb73；[最终push CI](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39416514821)13/13；PR事件另轮CI因账单未启动，保留历史失败，不虚称全部事件成功 |
 | M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、D34/D35及执行矩阵 | 已完成本轮范围：用户确认审核，PR #6实际合入；Windows原生验证按原决定暂缓，未执行不算通过 | [OpenPaw #6](https://github.com/KunlunMeta-Limited/openpaw/pull/6)，head 53243079b5d969486ff72f83102b6e0fd7890f7d，merge 3a159a41c5440df6ce0cbbedb4edc7b0a87fe428；Linux完整26/26；用户会话确认审核，页面无独立Review；[0003履历](../changes/CHG-2026-0003.md#12-验证和审批记录) |
-| M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；[0004第9/10节](../changes/CHG-2026-0004.md#9-影响数据流和实现)的H01—H12 | 待PR审核：用户已验收4263529交付，Linux完整26/26；Windows本轮暂缓；PR未合入，不进入T4 | [OpenPaw #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)，base merge/ai-ofice-react-overagent、创建head b5a2c2a2a44902139ad27cf6f2cd9a2b8859e27d；尚无平台Review、未合入；CI账单未启动与本地Windows门禁冲突分别记录于[0004](../changes/CHG-2026-0004.md#12-验证和审批记录) |
-| M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；聊天+任务/白板+真实账本及快照恢复 | 待实施 | 未创建；批准/合入待发生 |
+| M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；[0004第9/10节](../changes/CHG-2026-0004.md#9-影响数据流和实现)的H01—H12 | 已完成本轮批准范围并合入；Linux准确交付与合入head均完整26/26，Windows按用户明确指示暂缓、未验证 | [OpenPaw #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)，head 825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52；2026-10-21 19:16:12合入；用户会话确认、API无独立Review；[0004履历](../changes/CHG-2026-0004.md#12-验证和审批记录)保留CI未启动与门禁例外冲突 |
+| M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；[0005第9/10节](../changes/CHG-2026-0005.md#9-影响数据流和实现)具体方案及O01—O10 | 提案待审，未实施；当前页面仍为独立协议演示/聊天预览 | 未创建；方案批准、产品验收、PR审核/合入待发生 |
 | M5 / T5 | 常规产品闭环：审批写产物、详情、交接与发言 | [演示步骤3—6](#product-demo)、[T5任务卡](#tx-t5)；文件哈希、call/审批、真浏览器动画/详情可交叉核对 | 待实施 | 未创建；批准/合入待发生 |
 | M6 / T6 | 故障恢复可重复；已批准扩展单独验收 | [演示步骤7](#product-demo)、[T6任务卡](#tx-t6)；故障矩阵、v1取消/180秒限制；纳入范围的Rx另验 | 待实施；R1/R2/R4未批准，扩展未实施 | 未创建；若批准跨仓扩展，全部必要PR及Rx版本一起记录 |
 | M7 / T7 | 固定SDK可复用同一Host | [T7任务卡](#tx-t7)；真实SDK请求/事件迭代/审批/abort及Office并用 | 待实施 | 未创建；不声明OpenWork桌面已验收 |
@@ -1268,3 +1270,7 @@ Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2
 2026-10-21 M3交付验收：本会话用户明确“审批通过”，验收提交`4263529059234ae913da3b40a3efe3eb6e9f7f56`及0004 r2/0001 r3共同交付。Linux准确版本完整26/26，Windows按本轮明确安排暂缓，不记通过。当前仅登记事实并准备T3 PR，目标merge/ai-ofice-react-overagent；平台审核、合入与M3完成仍待发生，不开始T4。
 
 2026-10-21 M3平台登记：[PR #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)已创建，目标merge/ai-ofice-react-overagent，OPEN且非Draft；创建head b5a2c2a2a44902139ad27cf6f2cd9a2b8859e27d。0004 r2/0001 r3的用户交付验收独立保留，平台暂无Review、mergedAt=null，M3不记完成。PR CI抽查fmt steps为空且注释报账单/预算未启动；本地Linux26/26与Windows暂缓/交付门禁冲突分别记录，不混为代码失败或通过。
+
+### M3合入与M4提案（2026-10-21）
+
+用户确认PR完成，API核实#7于北京时间19:16:12合入d11b944，最终head825a86c，reviews为空；用户会话确认与实际合入分列，不伪填平台Approve。合入head Linux26/26复验通过，Windows暂缓未验证。0001/0004保留approved机器状态及MERGED事实，因为现有closed强制双平台passed，当前不改门禁。T4主CHG0005 r1已起草待审，当前只演示Office独立协议，Host /office/chat实测404，provider=echo；T4代码和真实产品旅程未实施。
