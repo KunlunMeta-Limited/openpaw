@@ -3,7 +3,7 @@
 //! 禁止承担职责：不操作桌面、不递归委派、不继承或传播父会话授权。
 //! 关联设计章节：ADR-006 父子授权边界；CHG-2026-0032 Office 多模态合并设计。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -11,11 +11,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
 use openpaw_core::{
-    Capabilities, CompletionRequest, CompletionResponse, Error, LlmProvider, Message, Role,
-    Session, StreamEvent, ToolCallOutcome, ToolCategory, ToolConcurrency, ToolExecutor, ToolHost,
-    ToolHostValidator, ToolSpec,
+    Capabilities, CompletionRequest, CompletionResponse, Error, LlmProvider, StreamEvent,
+    ToolCallOutcome, ToolCategory, ToolConcurrency, ToolExecutor, ToolHost, ToolHostValidator,
+    ToolSpec,
 };
-use openpaw_engine::{AgentEvent, AgentLoop};
+use openpaw_engine::AgentEvent;
 use openpaw_tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -34,6 +34,7 @@ const DEFAULT_GLOBAL_SUBAGENTS: usize = 4;
 /// 功能：共享父子模型请求额度及同工作区写入互斥；不持有会话授权。
 pub(crate) struct DelegationShared {
     model_slots: Arc<Semaphore>,
+    runtime: RwLock<std::sync::Weak<crate::runtime::AppState>>,
     workspace_write_locks: Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
 }
 
@@ -55,6 +56,7 @@ impl DelegationShared {
             .unwrap_or(DEFAULT_GLOBAL_SUBAGENTS);
         Arc::new(Self {
             model_slots: Arc::new(Semaphore::new(slots)),
+            runtime: RwLock::new(std::sync::Weak::new()),
             workspace_write_locks: Mutex::new(HashMap::new()),
         })
     }
@@ -63,8 +65,21 @@ impl DelegationShared {
     fn with_slots(slots: usize) -> Arc<Self> {
         Arc::new(Self {
             model_slots: Arc::new(Semaphore::new(slots)),
+            runtime: RwLock::new(std::sync::Weak::new()),
             workspace_write_locks: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// 功能：绑定共享普通会话运行时的弱引用。
+    /// 参数：runtime 为当前 Host。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：仅更新弱引用，不持有 Host 循环引用。
+    /// 并发与取消：短写锁；不跨 await。
+    /// 权限：仅内部组装，模型不能替换。
+    /// 关联：CHG-2026-0034。
+    pub(crate) fn bind_runtime(&self, runtime: &Arc<crate::runtime::AppState>) {
+        *self.runtime.write().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(runtime);
     }
 
     fn workspace_write_lock(&self, workspace: &PathBuf) -> Arc<AsyncMutex<()>> {
@@ -104,7 +119,8 @@ pub(crate) struct DelegationContext {
     state_file: PathBuf,
     slots: Semaphore,
     shared: Arc<DelegationShared>,
-    manual_permissions: bool,
+    #[cfg(test)]
+    _runtime_keeper: Option<Arc<crate::runtime::AppState>>,
     enabled: bool,
 }
 
@@ -119,7 +135,6 @@ struct DelegationRecord {
     workspace_name: String,
     task_fingerprint: String,
     task: String,
-    running: bool,
     completed: Option<CachedDelegationOutcome>,
 }
 
@@ -177,8 +192,8 @@ impl DelegationContext {
             state_file,
             slots: Semaphore::new(MAX_PARALLEL_SUBAGENTS),
             shared,
-            manual_permissions: std::env::var("OPENPAW_ENGINE_PERMISSIONS").as_deref()
-                == Ok("manual"),
+            #[cfg(test)]
+            _runtime_keeper: None,
             enabled,
         })
     }
@@ -222,6 +237,21 @@ impl DelegationContext {
         })
     }
 
+    /// 功能：为真实子执行组装仅工作区内置工具。
+    /// 参数：无。
+    /// 返回：使用共享写锁的子工具 Host。
+    /// 错误：无。
+    /// 状态：每个会话维护自己的媒体上下文。
+    /// 并发与取消：共享工作区写锁；取消由普通 runtime 管理。
+    /// 权限：无桌面工具、无递归委派。
+    /// 关联：ADR-006、CHG-2026-0034。
+    pub(crate) fn child_tool_host(&self) -> Arc<dyn ToolHost> {
+        Arc::new(WorkspaceToolHost::new(
+            self.workspace.clone(),
+            self.shared.workspace_write_lock(&self.workspace),
+        ))
+    }
+
     async fn run(&self, input: DelegateTaskInput) -> openpaw_core::Result<ToolCallOutcome> {
         let task = input.task.trim();
         if task.is_empty() || task.chars().count() > MAX_DELEGATE_TASK_CHARS {
@@ -230,247 +260,52 @@ impl DelegationContext {
             )));
         }
         let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
-        let has_explicit_name = input
-            .name
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        let requested_name = normalized_name(input.name.as_deref(), sequence)?;
-        let display_name = requested_name.clone();
-        let requested_logical_key = logical_agent_key(&requested_name);
-        let task_fingerprint = normalized_task_fingerprint(task);
-        let (workspace_id, name, logical_key) = {
-            let mut records = self
-                .delegations
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Some((_, record)) = records
-                .iter_mut()
-                .find(|(_, record)| record.task_fingerprint == task_fingerprint)
-            {
-                if record.running {
-                    return Ok(ToolCallOutcome::error(format!(
-                        "相同子任务已由“{}”执行中，请等待并复用结果，不要重复创建空间。",
-                        record.workspace_name
-                    )));
-                }
-                if let Some(cached) = &record.completed {
-                    self.office.reused_main_result(&self.parent_session_id);
-                    return Ok(ToolCallOutcome {
-                        media: Vec::new(),
-                        content: cached.content.clone(),
-                        is_error: false,
-                        structured: Some(cached.structured.clone()),
-                    });
-                }
-            }
-            let logical_key = if records.contains_key(&requested_logical_key) {
-                requested_logical_key.clone()
-            } else if has_explicit_name {
-                best_reusable_delegation(&records, &requested_name, task)
-                    .unwrap_or_else(|| requested_logical_key.clone())
-            } else {
-                requested_logical_key.clone()
-            };
-            if let Some(record) = records.get_mut(&logical_key) {
-                if record.running {
-                    return Ok(ToolCallOutcome::error(format!(
-                        "子 Agent“{}”已有任务执行中；请合并职责或等待完成后继续使用该 Agent。",
-                        record.workspace_name
-                    )));
-                }
-                record.task_fingerprint = task_fingerprint.clone();
-                record.task = task.to_string();
-                record.running = true;
-                record.completed = None;
-                (
-                    record.workspace_id.clone(),
-                    record.workspace_name.clone(),
-                    logical_key,
-                )
-            } else {
-                let workspace_id = if has_explicit_name {
-                    format!(
-                        "{}:agent:{:016x}",
-                        self.parent_session_id,
-                        stable_logical_hash(&requested_logical_key)
-                    )
-                } else {
-                    format!(
-                        "{}:agent:{sequence}-{}",
-                        self.parent_session_id,
-                        Uuid::new_v4().simple()
-                    )
-                };
-                records.insert(
-                    requested_logical_key.clone(),
-                    DelegationRecord {
-                        workspace_id: workspace_id.clone(),
-                        workspace_name: display_name.clone(),
-                        task_fingerprint: task_fingerprint.clone(),
-                        task: task.to_string(),
-                        running: true,
-                        completed: None,
-                    },
-                );
-                (workspace_id, display_name, requested_logical_key)
-            }
-        };
+        let name = normalized_name(input.name.as_deref(), sequence)?;
+        // 展示空间沿用旧协议，真实会话使用 runtime 分配的合法 UUID。
+        let workspace_id = format!(
+            "{}:agent:{sequence}-{}",
+            self.parent_session_id,
+            Uuid::new_v4().simple()
+        );
         let (provider, model, cancel) = {
-            let provider_model = self
+            let current = self
                 .provider_model
                 .read()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(|e| e.into_inner());
             (
-                provider_model.provider.clone(),
-                provider_model.model.clone(),
-                provider_model.cancel.clone(),
+                current.provider.clone(),
+                current.model.clone(),
+                current.cancel.clone(),
             )
         };
-        let _record_guard = DelegationRunGuard {
-            context: self,
-            key: &logical_key,
-            fingerprint: &task_fingerprint,
-        };
-        let _session_permit = tokio::select! {
+        let _permit = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(cancelled_outcome(&workspace_id, &name, &self.parent_session_id)),
-            permit = self.slots.acquire() => permit
-                .map_err(|_| Error::ToolHost("子 Agent 调度器已关闭".into()))?,
+            permit = self.slots.acquire() => permit.map_err(|_| Error::ToolHost("子 Agent 调度器已关闭".into()))?,
         };
-        let child_tools = Arc::new(WorkspaceToolHost::new(
-            self.workspace.clone(),
-            self.shared.workspace_write_lock(&self.workspace),
-        ));
-        let tools = child_tools.list_tools().await?;
-        let tool_host: Arc<dyn ToolHost> = child_tools;
-        let Some(child_approvals) = self.approvals.child(&workspace_id, &name, cancel.clone())
-        else {
-            return Ok(cancelled_outcome(
-                &workspace_id,
-                &name,
-                &self.parent_session_id,
-            ));
-        };
-        let agent = AgentLoop::new(provider.clone())
-            .with_model(model.clone())
-            .with_tool_host(tool_host)
-            .with_max_tokens(
-                openpaw_llm::config::ConfigSnapshot::from_env()
-                    .max_output_tokens(None)
-                    .map_err(Error::ToolHost)?,
-            );
-        let agent = openpaw_engine::approval::configure(
-            agent,
-            self.manual_permissions,
-            child_approvals.manager.clone(),
-        );
-
-        let mut session = Session::new(model.clone(), provider.name());
-        session.meta.id = workspace_id.clone();
-        session.parent_session_id = Some(self.parent_session_id.clone());
-        session.agent_type = Some("fork".into());
-        session.messages.push(Message::user_text(task));
-        let office = Arc::new(SubagentOfficeGuard::new(
-            self.office.clone(),
-            self.parent_session_id.clone(),
-            workspace_id.clone(),
-            name.clone(),
-            self.workspace.clone(),
-        ));
-        let sink_office = office.clone();
-        let mut sink = move |event: AgentEvent| sink_office.observe(&event);
-        let system = Some(
-            "你是主 Agent 委派的独立子 Agent。只完成当前子任务，必要时使用工具核实或生成产物；不要尝试再次委派。最终给出可供主 Agent 直接整合的清晰结果。"
-                .to_string(),
-        );
-        let result = agent
-            .run_turn_with_provider_and_cancel_token(
-                &mut session,
-                system,
-                &tools,
-                &mut sink,
-                cancel.clone(),
-                (provider, model),
+        let runtime = self
+            .shared
+            .runtime
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+            .ok_or_else(|| Error::ToolHost("委派运行时不可用，未启动子任务".into()))?;
+        runtime
+            .run_delegated(
+                crate::runtime::ChildSession {
+                    parent_id: self.parent_session_id.clone(),
+                    workspace_id,
+                    name,
+                },
+                self.workspace.clone(),
+                task.to_string(),
+                provider,
+                model,
+                cancel,
+                self.approvals.clone(),
             )
-            .await;
-        let cancelled = cancel.is_cancelled();
-        let completed = result.is_ok() && !cancelled;
-        office.finish(completed);
-        if cancelled {
-            self.finish_delegation(&logical_key, &task_fingerprint, None);
-            return Ok(cancelled_outcome(
-                &workspace_id,
-                &name,
-                &self.parent_session_id,
-            ));
-        }
-        if let Err(error) = result {
-            self.finish_delegation(&logical_key, &task_fingerprint, None);
-            return Ok(ToolCallOutcome {
-                media: Vec::new(),
-                content: format!("子 Agent“{name}”执行失败：{error}"),
-                is_error: true,
-                structured: Some(json!({
-                    "workspaceId": workspace_id,
-                    "workspaceName": name,
-                    "parentSessionId": self.parent_session_id,
-                    "status": "failed"
-                })),
-            });
-        }
-        let text = session
-            .messages
-            .iter()
-            .rev()
-            .find(|message| message.role == Role::Assistant)
-            .map(Message::text)
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or_else(|| "子 Agent 已完成任务，但没有返回文本结果。".into());
-        let structured = json!({
-            "workspaceId": workspace_id.clone(),
-            "workspaceName": name.clone(),
-            "parentSessionId": self.parent_session_id,
-            "status": "completed",
-            "result": text.clone()
-        });
-        let outcome = ToolCallOutcome {
-            media: Vec::new(),
-            content: format!("子 Agent“{name}”已完成：\n{text}"),
-            is_error: false,
-            structured: Some(structured.clone()),
-        };
-        self.finish_delegation(
-            &logical_key,
-            &task_fingerprint,
-            Some(CachedDelegationOutcome {
-                content: outcome.content.clone(),
-                structured,
-            }),
-        );
-        Ok(outcome)
-    }
-
-    fn finish_delegation(
-        &self,
-        logical_key: &str,
-        task_fingerprint: &str,
-        completed: Option<CachedDelegationOutcome>,
-    ) {
-        let mut records = self
-            .delegations
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(record) = records.get_mut(logical_key) {
-            if record.task_fingerprint == task_fingerprint {
-                record.running = false;
-                record.completed = completed;
-            }
-        }
-        let snapshot = persisted_delegation_state(&records);
-        if let Err(error) = save_delegations(&self.state_file, &snapshot) {
-            tracing::warn!(%error, "无法持久化子 Agent 委派状态");
-        }
+            .await
+            .map_err(Error::ToolHost)
     }
 
     /// 功能：可靠清除已完成结果，保留逻辑子空间。
@@ -503,44 +338,7 @@ impl DelegationContext {
     /// 权限：仅供主模型上下文，不向 Office 发布任务正文。
     /// 关联：Q5 与委派缓存。
     pub(crate) fn context_prompt(&self) -> Option<String> {
-        if !self.enabled {
-            return None;
-        }
-        let records = self
-            .delegations
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let available = records
-            .values()
-            .filter(|record| record.completed.is_some())
-            .map(|record| format!("- name={}；既有任务={}", record.workspace_name, record.task))
-            .collect::<Vec<_>>();
-        (!available.is_empty()).then(|| {
-            format!(
-                "本会话已有以下已完成子 Agent，可继续复用：\n{}\n优先继续使用既有 name；完全相同任务会直接返回缓存，高置信的相似职责和任务会复用既有空间。不要为近义职责重复创建空间。",
-                available.join("\n")
-            )
-        })
-    }
-}
-
-struct DelegationRunGuard<'a> {
-    context: &'a DelegationContext,
-    key: &'a str,
-    fingerprint: &'a str,
-}
-impl Drop for DelegationRunGuard<'_> {
-    fn drop(&mut self) {
-        let mut records = self
-            .context
-            .delegations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(record) = records.get_mut(self.key) {
-            if record.task_fingerprint == self.fingerprint {
-                record.running = false;
-            }
-        }
+        None
     }
 }
 
@@ -634,169 +432,6 @@ fn chinese_digits(value: u64) -> String {
         .collect()
 }
 
-fn logical_agent_key(name: &str) -> String {
-    name.chars()
-        .filter(|character| !character.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn normalized_task_fingerprint(task: &str) -> String {
-    task.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
-
-fn normalized_agent_capability(name: &str) -> String {
-    let mut value = name
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter(|character| character.is_alphanumeric())
-        .collect::<String>();
-    const SUFFIXES: &[&str] = &[
-        "子agent",
-        "agent",
-        "智能体",
-        "助手",
-        "专家",
-        "工作室",
-        "空间",
-        "调研",
-        "研究",
-        "分析",
-        "收集",
-        "整理",
-        "规划",
-        "策划",
-    ];
-    while let Some(suffix) = SUFFIXES.iter().find(|suffix| value.ends_with(**suffix)) {
-        value.truncate(value.len() - suffix.len());
-    }
-    let chars = value.chars().collect::<Vec<_>>();
-    let trailing_ascii = chars
-        .iter()
-        .rev()
-        .take_while(|character| character.is_ascii_alphanumeric())
-        .count();
-    if (1..=2).contains(&trailing_ascii)
-        && chars.len() > trailing_ascii
-        && !chars[chars.len() - trailing_ascii - 1].is_ascii()
-    {
-        value = chars[..chars.len() - trailing_ascii].iter().collect();
-    }
-    value
-}
-
-fn normalized_task_similarity_text(task: &str) -> String {
-    let mut value = task
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter(|character| character.is_alphanumeric())
-        .collect::<String>();
-    const GENERIC_ACTIONS: &[&str] = &[
-        "请", "帮忙", "负责", "进行", "完成", "整理", "收集", "调研", "研究", "分析", "补充",
-        "生成", "输出", "提供", "汇总", "查找", "搜索", "撰写", "编写", "相关",
-    ];
-    for action in GENERIC_ACTIONS {
-        value = value.replace(action, "");
-    }
-    value
-}
-
-fn character_bigrams(value: &str) -> HashSet<(char, char)> {
-    let chars = value.chars().collect::<Vec<_>>();
-    chars.windows(2).map(|pair| (pair[0], pair[1])).collect()
-}
-
-fn common_prefix_chars(left: &str, right: &str) -> usize {
-    left.chars()
-        .zip(right.chars())
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn text_similarity_score(left: &str, right: &str) -> u16 {
-    if left.is_empty() || right.is_empty() {
-        return 0;
-    }
-    if left == right {
-        return 1_000;
-    }
-    let left_chars = left.chars().count();
-    let right_chars = right.chars().count();
-    let shorter = left_chars.min(right_chars);
-    let mut score = if shorter >= 2 && (left.contains(right) || right.contains(left)) {
-        880
-    } else {
-        0
-    };
-    let left_bigrams = character_bigrams(left);
-    let right_bigrams = character_bigrams(right);
-    if !left_bigrams.is_empty() && !right_bigrams.is_empty() {
-        let overlap = left_bigrams.intersection(&right_bigrams).count();
-        score = score.max(((2_000 * overlap) / (left_bigrams.len() + right_bigrams.len())) as u16);
-    }
-    let prefix = common_prefix_chars(left, right);
-    if prefix >= 2 {
-        score = score.max((550 + prefix.min(6) * 50) as u16);
-    }
-    score.min(1_000)
-}
-
-fn reusable_delegation_score(
-    record: &DelegationRecord,
-    requested_name: &str,
-    task: &str,
-) -> Option<u16> {
-    let name_score = text_similarity_score(
-        &normalized_agent_capability(&record.workspace_name),
-        &normalized_agent_capability(requested_name),
-    );
-    let task_score = text_similarity_score(
-        &normalized_task_similarity_text(&record.task),
-        &normalized_task_similarity_text(task),
-    );
-    if name_score == 1_000 {
-        return Some(800 + task_score / 5);
-    }
-    if name_score >= 850 && task_score >= 120 {
-        return Some((name_score * 7 + task_score * 3) / 10);
-    }
-    if name_score >= 620 && task_score >= 450 {
-        return Some((name_score * 6 + task_score * 4) / 10);
-    }
-    (task_score >= 920).then_some(650 + name_score / 4)
-}
-
-fn best_reusable_delegation(
-    records: &HashMap<String, DelegationRecord>,
-    requested_name: &str,
-    task: &str,
-) -> Option<String> {
-    records
-        .iter()
-        .filter_map(|(logical_key, record)| {
-            reusable_delegation_score(record, requested_name, task)
-                .map(|score| (logical_key, score))
-        })
-        .max_by(|(left_key, left_score), (right_key, right_score)| {
-            left_score
-                .cmp(right_score)
-                .then_with(|| right_key.cmp(left_key))
-        })
-        .map(|(logical_key, _)| logical_key.clone())
-}
-
-fn stable_logical_hash(value: &str) -> u64 {
-    value
-        .as_bytes()
-        .iter()
-        .fold(0xcbf29ce484222325, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-        })
-}
-
 fn delegation_state_file(workspace: &std::path::Path, parent_session_id: &str) -> PathBuf {
     workspace
         .join(".openpaw")
@@ -866,7 +501,6 @@ fn load_delegations(
                     workspace_name,
                     task_fingerprint: record.task_fingerprint,
                     task: record.task,
-                    running: false,
                     completed: if reusable { record.completed } else { None },
                 },
             )
@@ -925,7 +559,7 @@ fn save_delegations(
 fn delegate_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate_task".into(),
-        description: "把一个清晰、可独立完成的子任务交给真实子 Agent，并等待其结果。委派前先合并重复或高度重叠的职责；同一逻辑 Agent 使用稳定且唯一的功能名称 name，优先中文并保留必要技术标识；后续相同职责复用该 name。适合独立子任务，简单任务不要调用。".into(),
+        description: "把一个清晰、可独立完成的子任务交给真实子 Agent，并等待其结果。委派前先合并重复或高度重叠的职责；name 仅用于显示，优先中文并保留必要技术标识；每次新委派创建独立子身份，不按名称或旧答案复用。适合独立子任务，简单任务不要调用。".into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1161,7 +795,7 @@ impl ToolHostValidator for WorkspaceToolHost {
     }
 }
 
-struct SubagentOfficeGuard {
+pub(crate) struct SubagentOfficeGuard {
     office: OfficeDispatcher,
     parent_session_id: String,
     workspace_id: String,
@@ -1170,7 +804,15 @@ struct SubagentOfficeGuard {
 }
 
 impl SubagentOfficeGuard {
-    fn new(
+    /// 功能：登记本次真实子回合的展示生命周期。
+    /// 参数：Office、父会话、兼容子空间身份、显示名及实际工作目录。
+    /// 返回：离开作用域即清理的展示 guard。
+    /// 错误：展示入队失败不改变引擎执行结果。
+    /// 状态：登记子空间并发送一次真实交接。
+    /// 并发与取消：同步入队；取消或丢弃时释放展示状态。
+    /// 权限：不创建执行权限，不发布任务正文。
+    /// 关联：CHG-2026-0034、普通 runtime 子执行。
+    pub(crate) fn new(
         office: OfficeDispatcher,
         parent_session_id: String,
         workspace_id: String,
@@ -1192,7 +834,15 @@ impl SubagentOfficeGuard {
         }
     }
 
-    fn observe(&self, event: &AgentEvent) {
+    /// 功能：投影子回合的实际引擎事件。
+    /// 参数：event 为当前子执行的真实事件。
+    /// 返回：无。
+    /// 错误：展示故障不反向改变执行结果。
+    /// 状态：更新当前子空间的工具、文字和产物展示。
+    /// 并发与取消：短互斥锁，不等待网络。
+    /// 权限：不展示 reasoning，不复制父工具权限。
+    /// 关联：CHG-2026-0034。
+    pub(crate) fn observe(&self, event: &AgentEvent) {
         if let Some(turn) = self
             .turn
             .lock()
@@ -1204,7 +854,15 @@ impl SubagentOfficeGuard {
         }
     }
 
-    fn finish(&self, completed: bool) {
+    /// 功能：按已提交的子回合结果结束展示。
+    /// 参数：completed 表示实际执行及持久化已成功。
+    /// 返回：无。
+    /// 错误：展示故障不改变已提交结果。
+    /// 状态：最多结束一次并释放场景活动。
+    /// 并发与取消：锁内取走 guard；取消不冒充成功。
+    /// 权限：只发布真实结果，不重新执行工具。
+    /// 关联：CHG-2026-0034。
+    pub(crate) fn finish(&self, completed: bool) {
         let turn = self
             .turn
             .lock()
@@ -1274,12 +932,21 @@ mod tests {
         approvals: Arc<HostApprovalManager>,
         provider: Arc<dyn LlmProvider>,
         model: &str,
-        manual_permissions: bool,
+        _manual_permissions: bool,
         cancel: CancellationToken,
     ) -> Arc<DelegationContext> {
         let state_file = delegation_state_file(&workspace, parent_session_id);
         let delegations = load_delegations(&state_file, parent_session_id);
         let sequence = delegations.len() as u64;
+        let home = tempfile::tempdir().unwrap().keep();
+        let mut runtime = crate::runtime::AppState::new(crate::protocol::HostConfig {
+            home,
+            workspace: workspace.clone(),
+            ..Default::default()
+        });
+        Arc::get_mut(&mut runtime).unwrap().office = office.clone();
+        let shared = DelegationShared::with_slots(DEFAULT_GLOBAL_SUBAGENTS);
+        shared.bind_runtime(&runtime);
         Arc::new(DelegationContext {
             parent_session_id: parent_session_id.into(),
             workspace,
@@ -1294,8 +961,8 @@ mod tests {
             delegations: Mutex::new(delegations),
             state_file,
             slots: Semaphore::new(MAX_PARALLEL_SUBAGENTS),
-            shared: DelegationShared::with_slots(DEFAULT_GLOBAL_SUBAGENTS),
-            manual_permissions,
+            shared,
+            _runtime_keeper: Some(runtime),
             enabled: true,
         })
     }
@@ -1317,34 +984,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidation_survives_restart_preserves_identity_and_propagates_write_failure() {
+    async fn legacy_result_invalidation_preserves_identity_and_propagates_write_failure() {
         let host = test_host();
-        let args = json!({"name":"review","task":"check files"});
-        let first = host.call("delegate_task", args.clone()).await.unwrap();
-        assert!(!first.is_error);
-        let id = first.structured.unwrap()["workspaceId"].clone();
+        host.context.delegations.lock().unwrap().insert(
+            "old".into(),
+            DelegationRecord {
+                workspace_id: "parent:agent:old".into(),
+                workspace_name: "review".into(),
+                task_fingerprint: "old-task".into(),
+                task: "check files".into(),
+                completed: Some(CachedDelegationOutcome {
+                    content: "known old result".into(),
+                    structured: json!({}),
+                }),
+            },
+        );
         host.context.invalidate_results().unwrap();
         let restored = load_delegations(&host.context.state_file, "parent");
-        assert_eq!(restored.len(), 1);
-        let record = restored.values().next().unwrap();
-        assert_eq!(record.workspace_id, id.as_str().unwrap());
-        assert!(record.completed.is_none());
-        assert!(host.context.context_prompt().is_none());
-        let second = host.call("delegate_task", args).await.unwrap();
-        assert_eq!(second.structured.unwrap()["workspaceId"], id);
+        assert_eq!(restored["old"].workspace_id, "parent:agent:old");
+        assert!(restored["old"].completed.is_none());
         std::fs::remove_file(&host.context.state_file).unwrap();
         std::fs::create_dir(&host.context.state_file).unwrap();
         assert!(host.context.invalidate_results().is_err());
-        assert!(host
-            .context
-            .delegations
-            .lock()
-            .unwrap()
-            .values()
-            .next()
-            .unwrap()
-            .completed
-            .is_some());
     }
 
     #[test]
@@ -1360,7 +1021,6 @@ mod tests {
                         workspace_name: format!("agent-{index}"),
                         task_fingerprint: format!("task-{index}"),
                         task: format!("task-{index}"),
-                        running: false,
                         completed: Some(CachedDelegationOutcome {
                             content: "old".into(),
                             structured: json!({}),
@@ -1559,65 +1219,41 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn persisted_workspace_identity_and_display_name_are_preserved() {
-        let workspace = tempfile::tempdir().unwrap().keep();
-        let state_file = delegation_state_file(&workspace, "legacy-parent");
+    #[test]
+    fn legacy_workspace_identity_and_missing_transcript_are_preserved_without_reuse() {
+        let host = test_host();
         save_delegations(
-            &state_file,
+            &host.context.state_file,
             &PersistedDelegationState {
                 version: 2,
                 records: vec![PersistedDelegationRecord {
-                    logical_key: "audit-review".into(),
-                    workspace_id: "legacy-parent:agent:0000000000000001".into(),
-                    workspace_name: "audit-review".into(),
-                    task_fingerprint: "review release".into(),
-                    task: "review release".into(),
+                    logical_key: "review".into(),
+                    workspace_id: "parent:agent:old".into(),
+                    workspace_name: "历史审核".into(),
+                    task_fingerprint: "old".into(),
+                    task: "历史任务".into(),
                     completed: Some(CachedDelegationOutcome {
-                        content: "legacy result".into(),
-                        structured: json!({
-                            "workspaceId": "legacy-parent:agent:0000000000000001",
-                            "workspaceName": "audit-review",
-                            "parentSessionId": "legacy-parent",
-                            "status": "completed"
-                        }),
+                        content: "可证实的旧结果".into(),
+                        structured: json!({"workspaceId":"parent:agent:old"}),
                     }),
                 }],
             },
         )
         .unwrap();
-        let (events, _) = broadcast::channel(8);
-        let approvals = HostApprovalManager::new("legacy-parent", events, CancellationToken::new());
-        let context = test_context(
-            "legacy-parent",
-            workspace.clone(),
-            OfficeDispatcher::new(None),
-            approvals,
-            Arc::new(openpaw_llm::EchoProvider::new()),
-            "echo",
-            false,
-            CancellationToken::new(),
+        let restored = load_delegations(&host.context.state_file, "parent");
+        assert_eq!(restored["review"].workspace_name, "历史审核");
+        assert_eq!(
+            restored["review"].completed.as_ref().unwrap().content,
+            "可证实的旧结果"
         );
-        let host = DelegatingToolHost::new(workspace, context.clone());
-
-        assert!(context
-            .context_prompt()
-            .unwrap()
-            .contains("name=audit-review"));
-        let cached = host
-            .call(
-                "delegate_task",
-                json!({"name":"audit-review","task":"review release"}),
-            )
-            .await
-            .unwrap()
-            .structured
-            .unwrap();
-        assert_eq!(cached["workspaceName"], "audit-review");
+        assert!(
+            host.context.context_prompt().is_none(),
+            "旧答案不得冒充持久子历史"
+        );
     }
 
     #[tokio::test]
-    async fn repeated_logical_agent_reuses_one_workspace_across_turns() {
+    async fn same_name_without_explicit_identity_creates_distinct_children() {
         let host = test_host();
         let first = host
             .call(
@@ -1636,14 +1272,14 @@ mod tests {
             .await
             .unwrap();
         assert!(!second.is_error, "{}", second.content);
-        assert_eq!(
+        assert_ne!(
             first["workspaceId"],
             second.structured.unwrap()["workspaceId"]
         );
     }
 
     #[tokio::test]
-    async fn similar_capability_reuses_existing_workspace_for_a_new_task() {
+    async fn similar_names_never_merge_new_child_identities() {
         let host = test_host();
         let first = host
             .call(
@@ -1664,8 +1300,8 @@ mod tests {
         assert!(!second.is_error, "{}", second.content);
         assert!(second.content.contains("补充系统安全规范与限制说明"));
         let second = second.structured.unwrap();
-        assert_eq!(first["workspaceId"], second["workspaceId"]);
-        assert_eq!(second["workspaceName"], "安全规范调研 Agent");
+        assert_ne!(first["workspaceId"], second["workspaceId"]);
+        assert_eq!(second["workspaceName"], "安全规范研究助手");
     }
 
     #[tokio::test]
@@ -1693,7 +1329,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identical_task_reuses_completed_result_instead_of_creating_a_space() {
+    async fn identical_task_is_new_execution_in_a_distinct_child() {
         let host = test_host();
         let first = host
             .call(
@@ -1710,56 +1346,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!second.is_error, "{}", second.content);
-        assert_eq!(
+        assert_ne!(
             first.structured.unwrap()["workspaceId"],
             second.structured.unwrap()["workspaceId"]
         );
-    }
-
-    #[tokio::test]
-    async fn completed_delegation_survives_parent_context_recreation() {
-        let workspace = tempfile::tempdir().unwrap().keep();
-        let make_host = || {
-            let (events, _) = broadcast::channel(8);
-            let approvals =
-                HostApprovalManager::new("persistent-parent", events, CancellationToken::new());
-            let context = test_context(
-                "persistent-parent",
-                workspace.clone(),
-                OfficeDispatcher::new(None),
-                approvals,
-                Arc::new(openpaw_llm::EchoProvider::new()),
-                "echo",
-                false,
-                CancellationToken::new(),
-            );
-            Arc::new(DelegatingToolHost::new(workspace.clone(), context))
-        };
-        let first = make_host()
-            .call(
-                "delegate_task",
-                json!({"name":"交通住宿","task":"整理交通和住宿信息"}),
-            )
-            .await
-            .unwrap()
-            .structured
-            .unwrap();
-        let recreated = make_host();
-        assert!(recreated
-            .context
-            .context_prompt()
-            .unwrap()
-            .contains("name=交通住宿"));
-        let replay = recreated
-            .call(
-                "delegate_task",
-                json!({"name":"另一个近义名称","task":"整理交通和住宿信息"}),
-            )
-            .await
-            .unwrap()
-            .structured
-            .unwrap();
-        assert_eq!(first["workspaceId"], replay["workspaceId"]);
     }
 
     #[tokio::test]
@@ -1946,68 +1536,6 @@ mod tests {
                 _ => {}
             }
         }
-    }
-
-    #[tokio::test]
-    async fn child_manual_approval_uses_parent_manager_and_clears_pending() {
-        let workspace = tempfile::tempdir().unwrap().keep();
-        std::fs::write(workspace.join("README.md"), "approved child read").unwrap();
-        let (events, mut event_rx) = broadcast::channel(16);
-        let approvals = HostApprovalManager::new("parent-manual", events, CancellationToken::new());
-        let provider: Arc<dyn LlmProvider> = Arc::new(openpaw_llm::MockProvider::scripted(vec![
-            openpaw_llm::MockMode::ToolUse {
-                tool_name: "read_file".into(),
-                input: json!({"path":"README.md"}),
-                text: "准备读取".into(),
-            },
-            openpaw_llm::MockMode::Fixed("子 Agent 已读取文件".into()),
-        ]));
-        let context = test_context(
-            "parent-manual",
-            workspace.clone(),
-            OfficeDispatcher::new(None),
-            approvals.clone(),
-            provider,
-            "mock-1",
-            true,
-            CancellationToken::new(),
-        );
-        let host = Arc::new(DelegatingToolHost::new(workspace, context));
-        let running = {
-            let host = host.clone();
-            tokio::spawn(async move {
-                host.call("delegate_task", json!({"task":"读取 README"}))
-                    .await
-                    .unwrap()
-            })
-        };
-
-        let asked = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
-            .await
-            .expect("permission asked timeout")
-            .expect("permission event");
-        assert_eq!(asked.event_type, "permission.asked");
-        assert_eq!(asked.properties["sessionID"], "parent-manual");
-        assert_eq!(asked.properties["permission"], "read_file");
-        let pending = approvals.list().await;
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].permission, "read_file");
-        assert!(
-            approvals
-                .reply(&pending[0].id, true, "approved in test".into())
-                .await
-        );
-
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), running)
-            .await
-            .expect("approved child completion timeout")
-            .expect("delegate task");
-        assert!(!outcome.is_error, "{}", outcome.content);
-        assert!(outcome.content.contains("子 Agent 已读取文件"));
-        assert!(approvals.list().await.is_empty());
-        let replied = event_rx.recv().await.expect("permission replied event");
-        assert_eq!(replied.event_type, "permission.replied");
-        assert_eq!(replied.properties["sessionID"], "parent-manual");
     }
 
     #[tokio::test]

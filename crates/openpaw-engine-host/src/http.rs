@@ -46,6 +46,7 @@ const HOST_FORCE_HARVEST_MARGIN: Duration = Duration::from_millis(100);
 /// 权限：所有路由统一经过 Basic Authentication 中间件。
 /// 关联：`API-HOST-*`、`REQ-B-HOST-003`。
 pub fn build_router(state: Arc<AppState>) -> Router {
+    state.bind_delegation_runtime();
     state.main_office.start(state.shutdown_token());
     let router = Router::new()
         .route("/global/health", get(health))
@@ -661,7 +662,10 @@ fn main_approval_bridge(
         let mut pending = std::collections::HashMap::<String, CancellationToken>::new();
         loop {
             let event = tokio::select! { _ = stop.cancelled() => break, event = receiver.recv() => match event {Ok(event)=>event,Err(_)=>break} };
-            if event.properties["sessionID"].as_str() != Some(&handle.id) {
+            if !event.properties["sessionID"]
+                .as_str()
+                .is_some_and(|owner| handle.approvals.owns_session(owner))
+            {
                 continue;
             }
             if event.event_type == "permission.replied" {
@@ -1311,6 +1315,8 @@ async fn permissions(
     for session in state.sessions.read().await.values() {
         out.extend(session.approvals.list().await);
     }
+    out.sort_by(|left, right| left.id.cmp(&right.id));
+    out.dedup_by(|left, right| left.id == right.id);
     Json(out)
 }
 
@@ -1684,7 +1690,17 @@ mod tests {
                     },
                     Some("offices.initialize"|"office.read") => serde_json::json!({"offices":[],"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}}),
                     Some("office.snapshot") => serde_json::json!({"teamId":body["teamId"],"seq":body["snapshot"]["seq"],"status":"applied"}),
-                    Some("ui.next") => { tokio::time::sleep(Duration::from_millis(20)).await; serde_json::json!({"actions":[]}) },
+                    Some("ui.next") => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        let seen = seen.lock().await;
+                        let employee = seen.iter().rev().find_map(|message| {
+                            message["snapshot"]["employees"].as_array().and_then(|employees|employees.get(1)).map(|employee|(message["teamId"].clone(),employee["id"].clone()))
+                        });
+                        if scenario == "delegate-inspect" && !seen.iter().any(|message|message["type"] == "ui.respond") {
+                            if let Some((team, employee)) = employee { serde_json::json!({"actions":[{"id":"inspect-real-child","teamId":team,"action":"employee.inspect","employeeId":employee}]}) }
+                            else { serde_json::json!({"actions":[]}) }
+                        } else { serde_json::json!({"actions":[]}) }
+                    },
                     Some("decision.request") => {
                         if choice == "pending" || choice == "child-pending" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") { std::future::pending::<()>().await; }
                         let chosen = if choice == "child-pending" {"confirm"}else{choice};
@@ -1736,6 +1752,7 @@ mod tests {
             ("OPENPAW_OPENAI_BASE_URL", format!("http://{address}/v1")),
             ("OPENPAW_OPENAI_MODEL", "fixture-model".into()),
             ("OPENPAW_MAIN_API_KEY", "fixture-gateway-key".into()),
+            ("OPENPAW_ENGINE_MAX_MODEL_REQUESTS", "1".into()),
             (
                 "OPENPAW_ENGINE_PERMISSIONS",
                 if scenario == "write" || scenario == "delegate-write" {
@@ -1762,7 +1779,7 @@ mod tests {
             provider: "openai".into(),
             ..Default::default()
         };
-        let mut state = AppState::new(config.clone());
+        let mut state = AppState::new_with_turn_limits(config.clone(), 1, 0).unwrap();
         Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
             &config.home,
             &config.workspace,
@@ -1922,6 +1939,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delegated_child_has_public_history_and_parent_relation_after_reload() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-write", "confirm").await;
+        let mut public_events = fixture.state.global_events.subscribe();
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派子 Agent 写文件"))
+            .await
+            .unwrap();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(8),
+            to_bytes(response.into_body(), 200_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("parent integrated"));
+        let parent = fixture
+            .state
+            .main_office
+            .record(&fixture.team)
+            .unwrap()
+            .session
+            .unwrap();
+        let read = |app: Router, path: String| async move {
+            let response = app
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(
+                &to_bytes(response.into_body(), 200_000).await.unwrap(),
+            )
+            .unwrap()
+        };
+        let sessions = read(fixture.app.clone(), "/session".into()).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["parentID"] == parent)
+            .expect("委派必须创建可公开查询的真实子会话");
+        let child_id = child["id"].as_str().unwrap();
+        let history = read(fixture.app.clone(), format!("/session/{child_id}/message")).await;
+        assert!(history
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .any(|part| part["tool"] == "write_file"));
+        assert!(history.to_string().contains("tool results integrated"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("approved.txt")).unwrap(),
+            "approved once"
+        );
+        let parent_history = read(fixture.app.clone(), format!("/session/{parent}/message")).await;
+        assert!(
+            parent_history.to_string().contains(child_id),
+            "真实子 ID 必须对父模型和历史可见"
+        );
+        assert!(!parent_history
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["parts"].as_array().unwrap())
+            .any(|part| part["tool"] == "write_file"));
+        let mut child_tool_events = 0;
+        while let Ok(event) = public_events.try_recv() {
+            if event.event_type == "message.part.updated"
+                && event.properties["part"]["tool"] == "write_file"
+            {
+                assert_eq!(event.properties["part"]["sessionID"], child_id);
+                child_tool_events += 1;
+            }
+        }
+        assert!(
+            child_tool_events > 0,
+            "实际子工具必须通过公开事件报告子 owner"
+        );
+        let requests = fixture.model_seen.lock().await;
+        let child_request = requests
+            .iter()
+            .find(|request| {
+                !request["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == "delegate_task")
+            })
+            .unwrap();
+        assert!(
+            !child_request["messages"]
+                .to_string()
+                .contains("委派子 Agent 写文件"),
+            "新子不得复制父历史"
+        );
+        assert!(!child_request["tools"].to_string().contains("desktop"));
+        drop(requests);
+        let reloaded = build_router(AppState::new(fixture.state.config.clone()));
+        assert_eq!(
+            read(reloaded.clone(), format!("/session/{child_id}")).await["parentID"],
+            parent
+        );
+        assert_eq!(
+            read(reloaded, format!("/session/{child_id}/message")).await,
+            history
+        );
+    }
+
+    #[tokio::test]
+    async fn employee_inspect_returns_real_child_readonly_overview_without_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-inspect", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派读取 README 并汇报"))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let overview = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Some(value) = fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|message| message["type"] == "ui.respond")
+                    .cloned()
+                {
+                    break value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(overview["interactionId"], "inspect-real-child");
+        assert_eq!(overview["presentation"]["content"]["template"], "detail-v1");
+        assert!(overview.to_string().contains("只读"));
+        assert!(overview["presentation"]["content"]["actions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let fields = overview["presentation"]["content"]["fields"]
+            .as_array()
+            .unwrap();
+        let child_id = fields[0]["value"].as_str().unwrap();
+        let child = fixture
+            .state
+            .get(child_id)
+            .await
+            .expect("概览指向真实子会话");
+        assert!(child.child.is_some());
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            4,
+            "只读查看不得调用模型或工具"
+        );
+    }
+
+    #[tokio::test]
     async fn main_alone_delegates_real_child_and_projects_one_assignment_and_return() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -1967,7 +2155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn main_distinct_delegations_each_handoff_once_but_cached_result_has_no_new_execution() {
+    async fn main_new_delegations_each_execute_and_handoff_even_for_identical_tasks() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
@@ -1996,8 +2184,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(80)).await;
         }
         let record = fixture.state.main_office.record(&fixture.team).unwrap();
-        assert_eq!(record.snapshot["tasks"].as_array().unwrap().len(), 2);
-        assert_eq!(record.snapshot["employees"].as_array().unwrap().len(), 2);
+        assert_eq!(record.snapshot["tasks"].as_array().unwrap().len(), 3);
+        assert_eq!(record.snapshot["employees"].as_array().unwrap().len(), 4);
         let seen = fixture.seen.lock().await;
         let events: Vec<_> = seen
             .iter()
@@ -2013,20 +2201,15 @@ mod tests {
                 .iter()
                 .filter(|event| event["kind"] == "task.assigned")
                 .count(),
-            2
+            3
         );
-        assert!(events.iter().any(|event| event["kind"] == "note"
-            && event["summary"]
-                .as_str()
-                .unwrap()
-                .contains("未启动新子执行")));
         assert_eq!(
             seen.iter()
                 .filter(|message| message["command"]["capability"] == "office.visit")
                 .count(),
-            2
+            3
         );
-        assert_eq!(fixture.model_seen.lock().await.len(), 10);
+        assert_eq!(fixture.model_seen.lock().await.len(), 12);
     }
 
     #[tokio::test]
@@ -2111,6 +2294,38 @@ mod tests {
         assert_eq!(decision[0]["decision"]["actorId"], "office-lead");
         assert_ne!(decision[1]["decision"]["actorId"], "office-lead");
         assert!(!fixture.workspace.path().join("approved.txt").exists());
+        let pending = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/permission")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pending: serde_json::Value =
+            serde_json::from_slice(&to_bytes(pending.into_body(), 200_000).await.unwrap()).unwrap();
+        let items = pending.as_array().unwrap();
+        assert_eq!(items.len(), 1, "父聚合及子会话读取不能重复返回相同审批");
+        let owner = items[0]["sessionID"].as_str().unwrap();
+        let owner_handle = fixture
+            .state
+            .get(owner)
+            .await
+            .expect("审批实际 owner 必须是可读子会话");
+        assert!(owner_handle.child.is_some());
+        assert_ne!(
+            Some(owner),
+            fixture
+                .state
+                .main_office
+                .record(&fixture.team)
+                .unwrap()
+                .session
+                .as_deref()
+        );
         drop(response);
         let record = fixture.state.main_office.record(&fixture.team).unwrap();
         let id = record.session.unwrap();

@@ -77,6 +77,115 @@ struct MainProjection {
 }
 
 impl MainOffice {
+    fn inspect(&self, team: &str, action: &Value) -> Value {
+        let unavailable = |description: &str| serde_json::json!({"template":"detail-v1","title":"员工详情","description":description,"fields":[],"actions":[]});
+        let Ok(record) = self.record(team) else {
+            return unavailable("办公室不存在，未启动任何工作。");
+        };
+        let employee = record.snapshot["employees"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|employee| {
+                if action["action"] == "actor.inspect" {
+                    action["actorId"]
+                        .as_str()
+                        .is_some_and(|actor| !actor.is_empty() && employee["sceneActorId"] == actor)
+                } else {
+                    employee["id"] == action["employeeId"]
+                }
+            });
+        let Some(employee) = employee else {
+            return unavailable("该人物尚未绑定实际 Agent，没有可查看的工作记录。");
+        };
+        let employee_id = employee["id"].as_str().unwrap_or("");
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = sessions
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|handle| {
+                handle.workspace == record.workspace
+                    && (handle.id == employee_id
+                        || handle.child.as_ref().is_some_and(|child| {
+                            Some(child.parent_id.as_str()) == record.session.as_deref()
+                                && child.workspace_id == employee_id
+                        }))
+            });
+        let Some(handle) = handle else {
+            return unavailable("该员工尚无已加载的持久会话记录；未生成或重放工作。");
+        };
+        let truncate = |text: String, maximum: usize| {
+            let mut used = 0;
+            text.chars()
+                .take_while(|character| {
+                    used += character.len_utf16();
+                    used <= maximum
+                })
+                .collect::<String>()
+        };
+        let history = handle.wire_messages();
+        let last_input = history
+            .iter()
+            .rev()
+            .find(|message| message["info"]["role"] == "user")
+            .map(|message| {
+                message["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let recent = history
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .map(|message| {
+                let role = message["info"]["role"].as_str().unwrap_or("消息");
+                let text = message["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{role}: {text}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tools = history
+            .iter()
+            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "tool")
+            .rev()
+            .take(3)
+            .map(|part| {
+                format!(
+                    "{} [{}] callID={}\n输入：{}\n结果：{}",
+                    part["tool"].as_str().unwrap_or("工具"),
+                    part["state"]["status"].as_str().unwrap_or("unknown"),
+                    part["callID"].as_str().unwrap_or(""),
+                    part["state"]["input"],
+                    part["state"]["output"]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let state = handle
+            .turn_outcomes()
+            .last()
+            .map(|turn| format!("{:?}", turn.state))
+            .unwrap_or_else(|| "尚未执行".into());
+        serde_json::json!({"template":"detail-v1","title":format!("{} · 只读详情", employee["name"].as_str().unwrap_or("Agent")),
+            "description":"实际会话记录的一页概览；查看不会发起对话或执行工具。",
+            "fields":[{"label":"会话编号","value":handle.id},{"label":"任务","value":truncate(last_input,2000)},
+                {"label":"状态 / 更新时间","value":format!("{} / {}",state,handle.updated_at.load(std::sync::atomic::Ordering::Acquire))},
+                {"label":"最近消息","value":truncate(recent,2000)},{"label":"最近工具","value":truncate(tools,2000)}],"actions":[]})
+    }
+
     /// 功能：加载办公室目录或为配置的工作目录创建稳定身份。
     /// 参数：home、workspace 和可选受控 gateway 地址。
     /// 返回：共享目录，加载失败保留错误并拒绝聊天。
@@ -784,16 +893,16 @@ impl MainOffice {
                             let Some(team) = action["teamId"].as_str() else {
                                 continue;
                             };
-                            let Ok(record) = office.record(team) else {
-                                continue;
-                            };
-                            let description = match action["action"].as_str() {
-                                Some("actor.inspect"|"employee.inspect") => "人员状态由实际 Agent 执行同步。当前版本仅开放聊天和工具单次审批。",
-                                _ => "此操作尚未开放，未启动或修改任务。",
+                            let content = match action["action"].as_str() {
+                                Some("actor.inspect" | "employee.inspect") => {
+                                    office.inspect(team, action)
+                                }
+                                _ => {
+                                    serde_json::json!({"template":"detail-v1","title":"操作说明","description":"此操作尚未开放，未启动或修改任务。","fields":[],"actions":[]})
+                                }
                             };
                             let response = serde_json::json!({"type":"ui.respond","interactionId":id,
-                                "presentation":{"target":"dialog","content":{"template":"detail-v1",
-                                "title":record.snapshot["workspace"]["name"],"description":description,"fields":[],"actions":[]}}});
+                                "presentation":{"target":"dialog","content":content}});
                             tokio::select! { _ = shutdown.cancelled() => return,
                             _ = office.message(response,Duration::from_secs(5)) => {} }
                         }
@@ -804,7 +913,7 @@ impl MainOffice {
         });
     }
 }
-const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。可将职责清晰、可独立执行的任务通过 delegate_task 交给真实子 Agent，简单问答无需委派。当用户明确要求多 Agent、子 Agent、多空间协作且存在多个独立职责时，必须先调用 delegate_task；失败时说明原因，不能静默退化为单 Agent。按任务实际依赖安排协作，不套用固定领域角色或阶段模板。name 由你根据本次职责选择，优先使用清晰简短的中文功能名称；必要的 API、SQL 等技术标识可以保留。相同职责继续使用稳定 name，不要为近义职责重复创建空间。主 Agent 负责整合真实结果。每轮结束发送有效最终答复，严格遵循用户指定语言、格式和详略；允许纯文本、Markdown、JSON、XML等，不强制章节、文件清单或“无”占位。只有确实需要交付文件时，写入独立文件并调用 register_artifact 登记用户应查看的真实相对路径；shell或子Agent生成的成品也可登记，不登记检索脚本、临时数据和调试文件。子Agent过程文件保留在子空间。图示和图表只是可选展示能力，按用户需要选择合适格式，不因回答涉及某个主题就额外生成图表或强制使用Mermaid。可选图表文件.chart.json支持type为bar、bar3d、line、area、pie、donut、radar，以及title、categories、series[{name,data}]字段；数值必须真实、分类与系列等长，超过预览能力可交付其他通用格式。不得编造文件、工具执行或验证结果。"#;
+const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。可将职责清晰、可独立执行的任务通过 delegate_task 交给真实子 Agent，简单问答无需委派。当用户明确要求多 Agent、子 Agent、多空间协作且存在多个独立职责时，必须先调用 delegate_task；失败时说明原因，不能静默退化为单 Agent。按任务实际依赖安排协作，不套用固定领域角色或阶段模板。name 由你根据本次职责选择，优先使用清晰简短的中文功能名称；必要的 API、SQL 等技术标识可以保留。name 只用于展示，新委派建立独立真实子会话，不按名称或相似职责合并历史。主 Agent 负责整合真实结果。每轮结束发送有效最终答复，严格遵循用户指定语言、格式和详略；允许纯文本、Markdown、JSON、XML等，不强制章节、文件清单或“无”占位。只有确实需要交付文件时，写入独立文件并调用 register_artifact 登记用户应查看的真实相对路径；shell或子Agent生成的成品也可登记，不登记检索脚本、临时数据和调试文件。子Agent过程文件保留在子空间。图示和图表只是可选展示能力，按用户需要选择合适格式，不因回答涉及某个主题就额外生成图表或强制使用Mermaid。可选图表文件.chart.json支持type为bar、bar3d、line、area、pie、donut、radar，以及title、categories、series[{name,data}]字段；数值必须真实、分类与系列等长，超过预览能力可交付其他通用格式。不得编造文件、工具执行或验证结果。"#;
 
 impl MainOffice {
     fn update(
@@ -1345,25 +1454,6 @@ impl OfficeDispatcher {
     pub(crate) fn cancel_main(&self, session: &str) {
         if let Some(main) = self.main() {
             main.cancel(session);
-        }
-    }
-
-    /// 功能：标记旧子任务结果复用，避免伪造新交接。
-    /// 参数：session 为父会话。
-    /// 返回：无。
-    /// 错误：投影失败只记录日志。
-    /// 状态：新增脱敏 note，不创建子成员或执行任务。
-    /// 并发与取消：同步短锁，不等待网络。
-    /// 权限：不向 main 发送缓存正文。
-    /// 关联：T1-07。
-    pub(crate) fn reused_main_result(&self, session: &str) {
-        if let Some(main) = self.main() {
-            main.update(session,|_,record| {
-                record.snapshot["events"] = serde_json::json!([{"id":format!("reuse-{}",uuid::Uuid::new_v4().simple()),"kind":"note",
-                    "summary":"复用已完成的子任务结果，未启动新子执行","occurredAt":chrono::Utc::now().to_rfc3339(),
-                    "taskId":"","employeeId":"","fromEmployeeId":""}]);
-                Vec::new()
-            });
         }
     }
 
