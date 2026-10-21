@@ -54,6 +54,14 @@ fn emit(check: Check, pass: &mut usize, warn: &mut usize) {
 }
 
 /// `openpaw doctor` — run all checks, print the summary, exit 0.
+/// 功能：检查共享 Provider 配置并保持 WARN 退出 0。
+/// 参数：见签名；入口路径/名称或显式配置。
+/// 返回：见签名的退出码、Provider 或摘要。
+/// 错误：配置和读取失败脱敏处理；doctor WARN 不失败。
+/// 状态：诊断不连接模型；摘要不写 JSONL。
+/// 并发与取消：使用已有运行时和锁，未新增调度或恢复决策。
+/// 权限：密钥不进入输出或摘要。
+/// 关联：CHG-2026-0023 共享配置/目录。
 pub fn run(home: &Path, workspace: &Path) -> i32 {
     let mut pass = 0usize;
     let mut warn = 0usize;
@@ -65,6 +73,34 @@ pub fn run(home: &Path, workspace: &Path) -> i32 {
     // printed — only set/not set).
     for name in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
         emit(check_env_key(name), &mut pass, &mut warn);
+    }
+
+    let config = openpaw_llm::config::ConfigSnapshot::from_env();
+    let media_check = match config.capabilities("openai", "") {
+        Ok(_) => Check::Pass(
+            "model input capabilities: valid local declarations (undeclared models are text only)"
+                .into(),
+        ),
+        Err(error) => Check::warn(
+            error,
+            "model capability configuration is invalid",
+            "check OPENPAW_MODEL_CAPABILITIES JSON without adding credentials",
+        ),
+    };
+    emit(media_check, &mut pass, &mut warn);
+    for (name, _, _) in openpaw_llm::config::PROVIDERS {
+        let check = match config.resolve(name, Default::default()) {
+            Ok(c) => Check::Pass(format!(
+                "{name}: model={}, max output tokens={} (local configuration)",
+                c.model, c.max_output_tokens
+            )),
+            Err(error) => Check::warn(
+                format!("{name}: {error}"),
+                "provider configuration is not usable locally",
+                "check model, base URL, API key environment and token settings",
+            ),
+        };
+        emit(check, &mut pass, &mut warn);
     }
 
     // (c) index.db opens and reports its schema version.
@@ -138,7 +174,7 @@ fn check_home_writable(home: &Path) -> Check {
 /// is never printed.
 fn check_env_key(name: &str) -> Check {
     match std::env::var(name) {
-        Ok(value) if !value.is_empty() => Check::Pass(format!("{name}: set (value hidden)")),
+        Ok(value) if !value.trim().is_empty() => Check::Pass(format!("{name}: set (value hidden)")),
         _ => Check::warn(
             format!("{name}: not set"),
             "the anthropic/openai providers read their key from the environment; \
@@ -158,13 +194,13 @@ fn check_index_db(home: &Path) -> Check {
             Err(e) => Check::warn(
                 format!("index.db opens but the schema query failed: {e}"),
                 "the schema_version table should be readable right after open.",
-                "remove index.db and let the next chat rebuild it.",
+                "back up index.db and inspect its schema; preserve audit and other records.",
             ),
         },
         Err(e) => Check::warn(
             format!("index.db cannot be opened: {e}"),
             "the index must be a readable SQLite database for session list/show/search.",
-            "check the home permissions; remove index.db to rebuild it on the next chat.",
+            "check home permissions and back up index.db before repairing it; preserve audit records.",
         ),
     }
 }

@@ -22,6 +22,8 @@ pub mod approval;
 pub mod budget;
 pub mod error;
 pub mod guardrail;
+/// 功能：共享媒体内容与校验。Stability: unstable.
+pub mod media;
 pub mod memory_provider;
 pub mod message;
 pub mod policy;
@@ -40,6 +42,7 @@ pub use guardrail::{
     AllowlistGuardrail, CheckContext, GuardrailChain, GuardrailDecision, PermissiveGuardrail,
     ToolGuardrail,
 };
+pub use media::InlineMedia;
 pub use memory_provider::{
     InMemoryProvider, MemoryEntry, MemoryProvider, MemorySearchQuery, MemorySearchResult,
 };

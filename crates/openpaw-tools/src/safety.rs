@@ -98,7 +98,7 @@ mod tests {
         let ws = dir.path();
         std::fs::write(ws.join("a.txt"), "x").unwrap();
         let p = resolve(ws, "a.txt").unwrap();
-        assert!(p.starts_with(ws));
+        assert_eq!(p, dunce_canonicalize(ws).unwrap().join("a.txt"));
     }
 
     #[test]
@@ -114,8 +114,37 @@ mod tests {
         let ws = dir.path();
         std::fs::create_dir(ws.join("sub")).unwrap();
         let p = resolve(ws, "sub/new.txt").unwrap();
-        assert!(p.starts_with(ws));
-        assert!(p.ends_with("new.txt"));
+        assert_eq!(p, dunce_canonicalize(ws).unwrap().join("sub/new.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_symlink_workspace_uses_canonical_root_and_rejects_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let alias = dir.path().join("alias");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("a.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let canonical_root = dunce_canonicalize(&root).unwrap();
+        assert_eq!(
+            resolve(&alias, "a.txt").unwrap(),
+            canonical_root.join("a.txt")
+        );
+        assert_eq!(
+            resolve(&alias, "sub/new.txt").unwrap(),
+            canonical_root.join("sub/new.txt")
+        );
+        for target in ["../outside/new.txt", "escape/new.txt"] {
+            assert!(resolve(&alias, target)
+                .unwrap_err()
+                .to_string()
+                .contains("escapes workspace"));
+        }
     }
 
     #[test]

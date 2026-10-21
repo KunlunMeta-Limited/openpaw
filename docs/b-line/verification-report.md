@@ -1,0 +1,212 @@
+# B 线验证报告
+
+> 历史验证快照：本文件记录早期脚本和缺陷证据，不代表当前工作树的最终验收。当前候选证据以 `../../ai-office-react-main/docs/04-验收记录.md` 为准；旧失败结论仅用于追溯缺陷来源。
+
+> 当前审计日期：2026-09-18
+> 当前裁决：**历史报告，不作为当前候选发布裁决。** 下列旧验收路径和历史绿测只作背景；当前候选状态以 AI Office `docs/04-验收记录.md` 为准。本文保留早期 SSE、回合/工具安全和可靠动画审查结论，不能用其中的“当前候选”措辞覆盖 2026-09-18 工作树事实。
+
+本报告由 `chenningbo/kunlun/run-acceptance.sh` 和 `run-acceptance.ps1` 生成或
+更新，记录实际日期、源码路径、命令输出和退出码。由于所提供源码目录不包含
+Git 元数据，报告不宣称任何 branch 或 commit。
+
+报告必须包括失败项、因外部 key 跳过的检查，以及 OpenWork T7/T9/M4 明确的
+范围外状态。
+
+## 当前证据
+
+旧的跨项目报告维护在 `chenningbo/kunlun` 验收目录中。路径、源码和测试覆盖已经变化，这些报告不是当前候选的权威通过证据：
+
+- `../../../chenningbo/kunlun/verification-report.md`：最终 Ubuntu/WSL 运行记录；
+  所有记录的命令退出码均为 `0`，包括 Rust 格式检查、engine 与 host 测试、
+  sidecar 测试、engine-host 构建与 Clippy、5000 行预算、无 `axum` 的 feature-off
+  依赖树、npm/Vitest/Playwright，以及 OpenPaw 到 AI Office 的联调探针。
+- `../../../chenningbo/kunlun/verification-report-windows.md`：最终 Windows
+  PowerShell Core 运行记录；所有已执行命令退出码均为 `0`。由于 MSVC toolchain
+  缺少对应 component，Windows Clippy 被明确记录为未执行；由于 Playwright 使用
+  已安装的系统 Chrome，Chromium 下载被明确跳过。
+
+历史联调探针记录了四个通过场景：echo/session/office 降级行为、manual approval 与
+tools、stream abort（包括同一 session 返回 `409` 和跨 session 并行），以及
+Basic Authentication。外部 Anthropic/OpenAI 调用有意不执行。OpenWork
+T7/T9/M4、managed spawn 和 OpenCode v2 仍不在范围内，不宣称已通过。源码目录
+不含 Git 元数据，因此不虚构 branch、commit 或 PR 标识。
+
+## 当前增量证据
+
+- AI Office 对话中心首次进入时会自动选中最新会话，并通过网关读取用户与王明的正文，
+  不再把已有会话误显示为“暂无消息”。
+- 快捷工具的语音入口会明确显示“语音输入：不支持”；浏览器弹窗被阻止时会显示中文
+  状态，避免入口静默失败。
+- 旧记录中的前端 Vitest 29 项、Playwright 2 项和四组联调只覆盖早期范围，不能替代当前多会话、长回复、恢复、压力和动画因果测试。
+- 所有新增验证报告、演示日志和错误提示均使用中文；仅保留 HTTP 路径、命令、包名和
+  provider/model 标识等必要技术原文。
+- CHG-2026-0019 的 Session mutation 增量使用隔离容器验证，未替换或重启现有服务。
+  Host HTTP 合同矩阵为 32/32；OpenWork direct Host 与 `bootAttachedWorld` 代理 journey
+  为 8/8、零 skip。`pnpm typecheck` 退出 0；`pnpm evals:typecheck` 因缓存镜像中的既有
+  Bun/enterprise schema/NodeNext/Node 22 类型环境问题退出 2，且没有错误指向本次测试文件。
+- Rust 格式、默认依赖树和 engine-host CLI 构建退出 0；Host 全量 92/92。`xtask lines`
+  退出 1：Host 6156/5700、Host tests 2707/1900，aux 10008/10100。严格 Clippy
+  退出 101，原因是 `openpaw-sandbox` 11 条既有 warning。五项治理命令均因缺少固定版本
+  `AI_GOVERNANCE_FRAMEWORK` 退出 1。
+- CHG-2026-0020 将 REST 历史中的纯 ToolResult user 消息折叠回 assistant tool part，
+  修复 Revert 最终 assistant 后 OpenWork 误报无结果。Windows 定向测试因缺少 MSVC `link.exe`
+  未执行；Docker Linux 定向测试 1/1、Host 全量 92/92 通过，格式检查退出 0。
+- CHG-2026-0021 将可由 `TurnOutcome` 可靠关联的 assistant Revert 边界规范化为同回合 user
+  游标，使输入、输出和尾部按完整回合隐藏。Windows 测试仍因缺少 MSVC `link.exe` 未执行；
+  Docker Linux 定向测试 3/3、HTTP 33/33、Host 全包 93/93 通过，格式检查退出 0。
+  OpenWork 使用干净 `main` `3e58d95`，与 `origin/main` 为 0/0；从两仓源码重建并强制重建后，
+  `engine-host` 和 `openwork` 均健康。容器内 REST 实测 assistant 请求返回 user 游标，页面点击
+  Revert 后该轮输入与输出同时隐藏，Restore 无需刷新即恢复。最终边界复核确认 staged REST
+  snapshot 始终保留原始消息、已隐藏消息再次 Revert 仍返回 400，Restore 只清除游标；最新
+  `engine-host` 镜像已再次构建并健康启动，隔离 smoke 会话已删除。后续低风险去重统一了
+  staged 可见前缀和 committed turn 状态裁剪，并移除冷启动第三份临时消息克隆；同源 Linux
+  Docker 全量仍为 93/93。`xtask lines` 显示 Host 从 6278 降至 6267、Host tests 从 2862
+  降至 2859；门禁仍因 6267/5700 与 2859/1900 退出 1，本轮未调整预算。五项治理命令
+  在 `general-tools:latest` 中复跑仍全部退出 1，镜像内缺少 `/workspace/tools/pipeline.py`。
+
+## 当前强证据与失败证据
+
+| 类别 | 当前证据 | 判定 |
+| --- | --- | --- |
+| LLM mock contract | `mock_server_contract` 为 `8/8` | 局部通过；不覆盖 UTF-8 字节边界、截断流、终止 sentinel 和缓冲上限 |
+| LLM SSE 单元 | `sse::tests` 为 `3/3` | 局部通过；ASCII 拆分不能替代中文/emoji 和畸形流矩阵 |
+| Host reliability/runtime/HTTP | `7/7`、`10/10`、`15/15` | 局部通过；不覆盖冷加载隔离、全部孤儿恢复和真实 listener shutdown |
+| Session archive/fork/revert | PATCH/fork/revert/unrevert、Basic Auth、SSE 包络、并发、ToolResult 折叠、assistant 回合规范化、完整 staged snapshot、已隐藏边界 400 和重启 HTTP 33/33；Host 全包 93/93；OpenWork 既有 8/8 | Host 自动化通过；CHG-0021 使用未修改 OpenWork 主线完成 REST 与页面 Revert/Restore 无刷新复验；全仓 `evals:typecheck` 仍受既有环境基线阻断 |
+| 50K 助手正文 | provider 长度 50000；Host/JSONL 长度 50004，哈希不同并出现 `U+FFFD` | 失败 |
+| 180K 助手正文 | JSONL assistant 长度 180004，替换字符 7 个 | 失败 |
+| 动画可靠性 | v1 动作无 session/turn/eventId/sequence，MPSC `try_send` 和 HTTP POST 可丢 | 失败/未实现 |
+| T2/T6 | 固定 JSON fixtures 缺失；help snapshots 未覆盖三个 Host 旗标 | 未通过 |
+| T10 | 第 5 号角色终态语义与根计划冲突 | 待人工决策 |
+| 治理结构 | 2026-09-17 index/validate 和 2 个现有 Schema contracts 通过；索引共 13 个 CHG | 机器结构通过，不等于功能或人工审批通过 |
+| 公共中文注释 | `crates` 报告 902 个源码缺口；关键范围 10 个缺口均在 `openpaw-llm/src/sse.rs` | 未通过 |
+
+50K/180K 根因定位到 `crates/openpaw-llm/src/sse.rs` 对每个 HTTP byte chunk 独立执行 `String::from_utf8_lossy`。严格终止缺口还包括 `[DONE]` 被转换为 `null`、EOF 未完成 decoder、Anthropic 缺 `message_stop` 仍可 finalize 和无界缓冲。修复设计见 CHG-2026-0013 B10/B11；可靠动画生产端设计见 CHG-2026-0014；Host 冷加载和关闭设计见 CHG-2026-0015。
+
+## G01-G08 当前验证结论
+
+本轮只完成 draft 设计归档和追踪更新，没有运行重型功能、压力或故障注入测试。下表所有项目统一为 **待批准 / 待实施 / 阻断**；局部 `8/8`、`3/3`、`7/7`、`10/10`、`15/15` 不能替代对应门禁。
+
+| 项目 | 已确认缺口或风险 | 归属与必须完成的证据 | 当前状态 |
+| --- | --- | --- | --- |
+| G01 请求幂等 | `prompt_async` 重试可创建第二 turn，并可能重复 user、Provider、权限和工具副作用 | CHG-2026-0013 B12/§13.1；TEST-020 首次、重放、冲突、跨 session、响应丢失和重启矩阵 | 待批准 / 待实施 / 阻断 |
+| G02 SSE gap/reconnect | broadcast lag 当前可被静默过滤，客户端无法判断本地投影已缺事件 | CHG-2026-0013 B13/§13.2；TEST-021 session/global gap、主动断开、2 秒 REST 恢复和资源回落 | 待批准 / 待实施 / 阻断 |
+| G03 load 错误分类 | 损坏、无权限和暂时不可用可能被折叠为普通 404，半构造和诊断边界不完整 | CHG-2026-0015 §13.1；TEST-012 验证四类错误、原文件保护、脱敏和其它 session 隔离 | 待批准 / 待实施 / 阻断 |
+| G04 `taskkill /F` 恢复 | 当前丢弃 Router/AppState 的测试不等价于真实进程在持久化临界点被强杀 | CHG-2026-0015 §13.2；TEST-013 五阶段各至少 20 次，并与 CHG-2026-0013 B04/G01 联合 | 待批准 / 待实施 / 阻断 |
+| G05 shutdown 覆盖 | 无证据证明 SSE、同步 `/message`、半上传、approval/tool 和首次/二次 Ctrl+C 都能按 5 秒边界收敛 | CHG-2026-0015 §13.3；TEST-014 验证 listener、连接、任务、终态、端口重绑和强制退出 | 待批准 / 待实施 / 阻断 |
+| G06 并发与公平性 | 基础 4/32/FIFO 路径不能证明取消晋升唯一性、30 分钟稳定性或关闭时 permit/registry 全归零 | CHG-2026-0013 B14/§13.3 与 CHG-2026-0015 §13.4；TEST-022/016 同候选联合执行 | 待批准 / 待实施 / 阻断 |
+| G07 组合长回复 | 既有 fixture 不覆盖复杂 Markdown、代码、多 block、组合字符、reasoning/text 和 tool arguments 组合 | CHG-2026-0013 B15/§13.4；TEST-023 两种 Provider、确定性切块、50K/180K 逐层哈希和唯一 terminal | 待批准 / 待实施 / 阻断 |
+| G08 资源预算 | 请求、累计 Provider/Host 流、事件数以及 session 文件/行/消息/冷加载内存缺完整上限与超限收敛证据 | CHG-2026-0013 B16/§13.5 与 CHG-2026-0015 §13.5；TEST-024/015 低于、等于、超过边界矩阵 | 待批准 / 待实施 / 阻断 |
+
+G01/G02 可能新增公共请求字段、响应头、JSONL 幂等事实和 SSE 控制事件；G03/G05/G08 可能新增稳定错误码。对应 Schema 当前尚未实施或批准。若实现必须修改公共 wire、`openpaw-core`、`openpaw-store` 或 CHG 主允许表外文件，必须先扩展 draft、补负责人和兼容/回滚设计并重新人工审批。
+
+## 当前未完成项
+
+- CHG-2026-0013 的 B01-B16 均未获得人工批准和源码实施；B12-B16 对应 G01、G02、G06 稳态、G07 和 G08 流预算，全部保持阻断。
+- CHG-2026-0015 的主合同及 G03/G04/G05/G06 关闭边界/G08 session 历史预算附录均未获人工批准和实施。
+- 协调动画变更 `XCHG-2026-ANIMATION-001` 已收敛为 OpenPaw CHG-2026-0014 单一主合同，但仍是 draft；没有 v2 Schema、outbox、journal、ACK、cursor、snapshot 或自动化证据。
+- 固定 fixtures、Host help 旗标、永不返回 future 取消、并行工具最终输入校验、fsync 临界故障和 1000 次竞态压力未执行。
+- OpenWork attached Session mutation journey 已完成；完整三方联调、受保护分支、真实 CODEOWNER、PR/Required Checks 和回滚演练仍未完成。
+- 全仓公共中文注释迁移未完成；B10 修改 `sse.rs` 时必须按框架栏目补齐其公共声明 Rustdoc。
+
+最终裁决：**未通过，不建议发布。** 任何历史“所有命令退出 0”只适用于当时列出的命令和代码范围，不能覆盖当前确认缺陷，也不能把 T10-T12/M5 或整个 master-plan 标记完成。
+
+## 2026-10-08 CHG-2026-0022 修复候选
+
+OpenPaw 分支 `bugfix/revert-api-error-propagation`，基线 `0f7c2fa`。
+OpenWork 测试分支 `bugfix/openpaw-revert-api-regression`，业务源码基线 `3e58d95`。
+正式 Compose 四个服务保持原运行状态；所有验证在 CHG-0022 专用容器和隔离 home/workspace 中进行。
+日志与真实 wire 样本保存在工作区 `../artifacts/chg0022-fix-evidence/`。
+
+| 命令或检查 | 实际结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo test --offline --locked -p openpaw-engine-host --features engine-host` | exit 0；49 单元 + 14 reliability + 33 HTTP，96/96，零 ignored |
+| `cargo build --offline --locked -p openpaw-cli --features engine-host` | exit 0，隔离 UI 使用该 debug 二进制 |
+| `cargo tree --offline --locked -p openpaw-cli -e normal` | exit 0，默认依赖树无 Axum |
+| 严格 Host Clippy（含依赖） | Docker 命令 exit 1、Cargo 101；sandbox 11 条失败；干净 `0f7c2fa` 同命令同签名失败 |
+| 严格 Host Clippy `--no-deps` | Docker exit 1、Cargo 101；office collapsible_else_if、SessionMutationEvent large_enum_variant；同环境干净基线两项同签名失败 |
+| `cargo run --offline --locked -p xtask -- lines` | Cargo exit 1；基线 Host 6318/5700、测试 2859/1900；最终候选 6917/5700、3140/1900，本次增加 599/281 行；预算未修改 |
+| 五项 `governance/check.py` 命令 | Codex 捆绑 Python process exit 2；缺固定版本 AI_GOVERNANCE_FRAMEWORK，未进入规则检查；不能判定治理或注释机器合规 |
+| `pnpm evals:pr specs/openpaw-engine-attach.test.ts` | exit 0；PR lane，7/7、零 skip；实际订阅 SSE 并验证删除、正文、503 与 REST 一致 |
+| 实际输出的 Schema 2020-12 / Ajv 8 验证 | exit 0；16 个事件、10 条 REST 消息；禁止 responseBody 的负例被拒绝 |
+| `pnpm evals:typecheck` | pnpm exit 2，Docker exit 1；当前与干净 OpenWork 基线均为 362 条，去除路径/行号后签名完全相同；本次新增类型错误已修正 |
+
+Rust 测试使用 1.88.0 工具链、同一缓存和空 `OPENPAW_ENGINE_PERMISSIONS`。
+镜像默认 manual 会使需要工具授权的旧测试挂起；修正测试环境后完整运行通过。
+`cargo xtask lines` 在干净归档中没有 alias，实际使用上表 canonical 命令，不虚构 alias 检查通过。
+
+页面 journey 的首次启动失败分别为 Node 22 缺 AsyncDisposableStack、root Chromium 缺容器启动参数，
+以及没有 init 的专用容器无法回收子进程。这些运行未进入页面断言，不作为业务修复的反例或通过。
+补齐 Node 24、真实 Chromium 154 和容器 init 后的最终页面结果记录在下方及 CHG 审批验证记录。
+
+| 页面验证 | 实际结果与原始证据 |
+| --- | --- |
+| `pnpm evals:e2e openpaw-revert-resend` | exit 0；placement: local (daytona CLI missing or not authenticated)；1 passed、0 failed、0 skipped；`revert-browser/test-run.json` 三步与所有 trace 均通过 |
+| 真实 OpenPaw 503 的定向 `vitest --project=e2e --testNamePattern=OpenPaw` | exit 0；1 passed、2 未选择；只判定新旅程 Passed；`error-focused-final.json`。完整 CLI 中的新旅程三步也 Passed，见 `error-browser/test-run.json` |
+| `pnpm evals:e2e session-error-technical-details` | exit 1；placement: local (daytona CLI missing or not authenticated)；2 passed、1 failed、0 skipped；新真实 503 与既有 seeded diagnostics 都通过；旧 submit ownership 在 setup 因缺 `127.0.0.1:3306` MySQL 失败，未进入页面断言；原始 CLI Verdict Failed，验收覆盖判定 Incomplete |
+| 最终 `conversation_reliability` | exit 0；14/14，增加虚拟失败 assistant Fork 不复制错误、伪造 ID 拒绝、取消不发 API 错误断言；`chg0022-reliability-final.log` |
+
+503 页面明确显示 `Status: 503`、`Provider: openai`、`Code: provider_overloaded`，
+默认模式只展示安全错误；Developer mode 面板不包含测试 key 或请求正文；刷新恢复相同错误。
+回退页面通过真实菜单完成两轮后替换，provider 在首输出前挂起时输入恰好一条，旧第二轮
+user/assistant 均不可见，provider 请求不包含旧尾部；结束与刷新后的用户消息一致。
+
+首次 503 页面断言误写成 provider_server_error；观察页面和既有分类后改为 provider_overloaded，
+没有更改产品错误码。多个 world 扩展共享 fixture 名称导致错误世界绑定，在各自 describe 中
+创建与注册后解决；改动仅位于登记测试文件。严格类型与原有 Electron 测试另行记录，
+未选择、环境失败与核心功能通过不混为整个测试文件通过。
+
+旧 Electron 的首次干净基线控制（3e58d95）复现 headless-threads/dist 缺失；
+重建测试容器的离线 node_modules 与该包 dist 后，候选原有 diagnostics 旅程通过。
+此时另一个旧 Den submit ownership 旅程才进入其正确 world，并报告缺 MySQL。
+这是本次环境阻断，不能把不同首个错误称为基线同签名失败，也不能称该旧旅程通过。
+原始记录见 `seeded-error-browser/`、`submit-error-environment-red/`、`error-cli-result.json`。
+
+xtask 的根目录通过编译时 CARGO_MANIFEST_DIR 固定；共享缓存曾误用干净基线二进制。
+仅清理 xtask 构建缓存并在 `/src/xtask` 重编译后取得最终 6917/3140 计数。
+原始浏览器记录的 gitSha 是 OpenWork HEAD 3e58d95，测试含未提交变更；最终源码与文档
+指纹保存在 `candidate-manifest.json`，不能把该 HEAD 当作包含修复的已发布提交。
+
+## 2026-10-14 CHG-2026-0027 本地修复验证
+
+分支 `bugfix/attachment-presentation`，基线 `ba56f5a3f4cbf80ec3fac5d07963a6b0c0845845`。
+用户后续指定交付至现有 `feature/add-multimodal-capabilities`，两分支基线相同；
+本次直接携带变更切换并以“修复多模态附件辅助信息展示与会话标题”提交，白名单范围和被测源码保持一致。
+用户批准 Host + Store 展示属性修复；运行服务、用户历史与 OpenWork 源码保持原状。
+原始证据位于仓库外 `../artifacts/chg0027/`，记录格式如下：
+
+| 命令 / 检查 | 最终结果 |
+| --- | --- |
+| `cargo test --offline --locked --workspace -- --test-threads=1` | 退出 0；972 passed、0 failed、2 个既有 ignored；verified-test-default.log |
+| 同命令加 `--features engine-host` | 退出 0；1079 passed、0 failed、2 个既有 ignored；Host 104 项，CLI/Host parity 3 项；verified-test-host-workspace.log |
+| `cargo fmt --all -- --check` | Rust 1.88 与 1.99 均退出 0 |
+| 默认及 Host `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | Rust 1.99 两条均退出 0；strict-stable.log |
+| `cargo run --offline --locked -p xtask -- lines` | 退出 0；Store 3249/3500、Host 5731/7000、aux 11497/11500、Host tests 3943/4000；verified-lines.log |
+| xtask scrub / snapshot / golden / telemetry | 均退出 0；快照 11 traits、59 types，无漂移；预算、依赖和快照基线未调整 |
+| 默认 CLI `cargo tree --offline --locked -p openpaw-cli -e normal` | 退出 0，无 Axum；tree-default.log |
+| `cargo build --offline --locked -p openpaw-cli --features engine-host` | 退出 0；仅构建用于隔离页面验收的 debug 二进制 |
+| `cargo-deny 0.20.2 --workspace --locked --color never check --show-stats` | 退出 0；0 errors，bans 17 warnings、licenses 1 warning；deny.log |
+
+首次工具缺失、Rust 1.88 既有 sandbox lint、只读 fixture/target 写入及一次 CLI socket reset 均如实保留；
+补齐隔离工具链与可写测试目录，使用单线程完成全仓复验，未修改被测源码以规避这些环境问题。
+本地回归通过不代表已部署、真实模型全格式验收、完整 OpenWork journey 或整个 master-plan 完成。
+OpenWork 页面诊断、Schema 与降级兼容的最终结果在 CHG-0027 单独登记；中文 IME 不在通过范围。
+
+补充完成：原样 OpenWork 新会话、续聊、两轮刷新及 Host 重启后刷新，五次渲染诊断均通过；
+上一版 CHG-0026 实际 reader 在隔离数据上能读新接收及 Fork 记录。probe 退出 0，正式服务身份不变。
+Ajv 8.20.0 / Draft 2020-12 对两份合同验证 26 个正例、7 个负例，退出 0；
+样本包含实际页面生成的 4 条 REST 消息及对应 part 构造的事件；实际即时 SSE 同值由 Rust 回归覆盖。
+两次容器校验调用未取得可判定结果，改用当前 OpenWork 的同版本本地 Ajv；仓库依赖未改变。
+19 个实际文件全部属于 20 文件白名单，git diff --check 与中文 Rustdoc 人工检查通过。
+原始证据：openwork-probe.json、openwork-wire.json、openwork-render.png、schemas.json、scope.json。
+
+2026-10-14 用户后续明确授权启动并保留独立测试容器，含原样 OpenWork 前端。
+`node ../artifacts/chg0027/preview/start.mjs` 最终退出 0；两个测试容器 healthy，
+前端 `http://127.0.0.1:5188` 返回 200，独立 OpenWork API 8780 / Host 8799 鉴权代理通过。
+沿用现有 deepseek-flash 模型配置，Provider image=true；本次启动未发送真实模型请求。
+测试网络、工作区、历史及认证独立，正式容器 ID 和四个 OpenWork 关键业务文件哈希对照不变。
+首次 Edge 页面聊天输入框正常；新浏览器须在原有模型选择器选择 OpenAI / deepseek-flash。
+证据在 `../artifacts/chg0027/preview/preview-report.json`，授权和诊断环境校正见 CHG 第 11 节。
+测试环境保留供用户验收；不将其视为生产发布或中文 IME 修复。
+最终浏览器诊断退出 0、BROWSER_READY；输入框、OpenAI 分组中的 deepseek-flash 可用，
+通过原版 UI 选择后模型按钮正确显示。该模型偏好仅在诊断浏览器中保存；用户首次访问需选择一次。

@@ -3,7 +3,6 @@
 - **Status**: accepted
 - **Date**: 2026-08-30
 - **Deciders**: OpenPaw boundary review（会话 18）
-- **Follow-up**: 2026-09-08 实验重启，见 [ADR-002](ADR-002-engine-host-experiment.md) 和 [../engine-host/master.md](../engine-host/master.md)。1.0 正式清单仍然不含 engine-host。
 
 ## Context
 

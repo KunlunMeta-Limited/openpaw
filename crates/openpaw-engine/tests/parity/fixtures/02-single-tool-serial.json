@@ -8,11 +8,16 @@
     {
       "error_tools": [],
       "event_kinds": [
+        "message_start",
+        "text_delta",
         "turn_usage",
         "tool_use_start",
         "classifier_status",
         "classifier_status",
+        "tool_execution_start",
         "tool_result",
+        "message_start",
+        "text_delta",
         "turn_usage"
       ],
       "stop": "end_turn",

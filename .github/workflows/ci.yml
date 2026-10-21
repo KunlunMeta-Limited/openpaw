@@ -60,6 +60,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
+  engine-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --features engine-host -- -D warnings
+      - run: cargo test -p openpaw-engine-host -p openpaw-cli --features engine-host
+
   quality-gates:
     runs-on: ubuntu-latest
     steps:
@@ -77,6 +88,8 @@ jobs:
       # Q3 zero telemetry (Cargo.lock dependency names + source call-site symbols)
       - run: cargo run -p xtask -- telemetry
       # Q2 dependency whitelist
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      # v1 内置 cargo-deny 0.14，无法解析当前 advisory 数据库的 CVSS 4.0。
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --workspace
+          rust-version: stable

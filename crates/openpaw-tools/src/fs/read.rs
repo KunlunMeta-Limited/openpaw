@@ -1,7 +1,10 @@
-//! `read_file` — read a file with line numbers (same-source semantics:
-//! 10 MB guard, offset/limit window, `(empty file)` marker).
+//! 功能：读取文本或图片/音频；文本保留行号、10 MiB、offset/limit 和空文件语义。
+//! 输入输出边界：工作区相对路径进入，文本或内联原件结果返回。
+//! 禁止承担：不调用模型、不下载 URL、不绕过 safety 或审批。
+//! 关联：CHG-2026-0026。
 
 use std::path::Path;
+use tokio::io::AsyncReadExt;
 
 use openpaw_core::{Result, ToolCallOutcome, ToolCategory, ToolConcurrency, ToolSpec};
 use serde::Deserialize;
@@ -15,10 +18,18 @@ struct Args {
     limit: Option<usize>,
 }
 
+/// 功能：声明文本与媒体文件读取工具。
+/// 参数：无。
+/// 返回：只读、可并行的规格。
+/// 错误：无。
+/// 状态：无。
+/// 并发与取消：同步构建。
+/// 权限：执行仍经过工作区和审批检查。
+/// 关联：ToolRegistry。
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "read_file".into(),
-        description: "Read a file and return its contents with line numbers. Use offset and limit to read specific sections of large files. Always read a file before editing it.".into(),
+        description: "Read text with line numbers, or return an original PNG/JPEG/WebP/GIF image or WAV/MP3 audio for model understanding. Media ignores offset/limit. Use read_attachment with its ID to revisit it after compaction. Always read a file before editing it.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -35,6 +46,14 @@ pub fn spec() -> ToolSpec {
     }
 }
 
+/// 功能：读取已获准的工作区文本或媒体。
+/// 参数：workspace 为根路径，args 含 path 及可选文本行范围。
+/// 返回：文本行或内联媒体，失败为错误工具结果。
+/// 错误：路径越界、文件缺失、编码或大小非法。
+/// 状态：只读，不安装媒体缓存。
+/// 并发与取消：异步读取，调用方可丢弃 future。
+/// 权限：沿用 safety::resolve，审批由 AgentLoop 执行。
+/// 关联：read_media、read_attachment。
 pub async fn run(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
     let a: Args = match serde_json::from_value(args) {
         Ok(a) => a,
@@ -47,14 +66,38 @@ pub async fn run(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOu
 
     const MAX_READ_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
     let metadata = match tokio::fs::metadata(&path).await {
-        Ok(m) => m,
-        Err(e) => {
-            return Ok(ToolCallOutcome::error(format!(
-                "read {}: {e}",
-                path.display()
-            )))
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => {
+            return Ok(ToolCallOutcome::error(
+                "read requires an available regular file",
+            ))
         }
     };
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut header = Vec::new();
+    if let Ok(file) = tokio::fs::File::open(&path).await {
+        let _ = file.take(12).read_to_end(&mut header).await;
+    }
+    if openpaw_core::media::detect_mime(&header).is_some()
+        || matches!(
+            extension.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "wav" | "mp3"
+        )
+    {
+        return match super::media::read_media(&path).await {
+            Ok(media) => {
+                let mut outcome =
+                    ToolCallOutcome::ok(format!("Attachment {} ({})", media.id, media.mime));
+                outcome.media.push(media);
+                Ok(outcome)
+            }
+            Err(error) => Ok(ToolCallOutcome::error(error.to_string())),
+        };
+    }
     if metadata.len() > MAX_READ_SIZE {
         return Ok(ToolCallOutcome::error(format!(
             "file too large: {} bytes (max {MAX_READ_SIZE} bytes). Use offset/limit to read sections.",

@@ -1,0 +1,77 @@
+{
+  "all": [
+    {
+      "id": "mock",
+      "name": "OpenPaw mock",
+      "models": {
+        "mock-1": {
+          "id": "mock-1",
+          "name": "mock-1",
+          "capabilities": {
+            "input": {
+              "text": true,
+              "image": false,
+              "audio": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "echo",
+      "name": "OpenPaw echo",
+      "models": {
+        "echo-1": {
+          "id": "echo-1",
+          "name": "echo-1",
+          "capabilities": {
+            "input": {
+              "text": true,
+              "image": false,
+              "audio": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "models": {
+        "claude-sonnet-4": {
+          "id": "claude-sonnet-4",
+          "name": "claude-sonnet-4",
+          "capabilities": {
+            "input": {
+              "text": true,
+              "image": false,
+              "audio": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "models": {
+        "gpt-4o": {
+          "id": "gpt-4o",
+          "name": "gpt-4o",
+          "capabilities": {
+            "input": {
+              "text": true,
+              "image": false,
+              "audio": false
+            }
+          }
+        }
+      }
+    }
+  ],
+  "connected": [
+    "mock",
+    "echo"
+  ],
+  "default": "mock"
+}

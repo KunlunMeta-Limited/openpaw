@@ -34,6 +34,7 @@ pub async fn run(_workspace: &Path, input: serde_json::Value) -> Result<ToolCall
     }
     let pretty = serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string());
     Ok(ToolCallOutcome {
+        media: Vec::new(),
         content: format!("structured output recorded:\n{pretty}"),
         is_error: false,
         structured: Some(data.clone()),

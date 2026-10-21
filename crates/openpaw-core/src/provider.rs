@@ -341,11 +341,15 @@ impl Usage {
     }
 }
 
-/// Provider capability flags reported alongside every call.
+/// 功能：报告工具、流式和模型输入模态能力；媒体默认关闭。
 ///
 /// Stability: stable.
 #[derive(Debug, Clone, Copy)]
 pub struct Capabilities {
+    /// 功能：显式声明模型接收图片。Stability: unstable.
+    pub image_input: bool,
+    /// 功能：显式声明模型接收音频。Stability: unstable.
+    pub audio_input: bool,
     pub tool_use: bool,
     pub prompt_caching: bool,
     pub streaming: bool,
@@ -359,6 +363,8 @@ pub struct Capabilities {
 impl Default for Capabilities {
     fn default() -> Self {
         Self {
+            image_input: false,
+            audio_input: false,
             tool_use: false,
             prompt_caching: false,
             streaming: false,
@@ -406,6 +412,18 @@ pub trait LlmProvider: Send + Sync {
     }
 
     fn capabilities(&self) -> Capabilities;
+
+    /// 功能：查询实际选择模型的能力。
+    /// 参数：model 为当前请求模型。
+    /// 返回：能力声明；默认沿用既有能力。
+    /// 错误：无。
+    /// 状态：只读。
+    /// 并发与取消：无网络。
+    /// 权限：不自动更换模型。
+    /// 关联：媒体接收与自动压缩。Stability: unstable.
+    fn model_capabilities(&self, _model: &str) -> Capabilities {
+        self.capabilities()
+    }
 
     /// Human-readable provider tag for logging/UX, e.g. `"echo"`.
     /// Not stable as a config key.

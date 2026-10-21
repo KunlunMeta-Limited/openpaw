@@ -1,0 +1,350 @@
+# CHG-2026-0029：Everypaw 实时视觉工具
+
+状态：approved / 06列窗、07结构、09原始PNG、10调用/点击批次完成本地组合验收；08/11按任务图继续，既有平台与外部门禁保留。更新：2026-10-17。
+
+## 统一审查窄修登记（2026-10-17）
+
+### Windows 原生 Host 回调修复授权（2026-10-17）
+
+用户在获知原生 Host 的 `host.docker.internal` 回调超时、同端口回环可达的诊断后明确回答“ok 帮我修复”。据此在 `bugfix/native-host-bridge` 登记本次窄修；不引用历史授权代替本次指示。
+
+允许修改原十文件表内的 `ai_pc.rs` 中 `RegistrationInput::checked`：先保留原 URL/令牌验证，再仅在 Windows Host 将登记的 Docker 专用别名规范为 `127.0.0.1`，保留端口、路径、Basic/Bearer、回合身份、取消和 ACK。Linux 构建保持原地址，容器从宿主机发布端口访问的行为不按客户端 endpoint 猜测。不增加网络入口、配置字段、公共协议或依赖；不修改系统 hosts、Core、CLI 或部署文件。
+
+回归沿用已确认的 Host 工具桥 seam：原 `http.rs` 真实 Router/模型/桥接测试增加 Windows 原生场景，直接 PUT 登记 Docker 别名并取得窗口结果和精确 ACK，不通过测试代理改写地址；Everypaw 的原成对 Host 应用测试去掉手工别名替换。先验证旧代码失败，再实施并回归。配套 configuration-and-connection、testing、本 CHG 和 INDEX 记录实际检查/二进制身份。用户也已要求启动并使用当前独立新版 Host；修复验证后允许仅替换该 8810 原生实例，沿用原会话目录、模型和凭据，原 Docker 服务不动。回滚使用保留的 8ec11f8 EXE 和同一会话目录；原始记录不删。
+
+#### 本次修复验证记录
+
+业务改动只有 `RegistrationInput::checked` 在严格验证后按 `cfg!(windows)` 规范别名；原显式回环和 Linux 地址路径保留。原生 Router 测试首红：20.09秒、0次取得而预期1次；修复后1/1、0.12秒，经过真实 Basic 登记、模型选择、窗口/PNG六场景、可信身份、精确ACK及下一次模型请求。Everypaw三处官方Host成对入口移除了测试地址改写，受控模型/原生替身与真实HTTP/IPC/隔离存储的9/9通过；最终制品SHA及配对证据由Everypaw `docs/delivery/desktop-capability/native-host-bridge/engine-manifest.json` 固定。
+
+| 本次实际命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 退出0。Everypaw独立manifest格式检查也退出0。 |
+| 默认及显式Host的 `cargo clippy --offline --workspace --all-targets … -- -D warnings` | 两条退出0。 |
+| `cargo test --offline --workspace -- --test-threads=1` | 正常执行环境退出0，971 passed、2项既有ignored。 |
+| `cargo test --offline --workspace --features engine-host -- --test-threads=1` | 正常执行环境退出0，1089 passed、2项既有ignored；Host63+16+36、CLI/Host parity3/3包括在内。 |
+| `cargo run --offline -p xtask -- lines` | 退出0，Host6785/7000、外部tests3943/4000、aux11497/11500，未改变预算或计数。 |
+| `cargo run --offline -p xtask -- scrub --check`、`golden`、`telemetry` | 均退出0。 |
+| `cargo run --offline -p xtask -- snapshot --check` | 退出1，保留既已证明的Windows CRLF/LF基线差异；未改快照、Core或检查器。 |
+| `cargo tree --offline -p openpaw-cli --no-default-features` | 退出0，默认CLI无axum。 |
+| `cargo build --offline -p openpaw-cli --features engine-host --bin openpaw` | 退出0，jobs1、dev/test debug0、共享唯一engine-target；独立保存制品并核对配对SHA后才替换8810。 |
+
+首次检查发现共享target嵌入已归档engine-visual-review的MANIFEST_DIR，fixture/xtask找不到文件；已保留失败日志，刷新本树源码时间并重新编译，未修改样例或复制target。沙箱Windows ACL和桌面IPC进程身份检查受限，已在正常执行环境重跑上述全量测试及成对验证通过。cargo-deny既有advisory-db只读锁限制继续保留，不重复无效探测或宣称审计通过；真实Linux Docker网络、管理员/登录重启及生产模型理解仍非本次证明范围。
+
+最终修改仅原允许表内6文件；公共受限函数中文八栏目保持，不改Core、CLI、Cargo依赖、系统hosts、Docker服务或DeepSeek配置。不推送分支。运行切换、数据保留与回滚制品身份见Everypaw `.scratch/native-host-bridge/README.md`；旧8ec11f8制品保留。
+
+按既有 implement-spec 授权，独立 `bugfix/everypaw-visual-review` 从 `65f8fdc95fa20190b710f3d98392c1bcc0de3bea` 实施审查修正：`ai_pc_visual.rs` 把 ACK 容量与精确 nonce 的解释译成中文；`http.rs` 把现有七种视觉回合测试的数字编号改为命名场景，明确取得/ACK次数、模型能力与媒体错误预期。保留真实 Router、模型与桥请求、原身份、provider callID、保存投影、PNG 原件、REST 窄读取及环境锁/恢复断言；下述注册表只统一既有内部分派，不新增公共接口。
+
+本轮实际改动仅下述三份源码、本记录和 INDEX，均在原允许表内；Core、AgentLoop、Store、traits、Cargo、CI、预算/计数器、服务和模型配置不改。新增场景类型/方法保持私有，解释使用中文。原 65f/9d 证据不覆盖，最终源码、聚合补丁/实际回放与独立二进制身份另行刷新。已记录的 Windows snapshot 差异及 cargo-deny advisory-db 只读锁仍保留，不重复无效主机诊断，也不宣称门禁全绿。
+
+最终 Standards 新增一项内部重复分派判断：本轮再在原允许的 `ai_pc.rs`、`ai_pc_visual.rs`、`http.rs` 集中 Host 私有五工具 name/path 注册表。由它派生视觉工具成员判定、HTTP 路由及登记回执，保留既有名称、路径、回执顺序与响应字段；各工具严格参数校验和独立模式/等待规则继续显式保留。不向 Core/全局工具表导出，不改变协议和依赖。新增受限可见函数按八栏目中文 Rustdoc 记录；先验证 lines 预算，再执行最终相关回归/门禁。本轮文件总数调整为上述三份源码、本 CHG 和 INDEX，全部仍在原十文件允许表内。
+
+### 窄修最终本地检查
+
+原始日志位于 Everypaw 主工作区 `.local/final-review/logs/`，由独立窄修工作树实际编译/运行，jobs=1、debug=0、唯一既有 engine-target；没有复制构建缓存。命令均带已有离线依赖缓存。
+
+| 日志 | 实际命令与结果 |
+|---|---|
+| 12-engine-registry-host-routes | `cargo test --offline -p openpaw-engine-host --features engine-host registered_ -- --test-threads=1`：4项单元（含七场景封装）和2项reliability通过；早先11未带feature而0项运行，不作功能证明。 |
+| 21-engine-strict-host | `cargo clippy --offline --workspace --all-targets --features engine-host -- -D warnings`，exit0。 |
+| 22-engine-fmt | `cargo fmt --all -- --check`，exit0。 |
+| 23-engine-strict-default | `cargo clippy --offline --workspace --all-targets -- -D warnings`，exit0。 |
+| 24-engine-workspace-host | `cargo test --offline --workspace --features engine-host -- --test-threads=1`，exit0，1088 passed / 0 failed / 2 ignored；含真实CLI/Host parity。 |
+| 25-engine-workspace-default | `cargo test --offline --workspace -- --test-threads=1`，exit0，971 passed / 0 failed / 2 ignored。 |
+| 26-engine-lines | `cargo run --offline -p xtask -- lines`，exit0；Host6780/7000、Host外测3943/4000、aux11497/11500；未改预算、计数或移动测试。 |
+| 27-engine-scrub | `cargo run --offline -p xtask -- scrub --check`，exit0。 |
+| 28-engine-snapshot | `cargo run --offline -p xtask -- snapshot --check`，exit1，既有Windows CRLF/LF trait snapshot drift；未改Core或重生基线。 |
+| 29-engine-golden | `cargo run --offline -p xtask -- golden`，exit0。 |
+| 30-engine-telemetry | `cargo run --offline -p xtask -- telemetry`，exit0。 |
+| 31-engine-default-tree | `cargo tree --offline -p openpaw-cli --edges normal`，exit0；默认CLI依赖树不含axum。 |
+
+逐文件diff与原十文件允许表一致；两个新增受限函数都有完整八栏目中文Rustdoc，新增解释均中文。已有cargo-deny三种只读锁失败证据在`.local/final-review/cargo-deny-preparation.md`及原准备日志，未修改依赖与策略、不声称审计通过。最终签名提交、构建的新EXE、校验和及聚合补丁的实际index回放树由App的独立`docs/delivery/desktop-capability/review-fix/`记录，旧制品及失败保留。CODEOWNER、历史来源DCO、CI和部署仍为独立门禁。
+
+## 授权、基线与边界
+
+用户已确认 Everypaw 的桌面能力迁移规格、17 项正式任务并明确调用 implement-spec。规格 D05/D13–D19/D22 和任务 06–11 明确要求修改官方 Host 的工具声明、可信会话调用、取消、真实结果、PNG 主模型路径及交付证据。按 AGENTS.md“已有明确用户授权覆盖该范围时记录授权后继续”，本记录登记该既有授权，不再要求用户重复批准相同范围。历史 CHG-0026/0028 不作为本次新增功能的授权。
+
+权威需求：相邻 Everypaw 仓库 `.scratch/architecture-revision/spec.md`、`ticket-plan.md` 和正式 `issues/06` 至 `11`；不得以审核前 ticket-drafts 代替。源码基线为 `c105d80356f7217138d3b70bfab1d72d5a271f4d`，来自 `merge/multimodal-ai-pc-context-tools`；独立集成分支 `feature/everypaw-desktop-visual-integration`，工作树位于 Everypaw 忽略目录 `.local/engine-visual-integration/`。不修改用户现有源码分支、主服务、模型配置、会话或卷。
+
+这是可审查实现的范围授权，不能代替 L3 受保护接口 CODEOWNER 审阅、来源 DCO 缺口处理、CI 或部署批准；这些门禁保留未完成。任务图的依赖仍有效：准备本记录不表示 06 已开工或完成。
+
+## 允许修改文件
+
+| 文件 | 必要修改、符号与影响 |
+| --- | --- |
+| `crates/openpaw-engine-host/src/ai_pc.rs` | 扩充现有私有会话工具包装器、登记能力回执、动态工具声明与分发；保留原工具和媒体透传。新增视觉工具的严格参数、受信封装、取消控制、解析后 ACK、PNG InlineMedia 与相同模块的边界测试。模型参数不能携带身份或凭据。 |
+| `crates/openpaw-engine-host/src/ai_pc_visual.rs`（按需要新增） | 私有视觉协议/活动回合上下文、受信 invocation 标识、代次 RAII 及 HTTP 结果/媒体验证；为避免 ai_pc.rs 过大可拆出同一职责，不改变依赖方向或行数计数。不得暴露为 Core/全局工具 API。 |
+| `crates/openpaw-engine-host/src/lib.rs` | 若新增上述私有模块，只增加 feature 隔离下的模块声明；不新增公开导出或默认依赖。 |
+| `crates/openpaw-engine-host/src/runtime.rs` | SessionHandle/AppState 持有小型私有活动工具上下文；真实回合获准 running 后安装 requestID、Host turn、取消代次和所选模型实际能力，退出时仅清理自己的代次。复用原有会话生命周期、执行、持久化与取消；不绕过 runtime 写 Session，不改变 AgentLoop 算法。 |
+| `crates/openpaw-engine-host/src/http.rs` | 在既有受 Basic 保护的登记入口返回向后兼容的视觉协议/已实现工具回执；保留旧请求与失败码。必要的 Router 测试放入既有内联测试模块，不改变一般 prompt、SSE 或 Office 语义。 |
+| `docs/b-line/protocol.md` | 登记扩展回执、五类视觉工具参数、受信调用/取消/ACK、结果与媒体契约、期限、错误和兼容行为；沿用登记接口稳定编号。 |
+| `docs/b-line/configuration-and-connection.md` | 记录实际源码和构建身份、旧 Host 降级、容器宿主机路径、实际模型输入能力和未部署边界。 |
+| `docs/b-line/testing.md` | 记录工具/取消/ACK/媒体/身份的受控应用验收及真实 Docker、Windows、所选模型验证的不同证明范围。 |
+| `docs/changes/INDEX.md` | 登记本次新增 CHG 的独立授权、状态、实际文件数和未完成发布门禁。 |
+| 本 CHG | 更新实际符号、协议工程选择、逐项命令/退出码、审查结果、未执行原因与回滚说明。 |
+
+只允许表内文件出现在本次引擎分支差异中。若需要其他文件、依赖、公共接口或预算变更，先具体更新本 CHG 并核对已有授权是否覆盖；不能借用本表泛化扩大范围。新增/修改公共 Rust 项使用中文 Rustdoc，函数与方法具备固定八栏目。
+
+## 禁止路径及理由
+
+- Core、Engine/AgentLoop、Store、默认 Tools 注册表、公共 trait 和 provider：现有媒体与执行路径已经具备所需能力；先采用 Host 私有上下文与包装，不把桌面专属身份植入中立层。
+- Cargo.toml/lock、feature、CI、CODEOWNERS 和 xtask 行数/审计算法：本次不需要新依赖，不改变默认 CLI 无 axum，不通过移动测试或修改计数掩盖预算。若实测确需调整预算，必须在修改前单独记录测量、原因和最小范围，不能默默放松门禁。
+- Office、OpenWork、CLI 行为、部署文件和环境密钥：保持既有消费者与服务；不新增 Shell/文件系统/通用远控工具，不更换模型，不访问生产桌面作外发验收。
+
+## 行为和数据流
+
+1. 保留 `PUT/DELETE /session/{id}/ai-pc` 的 Basic 身份、严格登记请求、内存生命周期和 fork/delete/restart 隔离。成功登记回执另明确视觉协议版本和实际已实现工具；只有旧 204 时 Everypaw 仍可普通文字问答和使用旧工具，不能伪报五类视觉工具可用。各票只声明已实现工具。
+2. 新增职责为列窗口、实时结构、UTF-16 正文分页、目标 PNG 和顺序动作批次（invoke/click/set text/shortcut/wait）。具体名称/字段由对应实施票记录；本地取得预算由桌面端控制，模型参数不能扩大。默认广泛工具授权，复用既有工具审批，不新增独立读写开关、逐步骤权限弹窗或审批模型。
+3. 真实调度回合进入 running 后安装私有活动上下文，包含已接收 requestID、Host turn、取消代次和实际所选模型能力；RAII 只能清理自己的代次。包装器从此上下文与可信登记生成唯一 invocation ID，携带真实 session/request/turn/invocation 与模型的工具参数，经现有 Docker 可达桥转到普通桌面后端和受验证本机 IPC。身份不从模型参数读取。
+4. 原始 provider tool_use_id 并非现有 ToolExecutor::call 输入；不能按工具名/参数/顺序猜配并发取消的调用。原生 invocation ID 为真实独立主键；能通过真实 ToolResult 事件精确关联时可补 provider callID，无法取得时留空。
+5. 不同工具采用明确工程等待期限/容量；HTTP 收包期限不等于 UIA 执行期限。工具执行只发一次，不内部重试。桌面 Stop 按原回合直接取消为主；Host future Drop 的显式取消为独立、有界的补充控制。取消先到时必须拒绝晚到工作，不能误执行动作。同步原生动作未结束不代表已取消，执行位由能力端持有到真实结束。
+6. 每次结果保留唯一 delivery ID 和已投影的不可变内容。包装器完整读取、解析并验证媒体/活动代次后，向可信桌面桥发送精确调用与 delivery ID 的 ACK。只有此证据可标记 Host 已解析/接受该投影；不是 Engine/provider 接收或模型理解。ACK 失败如实保留 unknown，不能重执行；撤销后的后续交付和受管副本清理由原授权链处理。
+7. PNG 使用既有 ToolCallOutcome.media、InlineMedia 和主模型协议；以实际所选模型声明判定 image，不按模型名推断。无支持时明确失败，不 OCR、第二 VLM、自动换模型或静默文字替代。保留既有每图 5 MiB、每回合 4 个不同附件/20 MiB、32 MiB 请求等引擎传输限制，超限明确失败，不自创缩放/最长边/图像 token 默认值。
+8. 旧 current/history、已登记会话限制全局 session_search、媒体回看/清理、会话持久化、普通模型网络重试和现有 Office 语义继续有效。令牌、完整采集内容和 PNG 不进入诊断日志或 Office 动作。
+
+## 替代方案
+
+不只改 Everypaw 路由或提示词，因为模型必须实际可选择工具并收到结果。不新增通用 MCP/独立网络原生入口。不直接改 Core ToolExecutor 传入上下文：本期可信应用回合/原生 invocation 可以通过 Host 私有状态实现；若未来必须在执行前取得 provider callID，再按受保护接口治理。ACK 区分真实 Host 解析与仅 socket 写成功，不以界面推断代替交付事实。
+
+## 验证计划
+
+沿用已获用户确认的悬浮提交与 Host 工具桥 seam：真实受控 Host/HTTP、原生能力替身、隔离本地存储与受控时序，检查模型真实输入、调用次数、媒体字节、来源和取消/迟到。逐票红→绿，保留原工具和会话回归。错误参数/身份伪造、未登记、旧 Host、服务切换/撤销、取消早到、相同并发调用、超时不重发、ACK 失败和跨会话媒体均需覆盖。
+
+最终按 AGENTS 执行 fmt、workspace strict Clippy/tests、lines/scrub/snapshot/golden/telemetry、显式 Host feature strict Clippy/tests、CLI/Host parity、默认 CLI tree 无 axum 与现行依赖检查，逐项登记真实退出码。预算不足和既有未通过项不得隐去。真实 Docker 可达、Windows 操作和实际所选 DeepSeek 模态验证另记，替身/回环不冒称通过；当前 Docker Desktop 管道不可用，未启动服务。
+
+## 回滚
+
+未部署，只回退本次独立源码分支/补丁；不重置任何用户来源分支，不删除 session/卷/授权/证据。应用发现旧 Host 时明确关闭新增视觉工具能力，保留普通问答及旧工具。未来部署仍需最终具体制品与单独授权；此 CHG 不执行服务切换。
+
+## 执行记录
+
+### 11 实施前登记（2026-10-17）
+
+正式11在既有批准的 ai_pc.rs、ai_pc_visual.rs 与本表文档范围内扩展同一 `ai_pc_action_batch`，不增加工具、依赖、审批或预算。模型步骤增加 `set_text:{target_id,text}`（text显式必填、允许空字符串）、`shortcut:{target_id,key,modifiers?}`（VK名称及明确修饰键白名单，未知值整批拒绝）与 `wait:{delay_ms}`（非负 signed32、允许0）。所有步骤严格解析后才可分发任何效果；wait不接受target，输入动作仍绑定原context/native generation/窗口witness。
+
+沿用10的桌面会话FIFO、原调用证据、独立取消与未知不重放。仅动作批次的工程等待期限按已校验wait总毫秒加既有native/桌面10秒、Host20秒计算，使用u64安全求和；不把短HTTP收包期限当作wait产品上限，不扩大其他工具期限。已有悬浮问答180秒总体期限仍保留，其取消不证明同步输入已经结束。实际Windows通过自建隔离EDIT验证ValuePattern整值替换、只读/不支持、目标焦点与真实快捷键；部分SendInput可能已经生效，保留接受数量并报告unknown，不补发。
+
+### 10 Host 局部验证（2026-10-16）
+
+动作票在 `feature/everypaw-visual-10` 复用 07 的私有 `call(name, ...)` 接缝（本分支提交 `b5428a4`），只修改已登记的七个文件：ai_pc.rs、ai_pc_visual.rs、http.rs、本记录及三份 b-line 文档。`validate` 严格验证 generation、1–64 步 invoke/click 与 target_id，拒绝额外字段；`specs` 声明 Write/NeverParallel，`DesktopTools::call/validate_input` 接通已授权路由。`ai_pc_visual::call` 将实际 error/unknown/cancelled 投影标为工具错误，保留一次请求、精确 ACK、原身份和无重试合同；登记回执只增加已实现动作工具。
+
+新行为测试 `action_batches_use_existing_write_approval_and_return_actual_partial_result_once` 首先真实红（工具尚未声明），实现后 1/1 绿。此后 `cargo test -p openpaw-engine-host --features engine-host -- --test-threads=1` 退出 0（59+16+36=111 项），显式 Host 全目标严格 Clippy 退出 0，fmt 退出 0，`cargo run -p xtask -- lines` 退出 0（Host business6505/7000、Host外部tests3943/4000、aux11497/11500）。未修改预算、计数或依赖；新增测试位于原批准模块的自然内联边界。切换共享 target 后曾出现 0 tests 的旧分支缓存，刷新本分支源码时间并确认真实编译路径后重新完成上述红绿；旧缓存不计为通过。
+
+上述是早期单票局部结果。后续已完成独立原生取消控制确认、真实 pipe 断连取消、丢失回执保留 unknown 与原窗口遮挡检查；这些桌面行为由 Everypaw 应用边界和自建真实 Win32 控件验证，不由 Host HTTP 成功推断原生已停止。
+
+### 10 组合后验收（2026-10-16）
+
+实现提交 `027d3aa`，合引擎主线 `d568346`（含09）得到 `846c2e3`；Everypaw 合主线 `843d326`，组合代码 `53c9a5d`。冲突按已实现能力合并：list/PNG/actions 均保留、登记头三工具、工具总数27、PNG媒体保持、动作 error/unknown/cancelled 仍是工具错误。只修改相对主线已登记七个文件，没有依赖、预算、Core／AgentLoop／审批算法或生产配置变化。Engine 实现及合并提交带 Signed-off-by，未解决既有来源 DCO／CODEOWNER／CI 门禁。
+
+| 命令／验收 | 当前实际结果 |
+| --- | --- |
+| Host `cargo test -p openpaw-engine-host --features engine-host -- --test-threads=1` | 组合后退出0，59+16+36=111；动作原始调用与部分结果、09六场景Router、取消／代次和精确ACK均通过。 |
+| `cargo test --workspace` | 合09前退出0；最终相关变化由组合后Host111、两种workspace strict Clippy和parity复核，不声称最终全workspace重跑。 |
+| `cargo clippy --workspace --all-targets -- -D warnings` 与显式 `--features engine-host` | 组合后均退出0，数组splat保留`--`，无警告放行。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 组合后3/3绿。 |
+| fmt、lines、scrub、golden、telemetry | 组合后均退出0；实际Host6573/7000、外部tests3943/4000、aux11497/11500；scrub356，telemetry284 dependencies／229 symbols。 |
+| 默认 `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，既有Windows CRLF/LF快照偏差；未修改受保护快照／检查器。 |
+| `cargo deny --version` | 退出101，未安装cargo-deny；不安装新工具，依赖审计仍需CI。 |
+| `cargo build -p openpaw-cli --features engine-host` | 组合后退出0；仅保留单文件 `openpaw-actions10.exe`，SHA256 `1392AAD06DA65707DCD38F5144CD5ED206C30412D6F4F01570D7EA700F67B437`，未部署。 |
+| Everypaw组合后 `paired_ --ignored --test-threads=1` | 3/3绿（10.94秒）：真实官方Host隔离进程、受控SSE模型、HTTP桥、验证pipe原生替身及隔离Recorder。保留原列窗、09同轮四图窗口／子区PNG；独立动作场景list→invoke有效/click失效/invoke后续→answer，真实ToolResult等于保存投影，completed/error/not_started、执行1次、无强制观察／重放、无token。 |
+| Everypaw Desktop与真实控件 | 组合后主测试87通过/8ignored、通知2通过/1ignored；真实隔离Win32 Invoke/click1/1（0.31秒），拒跨context及遮挡窗口，失败后不点击后续目标。 |
+
+共享xtask的 `env!(CARGO_MANIFEST_DIR)` 会保留编译来源路径；首次lines误返回旧09的6529。刷新本分支xtask源码时间、确认真实编译路径后，五项xtask均重新执行，上表6573为正确组合值；未改算法或预算。一次PowerShell嵌套数组错误未实际执行检查，纠正数组后才取得上表结果，不将参数错误当业务失败。
+
+桌面实际执行位仅在原生返回／进程确认结束后释放；停止、排队取消和10秒超时四场景以及控制断连／回执丢失已从真实HTTP/IPC与保存证据核对。完整红绿及Recorder分阶段验证见Everypaw `ticket-10-verification.md`。三共享target的构建／执行已全部结束并明确交07继续结构组合验证；本票只剩本地文档提交。实际Docker、管理员／多屏DPI、DeepSeek真实调用／模态、CI和部署未验证，不把回环／替身作为通过。生产DeepSeek、服务、数据卷和配置均未改变，不push／部署。
+
+
+### 09 实施前的具体范围补充
+
+既有规格 D15/D16 与正式09要求 PNG 经实际主模型媒体路径交付。沿用本 CHG 已登记授权：在 ai_pc.rs/ai_pc_visual.rs 实施严格 `{target_id}` 的 `ai_pc_capture_target`，受信调用 `/ai-pc/capture`，只接受单张合法原始 PNG，runtime 的实际 image=false/unknown 在原生分发前失败。媒体置于 ToolCallOutcome.media，不复制到文字投影；最大响应 7 MiB 仅用于一张合法5 MiB原件的Base64及有界元数据，沿用原件限制，不缩放。
+
+实测现有 Everypaw SSE 每行1 MiB、REST全历史2 MiB会被合法PNG附件撑破。允许 http.rs 在既有 messages 路由增加可选 `turnID` 与 `textOnly=true` 窄读取；默认路由内容和其他消费者保持原语义。窄读取只返回指定回合的 assistant text，既有 runtime 快照不改变持久化或公共投影。Everypaw SSE仅消费文字且有界丢弃超大非正文event，最终文字以该窄REST恢复。实际>1 MiB完整PNG经真实受控provider、SSE与REST验收，不以提高客户端总容量代替。
+
+此扩展沿用既有 GET messages 路径和稳定编号 `API-HOST-SESSION-004`，是同一路径的可选窄读取合同。新增私有 `MessageQuery`（turn_id/text_only）和扩充 `messages` 过滤逻辑：需有效ASCII turnID，保留指定回合assistant的info/error与text，缺省不变。没有新增Core/runtime接口或事件。Host当前仍先复制wire_messages历史快照再过滤，不能宣称历史内存或CPU开销恒定/全程流式。窄REST传输≤2MiB、SSE保留行≤1MiB/累计wire≤128MiB/180秒；同轮四张原件走四次工具结果，受控paired验证其实际主模型请求和最终文字恢复。超过任一工程边界明确失败，不删媒体以伪装成功。
+
+09新增行为测试优先扩充已有 Router 用例及 Everypaw 成对验收。当前 Host tests 3943/4000 仅余57行，若实测超过先记录必要用例和最小预算文件范围，不以搬迁测试避计数。
+
+### 09 实际实现与本地验收（2026-10-16）
+
+隔离分支 `feature/everypaw-visual-09` 从集成 `4acf3c8` 实施。红测试提交266e078，借用07中性名称分发接缝54a676b（源4fe7b50），PNG实现8cf2283；Engine提交均带DCO。仅修改本表已批准文件；没有Core/AgentLoop/provider、Cargo、xtask或生产配置变化。新增私有字段不作为公共API；变动的pub(crate)工具声明说明与pub(super)调用函数保留中文八栏目。
+
+`ai_pc_capture_target`为ReadOnly/ParallelSafe，严格单个target_id；`ai_pc_visual::call`在取得前检查runtime实际image，capture最多7MiB并要求恰一张PNG，InlineMedia原件验证在精确ACK前完成，媒体仅走现有ToolCallOutcome.media。MessageQuery对turn_id显式命名turnID；该命名错误由真实Router窄REST断言先红后修绿，不靠客户端猜字段。
+
+| 已执行命令/场景 | 实际结果 |
+| --- | --- |
+| `registered_visual_tool_reaches_model_with_trusted_turn_and_exact_parsed_ack` | 最终退出0；6场景list、PNG支持、image未知、仅text、错误MIME、非法原件；不支持时native0、非法媒体不ACK，实际第二provider请求包含相同PNG。窄REST正确过滤text/保留原info，默认REST仍含原件；缺参数/单turnID为400。 |
+| `cargo test -p openpaw-engine-host --features engine-host` | 最终退出0，58+16+36=110；包含窄REST参数和turnID修复后的全部测试。 |
+| `cargo test --workspace` | 退出0；跨工作树切换先刷新09 Host/CLI/xtask源mtime并确认实际编译路径，使用现有共享target、jobs=1、debug=0及隔离临时目录执行提权。 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 最终退出0。 |
+| `cargo clippy --workspace --all-targets --features engine-host -- -D warnings` | 最终退出0；PowerShell吞`--`的首次参数错误保留，后用cmd保持分隔符实际严格执行。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 退出0，3项通过。 |
+| `cargo fmt --all -- --check` 与 `git diff --check` | 最终退出0。 |
+| `cargo run -p xtask -- lines` | 最终退出0；Host6529/7000、tests3943/4000、aux11497/11500，无预算或计数变更。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，扫描356文件。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1；与06/07及未实施基线相同的Windows CRLF/LF快照偏差，未修改Core、快照或检查器掩盖。 |
+| `cargo run -p xtask -- golden` | 退出0，全部golden通过。 |
+| `cargo run -p xtask -- telemetry` | 退出0，284 dependencies、229 symbols clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，532行依赖树、axum匹配数0。 |
+| `cargo deny --version` | 退出1，未安装cargo-deny；不安装新工具，不冒称依赖审计通过，仍需CI门禁。 |
+| `cargo build -p openpaw-cli --features engine-host` | 退出0；独立09官方制品openpaw-png09.exe，SHA256 AA73B0709453596B631921E1C87C28E67F36EF001CA49D5F7BE0885B29C86467，未部署。 |
+| Everypaw同轮四张窗口＋子区PNG paired | 退出0，1/1（10.98秒）。真实官方Host进程/受控SSE provider/桌面HTTP/验证pipe/真实隔离Recorder。1100×1100原件4,841,533B×4=19,366,132B≈18.47MiB，同回合四个不同附件；子区768×768原件2,360,312B。完整解码核对RGBA，逐字节核对保存和实际provider data URL，最终SSE/窄REST回答成功。原列窗paired另1/1绿。 |
+| Everypaw真实WGC像素 | 自建320×240黑色窗口、80×90白EDIT、遮挡/自有picker marker、负坐标、最小化明确失败；最终1/1绿，07共享window缓存修正后再1/1绿。仅捕获自己的隔离测试窗口。 |
+| Everypaw大SSE文字/错误恢复 | 退出0；1.1MB文本行丢弃后窄REST原文恢复，2.1MB正文超过2MiB明确失败，超大error事件后权威failed明确失败。 |
+
+四图fixture首次1160² Fast噪声RGBA超过既有5MiB，在服务前失败；改1100²进入合法范围后绿，没有放宽产品上限。原生fixture曾因STATIC系统颜色、NOACTIVATE选窗规则及UIA数值类型50004误判失败，修正独立fixture后真实像素绿。完整失败及命令记录在Everypaw ticket-09-verification.md。
+
+09最终本地治理命令已按共享缓存序列完成，结果如上；Engine集成仍为基线4acf3c8，无新产品tip待合，Everypaw交付前已合最新纯文档13e059f。Desktop/Recorder和Engine共享构建/执行位均已释放给10。Docker、真实混合DPI/多屏/管理员、HDR及DeepSeek模态接受/理解未验证，不把受控模型或回环宣称这些通过；未改变DeepSeek image配置。CODEOWNER、CI、来源DCO缺口、部署与既有平台门禁独立保留。07后续结构工具合并需保留本票六场景Router与大图paired，并重新核对合并制品，不拿09独立SHA256代替。
+### 07 实施前登记（2026-10-16）
+
+基于 `4acf3c8`，继续已批准路径内的实时结构工具：`ai_pc_query_structure`。模型仅传 native generation、target_id、逗号分隔 directions、offset、limit、boxes；可信会话/Host turn/执行 generation/invocation 继续由运行时安装。方向集合对齐固定 Everywhere 的 all/parent/child(children)/previous(prev)/next/sibling(siblings)/none，默认 all/0/128/false、limit 最大 1024，非法输入拒绝。工具为 ReadOnly/ParallelSafe；复用现有一次调用、取消及精确 ACK 合同，只按工具选择 `/ai-pc/windows` 或 `/ai-pc/structure`，不提前声明其他未完成工具。模型投影 Balanced4096 估算 tokens 和实际取得/信息权限由桌面负责。Host 新测试写在既有批准模块的自然 inline test seam，不移动已有测试、改变计数或预算；06 测得 Host business6454/7000、外部tests3943/4000、aux11497/11500，若真实增量超限先登记最小治理变更再继续。
+
+### 10 预实施登记
+
+2026-10-16：正式任务 10 沿已批准 D16–D19 和既有允许文件表实施 `ai_pc_action_batch`。模型参数严格为 `{generation, steps:[{action:"invoke"|"click",target_id}]}`，最多 64 步；会话、原回合和 invocation 继续由可信 Host 封装。声明采用既有 Write/NeverParallel 工具分类与权限机制，不增加独立开关或逐步骤审批。此阶段不声明 set-text、shortcut、wait。
+
+复用 `ai_pc_visual::call` 的唯一调用、取消、精确 ACK 与无重试路径，按工具选择 `/ai-pc/actions`；仅返回实际步骤状态，不强制观察或重放。桌面主路径将 Stop、Host 取消和等待超时传入独立 IPC Cancel，能力端在每步开始前检查取消，整批串行并保留实际完成槽位。实现仅改允许表中的 ai_pc.rs、ai_pc_visual.rs、http.rs 和对应文档；不改 Core/Engine/Store、依赖、审批算法或预算。真实隔离 Windows 控件与受控 Host/HTTP/IPC 验收分别记录。
+
+
+2026-10-16：04 完成后，在 `feature/everypaw-visual-06`（`.local/engine-visual-06`）实施 06，基于已批准集成提交 `64d601c`。本轮实际改动为表内 10 个文件（包含本记录和索引），不修改 Core、Engine、Cargo、xtask 或生产服务。新增/修改公共 Rust 项已人工核对中文说明，函数/方法保留八栏目；登记路径保持原稳定编号。
+
+### 06 实际符号与工程选择
+
+- `ai_pc::Registration.visual`、`specs`、`DesktopTools::{call,list_tools}` 和 `ToolHostValidator::validate_input`：只新增 `ai_pc_list_windows`，严格空对象，沿用 ReadOnly/ParallelSafe；保留 current/history、受管 session_search 限制和媒体行为。
+- 私有 `ai_pc_visual::{VisualContext,ExecutionGuard,call}`：`runtime::run_turn` 在 durable admission 获准 running 后安装可信 request/Host turn/UUID generation/取消 token/实际模型 image 能力；guard 只清理自己的代次。调用创建独立 invocation，不猜配 provider callID。
+- `http` 现有登记入口成功回执增加 `openpaw-desktop-protocol: 1` 与 `openpaw-desktop-tools: ai_pc_list_windows`。桌面端只有看到此组合才宣称实时工具可用；旧 204 仍可普通文字问答和使用旧工具。
+- 每次工具只发一次，Host 列窗等待 20 秒、结果 1 MiB；完整解析后对精确 invocation/delivery ACK 等待 2 秒、严格接受不超过 128 字节的 `{status:"accepted"}`。独立 OnceLock 取消队列容量 64，Drop 使用 try_send、每条最多 2 秒且不重试；队满/运行时关闭不保证补充通知。桌面原回合 Stop 是主取消路径。
+- 桌面仍绑定随机端口 `0.0.0.0` 并登记 `host.docker.internal`；原生入口仅受验证本机 IPC。桌面桥 HTTP 收包 3 秒与 native 执行等待分开，最多两个 detached acquisition，占位到真实完成。迟到实际取得内容留在原调用本地，不恢复生成/不 ACK；此行为不等于取消了同步原生操作。
+
+### 06 已执行命令
+
+所有 Cargo 命令均经相邻 Everypaw `scripts/native.ps1`、独立 `.local/engine-target`，dev/test debug=0、jobs=1；未发出真实模型请求。
+
+| 命令 | 结果与证明范围 |
+| --- | --- |
+| `cargo test -p openpaw-engine-host --features engine-host` | 退出 0；58+16+36=110 项。包括真实受控 Router/模型 HTTP 的可信回合与精确 ACK、取消及旧代次不 ACK/不重放。 |
+| `cargo build -p openpaw-cli --features engine-host` | 退出 0；生成真实官方 `debug/openpaw.exe`，供后续 Everypaw 成对进程验收。 |
+| `cargo test --workspace` | 首次退出 101：既有 Windows `add_write_acl_on_temp_dir` 在沙箱中 SetNamedSecurityInfo 错误 5。随后对隔离临时目录以执行提权重跑完整 workspace，退出 0。未修改测试或 ACL 实现。 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | 退出 0，默认依赖隔离保持。 |
+| `cargo clippy --workspace --all-targets --features engine-host -- -D warnings` | 最终退出 0，包含本轮新 Host 测试。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 退出 0，3 项通过。 |
+| `cargo fmt --all -- --check` | 退出 0。 |
+| `cargo run -p xtask -- lines` | 退出 0；Host business 6454/7000、Host tests 3943/4000、aux 11497/11500。未更改预算/计数。 |
+| `cargo run -p xtask -- scrub --check` | 退出 0，扫描 356 文件。 |
+| `cargo run -p xtask -- snapshot --check` | 退出 1：检测到既有快照在 Windows checkout 为 CRLF，而检查器逐字节比较 LF rendered；未改 Core/snapshot/检查器。对未实施 06 的 `engine-visual-integration`（64d601c）同命令也退出 1，记录既有平台门禁，未重写受保护快照来掩盖。 |
+| `cargo run -p xtask -- golden` | 退出 0，全部 golden 通过。 |
+| `cargo run -p xtask -- telemetry` | 退出 0，284 dependencies、229 symbols clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出 0，axum 匹配数 0。 |
+| `cargo deny --version` | 退出 1，本机未安装 cargo-deny；依赖审计由现行 CI 门禁完成，不宣称本地审计通过。 |
+
+Everypaw 已运行 `paired_official_host_model_desktop_http_ipc_and_store_roundtrip --ignored`（退出 0）：真实官方 `openpaw.exe` 隔离进程、本地受控 SSE 模型、真实桌面 HTTP 桥、受验证 named-pipe 原生替身、隔离 Recorder、精确 ACK 和第二轮模型请求贯通；ToolResult 与保存投影逐值一致、原回合关联正确、不含 token。另实际 Windows `metadata_window_list_retains_real_child_witness_without_initializing_uia --ignored` 退出 0，证明 EnumWindows 取得自建子进程窗口、应用身份和 -wv 引用、OS 销毁后失效，metadata 未初始化 UIA。这两个证明面分别记载于 Everypaw `ticket-06-verification.md`。
+
+真实 Docker Desktop Linux engine 管道不可用，未做容器连通验收；回环/原生替身不作为 Docker 通过证据。L3 CODEOWNER、来源 DCO 缺口、CI 和部署仍待独立完成；本轮不 push、不部署、不切换现有 DeepSeek 服务。
+
+## 07：实时结构查询
+
+本票从06的 `4acf3c8` 开始，在 `feature/everypaw-visual-07` 实施，Everypaw为 `feature/desktop-structure-07`。沿用上述既有用户授权及10文件边界；未改Core/Engine/Store/Tools/provider、依赖、预算或计数。先提交最小共同分发接缝 `4fe7b50`，其后只在已允许的 ai_pc/ai_pc_visual/http 和本文、b-line协议/连接/验证、索引中加入结构行为及证据。
+
+实际符号为 `validate_structure`、`specs` 的 `ai_pc_query_structure`、`DesktopTools::call/validate_input`、`ai_pc_visual::call` 的 `/ai-pc/structure`，登记头按实际实现增加结构工具。严格模型字段为原生generation/target_id/directions/offset/limit/boxes；默认all/0/128/false，正limit由桌面钳制1024，模型不能填写可信身份。仍为ReadOnly/ParallelSafe，单次HTTP→原始可信调用→精确ACK→既有ToolCallOutcome；无媒体、摘要模型、自动重试或新增权限流程。
+
+每次返回独立当前观察、紧凑节点/必要关系/状态/短正文，坐标按需；本地实际取得与4096估算token模型副本分别保留。原始窗口witness在metadata/UIA owner之间只传无COM的Arc租约并复核，-wv缓存同一短ID；引用关闭/替换/跨上下文/旧代次均不重绑。实际取得节点/字节/平台操作和同步调用间期限由桌面控制，返回及ACK重新检查当前信息规则。取消先到以pending_visual_tool占位，可信route晚到只纠正名称、拒绝执行；原生迟到completion仅保存原invocation本地。
+
+| 已执行命令 | 实际结果 |
+| --- | --- |
+| `cargo test -p openpaw-engine-host --features engine-host --lib -- --test-threads=1` | 退出0，60/60。新schema严格输入及真实Host Router/受控SSE模型选择structure、可信参数、精确ACK、第二次模型请求完整投影均通过；保留列窗/旧工具/附件/取消回归。 |
+| `cargo test --workspace --features engine-host -- --test-threads=1` | 退出0，全workspace及CLI/Host parity通过；源码路径明确是engine-visual-07，不以其他分支fresh冒充。 |
+| `cargo test --workspace -- --test-threads=1` | 退出0，默认workspace完整通过，保留默认依赖隔离。 |
+| `cargo fmt --all -- --check` | 退出0。 |
+| 默认及显式 `--features engine-host` 的 `cargo clippy --workspace --all-targets -- -D warnings` | 两条退出0。 |
+| `cargo run -p xtask -- lines` | 退出0：Host6526/7000、Host外部tests3943/4000、aux11497/11500。新测试在获准源文件内联，未移动旧测试或改变计数。并行视觉票最终叠加仍须重新测量。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，复现06已在未实施分支证明的Windows CRLF/LF逐字节差异；本票未改Core、快照或检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 两条退出0，golden全通过；284依赖、229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo deny --version` | 退出101，命令未安装；不安装新依赖，不宣称本地依赖审计通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0；仅隔离构建。留单份25,238,528字节 `openpaw-structure07.exe` 供共享target被下一票覆盖后的成对验收，非复制缓存。SHA256 `0D8ACAE7249254AA675C113CAF72BFA76A596E6F1F882593D9E6143F3023E1A9`。 |
+
+Everypaw真实HTTP/受验证IPC/SQLite边界最终1/1绿（6.61秒）：默认/钳制、严格参数、连续独立观察、1024实际节点/4096估算token、空容器折叠/文本去重、全局/服务/授权/应用收窄、精确ACK、cancel-before-request和超过5秒实际迟到归属均核对。大结构首红504来自逐节点pop重复序列化，改确定性前缀二分后绿，未提高超时/预算。自建离屏不激活STATIC/BUTTON子进程真实UIA测试1/1绿（3.56秒），保留方向/offset/越界/limit/boxes/同ID当前名称/替换旧ID拒绝/跨context及代次/关闭全部严格断言；首红查明S_OK+null在Windows binding表现为Err(code0)，修为真正失败HRESULT才记partial，未吞掉provider失败。
+
+以上是07独立阶段证据，最终组合见下节。完整通用来源/工具过程UI由Everypaw正式14消费本票的本地/交付/ACK证据；本票不冒称该界面、真实Docker、管理员快捷键、生产模型、CODEOWNER/DCO/CI或部署通过。
+
+### 07 与09/10最终组合（2026-10-17）
+
+07分支合入最新引擎集成 `a86abfbaa0017121cfa6a42624fdc23abbfae634`，明确合并结构/PNG/动作的声明、验证、路由与测试。最终实现候选 `663de83`；注册回执准确列四个新工具，已登记工具总数28。首跑仅旧合并断言27与实际28不符，按规格更新独立预期并完整重跑。结构的ReadOnly/ParallelSafe与动作Write/NeverParallel继续分开；未改默认工具审批、Core/AgentLoop/Store/provider、依赖、预算或计数。
+
+| 当前组合实际命令 | 结果 |
+| --- | --- |
+| `cargo test --workspace --features engine-host -- --test-threads=1` | 最终退出0，完整workspace；Host61+16+36=113，CLI/Host parity3/3。保留07结构Router与09六场景PNG/窄REST及10实际部分结果。 |
+| `cargo test --workspace -- --test-threads=1` | 退出0，完整默认workspace及doctest。跨树刷新源码mtime，编译输出明确engine-visual-07。 |
+| 默认与显式Host `cargo clippy --workspace --all-targets … -- -D warnings` | 两条退出0。 |
+| `cargo fmt --all -- --check` | 退出0。 |
+| `cargo run -p xtask -- lines` | 退出0，Host6638/7000、tests3943/4000、aux11497/11500，无预算/计数变化。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，仍为06已在未实施基线证明的Windows CRLF/LF平台差异；未修改受保护快照或检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 均退出0，golden全绿；284依赖、229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo deny --version` | 退出101，未安装；未新增工具，不宣称本地依赖审计通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0。由663de83重建隔离官方CLI `openpaw-structure07.exe`，SHA256 `3B2563AC0D5BDBFFFD91B6B6255968BC6A182E68C35107E23CF0EB6D49EAE5BA`，替代此前合09前的同名制品。 |
+
+Everypaw对应候选 `d86a869` 已合最新 `6cb7593`。Recorder121/121、Desktop88＋通知2、真实层级UIA/WGC像素/Invoke点击各1/1通过；新组合CLI官方paired4/4（11.77秒）：结构与列窗完整已交付投影/精确ACK、同轮四张4,841,533B原PNG与2,360,312B子区PNG的保存/provider字节及SSE/窄REST、动作实际部分结果/不重放。最新native注册/字段读取deadline也经真实层级复验。没有访问真实用户桌面或调用生产模型。
+
+最终变更仍仅10个允许文件，公共/受限可见Rust项的中文八栏目保持；实现与合并提交均带DCO。snapshot、cargo-deny缺失、真实Docker/管理员/登录重启、CODEOWNER/历史来源DCO/CI和部署仍待独立完成。完整Everypaw证据为其 `ticket-07-verification.md`；没有切换DeepSeek、运行服务、push或清理数据。
+
+## 08：正文分页实施前范围登记
+
+沿用已批准正式08及D14/D19，基于集成 `1b2312e` 在 `feature/everypaw-visual-08` 实施。只修改允许表中的 ai_pc.rs（`validate_text`、`validate`、`specs`、`DesktopTools::call/validate_input`及自然内联测试）、ai_pc_visual.rs（`call`增加 `/ai-pc/text`）、http.rs（登记回执增加已实现工具）及三份b-line文档、本记录/索引；不新增依赖、不改Core/Engine/Store/provider或预算/计数。
+
+`ai_pc_read_text` 为ReadOnly/ParallelSafe，严格参数 `{generation,target_id,offset?,limit?}`；offset默认0、带符号UTF-16 code units，绝对值最多10,469,374；limit默认4096，正整数由桌面钳制16384。模型不能填写session/request/turn/invocation、权限或native probe。桌面单次probe最多10,485,760 UTF-16、正offset前缀至少4098且带额外边界/sentinel；负offset相对此次取得前缀末端，长度下界时明确bounded_prefix_end。返回当前独立观察、实际start/end/next与exact/lower_bound长度；不缓存冻结全文，不用TextUnit_Character冒充UTF-16，不作无界GetText/Value读取。模型投影另限10240估算tokens并复用既有更小字节预算，裁短则next严格跟随实际发送末尾；本地原取得页保持完整。代理项中间的start向前对齐，limit1可完整返回2单元pair；末尾收回边界，不替换或跳字。
+
+复用可信活动回合、单次HTTP、精确ACK/取消和实际迟到证据；不引入媒体、OCR、额外模型或权限弹窗。新增Operation明确保留真实completion；每次原生目标/权限及交付/ACK复查，失败不重绑或重试。通过既有已获用户确认的Host工具桥/真实HTTP/验证IPC/隔离Recorder与自建Windows长正文验证；真实生产模型、Docker、管理员和外部门禁继续单独记录。上述授权已覆盖本次具体符号/契约，按AGENTS已有授权条款继续，不重复索要确认。回滚仍为未部署独立分支回退，不删除任何用户数据。
+
+08局部已执行：Host schema首红缺工具声明，实现后1/1绿；Host完整62+16+36=114绿；默认workspace、默认strict Clippy绿；lines实测6673/7000，外部tests3943/4000、aux11497/11500，未修改预算。进一步Recorder红绿发现probe上限边界会产生超过最大合法offset的next，修为null＋partial/工程上限说明，不能把lower_bound误称全文结束。已按root发现的既有cargo-deny绝对路径运行 `--workspace --locked --color never check --show-stats`，退出1：`C:/Users/JingJia/.cargo/advisory-dbs/db.lock` exclusive lock on read-only path；没有安装/更换配置或复制审计库，审计尚未通过。最终组合证据待后续追加。
+### 11：文字、快捷键与可取消等待（2026-10-17）
+
+工作分支 `feature/everypaw-visual-11`，已合引擎集成 `1b2312e9b2a71639fba0c978cbfe4182efc35289`，保留07结构、09六场景PNG与窄REST、10动作的全部路径。实际产品改动仅表内 `ai_pc.rs` 的严格步骤解析/快捷键验证/schema和 `ai_pc_visual.rs` 的动作专属等待期限；配套更新本记录、INDEX、b-line协议/配置/测试。没有新增工具、Cargo依赖、Core/AgentLoop/Store/provider改动、审批模型、预算或计数豁免。
+
+动作枚举新增set_text/shortcut/wait，模型不能写可信身份；wait只接受非负i32、0合法、无target，整批解析失败不分发任何效果。仅动作Host期限为20,000毫秒加已验证wait总时长，使用u64检查求和；桌面/native为10,000加总wait，问答180秒总期限保留。键语法和原生实际效果契约见更新协议；未知输入不重试，不增逐步确认或自动后续观察。中文公共Rustdoc八栏目保持，新增校验函数和步骤为私有实现；签名提交和合并保留DCO。
+
+红绿证据：既有动作测试改为混合set_text/shortcut/wait后先因旧Host验证器真实失败，扩充严格步骤/schema后通过；非法后续步骤、缺text、负数/溢出wait、未知修饰键、组合主键在任何HTTP前拒绝。再加入真实21秒HTTP延迟，先在旧20秒期限失败，动作专属期限调整后1/1通过（21.05秒），未扩大其他工具期限。Everypaw的11秒wait、可取消wait、同步文字挂起/迟到和真实EDIT/Ctrl+A分别记录在其ticket-11-verification，不把HTTP替身当作真实输入。
+
+所有Cargo仍使用共享唯一engine-target、jobs1、dev/test debug0，经Everypaw native.ps1；刷新当前工作树源mtime并确认编译路径，避免跨树fresh伪证据。实际命令如下：
+
+| 命令 | 实际结果与范围 |
+| --- | --- |
+| `cargo test -p openpaw-engine-host --features engine-host` | 退出0，61+16+36=113项，混合批次及21秒真实等待通过，保留结构Router/PNG/原动作/附件/取消回归。 |
+| `cargo test --workspace -- --test-threads=1` | 退出0，完整默认workspace；未将此条冒称显式Host全workspace。 |
+| 默认与显式Host `cargo clippy --workspace --all-targets … -- -D warnings` | 两条退出0。 |
+| `cargo test -p openpaw-cli --features engine-host --test session_host_parity` | 退出0，3/3。 |
+| `cargo fmt --all -- --check` | 退出0。 |
+| `cargo run -p xtask -- lines` | 退出0：Host6734/7000、tests3943/4000、aux11497/11500；无计数或预算变化。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，仍为06已在未实施基线证明的Windows CRLF/LF差异；未修改受保护快照/检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 均退出0，golden全绿；284依赖/229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| `cargo deny --version` | 退出101，命令未安装；未安装额外依赖，不宣称本地审计通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0。复制单份独立 `openpaw-input11.exe` 供Desktop成对测试，SHA256 `DE0FED33B1CE351F6F4FC4312759433E6810DFD4F90AF4E5FEC856762B3231CF`，不复制缓存。 |
+
+Engine构建位已正式交08，后续08/最终17组合需重新核对实际制品。11不部署、不push、不切服务、不改DeepSeek、不读取真实用户桌面；真实Docker/管理员/混合DPI/登录重启、生产模型接受、CODEOWNER、历史来源DCO和CI仍独立保留。既有Windows snapshot和缺cargo-deny已如实列出。
+
+### 08 最终组合核验（2026-10-17）
+
+实现候选 `62bb441` 已合引擎集成 `67a22b2`，包含07/08/09/10/11全部产品路径。08新增ReadOnly/ParallelSafe正文工具，登记总数29，回执五种视觉工具完整；没有新增Core/AgentLoop/provider/依赖、全局工具、端口、权限开关或预算豁免。业务改动只在已预先登记的ai_pc.rs/ai_pc_visual.rs/http.rs；配套文档仍在原允许表内。中文公共/受限可见Rustdoc八栏目及DCO保留。
+
+| 实际命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 退出0。 |
+| `cargo test --workspace` | 退出0，默认配置完整workspace通过。 |
+| `cargo test --workspace --features engine-host` | 退出0，含Host62+16+36=114及CLI/Host parity3/3；混合动作真实21秒HTTP、正文严格schema/身份与原有结构/PNG保留。 |
+| 默认与显式Host的 `cargo clippy --workspace --all-targets -- -D warnings` | 两者退出0。 |
+| `cargo run -p xtask -- lines` | 退出0；Host6769/7000、外部tests3943/4000、aux11497/11500；预算与计数器未改。 |
+| `cargo run -p xtask -- scrub --check` | 退出0，356文件clean。 |
+| `cargo run -p xtask -- snapshot --check` | 退出1，仍为06已在未实施基线证明的Windows CRLF/LF快照差异；未改受保护快照/检查器。 |
+| `cargo run -p xtask -- golden` / `telemetry` | 均退出0，golden全绿，284依赖/229符号clean。 |
+| `cargo tree -p openpaw-cli --no-default-features` | 退出0，axum匹配0。 |
+| 既有cargo-deny0.20.2绝对路径 `--workspace --locked --color never check --show-stats` | 实际退出1：`C:/Users/JingJia/.cargo/advisory-dbs/db.lock` exclusive lock on read-only path。二进制已存在；先前PATH下查不到命令不代表没有二进制。未新增工具、审计库、配置或豁免，审计未通过。 |
+| `cargo build -p openpaw-cli --features engine-host --bin openpaw` | 退出0；只复制一份独立 `openpaw-text08-62bb441.exe`，SHA256 `3AC6227018C57AD878D37423002873CFC67B5D0B92FAD5D8BBEC92EDB25C5719`。 |
+
+Everypaw对应App696430d：Recorder126/126、Desktop91＋通知2及两个manifest的fmt通过；自建屏幕外、不激活Win32 EDIT的真实TextPattern长正文1/1（0.76秒），18,001 UTF-16逐页拼接无遗漏，涵盖非BMP/组合/CRLF、负尾页、越界、夹断、实时更新及旧/跨context/关闭失败。真实HTTP＋受验证IPC检查原取得页、独立模型投影、精确ACK、撤销及超过5秒的迟到只归原调用。未读取用户应用或注入真实用户输入。
+
+新组合CLI的官方Host成对 `paired_ --ignored` 7/7通过（15.73秒），覆盖列窗、结构、正文、原始PNG、动作、混合输入和12追问/重生成。正文工具确由模型选择，offset1/limit3的实际下一次provider请求收到 `😀e`、UTF-16 range0..3、next3、exact7与10240估算token标记；逐值等于持久投影，原调用host_accepted且无令牌外露。ACK只证明Host已解析接受该精确投影，不等于生产模型理解。大PNG原件、部分动作与重生成不重放的既有证据仍通过。
+
+最终源码范围/预算未扩大，没有更换DeepSeek、启动/重启现有服务、push/部署或清理数据。snapshot、cargo-deny锁路径、真实Docker/管理员/Alt+Alt/混合DPI/登录重启、生产模型接受性、CODEOWNER、历史来源DCO和CI仍独立待验。完整Everypaw记录为 `ticket-08-verification.md`；纯文档集成更新不改变以上候选产品代码。

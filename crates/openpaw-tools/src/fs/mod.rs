@@ -3,6 +3,7 @@
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod media;
 pub mod notebook_edit;
 pub mod read;
 pub mod write;

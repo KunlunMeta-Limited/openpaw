@@ -36,7 +36,7 @@ below, then browse the [tutorials](#tutorials--cli-reference).
 - **Agent engine** — the agent loop with streaming, retries, compaction,
   and approval branches, ported from a production codebase and verified by
   golden-session round-trips.
-- **21 tools** — filesystem (6), exec (3), web (3), and meta (9, including
+- **22 tools** — filesystem (6), exec (3), web (3), and meta (10, including
   session full-text search), each with
   contract + failure-path tests. `bash` commands pass through a
   tree-sitter AST safety chain (dangerous → blocked, uncertain → approval,
@@ -47,7 +47,7 @@ below, then browse the [tutorials](#tutorials--cli-reference).
   | Filesystem (6) | `read_file` `write_file` `edit_file` `grep` `glob` `notebook_edit` |
   | Exec (3) | `bash` `clipboard` `sleep` |
   | Web (3) | `web_fetch` `web_search` `web_extract` |
-  | Meta (9) | `think` `todo_add` `todo_update` `todo_list` `clarify` `enter_plan_mode` `exit_plan_mode` `structured_output` `session_search` |
+  | Meta (10) | `think` `todo_add` `todo_update` `todo_list` `clarify` `enter_plan_mode` `exit_plan_mode` `structured_output` `session_search` `read_attachment` |
 
 - **OS-level sandbox** — Windows restricted tokens + job objects, Linux
   bubblewrap, macOS Seatbelt; unsupported platforms fail closed. Exposed
@@ -72,6 +72,29 @@ below, then browse the [tutorials](#tutorials--cli-reference).
   [docs/tutorials/sidecar-clients.md](docs/tutorials/sidecar-clients.md).
 
 ## Build from source
+
+### 图片与录音附件
+
+CLI 与 Host 可以把附件交给所选模型理解，并接收文字回答。图片通过 OpenAI Chat
+Completions 或 Anthropic Messages；原生音频通过支持音频输入的 Chat Completions 模型。
+先声明你实际使用模型的输入能力；未声明的模型按纯文本处理，不会自动更换模型或转写录音。
+
+```powershell
+$env:OPENPAW_MODEL_CAPABILITIES = '{"openai":{"your-vision-model":{"input":["text","image"],"context_window":128000},"your-audio-model":{"input":["text","audio"]}}}'
+openpaw chat --provider openai --model your-vision-model --attach "C:\images\screen.png"
+```
+
+输入文字会同时发送待发送附件；交互中可用 `/attach <path>` 添加、`/send` 单独发送、
+`/clear-attachments` 清空。`--attach` 可重复，EOF 不发送待发送附件。音频用相同命令，
+选择已声明 `audio` 的模型。`read_file` 支持工作区媒体，`read_attachment` 可按编号回看历史原件。
+
+支持 PNG/JPEG/WebP/GIF（请求仅使用首帧）、WAV/MP3。单图 5 MiB、单音频 20 MiB，
+每回合最多 4 个不同附件且原件总量 20 MiB；模型请求另有 32 MiB 上限。
+原件内联保存在 JSONL；自动压缩仅改变模型上下文，完整记录保留原件与真实生成消息。
+本地检查 MIME、容器签名及大小，不解码、压缩或转码；上游仍可能有额外尺寸或时长限制。
+
+本轮通过本地 HTTP、CLI/Host 和历史契约测试；真实理解效果及第三方工具媒体适配尚待实测。
+Host 请求与完整配置见 [配置说明](docs/b-line/configuration-and-connection.md#图片与原生音频配置chg-2026-0026)。
 
 Prerequisites: **Rust 1.88+** (the MSRV floor; the toolchain channel is
 pinned to `stable` via `rust-toolchain.toml`) and Git. Windows is the

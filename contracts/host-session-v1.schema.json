@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpaw.local/contracts/host-session-v1.schema.json",
+  "title": "OpenPaw 会话响应契约 v1",
+  "description": "约束 Host 会话创建、列表、详情、更新、分支、回退和 SSE info 使用的公共 Session 形状。",
+  "type": "object",
+  "required": ["id", "title", "slug", "directory", "time"],
+  "properties": {
+    "id": {
+      "title": "会话编号",
+      "description": "Host 分配的稳定会话唯一编号。",
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "title": "会话标题",
+      "description": "用户标题、自动标题或分支标题。",
+      "type": "string"
+    },
+    "slug": {
+      "title": "兼容标识",
+      "description": "供 OpenCode v1 消费者使用的兼容 slug，当前与会话编号相同。",
+      "type": "string",
+      "minLength": 1
+    },
+    "directory": {
+      "title": "工作区目录",
+      "description": "会话所属工作区的规范化绝对路径。",
+      "type": "string",
+      "minLength": 1
+    },
+    "time": {
+      "title": "会话时间",
+      "description": "会话创建、最近更新和可选归档时间，单位均为 Unix 毫秒。",
+      "type": "object",
+      "required": ["created", "updated"],
+      "properties": {
+        "created": {
+          "title": "创建时间",
+          "description": "会话创建时间，使用 Unix 毫秒。",
+          "type": "integer",
+          "minimum": 0
+        },
+        "updated": {
+          "title": "更新时间",
+          "description": "会话最近更新时间，使用 Unix 毫秒。",
+          "type": "integer",
+          "minimum": 0
+        },
+        "archived": {
+          "title": "归档时间",
+          "description": "会话归档时间，必须是正数 Unix 毫秒；未归档时省略。",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "revert": {
+      "title": "暂存回退",
+      "description": "存在可取消的暂存回退时返回的游标；提交回退或取消回退后省略。",
+      "type": "object",
+      "required": ["messageID"],
+      "properties": {
+        "messageID": {
+          "title": "回退消息编号",
+          "description": "第一条被暂时隐藏的消息稳定编号。",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
