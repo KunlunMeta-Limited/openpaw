@@ -119,3 +119,5 @@ T4应直接Rust调用上述接口，按Office固定Schema新增自己的DTO/NDJS
 CHG-2026-0005 r2仅批准配置子范围，完整Office方案仍待审核。CLI/Host默认读取OPENPAW_HOME/.env或用户目录/.openpaw/.env；复制仓库.env.example，填写DeepSeek密钥后执行openpaw config show和openpaw chat。--env-file可显式选择文件，chat --home仅选数据存储；文件只在启动时读取。
 
 Host命令保持openpaw engine-host --config /absolute/path/host.toml。TOML明确的provider/model/base_url/api_key_env优先；沿用.env请省略这些字段。根、工具和办公室绑定仍只来自TOML，不能用.env覆盖权限。旧load/start嵌入式API保持原行为。本轮不修改Office、不开T4 PR，不把模型配置或独立健康检查算成M4完成。Linux/Windows实测结果见0005验证记录，未运行不能当通过。
+
+配置实现提交f70d43763c24c595d44c0b6ee6bdea52c2de2760已通过Linux原26项全量，见0005专用验证记录与仓库外准确head报告。Windows原生没有环境，未计通过；真实DeepSeek只在用户填入密钥后连接。该结果仅覆盖配置子范围，不改变T4/M4和Office页面未接入的状态。
