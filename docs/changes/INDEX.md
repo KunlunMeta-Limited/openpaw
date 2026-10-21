@@ -11,7 +11,7 @@
 
 | 变更编号 | 标题 | 状态 | 风险 | 负责人 | 接口数量 | 文件数量 |
 | --- | --- | --- | --- | --- | ---: | ---: |
-| CHG-2026-0033 | [main 对话与真实交接](CHG-2026-0033-main对话与交接.md) | approved / 实施中 | high | 用户批准；Codex 实施 | main 兼容入口与七消息，详见 CHG | 允许 10 |
+| CHG-2026-0033 | [main 对话与真实交接](CHG-2026-0033-main对话与交接.md) | approved / 实现已交付；验收部分通过 | high | 用户批准；Codex 实施 | main 兼容入口与七消息，详见 CHG | 实际 6；允许 10 |
 | CHG-2026-0001 | OpenPaw B 线治理接入和历史实现反向审查 | approved | high | OpenPaw 项目负责人（待确认） | 0 | 15 |
 | CHG-2026-0003 | B 线新增公共 Rust 接口中文注释补齐 | approved | high | OpenPaw 项目负责人（待确认） | 0 | 11 |
 | CHG-2026-0005 | 对话任务技能与动画闭环兼容复核 | approved | medium | OpenPaw 项目负责人（用户授权） | 0 | 1 |
