@@ -974,6 +974,12 @@ mod tests {
         let delegations = load_delegations(&state_file, parent_session_id);
         let sequence = delegations.len() as u64;
         let home = tempfile::tempdir().unwrap().keep();
+        let mut meta=openpaw_core::SessionMeta::new(model,provider.name());
+        meta.id=parent_session_id.to_string();
+        let mut writer=openpaw_store::SessionWriter::create(home.join("sessions").join(format!("{parent_session_id}.jsonl"))).unwrap();
+        writer.append(&openpaw_core::SessionEvent::Meta(meta)).unwrap();
+        writer.append(&openpaw_core::SessionEvent::Metadata{title:None,mode:None,model_override:None,cwd:Some(workspace.to_string_lossy().into()),workspace_id:None,workspace_name:None,task_id:None}).unwrap();
+        drop(writer);
         let mut runtime = crate::runtime::AppState::new(crate::protocol::HostConfig {
             home,
             workspace: workspace.clone(),
