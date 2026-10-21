@@ -12,11 +12,38 @@ use std::path::Path;
 /// 权限：授权根与工具仅取自本机配置。
 /// 关联：需求/设计REQ-OP-002、REQ-OP-009；DES-OP-006。
 pub fn run(config: &Path, port: Option<u16>) -> i32 {
+    run_with_env(config, port, None)
+}
+/// 功能：通过共用.env配置启动Host，保留原run入口。
+/// 参数：config为原Host TOML；port为可选端口；env_file为可选显式模型配置。
+/// 返回：正常关闭为零，配置或运行失败为二。
+/// 错误：使用脱敏错误，不打印.env内容或密钥。
+/// 状态：配置只在启动时读取，不修改进程环境。
+/// 并发与取消：复用原Host优雅关闭和实际工具清理。
+/// 权限：模型字段可回退.env；授权根和工具仍只来自TOML。
+/// 关联：需求/设计REQ-OP-003、REQ-OP-009；DES-OP-002、DES-OP-006。
+pub fn run_with_env(config: &Path, port: Option<u16>, env_file: Option<&Path>) -> i32 {
     let result = (|| {
-        let config = openpaw_engine_host::HostConfig::load(config).map_err(|e| e.to_string())?;
+        let settings = openpaw_llm::model_config::ModelEnvironment::load(
+            &openpaw_core::openpaw_home(),
+            env_file,
+        )
+        .map_err(|_| "模型.env读取失败，文件缺失、不可读或格式错误（内容已隐藏）".to_owned())?;
+        let config =
+            openpaw_engine_host::HostConfig::load_with_model_environment(config, &settings)
+                .map_err(|e| e.to_string())?;
+        let (provider, _) = settings
+            .assemble(
+                Some(&config.provider),
+                config.model.as_deref(),
+                config.base_url.as_deref(),
+                config.api_key_env.as_deref(),
+                "echo",
+            )
+            .map_err(|_| "Provider配置不合法或缺少凭据".to_owned())?;
         let rt = tokio::runtime::Runtime::new().map_err(|_| "无法启动异步运行时".to_string())?;
         rt.block_on(async move {
-            let host=openpaw_engine_host::Host::start(config).await.map_err(|e|e.to_string())?;
+            let host=openpaw_engine_host::Host::with_provider(config, provider).await.map_err(|e|e.to_string())?;
             let server=match openpaw_engine_host::HostServer::bind(host.clone(),port.unwrap_or(0)).await {
                 Ok(server)=>server,
                 Err(e)=>{let _=host.shutdown().await;return Err(e.to_string());}

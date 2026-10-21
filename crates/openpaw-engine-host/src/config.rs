@@ -164,12 +164,51 @@ impl HostConfig {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub fn load(path: &Path) -> HostResult<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|_| HostError::new("invalid_input", "无法读取Host配置"))?;
-        let config: Self = toml::from_str(&text)
-            .map_err(|_| HostError::new("invalid_input", "Host配置格式或字段不合法"))?;
+        let (config, _) = Self::read_config(path)?;
         config.validate()?;
         Ok(config)
+    }
+    /// 功能：显式加载Host配置，并以共用模型环境填补未填写的模型字段。
+    /// 参数：path为可信TOML；environment为只读.env与系统环境快照。
+    /// 返回：完成原权限和路径校验的HostConfig，TOML明确值始终优先。
+    /// 错误：读取、格式、路径或权限配置错误；不回显原始文件。
+    /// 状态：不创建目录、不修改进程环境；原load入口语义保持不变。
+    /// 并发与取消：启动时同步只读，无共享可变状态。
+    /// 权限：不从.env接收工作根、工具或办公室授权。
+    /// 关联：需求/设计REQ-OP-003、REQ-OP-009；DES-OP-002、DES-OP-006。
+    pub fn load_with_model_environment(
+        path: &Path,
+        environment: &openpaw_llm::model_config::ModelEnvironment,
+    ) -> HostResult<Self> {
+        let (mut config, explicit_provider) = Self::read_config(path)?;
+        if !explicit_provider {
+            config.provider = environment.provider(None, "echo").to_owned();
+        }
+        if config.model.is_none() {
+            config.model = environment.value("OPENPAW_MODEL").map(str::to_owned);
+        }
+        if config.base_url.is_none() {
+            config.base_url = environment.value("OPENPAW_BASE_URL").map(str::to_owned);
+        }
+        if config.api_key_env.is_none() {
+            config.api_key_env =
+                openpaw_llm::model_config::ModelEnvironment::key_name(&config.provider)
+                    .map(str::to_owned);
+        }
+        config.validate()?;
+        Ok(config)
+    }
+    fn read_config(path: &Path) -> HostResult<(Self, bool)> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|_| HostError::new("invalid_input", "无法读取Host配置"))?;
+        let value: toml::Value = toml::from_str(&text)
+            .map_err(|_| HostError::new("invalid_input", "Host配置格式或字段不合法"))?;
+        // 必须在serde应用echo默认值之前记录是否明确填写，避免默认值覆盖.env。
+        let explicit_provider = value.get("provider").is_some();
+        let config: Self = value
+            .try_into()
+            .map_err(|_| HostError::new("invalid_input", "Host配置格式或字段不合法"))?;
+        Ok((config, explicit_provider))
     }
     /// 功能：校验目录、槽、预算、工具和凭据引用。
     /// 参数：self为待启动配置。

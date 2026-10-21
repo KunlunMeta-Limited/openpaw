@@ -24,3 +24,9 @@ pub use openai::OpenAiProvider;
 /// 禁止职责：不处理Office协议或复制存储。
 pub mod assembly;
 pub use assembly::{assemble_provider, resolve_model};
+
+/// 职责：共享模型配置读取与装配。
+/// 输入输出：只读.env及系统环境到原Provider。
+/// 依赖：复用assembly和dotenvy，不依赖Host。
+/// 禁止职责：不修改进程环境、不回显秘密、不处理Office协议。
+pub mod model_config;

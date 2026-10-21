@@ -2,9 +2,11 @@
 # Windows原生：使用正斜杠路径，例如home = "C:/Users/user/openpaw-data"，root = "C:/Users/user/project"。
 # home与所有工作根互不包含；不能把项目根设成用户整个home或磁盘根。
 home = "/home/user/openpaw-data"
-provider = "echo" # 离线演示；真实模型改为openai或anthropic
+# 明确填写优先于.env。沿用统一.env模型时省略下面provider/model/base_url/api_key_env。
+# 默认.env：OPENPAW_HOME/.env或用户目录/.openpaw/.env；也可用--env-file指定。
+provider = "echo" # 保留原离线演示；希望使用.env时删除或注释这一行
 # model = "gpt-4o"
-# api_key_env = "OPENAI_API_KEY" # 只填环境变量名，不能填密钥
+# api_key_env = "OPENAI_API_KEY" # 只填变量名，值可来自系统环境或.env；省略时按Provider选标准名
 # base_url = "https://api.openai.com/v1"
 max_active_runs = 4
 run_timeout_secs = 1800

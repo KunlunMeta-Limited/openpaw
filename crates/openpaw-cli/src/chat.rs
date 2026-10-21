@@ -22,10 +22,22 @@ const EXIT_WORDS: [&str; 4] = ["exit", "quit", "/exit", "/quit"];
 /// 关联：需求/设计 REQ-OP-003。
 #[derive(Debug, clap::Args)]
 pub struct ChatArgs {
-    /// Offline provider: `mock` (counter replies) or `echo`. Real network
-    /// providers plug into this seam as they land.
-    #[arg(long, default_value = "mock")]
-    pub provider: String,
+    /// 用途：显式Provider；缺省使用统一环境或原mock默认。
+    /// 字段：可选Provider名称。
+    /// 来源去向：CLI到原模型装配。
+    /// 约束：未知或空值拒绝。
+    /// 稳定性：保持原命令兼容。
+    /// 关联：需求/设计REQ-OP-003；DES-OP-002。
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// 用途：选择共用模型配置文件。
+    /// 字段：可选.env路径。
+    /// 来源去向：CLI到ModelEnvironment。
+    /// 约束：只读且不向工具环境注入。
+    /// 稳定性：新增可选字段。
+    /// 关联：需求/设计REQ-OP-003；DES-OP-002。
+    #[arg(long)]
+    pub env_file: Option<PathBuf>,
     /// 用途：显式覆盖Provider默认模型
     /// 字段：可选名称
     /// 来源去向：CLI到共享装配
@@ -65,17 +77,22 @@ pub fn run(args: ChatArgs) -> i32 {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let key_name = match args.provider.as_str() {
-        "anthropic" => Some("ANTHROPIC_API_KEY"),
-        "openai" => Some("OPENAI_API_KEY"),
-        _ => None,
+    let settings = match openpaw_llm::model_config::ModelEnvironment::load(
+        &openpaw_core::openpaw_home(),
+        args.env_file.as_deref(),
+    ) {
+        Ok(settings) => settings,
+        Err(_) => {
+            eprintln!("error: 模型.env读取失败。\nwhy: 文件缺失、不可读或格式错误，内容已隐藏。\nnext: 检查--env-file或OpenPaw数据目录的.env。");
+            return 1;
+        }
     };
-    let key = key_name.and_then(|name| std::env::var(name).ok());
-    let (provider, model) = match openpaw_llm::assemble_provider(
-        &args.provider,
+    let (provider, model) = match settings.assemble(
+        args.provider.as_deref(),
         args.model.as_deref(),
-        key,
         args.base_url.as_deref(),
+        None,
+        "mock",
     ) {
         Ok(assembled) => assembled,
         Err(e) => {

@@ -113,3 +113,9 @@ T4应直接Rust调用上述接口，按Office固定Schema新增自己的DTO/NDJS
 前述各段保留当时状态，当前以此补登为准：#7已合入，head825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52，GitHub mergedAt=2026-10-21T11:16:12Z。用户已确认PR完成；API无独立Review，不编造Approve。0001/0004交付验收保持4263529，合入head另已Linux完整26/26复验；Windows本轮暂缓、未验证，支持和T8目标保留。
 
 下一阶段[0005第4/9/10节](../changes/CHG-2026-0005.md)提供准确文件范围、聊天/业务两通道方案、模型配置和O01—O10产品验收。当前只是提案待审，没有Office聊天代码或新配置段；原/health和Host::submit_run可用，/office/chat仍404。现场Office独立协议验证与Host smoke均有仓库外证据，但不是T4真实对话验收。
+
+## T4前置：统一.env模型配置
+
+CHG-2026-0005 r2仅批准配置子范围，完整Office方案仍待审核。CLI/Host默认读取OPENPAW_HOME/.env或用户目录/.openpaw/.env；复制仓库.env.example，填写DeepSeek密钥后执行openpaw config show和openpaw chat。--env-file可显式选择文件，chat --home仅选数据存储；文件只在启动时读取。
+
+Host命令保持openpaw engine-host --config /absolute/path/host.toml。TOML明确的provider/model/base_url/api_key_env优先；沿用.env请省略这些字段。根、工具和办公室绑定仍只来自TOML，不能用.env覆盖权限。旧load/start嵌入式API保持原行为。本轮不修改Office、不开T4 PR，不把模型配置或独立健康检查算成M4完成。Linux/Windows实测结果见0005验证记录，未运行不能当通过。

@@ -11,7 +11,12 @@ use clap::{Parser, Subcommand};
 
 use crate::{config_cmd, evolve_cmd, goal_cmd, memory_cmd, model_cmd, session_cmd, tool_cmd};
 
-/// openpaw — an open, evolvable personal AI agent.
+/// 用途：OpenPaw命令行入口及全局配置选项。
+/// 字段：子命令、可选.env和feature控制的sidecar参数。
+/// 来源去向：本机参数到原CLI及Host装配。
+/// 约束：显式文件只作用于模型配置相关入口，不修改进程环境。
+/// 稳定性：新增可选参数，既有子命令保留。
+/// 关联：需求/设计REQ-OP-002、REQ-OP-003；DES-OP-002。
 #[derive(Debug, Parser)]
 #[command(
     name = "openpaw",
@@ -20,6 +25,14 @@ use crate::{config_cmd, evolve_cmd, goal_cmd, memory_cmd, model_cmd, session_cmd
     after_help = "Run `openpaw hello` for a zero-config echo conversation, `openpaw chat` for the full agent loop, `openpaw doctor` for environment checks, and `openpaw init` to create the home skeleton."
 )]
 pub struct Cli {
+    /// 用途：显式选择模型.env，覆盖OpenPaw数据目录默认文件。
+    /// 字段：可选本机路径，支持中文、空格和Windows原生路径。
+    /// 来源去向：命令行到共用ModelEnvironment。
+    /// 约束：缺失或错误返回非零；不修改进程环境。
+    /// 稳定性：新增全局可选参数；不影响无关子命令。
+    /// 关联：需求/设计REQ-OP-003；DES-OP-002。
+    #[arg(long, global = true)]
+    pub env_file: Option<PathBuf>,
     /// Subcommand to run; omit it to print help.
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -79,9 +92,9 @@ pub enum Command {
     /// 稳定性：新增可选参数。
     /// 关联：需求REQ-OP-003、REQ-OP-004。
     Chat {
-        /// Offline provider: `mock` (counter replies) or `echo`.
-        #[arg(long, default_value = "mock")]
-        provider: String,
+        /// 模型Provider；显式参数优先，其次.env，无配置默认mock。
+        #[arg(long)]
+        provider: Option<String>,
         /// 用途：覆盖Provider默认模型
         /// 字段：可选模型
         /// 来源去向：CLI到引擎
