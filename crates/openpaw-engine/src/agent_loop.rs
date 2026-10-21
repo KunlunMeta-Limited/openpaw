@@ -307,7 +307,7 @@ impl AgentLoop {
             event_sink,
             CancellationToken::new(),
             (provider, model),
-            (&mut Vec::new(), Vec::new()),
+            (&mut Vec::new(), Vec::new(), None),
         )
         .await
     }
@@ -337,7 +337,7 @@ impl AgentLoop {
             event_sink,
             token,
             (provider, model),
-            (&mut Vec::new(), Vec::new()),
+            (&mut Vec::new(), Vec::new(), None),
         )
         .await
     }
@@ -366,7 +366,7 @@ impl AgentLoop {
             event_sink,
             token,
             provider_and_model,
-            (&mut Vec::new(), Vec::new()),
+            (&mut Vec::new(), Vec::new(), None),
         )
         .await
     }
@@ -397,7 +397,7 @@ impl AgentLoop {
             sink,
             options.cancel,
             selection,
-            (generated, options.attachments),
+            (generated, options.attachments, options.recorder),
         )
         .await
     }
@@ -411,9 +411,14 @@ impl AgentLoop {
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         token: CancellationToken,
         provider_and_model: (Arc<dyn LlmProvider>, String),
-        collection: (&mut Vec<Message>, Vec<openpaw_core::InlineMedia>),
+        collection: (
+            &mut Vec<Message>,
+            Vec<openpaw_core::InlineMedia>,
+            Option<crate::turn_execution::ExecutionRecorder>,
+        ),
     ) -> Result<StopReason> {
-        let (generated, attachments) = collection;
+        let (generated, attachments, recorder) = collection;
+        let mut response_index = 0usize;
         let mut known_media = std::collections::HashMap::<String, openpaw_core::InlineMedia>::new();
         for media in attachments
             .iter()
@@ -463,10 +468,10 @@ impl AgentLoop {
                     .finish_after_iteration_budget(
                         session,
                         system.as_deref(),
-                        &provider,
-                        &model,
+                        (&provider, &model),
                         event_sink,
                         generated,
+                        (recorder.as_ref(), response_index),
                     )
                     .await;
             }
@@ -555,7 +560,15 @@ impl AgentLoop {
             };
 
             // ⑥ 带重试地读取模型流
-            let resp = match self.stream_with_retry(&provider, req, event_sink).await {
+            let resp = match self
+                .stream_with_retry(
+                    &provider,
+                    req,
+                    event_sink,
+                    (recorder.as_ref(), response_index),
+                )
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => {
                     if self.is_cancelled() {
@@ -565,6 +578,12 @@ impl AgentLoop {
                 }
             };
 
+            crate::turn_execution::observe(
+                recorder.as_ref(),
+                response_index,
+                "response",
+                serde_json::json!({"content":resp.content}),
+            )?;
             // ⑦ 累加用量（饱和加法，见 Usage 文档）并更新 token 预算
             let usage = resp.usage;
             session.total_input_tokens = session
@@ -612,6 +631,7 @@ impl AgentLoop {
                     let nudge = Message::user_text(nudge).identified();
                     generated.push(nudge.clone());
                     session.messages.push(nudge);
+                    response_index += 1;
                     continue;
                 }
                 return Ok(resp.stop_reason);
@@ -634,7 +654,10 @@ impl AgentLoop {
                     name: name.clone(),
                 });
             }
-            let results = self.execute_tools(tool_uses, event_sink).await;
+            let results = self
+                .execute_tools(tool_uses, event_sink, (recorder.as_ref(), response_index))
+                .await?;
+            response_index += 1;
             let media: Vec<_> = results
                 .iter()
                 .flat_map(|block| {
@@ -678,11 +701,12 @@ impl AgentLoop {
         &self,
         session: &mut openpaw_core::Session,
         system: Option<&str>,
-        provider: &Arc<dyn LlmProvider>,
-        model: &str,
+        provider_and_model: (&Arc<dyn LlmProvider>, &str),
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         generated: &mut Vec<Message>,
+        recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
     ) -> Result<StopReason> {
+        let (provider, model) = provider_and_model;
         let instruction = "工具调用轮次已达到上限。工具现已禁用。请仅依据已有消息和工具结果给出有效最终答复，遵循用户指定的语言和输出格式，如实说明必要的限制；不得再请求或声称调用任何工具。";
         let final_system = match system {
             Some(value) if !value.trim().is_empty() => format!("{value}\n\n{instruction}"),
@@ -702,7 +726,7 @@ impl AgentLoop {
         let mut buffered_events = Vec::new();
         let mut resp = {
             let mut buffered_sink = |event| buffered_events.push(event);
-            self.stream_with_retry(provider, req.clone(), &mut buffered_sink)
+            self.stream_with_retry(provider, req.clone(), &mut buffered_sink, (None, 0))
                 .await?
         };
         let mut total_usage = resp.usage;
@@ -724,7 +748,7 @@ impl AgentLoop {
             buffered_events.clear();
             resp = {
                 let mut buffered_sink = |event| buffered_events.push(event);
-                self.stream_with_retry(provider, repair_req, &mut buffered_sink)
+                self.stream_with_retry(provider, repair_req, &mut buffered_sink, (None, 0))
                     .await?
             };
             total_usage = add_usage(total_usage, resp.usage);
@@ -743,6 +767,18 @@ impl AgentLoop {
             ));
         }
 
+        crate::turn_execution::observe(
+            recording.0,
+            recording.1,
+            "response_start",
+            serde_json::json!({}),
+        )?;
+        crate::turn_execution::observe(
+            recording.0,
+            recording.1,
+            "response",
+            serde_json::json!({"content":resp.content}),
+        )?;
         for event in buffered_events {
             event_sink(event);
         }
@@ -779,6 +815,7 @@ impl AgentLoop {
         provider: &Arc<dyn LlmProvider>,
         req: CompletionRequest,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
     ) -> Result<openpaw_core::CompletionResponse> {
         let has_media = !openpaw_core::media::message_media(&req.messages).is_empty();
         let mut attempts: u32 = 0;
@@ -925,15 +962,33 @@ impl AgentLoop {
                         }
                         if !message_start_emitted {
                             message_start_emitted = true;
+                            crate::turn_execution::observe(
+                                recording.0,
+                                recording.1,
+                                "response_start",
+                                serde_json::json!({}),
+                            )?;
                             event_sink(AgentEvent::MessageStart);
                         }
                         if !pending_thinking.is_empty() {
+                            crate::turn_execution::observe(
+                                recording.0,
+                                recording.1,
+                                "reasoning",
+                                serde_json::json!({"text":pending_thinking}),
+                            )?;
                             event_sink(AgentEvent::ThinkingDelta {
                                 text: std::mem::take(&mut pending_thinking),
                             });
                         }
                         saw_text_delta = true;
                         emitted_visible_output = true;
+                        crate::turn_execution::observe(
+                            recording.0,
+                            recording.1,
+                            "text",
+                            serde_json::json!({"text":text}),
+                        )?;
                         event_sink(AgentEvent::TextDelta { text });
                     }
                     openpaw_core::StreamEvent::ThinkingDelta { text, .. } => {
@@ -985,9 +1040,21 @@ impl AgentLoop {
                         // 某些 provider 只为非流式响应发送 Final；保持 AgentEvent 契约一致，
                         // 使 Host 适配器能为每个模型响应分配独立消息编号。
                         if !message_start_emitted {
+                            crate::turn_execution::observe(
+                                recording.0,
+                                recording.1,
+                                "response_start",
+                                serde_json::json!({}),
+                            )?;
                             event_sink(AgentEvent::MessageStart);
                         }
                         if !pending_thinking.is_empty() {
+                            crate::turn_execution::observe(
+                                recording.0,
+                                recording.1,
+                                "reasoning",
+                                serde_json::json!({"text":pending_thinking}),
+                            )?;
                             event_sink(AgentEvent::ThinkingDelta {
                                 text: std::mem::take(&mut pending_thinking),
                             });
@@ -997,9 +1064,21 @@ impl AgentLoop {
                         for block in &resp.content {
                             match block {
                                 ContentBlock::Text { text } if !saw_text_delta => {
+                                    crate::turn_execution::observe(
+                                        recording.0,
+                                        recording.1,
+                                        "text",
+                                        serde_json::json!({"text":text}),
+                                    )?;
                                     event_sink(AgentEvent::TextDelta { text: text.clone() });
                                 }
                                 ContentBlock::Thinking { thinking, .. } if !saw_thinking_delta => {
+                                    crate::turn_execution::observe(
+                                        recording.0,
+                                        recording.1,
+                                        "reasoning",
+                                        serde_json::json!({"text":thinking}),
+                                    )?;
                                     event_sink(AgentEvent::ThinkingDelta {
                                         text: thinking.clone(),
                                     });
@@ -1042,14 +1121,17 @@ impl AgentLoop {
         &self,
         tool_uses: Vec<ToolUseCall>,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Vec<ContentBlock> {
+        recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+    ) -> Result<Vec<ContentBlock>> {
         if tool_uses.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if self.parallel_tools && tool_uses.len() > 1 {
-            self.execute_tools_phased(tool_uses, event_sink).await
+            self.execute_tools_phased(tool_uses, event_sink, recording)
+                .await
         } else {
-            self.execute_tools_sequential(tool_uses, event_sink).await
+            self.execute_tools_sequential(tool_uses, event_sink, recording)
+                .await
         }
     }
 
@@ -1065,7 +1147,8 @@ impl AgentLoop {
         &self,
         tool_uses: Vec<ToolUseCall>,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Vec<ContentBlock> {
+        recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+    ) -> Result<Vec<ContentBlock>> {
         let ctx = self.check_context();
         let cancel = self.current_cancel_token();
 
@@ -1084,12 +1167,14 @@ impl AgentLoop {
                 PreparedToolInput::Classified { input, decision } => (input, decision),
                 PreparedToolInput::Rejected(outcome) => {
                     denied.push(tool_result_block(&id, &name, &outcome));
+                    record_tool_result(recording, &id, &name, &outcome, None, false, false)?;
                     event_sink(tool_result_event(&id, &name, &outcome, None));
                     continue;
                 }
                 PreparedToolInput::Cancelled => {
                     let outcome = ToolCallOutcome::error("cancelled by user");
                     denied.push(tool_result_block(&id, &name, &outcome));
+                    record_tool_result(recording, &id, &name, &outcome, None, false, true)?;
                     event_sink(tool_result_event(&id, &name, &outcome, None));
                     continue;
                 }
@@ -1104,6 +1189,7 @@ impl AgentLoop {
                         },
                     });
                     let outcome = ToolCallOutcome::error(format!("blocked by guardrail: {reason}"));
+                    record_tool_result(recording, &id, &name, &outcome, None, false, false)?;
                     event_sink(tool_result_event(&id, &name, &outcome, None));
                     denied.push(tool_result_block(&id, &name, &outcome));
                 }
@@ -1139,6 +1225,12 @@ impl AgentLoop {
             let mut tasks = tokio::task::JoinSet::new();
             let mut metadata = Vec::with_capacity(safe.len());
             for (index, (id, name, input)) in safe.into_iter().enumerate() {
+                crate::turn_execution::observe(
+                    recording.0,
+                    recording.1,
+                    "tool_start",
+                    serde_json::json!({"call_id":id,"name":name,"input":input,"authorization":"approved"}),
+                )?;
                 event_sink(AgentEvent::ToolExecutionStart {
                     tool_use_id: id.clone(),
                     name: name.clone(),
@@ -1151,6 +1243,7 @@ impl AgentLoop {
                 let hooks = hook_chain.clone();
                 let cancel = cancel.clone();
                 tasks.spawn(async move {
+                    let mut interrupted = false;
                     let outcome = std::panic::AssertUnwindSafe(execute_prepared_cancelled(
                         hooks.as_deref(),
                         &*host,
@@ -1158,14 +1251,18 @@ impl AgentLoop {
                         input,
                         &ctx,
                         &cancel,
+                        &mut interrupted,
                     ))
                     .catch_unwind()
                     .await
-                    .unwrap_or_else(|_| ToolCallOutcome::error("tool task panicked"));
-                    (index, outcome)
+                    .unwrap_or_else(|_| {
+                        interrupted = true;
+                        ToolCallOutcome::error("tool task panicked")
+                    });
+                    (index, outcome, interrupted)
                 });
             }
-            let mut completed: Vec<Option<ToolCallOutcome>> =
+            let mut completed: Vec<Option<(ToolCallOutcome, bool)>> =
                 (0..metadata.len()).map(|_| None).collect();
             let mut cancelled = false;
             while !tasks.is_empty() {
@@ -1180,23 +1277,37 @@ impl AgentLoop {
                         let Some(joined) = joined else {
                             break;
                         };
-                        if let Ok((index, outcome)) = joined {
-                            completed[index] = Some(outcome);
+                        if let Ok((index, outcome, interrupted)) = joined {
+                            let (id, name, started) = &metadata[index];
+                            record_tool_result(recording, id, name, &outcome, Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)), true, interrupted)?;
+                            completed[index] = Some((outcome, interrupted));
                         }
                     }
                 }
             }
             drop(tasks);
             for (index, (id, name, started)) in metadata.into_iter().enumerate() {
-                let outcome = completed[index].take().unwrap_or_else(|| {
+                let has_result = completed[index].is_some();
+                let (outcome, interrupted) = completed[index].take().unwrap_or_else(|| {
                     if cancelled {
-                        ToolCallOutcome::error("cancelled by user")
+                        (ToolCallOutcome::error("cancelled by user"), true)
                     } else {
-                        ToolCallOutcome::error("tool task failed")
+                        (ToolCallOutcome::error("tool task failed"), true)
                     }
                 });
                 let duration_ms =
                     Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+                if !has_result {
+                    record_tool_result(
+                        recording,
+                        &id,
+                        &name,
+                        &outcome,
+                        duration_ms,
+                        true,
+                        interrupted,
+                    )?;
+                }
                 event_sink(AgentEvent::ToolResult {
                     media: outcome.media.clone(),
                     tool_use_id: id.clone(),
@@ -1219,6 +1330,8 @@ impl AgentLoop {
         // ── 阶段 3：在审批门后串行执行确认调用 ─────────────────────────
         for (id, name, input, reason) in confirm {
             let started = Instant::now();
+            let mut authorized = false;
+            let mut interrupted = false;
             let response = cancel_or(
                 &cancel,
                 self.approval
@@ -1226,8 +1339,18 @@ impl AgentLoop {
             )
             .await;
             let outcome = match response {
-                None => ToolCallOutcome::error("cancelled by user"),
+                None => {
+                    interrupted = true;
+                    ToolCallOutcome::error("cancelled by user")
+                }
                 Some(openpaw_core::ApprovalResponse::Approved) => {
+                    crate::turn_execution::observe(
+                        recording.0,
+                        recording.1,
+                        "tool_start",
+                        serde_json::json!({"call_id":id,"name":name,"input":input,"authorization":"approved"}),
+                    )?;
+                    authorized = true;
                     event_sink(AgentEvent::ToolExecutionStart {
                         tool_use_id: id.clone(),
                         name: name.clone(),
@@ -1240,6 +1363,7 @@ impl AgentLoop {
                         input,
                         &ctx,
                         &cancel,
+                        &mut interrupted,
                     )
                     .await
                 }
@@ -1249,6 +1373,15 @@ impl AgentLoop {
             };
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            record_tool_result(
+                recording,
+                &id,
+                &name,
+                &outcome,
+                duration_ms,
+                authorized,
+                interrupted,
+            )?;
             event_sink(AgentEvent::ToolResult {
                 media: outcome.media.clone(),
                 tool_use_id: id.clone(),
@@ -1267,7 +1400,7 @@ impl AgentLoop {
             });
         }
 
-        results
+        Ok(results)
     }
 
     /// Serial path: validate → classify → approve → call, one tool at a
@@ -1276,13 +1409,16 @@ impl AgentLoop {
         &self,
         tool_uses: Vec<ToolUseCall>,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
-    ) -> Vec<ContentBlock> {
+        recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+    ) -> Result<Vec<ContentBlock>> {
         let ctx = self.check_context();
         let cancel = self.current_cancel_token();
         let mut results = Vec::with_capacity(tool_uses.len());
 
         for (id, name, input) in tool_uses {
             let started = Instant::now();
+            let mut authorized = false;
+            let mut interrupted = false;
             event_sink(AgentEvent::ClassifierStatus {
                 tool_use_id: id.clone(),
                 status: ClassifierStatus::Checking,
@@ -1291,12 +1427,14 @@ impl AgentLoop {
             let (input, decision) = match prepared {
                 PreparedToolInput::Classified { input, decision } => (input, decision),
                 PreparedToolInput::Rejected(outcome) => {
+                    record_tool_result(recording, &id, &name, &outcome, None, false, false)?;
                     event_sink(tool_result_event(&id, &name, &outcome, None));
                     results.push(tool_result_block(&id, &name, &outcome));
                     continue;
                 }
                 PreparedToolInput::Cancelled => {
                     let outcome = ToolCallOutcome::error("cancelled by user");
+                    record_tool_result(recording, &id, &name, &outcome, None, false, true)?;
                     event_sink(tool_result_event(&id, &name, &outcome, None));
                     results.push(tool_result_block(&id, &name, &outcome));
                     continue;
@@ -1330,8 +1468,18 @@ impl AgentLoop {
                     )
                     .await;
                     match response {
-                        None => ToolCallOutcome::error("cancelled by user"),
+                        None => {
+                            interrupted = true;
+                            ToolCallOutcome::error("cancelled by user")
+                        }
                         Some(openpaw_core::ApprovalResponse::Approved) => {
+                            crate::turn_execution::observe(
+                                recording.0,
+                                recording.1,
+                                "tool_start",
+                                serde_json::json!({"call_id":id,"name":name,"input":input,"authorization":"approved"}),
+                            )?;
+                            authorized = true;
                             event_sink(AgentEvent::ToolExecutionStart {
                                 tool_use_id: id.clone(),
                                 name: name.clone(),
@@ -1344,6 +1492,7 @@ impl AgentLoop {
                                 input,
                                 &ctx,
                                 &cancel,
+                                &mut interrupted,
                             )
                             .await
                         }
@@ -1359,6 +1508,13 @@ impl AgentLoop {
                             reason: "guardrail allowed".into(),
                         },
                     });
+                    crate::turn_execution::observe(
+                        recording.0,
+                        recording.1,
+                        "tool_start",
+                        serde_json::json!({"call_id":id,"name":name,"input":input,"authorization":"approved"}),
+                    )?;
+                    authorized = true;
                     event_sink(AgentEvent::ToolExecutionStart {
                         tool_use_id: id.clone(),
                         name: name.clone(),
@@ -1371,6 +1527,7 @@ impl AgentLoop {
                         input,
                         &ctx,
                         &cancel,
+                        &mut interrupted,
                     )
                     .await
                 }
@@ -1378,6 +1535,15 @@ impl AgentLoop {
 
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            record_tool_result(
+                recording,
+                &id,
+                &name,
+                &outcome,
+                duration_ms,
+                authorized,
+                interrupted,
+            )?;
             event_sink(AgentEvent::ToolResult {
                 media: outcome.media.clone(),
                 tool_use_id: id.clone(),
@@ -1396,7 +1562,7 @@ impl AgentLoop {
             });
         }
 
-        results
+        Ok(results)
     }
 
     async fn prepare_tool_input(
@@ -1477,6 +1643,36 @@ where
     }
 }
 
+fn record_tool_result(
+    recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+    id: &str,
+    name: &str,
+    outcome: &ToolCallOutcome,
+    duration_ms: Option<u64>,
+    started: bool,
+    interrupted: bool,
+) -> Result<()> {
+    let disposition = if interrupted {
+        if started {
+            "unknown"
+        } else {
+            "cancelled"
+        }
+    } else if !started {
+        "denied"
+    } else if outcome.is_error {
+        "error"
+    } else {
+        "completed"
+    };
+    crate::turn_execution::observe(
+        recording.0,
+        recording.1,
+        "tool_result",
+        serde_json::json!({"call_id":id,"name":name,"outcome":outcome,"duration_ms":duration_ms,"disposition":disposition}),
+    )
+}
+
 fn tool_result_event(
     id: &str,
     name: &str,
@@ -1535,10 +1731,11 @@ async fn execute_prepared_cancelled(
     input: serde_json::Value,
     ctx: &CheckContext,
     cancel: &CancellationToken,
+    interrupted: &mut bool,
 ) -> ToolCallOutcome {
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => ToolCallOutcome::error("cancelled by user"),
+        _ = cancel.cancelled() => { *interrupted = true; ToolCallOutcome::error("cancelled by user") },
         outcome = execute_prepared(hooks, host, name, input, ctx) => outcome,
     }
 }

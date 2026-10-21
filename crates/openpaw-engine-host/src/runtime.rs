@@ -142,6 +142,8 @@ pub struct SessionHandle {
     /// 功能：保存与完整消息同步发布的中立展示注解。
     message_presentations: std::sync::RwLock<HashMap<String, MessagePresentationV1>>,
     pub writer: std::sync::Mutex<Option<SessionWriter>>,
+    execution_attempts:
+        std::sync::RwLock<Vec<openpaw_store::execution_attempts::ExecutionAttemptV1>>,
     session_path: PathBuf,
     pub agent: AgentLoop,
     pub approvals: Arc<HostApprovalManager>,
@@ -454,14 +456,24 @@ impl SessionHandle {
             .message_presentations
             .read()
             .unwrap_or_else(|error| error.into_inner());
-        message_projection::messages_wire(
+        let mut wire = message_projection::messages_wire(
             &self.id,
             self.created_at,
             &outcomes,
             &messages,
             &errors,
             &presentations,
-        )
+        );
+        message_projection::merge_execution_attempts(
+            &self.id,
+            &outcomes,
+            &self
+                .execution_attempts
+                .read()
+                .unwrap_or_else(|e| e.into_inner()),
+            &mut wire,
+        );
+        wire
     }
     /// 功能：设置当前回合状态并追加 `turn_outcome` 未知事件。
     /// 并发与取消：同 session 单回合保证状态转换串行；writer 锁保护追加。
@@ -586,6 +598,7 @@ struct SessionHandleInit {
     messages: Vec<openpaw_core::Message>,
     message_presentations: HashMap<String, MessagePresentationV1>,
     writer: SessionWriter,
+    execution_attempts: Vec<openpaw_store::execution_attempts::ExecutionAttemptV1>,
     session_path: PathBuf,
     agent: AgentLoop,
     approvals: Arc<HostApprovalManager>,
@@ -1270,6 +1283,7 @@ impl AppState {
             .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
         let projection = restored_session_projection(id, &read.events)?;
+        let execution_attempts = projection.execution_attempts;
         let message_presentations = projection.message_presentations;
         let messages = projection.messages;
         let mut turn_outcomes = projection.turn_outcomes;
@@ -1329,6 +1343,7 @@ impl AppState {
             messages: published_messages,
             message_presentations,
             writer,
+            execution_attempts,
             session_path: path,
             agent,
             approvals,
@@ -1515,6 +1530,7 @@ impl AppState {
             messages: Vec::new(),
             message_presentations: HashMap::new(),
             writer,
+            execution_attempts: Vec::new(),
             session_path: path,
             agent,
             approvals,
@@ -1541,6 +1557,7 @@ impl AppState {
             messages,
             message_presentations,
             writer,
+            execution_attempts,
             session_path,
             agent,
             approvals,
@@ -1566,6 +1583,7 @@ impl AppState {
             message_cache: std::sync::RwLock::new(messages),
             message_presentations: std::sync::RwLock::new(message_presentations),
             writer: std::sync::Mutex::new(Some(writer)),
+            execution_attempts: std::sync::RwLock::new(execution_attempts),
             session_path,
             agent,
             approvals,
@@ -1868,6 +1886,7 @@ impl AppState {
                 messages,
                 message_presentations,
                 writer,
+                execution_attempts: Vec::new(),
                 session_path: final_path,
                 agent,
                 approvals,
@@ -2493,6 +2512,14 @@ fn terminal_outcome(
     }
 }
 fn classify_turn_error(error: &openpaw_core::Error) -> TurnError {
+    if matches!(error, openpaw_core::Error::Session(message) if message.starts_with("execution record "))
+    {
+        return turn_error(
+            "persistence_failed",
+            "本轮执行记录保存失败，已停止后续执行。",
+            false,
+        );
+    }
     match error {
         openpaw_core::Error::RateLimited { .. } => turn_error(
             "provider_rate_limited",
@@ -3246,12 +3273,35 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                         | openpaw_engine::AgentEvent::CompactionPerformed { .. }
                         | openpaw_engine::AgentEvent::TurnUsage { .. }
                 ) {
-                    if let Some(wire_event) = events::to_wire_for_turn_response(
+                    if let Some(mut wire_event) = events::to_wire_for_turn_response(
                         &handle.id,
                         Some(&turn_id),
                         active_response_index,
                         &event,
                     ) {
+                        if let openpaw_engine::AgentEvent::ToolResult { tool_use_id, .. } = &event {
+                            if let Some(part) = handle
+                                .wire_messages()
+                                .iter()
+                                .filter(|m| {
+                                    m["info"]["id"]
+                                        == format!(
+                                            "msg_{}_{}_assistant{}",
+                                            handle.id,
+                                            turn_id,
+                                            if active_response_index == 0 {
+                                                String::new()
+                                            } else {
+                                                format!("_{active_response_index}")
+                                            }
+                                        )
+                                })
+                                .flat_map(|m| m["parts"].as_array().into_iter().flatten())
+                                .find(|p| p["callID"] == *tool_use_id)
+                            {
+                                wire_event.properties["part"]["state"] = part["state"].clone();
+                            }
+                        }
                         handle.emit(wire_event);
                     }
                     if let openpaw_engine::AgentEvent::ToolResult {
@@ -3283,6 +3333,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     provider_and_model: Some((provider, model)),
                     attachments,
                     system: system_prompt,
+                    recorder: Some(execution_recorder(handle.clone(), turn_id.clone())),
                 },
             )
             .await;
@@ -3438,17 +3489,30 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         if terminal.state == TurnState::Completed {
             snapshot.extend(generated);
         }
+        let terminal_state = terminal.state;
         let committed = matches!(terminal.state, TurnState::Completed | TurnState::Cancelled);
         handle.publish_terminal_snapshot(snapshot.clone(), terminal, failure);
         if committed {
             let mut completed: Vec<_> = completed_responses.into_iter().collect();
             completed.sort_unstable();
             for response in completed {
-                handle.emit(events::assistant_completed_for_turn_response(
+                let mut completion = events::assistant_completed_for_turn_response(
                     &handle.id,
                     Some(&turn_id),
                     response,
-                ));
+                );
+                if terminal_state == TurnState::Cancelled {
+                    // 保留旧消费者的流关闭标记，同时明确说明这不是成功答复。
+                    completion.properties["info"]["execution"] =
+                        serde_json::json!({"turnID":turn_id,"state":"cancelled","incomplete":true});
+                    completion.properties["info"]["error"] =
+                        serde_json::json!(message_projection::classified_error(&turn_error(
+                            "cancelled",
+                            "本轮已取消，已保存的执行事实仍可查看。",
+                            false
+                        )));
+                }
+                handle.emit(completion);
             }
         }
         finish_turn_projection(&handle);
@@ -3545,6 +3609,39 @@ fn append_event(handle: &SessionHandle, event: &SessionEvent) -> Result<(), Stri
         .lock()
         .map_err(|_| "会话写入器锁状态异常".to_string())?;
     journal::append(&mut writer, event)
+}
+
+fn execution_recorder(
+    handle: Arc<SessionHandle>,
+    turn_id: String,
+) -> turn_execution::ExecutionRecorder {
+    Arc::new(move |observation| {
+        let mut records = handle
+            .execution_attempts
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let sequence = records
+            .iter()
+            .rev()
+            .find(|r| r.turn_id == turn_id)
+            .map_or(1, |r| r.sequence + 1);
+        let record = openpaw_store::execution_attempts::ExecutionAttemptV1 {
+            turn_id: turn_id.clone(),
+            sequence,
+            response_index: observation.response_index,
+            occurred_at: chrono::Utc::now().timestamp_millis(),
+            kind: observation.kind,
+            payload: observation.payload,
+        };
+        let event = openpaw_store::transcript::encode(&record, "execution_attempt_v1");
+        // 先验证、再使用原独占 writer 提交。提交失败绝不发布此事实。
+        openpaw_store::execution_attempts::validate(&records, &record)
+            .map_err(|_| openpaw_core::Error::session("execution record validation failed"))?;
+        append_event(&handle, &event)
+            .map_err(|_| openpaw_core::Error::session("execution record persistence failed"))?;
+        records.push(record);
+        Ok(())
+    })
 }
 
 /// 功能：将 main 的会话所属人员及子执行事实写入原 Session 日志。

@@ -126,6 +126,9 @@ pub fn run(args: ChatArgs) -> i32 {
         return 1;
     }
 
+    let writer = Arc::new(Mutex::new(writer));
+    let mut turn_number = 0u64;
+
     // SQLite 仅缓存可见消息并支持全文搜索；list/show 直接读取共享 JSONL 目录。
     // 索引失败只警告，不能终止聊天或建议删除包含审计数据的整个数据库。
     let db_path = home.join("index.db");
@@ -202,7 +205,10 @@ pub fn run(args: ChatArgs) -> i32 {
         // The transcript is the durable conversation record: a failed append
         // means the session on disk no longer matches this run, so the
         // command must fail loudly instead of returning 0.
-        if let Err(error) = journal::append(&mut writer, &SessionEvent::Message(user_msg.clone())) {
+        if let Err(error) = journal::append(
+            &mut writer.lock().unwrap_or_else(|e| e.into_inner()),
+            &SessionEvent::Message(user_msg.clone()),
+        ) {
             return report_persistence_error("persist the user message", &transcript_path, &error);
         }
         original_history.push(user_msg.clone());
@@ -214,10 +220,35 @@ pub fn run(args: ChatArgs) -> i32 {
             sink_log.lock().unwrap_or_else(|e| e.into_inner()).push(ev);
         };
 
+        turn_number += 1;
+        let recorder_writer = writer.clone();
+        let turn_id = format!("turn_{turn_number}");
+        let sequence = std::sync::atomic::AtomicU64::new(0);
+        let recorder: turn_execution::ExecutionRecorder = Arc::new(move |observation| {
+            let record = openpaw_store::execution_attempts::ExecutionAttemptV1 {
+                turn_id: turn_id.clone(),
+                sequence: sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                response_index: observation.response_index,
+                occurred_at: i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                )
+                .unwrap_or(i64::MAX),
+                kind: observation.kind,
+                payload: observation.payload,
+            };
+            journal::append(
+                &mut recorder_writer.lock().unwrap_or_else(|e| e.into_inner()),
+                &openpaw_store::transcript::encode(&record, "execution_attempt_v1"),
+            )
+            .map_err(|_| openpaw_core::Error::session("execution record persistence failed"))
+        });
         approvals.begin_turn();
         let execution = rt.block_on(async {
             let attachments = openpaw_store::media::attachment_snapshot(&original_history).into_values().collect();
-            let turn = turn_execution::run_turn(&agent, &mut session, &specs, &mut sink, TurnOptions { attachments, ..Default::default() });
+            let turn = turn_execution::run_turn(&agent, &mut session, &specs, &mut sink, TurnOptions { attachments, recorder:Some(recorder), ..Default::default() });
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -247,23 +278,11 @@ pub fn run(args: ChatArgs) -> i32 {
 
         // 原始输入已提交；产出可以包含 User 角色的工具结果，必须完整保存。
         let events = log.lock().unwrap_or_else(|e| e.into_inner());
-        let completions: Vec<_> = events
-            .iter()
-            .filter_map(|event| {
-                if let AgentEvent::ToolResult { name, is_error, .. } = event {
-                    Some(SessionEvent::ToolCallComplete {
-                        call_id: String::new(),
-                        tool_name: name.clone().unwrap_or_default(),
-                        success: !*is_error,
-                        duration_ms: None,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let persisted =
-            journal::append_messages(&mut writer, &execution.generated_messages, &completions);
+        let persisted = journal::append_messages(
+            &mut writer.lock().unwrap_or_else(|e| e.into_inner()),
+            &execution.generated_messages,
+            &[],
+        );
         if let Err(error) = persisted {
             checkpoint.restore(&mut session);
             return report_persistence_error(

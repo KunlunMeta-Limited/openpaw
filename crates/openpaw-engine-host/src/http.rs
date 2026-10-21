@@ -1646,6 +1646,7 @@ mod tests {
         servers: Vec<tokio::task::JoinHandle<()>>,
         env: Vec<(&'static str, Option<std::ffi::OsString>)>,
         release_model: Arc<tokio::sync::Notify>,
+        ui_actions: Arc<tokio::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
     }
     impl Drop for MainFixture {
         fn drop(&mut self) {
@@ -1662,6 +1663,64 @@ mod tests {
         }
     }
     impl MainFixture {
+        async fn child_employee(&self) -> serde_json::Value {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(employee) = self.seen.lock().await.iter().rev().find_map(|item| {
+                        item["snapshot"]["employees"]
+                            .as_array()
+                            .and_then(|items| items.get(1))
+                            .cloned()
+                    }) {
+                        return employee;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("真实子员工投影已到达 gateway")
+        }
+
+        async fn ui(&self, action: serde_json::Value) -> serde_json::Value {
+            let id = action["id"].as_str().unwrap().to_string();
+            self.ui_actions.lock().await.push_back(action);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(response) = self
+                        .seen
+                        .lock()
+                        .await
+                        .iter()
+                        .find(|message| {
+                            message["type"] == "ui.respond" && message["interactionId"] == id
+                        })
+                        .cloned()
+                    {
+                        return response["presentation"]["content"].clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("现有 UI 桥未回复当前请求 {id}"))
+        }
+
+        async fn button(
+            &self,
+            current: &str,
+            id: &str,
+            content: &serde_json::Value,
+            label: &str,
+        ) -> serde_json::Value {
+            let option = content["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|option| option["label"] == label)
+                .unwrap();
+            self.ui(serde_json::json!({"id":id,"teamId":self.team,"action":"dialog.action","interactionId":current,"optionId":option["id"]})).await
+        }
+
         fn chat(&self, text: &str) -> Request<Body> {
             Request::builder().method("POST").uri("/api/chat").header("content-type","application/json")
                 .body(Body::from(serde_json::json!({"version":"1.0","teamId":self.team,"conversationId":"fixture",
@@ -1675,8 +1734,11 @@ mod tests {
         let models = model_seen.clone();
         let release_model = Arc::new(tokio::sync::Notify::new());
         let model_gate = release_model.clone();
+        let ui_actions = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
+        let gateway_actions = ui_actions.clone();
         let server = Router::new().route("/api/pawoffice/messages",post(move |headers:HeaderMap,Json(body):Json<serde_json::Value>| {
             let seen = gateway_seen.clone();
+            let actions = gateway_actions.clone();
             async move {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
@@ -1694,6 +1756,9 @@ mod tests {
                     Some("ui.next") => {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         let seen = seen.lock().await;
+                        if let Some(action) = actions.lock().await.pop_front() {
+                            return Json(serde_json::json!({"code":200,"msg":"OK","data":{"actions":[action]}}));
+                        }
                         let employee = seen.iter().rev().find_map(|message| {
                             message["snapshot"]["employees"].as_array().and_then(|employees|employees.get(1)).map(|employee|(message["teamId"].clone(),employee["id"].clone()))
                         });
@@ -1753,6 +1818,9 @@ mod tests {
                     } else {serde_json::json!({"choices":[{"delta":{"content":if parent {"parent integrated"} else {"child handled decisions"}},"finish_reason":"stop"}]})};
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
+                if scenario == "delegate-child-fail" && !parent && tools > 0 {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
                 if scenario == "delegate-resume" {
                     let task = messages[latest]["content"].as_str().unwrap_or("");
                     let call = if parent && tools == 0 {
@@ -1781,7 +1849,7 @@ mod tests {
                 } else { None };
                 let chunk = if let Some((name,args)) = call {
                     serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call-{tools}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
-                } else { serde_json::json!({"choices":[{"delta":{"content":if scenario == "emoji" {"😀".repeat(20_000)}else if parent {"parent integrated".into()}else{"tool results integrated".into()}},"finish_reason":"stop"}]}) };
+                } else { serde_json::json!({"choices":[{"delta":{"content":if scenario == "emoji" {"😀".repeat(20_000)}else if parent {"parent integrated".into()}else if scenario == "delegate-details" {format!("子结果开始|{}|子结果结束","🙂任务".repeat(12_000))}else{"tool results integrated".into()}},"finish_reason":"stop"}]}) };
                 ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response()
             }
         }));
@@ -1861,6 +1929,7 @@ mod tests {
             servers,
             env,
             release_model,
+            ui_actions,
         }
     }
 
@@ -3143,10 +3212,18 @@ Path('exclusive').rmdir()
         assert_eq!(overview["interactionId"], "inspect-real-child");
         assert_eq!(overview["presentation"]["content"]["template"], "detail-v1");
         assert!(overview.to_string().contains("只读"));
-        assert!(overview["presentation"]["content"]["actions"]
+        let labels = overview["presentation"]["content"]["actions"]
             .as_array()
             .unwrap()
-            .is_empty());
+            .iter()
+            .map(|action| action["label"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        for expected in ["任务", "消息", "工具", "状态", "刷新"] {
+            assert!(
+                labels.contains(&expected),
+                "员工详情缺少只读视图：{expected}"
+            );
+        }
         let fields = overview["presentation"]["content"]["fields"]
             .as_array()
             .unwrap();
@@ -3161,6 +3238,344 @@ Path('exclusive').rmdir()
             fixture.model_seen.lock().await.len(),
             4,
             "只读查看不得调用模型或工具"
+        );
+    }
+
+    #[tokio::test]
+    async fn employee_details_keep_failed_child_tool_facts_without_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-child-fail", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派读取文件，失败时保留真实过程"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let child = fixture.child_employee().await;
+        let models = fixture.model_seen.lock().await.len();
+        assert_eq!(models, 4, "子模型读完文件后失败，父模型接收失败汇总");
+        let overview = fixture.ui(serde_json::json!({"id":"failed-open","teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        let session = overview["fields"][0]["value"].as_str().unwrap();
+        let tools = fixture
+            .button("failed-open", "failed-tools", &overview, "工具")
+            .await;
+        assert_eq!(tools["fields"][0]["value"], session);
+        let text = tools["fields"].to_string();
+        for expected in [
+            "callID=call-0",
+            "read_file",
+            "README.md",
+            "actual tool content",
+            "completed",
+        ] {
+            assert!(
+                text.contains(expected),
+                "员工详情缺少已发生事实：{expected}"
+            );
+        }
+        assert_eq!(
+            text.matches("callID=call-0").count(),
+            1,
+            "真实调用只展示一次"
+        );
+        let status = fixture
+            .button("failed-tools", "failed-status", &tools, "状态")
+            .await;
+        assert!(
+            status["fields"].to_string().contains("failed"),
+            "不能把已完成工具当作成功回合"
+        );
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            models,
+            "只读查看不产生模型或工具调用"
+        );
+        eprintln!(
+            "T06 employee evidence: {}",
+            serde_json::json!({"employeeID":child["id"],"sessionID":session,"tool":"read_file","callID":"call-0","turnState":"failed","toolDisposition":"completed","readonlyModelRequests":0})
+        );
+    }
+
+    #[tokio::test]
+    async fn employee_task_view_keeps_delegation_result_and_turn_identity() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派真实子任务"))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let child = fixture.child_employee().await;
+        let content = fixture.ui(serde_json::json!({"id":"task-details","teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        let text = content["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|field| field["value"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("读取 README.md 并汇报"));
+        assert!(text.contains("turnID"));
+        assert!(
+            text.contains("tool results integrated"),
+            "任务详情必须包含这次实际委派结果"
+        );
+    }
+
+    #[tokio::test]
+    async fn employee_details_page_complete_frozen_history_and_refresh_without_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-details", "confirm").await;
+        let long_tool = format!("工具原文开始|{}|工具原文结束", "段落🙂".repeat(12_000));
+        std::fs::write(fixture.workspace.path().join("README.md"), &long_tool).unwrap();
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派读取长文并汇报"))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let child = fixture.child_employee().await;
+        let mut page = fixture.ui(serde_json::json!({"id":"long-open","teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        page = fixture
+            .button("long-open", "long-messages", &page, "消息")
+            .await;
+        let session = page["fields"][0]["value"].as_str().unwrap().to_string();
+        let mut current = "long-messages".to_string();
+        let initial_snapshot = page["description"]
+            .as_str()
+            .unwrap()
+            .split(" · 第")
+            .next()
+            .unwrap()
+            .to_string();
+        let first_fields = page["fields"].clone();
+        let second = fixture
+            .button(&current, "long-peek-next", &page, "下一页")
+            .await;
+        page = fixture
+            .button("long-peek-next", "long-return-first", &second, "上一页")
+            .await;
+        current = "long-return-first".into();
+        assert_eq!(page["fields"], first_fields, "上一页还原相同冻结内容");
+        // 使用公开会话入口追加新回合，验证已打开快照的后续页仍是原来的历史边界。
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/session/{session}/message"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"parts":[{"type":"text","text":"LATER-ONLY-MARKER"}]})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 500_000).await.unwrap();
+        let model_count = fixture.model_seen.lock().await.len();
+        let mut reconstructed = String::new();
+        for number in 0..20 {
+            assert!(page["fields"].as_array().unwrap().len() <= 30);
+            assert!(page["actions"].as_array().unwrap().len() <= 8);
+            assert!(page["description"]
+                .as_str()
+                .unwrap()
+                .starts_with(&initial_snapshot));
+            for field in page["fields"].as_array().unwrap().iter().skip(3) {
+                let value = field["value"].as_str().unwrap();
+                assert!(value.encode_utf16().count() <= 2000);
+                reconstructed.push_str(value);
+            }
+            if !page["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["label"] == "下一页")
+            {
+                break;
+            }
+            let next = format!("long-next-{number}");
+            page = fixture.button(&current, &next, &page, "下一页").await;
+            current = next;
+        }
+        let long_answer = format!("子结果开始|{}|子结果结束", "🙂任务".repeat(12_000));
+        assert_eq!(
+            reconstructed.matches(&long_answer).count(),
+            1,
+            "完整长消息仅出现一次，无漏页或重复"
+        );
+        assert!(!reconstructed.contains("LATER-ONLY-MARKER"));
+        let mut refreshed = fixture
+            .button(&current, "long-refresh", &page, "刷新")
+            .await;
+        assert!(refreshed["description"].as_str().unwrap().contains("第 1/"));
+        current = "long-refresh".into();
+        let mut fresh_text = String::new();
+        for number in 0..30 {
+            for field in refreshed["fields"].as_array().unwrap().iter().skip(3) {
+                fresh_text.push_str(field["value"].as_str().unwrap());
+            }
+            if !refreshed["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["label"] == "下一页")
+            {
+                break;
+            }
+            let next = format!("fresh-next-{number}");
+            refreshed = fixture.button(&current, &next, &refreshed, "下一页").await;
+            current = next;
+        }
+        assert_eq!(
+            fresh_text.matches("LATER-ONLY-MARKER").count(),
+            1,
+            "手动刷新必须看到真实新增记录"
+        );
+        let mut tools = fixture
+            .button(&current, "long-tools", &refreshed, "工具")
+            .await;
+        let mut tool_text = String::new();
+        current = "long-tools".into();
+        for number in 0..30 {
+            for field in tools["fields"].as_array().unwrap().iter().skip(3) {
+                tool_text.push_str(field["value"].as_str().unwrap());
+            }
+            if !tools["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["label"] == "下一页")
+            {
+                break;
+            }
+            let next = format!("tool-next-{number}");
+            tools = fixture.button(&current, &next, &tools, "下一页").await;
+            current = next;
+        }
+        assert!(tool_text.contains(&long_tool), "工具结果不被字段上限截断");
+        assert!(
+            tool_text.contains("callID=call-0")
+                && tool_text.contains("read_file")
+                && tool_text.contains("completed")
+        );
+        assert!(tool_text.contains("输入：") && tool_text.contains("README.md"));
+        let status = fixture
+            .button(&current, "long-status", &tools, "状态")
+            .await;
+        assert!(status.to_string().contains("更新时间"));
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            model_count,
+            "视图/翻页/刷新不得发起模型或工具"
+        );
+    }
+
+    #[tokio::test]
+    async fn employee_details_reject_cross_office_employee_and_replayed_buttons() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派任务并返回"))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let child = fixture.child_employee().await;
+        let child_view = fixture.ui(serde_json::json!({"id":"secure-child","teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        let child_session = child_view["fields"][0]["value"].clone();
+        let actor_view = fixture.ui(serde_json::json!({"id":"secure-actor","teamId":fixture.team,"action":"actor.inspect","actorId":child["sceneActorId"]})).await;
+        assert_eq!(
+            actor_view["fields"][0]["value"], child_session,
+            "员工/人物定位同一真实子会话"
+        );
+        let parent = fixture.ui(serde_json::json!({"id":"secure-parent","teamId":fixture.team,"action":"actor.inspect","actorId":"office-lead"})).await;
+        assert_ne!(
+            parent["fields"][0]["value"], child_session,
+            "主员工不冒用子会话"
+        );
+        let token = child_view["actions"][0]["id"].clone();
+        let invalid = fixture.ui(serde_json::json!({"id":"wrong-employee","teamId":fixture.team,"action":"dialog.action","interactionId":"secure-parent","optionId":token})).await;
+        assert!(invalid["description"].as_str().unwrap().contains("跨员工"));
+        let invalid = fixture.ui(serde_json::json!({"id":"wrong-office","teamId":"office-other","action":"dialog.action","interactionId":"secure-child","optionId":token})).await;
+        assert!(invalid["description"]
+            .as_str()
+            .unwrap()
+            .contains("办公室不匹配"));
+        let valid = fixture
+            .button("secure-child", "secure-next", &child_view, "消息")
+            .await;
+        assert_eq!(valid["fields"][0]["value"], child_session);
+        let replay = fixture
+            .button("secure-child", "secure-replay", &child_view, "消息")
+            .await;
+        assert!(replay["description"].as_str().unwrap().contains("过期"));
+        let forged = fixture.ui(serde_json::json!({"id":"forged","teamId":fixture.team,"action":"dialog.action","interactionId":"never-issued","optionId":"detail-fake"})).await;
+        assert!(forged["actions"].as_array().unwrap().is_empty());
+        let unbound = fixture.ui(serde_json::json!({"id":"unbound-actor","teamId":fixture.team,"action":"actor.inspect","actorId":"data-agent"})).await;
+        assert!(unbound["description"]
+            .as_str()
+            .unwrap()
+            .contains("尚未绑定"));
+        assert_eq!(fixture.model_seen.lock().await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn employee_details_expire_and_evict_old_associations_without_work() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("委派任务并返回"))
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let child = fixture.child_employee().await;
+        let first = fixture.ui(serde_json::json!({"id":"capacity-0","teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        for index in 1..=64 {
+            fixture.ui(serde_json::json!({"id":format!("capacity-{index}"),"teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        }
+        let evicted = fixture
+            .button("capacity-0", "capacity-evicted", &first, "消息")
+            .await;
+        assert!(evicted["description"].as_str().unwrap().contains("过期"));
+        let fresh = fixture.ui(serde_json::json!({"id":"expiry-open","teamId":fixture.team,"action":"employee.inspect","employeeId":child["id"]})).await;
+        // 沿公开边界验证真实60秒能力期限，不读取私有缓存或改动运行时时钟。
+        tokio::time::sleep(Duration::from_secs(61)).await;
+        let expired = fixture
+            .button("expiry-open", "expiry-after", &fresh, "消息")
+            .await;
+        assert!(expired["description"].as_str().unwrap().contains("过期"));
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            4,
+            "查看/回收无执行副作用"
         );
     }
 

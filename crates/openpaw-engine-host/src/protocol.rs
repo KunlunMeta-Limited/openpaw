@@ -560,7 +560,9 @@ pub fn unix_millis(time: DateTime<Utc>) -> i64 {
 #[allow(dead_code)]
 pub(crate) mod wire {
     use super::*;
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessageInfoWire { pub id: String, #[serde(rename="sessionID")] pub session_id: String, pub role: String, pub time: MessageTimeWire }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessageInfoWire { pub id: String, #[serde(rename="sessionID")] pub session_id: String, pub role: String, pub time: MessageTimeWire,
+    /// 功能：保留未完成尝试的回合关系，不将其视为成功模型答复。
+    #[serde(default, skip_serializing_if="Option::is_none")] pub execution: Option<serde_json::Value> }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessageTimeWire { #[serde(skip_serializing_if="Option::is_none")] pub created: Option<i64>, #[serde(skip_serializing_if="Option::is_none")] pub completed: Option<i64> }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessageWire { pub info: MessageInfoWire, #[serde(default)] pub parts: Vec<MessagePartWire> }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct MessagePartWire { #[serde(rename="type")] pub part_type: String, pub id: String, #[serde(rename="messageID")] pub message_id: String, #[serde(rename="sessionID")] pub session_id: String, #[serde(default, skip_serializing_if="Option::is_none")] pub text: Option<String>,
@@ -568,7 +570,9 @@ pub(crate) mod wire {
     #[serde(default, skip_serializing_if="Option::is_none")] pub synthetic: Option<bool>,
     /// 功能：保留文本展示元数据对象。
     #[serde(default, skip_serializing_if="Option::is_none")] pub metadata: Option<serde_json::Map<String, serde_json::Value>>, #[serde(rename="callID", default, skip_serializing_if="Option::is_none")] pub call_id: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub tool: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub state: Option<ToolStateWire>, #[serde(default, skip_serializing_if="Option::is_none")] pub mime: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub url: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub filename: Option<String>, #[serde(rename="attachmentID", default, skip_serializing_if="Option::is_none")] pub attachment_id: Option<String>, #[serde(default, skip_serializing_if="Vec::is_empty")] pub attachments: Vec<serde_json::Value> }
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct ToolStateWire { pub status: ToolStatusWire, #[serde(default)] pub input: serde_json::Value, #[serde(default)] pub output: String, #[serde(default)] pub error: String, #[serde(rename="durationMs", skip_serializing_if="Option::is_none")] pub duration_ms: Option<u64> }
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct ToolStateWire { pub status: ToolStatusWire, #[serde(default)] pub input: serde_json::Value, #[serde(default)] pub output: String, #[serde(default)] pub error: String, #[serde(rename="durationMs", skip_serializing_if="Option::is_none")] pub duration_ms: Option<u64>,
+    /// 功能：区分完成、错误、拒绝、取消和未知，不扩展旧 status 枚举。
+    #[serde(default, skip_serializing_if="Option::is_none")] pub disposition: Option<String> }
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)] #[serde(rename_all="lowercase")] pub enum ToolStatusWire { Running, Completed, Error }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct ProviderListWire { pub all: Vec<ProviderWire>, pub connected: Vec<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub default: Option<String> }
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] pub struct ProviderWire { pub id: String, pub name: String, #[serde(default)] pub models: std::collections::BTreeMap<String, ProviderModelWire> }
@@ -1058,6 +1062,154 @@ pub(crate) mod projection {
             }
         }
         result
+    }
+
+    /// 功能：合并已保存尝试，补充失败/取消过程并丰富既有成功工具元数据。
+    /// 参数：session_id、outcomes、records 与 wire 均属于同一授权会话。
+    /// 返回：无。
+    /// 错误：无；持久记录由 Store 校验。
+    /// 状态：只修改公开返回值，不改变成功模型历史。
+    /// 并发与取消：同步读取稳定快照；取消后的未确认结果保留 unknown。
+    /// 权限：完整输入结果仅通过原鉴权历史接口返回，不发送 Office 动作。
+    /// 关联：CHG-2026-0039、员工只读详情。
+    pub(crate) fn merge_execution_attempts(
+        session_id: &str,
+        outcomes: &[TurnOutcome],
+        records: &[openpaw_store::execution_attempts::ExecutionAttemptV1],
+        wire: &mut Vec<serde_json::Value>,
+    ) {
+        for start in records.iter().filter(|r| r.kind == "response_start") {
+            let Some(turn) = outcomes.iter().find(|t| t.turn_id == start.turn_id) else {
+                continue;
+            };
+            let suffix = if start.response_index == 0 {
+                "assistant".into()
+            } else {
+                format!("assistant_{}", start.response_index)
+            };
+            let id = format!("msg_{session_id}_{}_{}", start.turn_id, suffix);
+            let part_suffix = if start.response_index == 0 {
+                String::new()
+            } else {
+                format!("_{}", start.response_index)
+            };
+            let matching: Vec<_> = records
+                .iter()
+                .filter(|r| r.turn_id == start.turn_id && r.response_index == start.response_index)
+                .collect();
+            let successful = turn.state == TurnState::Completed;
+            let existing = wire.iter().position(|m| m["info"]["id"] == id);
+            if successful && existing.is_none() {
+                continue;
+            }
+            let position = existing.unwrap_or_else(|| {
+                let user = wire.iter().position(|m|m["info"]["id"] == turn.user_message_id).unwrap_or(wire.len().saturating_sub(1));
+                let next = wire.iter().enumerate().skip(user+1).find(|(_,m)|m["info"]["role"] == "user").map_or(wire.len(),|(i,_)|i);
+                wire.insert(next, serde_json::json!({"info":{"id":id,"sessionID":session_id,"role":"assistant","time":{"created":start.occurred_at}},"parts":[]}));
+                next
+            });
+            let message = &mut wire[position];
+            if !successful {
+                let full = matching
+                    .iter()
+                    .find(|r| r.kind == "response")
+                    .and_then(|r| r.payload["content"].as_array());
+                let text = full
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| b["text"].as_str())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_else(|| {
+                        matching
+                            .iter()
+                            .filter(|r| r.kind == "text")
+                            .filter_map(|r| r.payload["text"].as_str())
+                            .collect()
+                    });
+                let mut parts = Vec::new();
+                if !text.is_empty() {
+                    parts.push(serde_json::json!({"id":format!("prt_{session_id}_{}_text{part_suffix}",start.turn_id),"messageID":id,"sessionID":session_id,"type":"text","text":text}));
+                }
+                let reasoning = full
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .filter_map(|b| b["thinking"].as_str())
+                            .collect::<String>()
+                    })
+                    .unwrap_or_else(|| {
+                        matching
+                            .iter()
+                            .filter(|r| r.kind == "reasoning")
+                            .filter_map(|r| r.payload["text"].as_str())
+                            .collect()
+                    });
+                if !reasoning.is_empty() {
+                    parts.push(serde_json::json!({"id":format!("prt_{session_id}_{}_reasoning{part_suffix}",start.turn_id),"messageID":id,"sessionID":session_id,"type":"reasoning","text":reasoning}));
+                }
+                if let Some(blocks) = full {
+                    for block in blocks.iter().filter(|b| b["type"] == "tool_use") {
+                        let call = block["id"].as_str().unwrap_or_default();
+                        parts.push(serde_json::json!({"id":format!("prt_{session_id}_{}_{call}{part_suffix}",start.turn_id),"messageID":id,"sessionID":session_id,"type":"tool","callID":call,"tool":block["name"],"state":{"status":"running","input":block["input"],"output":"","error":""}}));
+                    }
+                }
+                message["parts"] = parts.into();
+                message["info"]["execution"] =
+                    serde_json::json!({"turnID":turn.turn_id,"state":turn.state,"incomplete":true});
+                message["info"]["time"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("completed");
+            }
+            for part in message["parts"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["type"] == "tool")
+            {
+                let call = part["callID"].clone();
+                let prepared = matching
+                    .iter()
+                    .find(|r| r.kind == "tool_start" && r.payload["call_id"] == call);
+                let result = matching
+                    .iter()
+                    .find(|r| r.kind == "tool_result" && r.payload["call_id"] == call);
+                if let Some(prepared) = prepared {
+                    part["state"]["input"] = prepared.payload["input"].clone();
+                }
+                if let Some(result) = result {
+                    let outcome = &result.payload["outcome"];
+                    let error = outcome["is_error"] == true;
+                    part["state"]["status"] = if error { "error" } else { "completed" }.into();
+                    part["state"]["output"] = if error {
+                        serde_json::json!("")
+                    } else {
+                        outcome["content"].clone()
+                    };
+                    part["state"]["error"] = if error {
+                        outcome["content"].clone()
+                    } else {
+                        serde_json::json!("")
+                    };
+                    part["state"]["disposition"] = result.payload["disposition"].clone();
+                    part["state"]["durationMs"] = result.payload["duration_ms"].clone();
+                    if let Ok(media) = serde_json::from_value::<Vec<openpaw_core::InlineMedia>>(
+                        outcome["media"].clone(),
+                    ) {
+                        if !media.is_empty() {
+                            part["attachments"] = serde_json::json!(attachments(&media));
+                        }
+                    }
+                } else if turn.state.is_terminal() {
+                    part["state"]["status"] = "error".into();
+                    part["state"]["disposition"] = "unknown".into();
+                    part["state"]["error"] =
+                        "未保存明确执行结果；不表示未执行或副作用已撤销。".into();
+                }
+            }
+        }
     }
 
     /// 功能：将单个用户输入块投影为公开 part。
