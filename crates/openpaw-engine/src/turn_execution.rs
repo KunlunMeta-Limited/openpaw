@@ -49,6 +49,48 @@ pub struct TurnOptions {
     pub attachments: Vec<openpaw_core::InlineMedia>,
     /// 本回合可选 Provider 与模型。
     pub provider_and_model: Option<(Arc<dyn LlmProvider>, String)>,
+    /// 可靠执行记录回调；失败立即中止回合，不继续未登记的工具副作用。
+    pub recorder: Option<ExecutionRecorder>,
+}
+
+/// 功能：描述与传输、存储无关的真实可见输出和工具执行事实。
+/// 约束：包含授权会话的完整正文，不得发送到诊断日志或 Office 动作。
+#[derive(Clone)]
+pub struct ExecutionObservation {
+    /// 本回合模型响应序号，与原消息事件顺序一致。
+    pub response_index: usize,
+    /// 登记的事实类型：response_start、text、response、tool_start、tool_result。
+    pub kind: String,
+    /// 类型对应的完整事实，工具事实始终携带 call_id。
+    pub payload: serde_json::Value,
+}
+
+/// 功能：由入口提供的同步可靠记录器；每次成功表示该事实已经提交。
+pub type ExecutionRecorder =
+    Arc<dyn Fn(ExecutionObservation) -> openpaw_core::Result<()> + Send + Sync>;
+
+/// 功能：在可见发布或工具副作用之前可靠登记中立事实。
+/// 参数：recorder 为入口记录器，response_index、kind、payload 描述当前事实。
+/// 返回：成功为空。
+/// 错误：记录器错误立即向回合传播，禁止继续执行。
+/// 状态：默认未配置时保持原行为；不自行写盘。
+/// 并发与取消：同步回调；调用方负责 writer 所有权和顺序。
+/// 权限：完整内容仅供授权会话记录，不发送日志或 Office。
+/// 关联：CHG-2026-0039、TurnOptions。
+pub(crate) fn observe(
+    recorder: Option<&ExecutionRecorder>,
+    response_index: usize,
+    kind: &str,
+    payload: serde_json::Value,
+) -> openpaw_core::Result<()> {
+    if let Some(recorder) = recorder {
+        recorder(ExecutionObservation {
+            response_index,
+            kind: kind.into(),
+            payload,
+        })?;
+    }
+    Ok(())
 }
 
 /// 功能：返回执行结果及可用于后续存储提交失败恢复的检查点。

@@ -17,6 +17,8 @@
 /// 权限：保持既有边界。
 /// 关联：CHG-2026-0023。
 pub mod catalog;
+/// 功能：导出独立执行事实的版本化校验能力。
+pub mod execution_attempts;
 pub mod frontmatter;
 pub mod global_db;
 /// 功能：有效历史附件索引。
