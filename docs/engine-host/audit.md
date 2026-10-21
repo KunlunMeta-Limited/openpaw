@@ -159,3 +159,5 @@ T1/D04 Windows整改：原生CI 5a9cc0f的Store两项尾损恢复在set_len返�
 ### D35：T2全量扫描发现的原TLS依赖公告
 
 当前cargo-deny真实命中RUSTSEC-2026-0382/rustls-webpki0.103.15与RUSTSEC-2026-0381/webpki-roots1.0.9，可能信任已撤销emSign中间证书。原Provider/HTTP工具使用同一TLS链，阻塞全量。计划最小补丁升为0.103.16/1.0.10；保留TLS实现/验证和全部公告门禁，复核精确新版本许可证/来源，不加全局例外或新backend。CHG范围已先登记；完成证据见验证记录，未通过当前双平台前不关闭。
+
+D35修复结果：0.103.16/1.0.10已锁定，原两包许可证实核、精确例外/分发通知同步；70d0385 Linux全量26/26（含cargo-deny与MSRV1.88）通过。原生Windows仍被GitHub付款/额度阻塞；D35及T2其他D项不提前标已关闭/合入，M2/非作者PR审核仍未完成。
