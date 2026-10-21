@@ -2765,8 +2765,18 @@ mod tests {
         std::fs::write(&registry, previous_registry).unwrap();
         let mut reloaded_state = AppState::new(fixture.state.config.clone());
         Arc::get_mut(&mut reloaded_state).unwrap().main_office = crate::office::MainOffice::new(
-            fixture.home.path(), fixture.workspace.path(), Some(std::env::var("OPENPAW_OPENAI_BASE_URL").unwrap().trim_end_matches("/v1").to_string()));
-        reloaded_state.office.attach_main(&reloaded_state.main_office);
+            fixture.home.path(),
+            fixture.workspace.path(),
+            Some(
+                std::env::var("OPENPAW_OPENAI_BASE_URL")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .to_string(),
+            ),
+        );
+        reloaded_state
+            .office
+            .attach_main(&reloaded_state.main_office);
         let reloaded = build_router(reloaded_state);
         assert_eq!(
             child_test_json(
@@ -2783,10 +2793,25 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if fixture.seen.lock().await.iter().any(|message| message["type"] == "offices.initialize" && message["offices"].as_array().into_iter().flatten().any(|snapshot|snapshot["employees"].as_array().is_some_and(|employees|employees.len() == 3))) { break; }
+                if fixture.seen.lock().await.iter().any(|message| {
+                    message["type"] == "offices.initialize"
+                        && message["offices"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|snapshot| {
+                                snapshot["employees"]
+                                    .as_array()
+                                    .is_some_and(|employees| employees.len() == 3)
+                            })
+                }) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("旧办公室文件通过已提交父会话事实恢复第三个员工，原协议初始化可见");
+        })
+        .await
+        .expect("旧办公室文件通过已提交父会话事实恢复第三个员工，原协议初始化可见");
         eprintln!(
             "T04 registration fault evidence: {}",
             serde_json::json!({"unstartedSession":child,"childModelRequestsAdded":0,"acceptedChildTurns":0,"persistedMemberIdentities":3})
