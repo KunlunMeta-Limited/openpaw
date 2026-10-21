@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-状态：T0、T1 已获用户审核并合入；T2实施与验证中，M2未通过；T3—T8未开始。修订日期：2026-10-21。
+状态：T0、T1 已获用户审核并合入；T2已实现，完整验证/M2受阻，未创建PR；T3—T8未开始。修订日期：2026-10-21。
 
 本文件同时服务人工评审和 coding agent：先明确真实协议、用户行为与系统边界，再定义实现方法、产物、测试和 PR 交接。下文均是待实施要求；不能将设计、fixture 通过或 feature 连线描述为功能已交付。用户提供的 master-plan 仅作为参考材料。
 
@@ -1045,7 +1045,7 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 |---|---|---|---|---|
 | M0 / T0 | 产品/协议/工程治理可直接指导后续开发 | [T0任务卡](#tx-t0)；官方Schema/SDK、治理、完整双平台基线；[提PR前核查](#milestone-gate) | 已完成：用户于2026-10-20会话确认审核通过，PR已合入 | [OpenPaw #4](https://github.com/KunlunMeta-Limited/openpaw/pull/4)，合入76e2ee2f5881afd5daab13cca3ca3460a561f023；GitHub无独立Review，审核证据为用户会话确认；[逐项核查](../verification/CHG-2026-0001/T0核查.md)、[验证记录](../verification/CHG-2026-0001/验证记录.md) |
 | M1 / T1 | 正确模型、可信停止和完整历史可复用 | [T1任务卡](#tx-t1)；D01—D04回归、真实Provider请求捕获、存储/取消边界、CLI兼容 | 已完成：用户2026-10-21确认T1审核通过；PR #5已合入 | [OpenPaw #5](https://github.com/KunlunMeta-Limited/openpaw/pull/5)，最终head 383d0922eba3d069794015e1f280668a690c482c；合入ac1b58285fb6c73dce6363ce88fe62100199bb73；[最终push CI](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39416514821)13/13；PR事件另轮CI因账单未启动，保留历史失败，不虚称全部事件成功 |
-| M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、D34、cmd/sh、大输出/路径/原子Todo原生证据 | 实施与验证中；M2尚未通过 | [CHG-2026-0003](../changes/CHG-2026-0003.md)、[验证](../verification/CHG-2026-0003/验证记录.md)；未创建PR；原生Windows/全量门禁满足后再提，T3不开始 |
+| M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、D34/D35、cmd/sh、大输出/路径/原子Todo原生证据 | 阻塞：Linux全量发现D35已补丁待重验；Windows CI因账单/额度未启动 | [CHG-2026-0003](../changes/CHG-2026-0003.md)、[验证](../verification/CHG-2026-0003/验证记录.md)；未创建PR；原生Windows/全量门禁满足后再提，T3不开始 |
 | M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；真实Host客户端两Session/重启/查询，复用T0 D16回归 | 待实施 | 未创建；批准/合入待发生 |
 | M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；聊天+任务/白板+真实账本及快照恢复 | 待实施 | 未创建；批准/合入待发生 |
 | M5 / T5 | 常规产品闭环：审批写产物、详情、交接与发言 | [演示步骤3—6](#product-demo)、[T5任务卡](#tx-t5)；文件哈希、call/审批、真浏览器动画/详情可交叉核对 | 待实施 | 未创建；批准/合入待发生 |

@@ -154,3 +154,8 @@ T1/D04 Windows整改：原生CI 5a9cc0f的Store两项尾损恢复在set_len返�
 | D34 | 原builder字面参数安全引用，不支持env/Windows字符明确拒绝，不静默忽略 | managed_process d34_*；ac1b582原实现三项真实失败 |
 
 共享根资源锁、Run/Approval CAS和Office DTO属于T3/T5；T2不以复制实现抢跑。Linux普通进程组不保证恶意脱组隔离；当前Windows受限组合明确不可用，原生本地Job执行与受限拒绝分别验收。
+
+
+### D35：T2全量扫描发现的原TLS依赖公告
+
+当前cargo-deny真实命中RUSTSEC-2026-0382/rustls-webpki0.103.15与RUSTSEC-2026-0381/webpki-roots1.0.9，可能信任已撤销emSign中间证书。原Provider/HTTP工具使用同一TLS链，阻塞全量。计划最小补丁升为0.103.16/1.0.10；保留TLS实现/验证和全部公告门禁，复核精确新版本许可证/来源，不加全局例外或新backend。CHG范围已先登记；完成证据见验证记录，未通过当前双平台前不关闭。

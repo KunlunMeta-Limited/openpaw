@@ -30,3 +30,11 @@ serde_yml 0.0.12 / libyml 已归档且存在 RUSTSEC-2025-0068，没有安全升
 完整原文保存在 third-party-licenses/，THIRD-PARTY-NOTICES.md 记录包、来源及校验值。T8 发布必须将 notices 和该目录随二进制一起分发。本 PR 不修改这两个包的源码。不为消除许可证提示重写 home 目录发现或 TLS 信任根。
 
 这是显式的政策修改提案，需审核人认可后随 T0 合入；不扩大到其他包/版本，不忽略安全公告，不降低置信度或关闭检查。若不接受该范围，应保持 PR Draft 并另行设计依赖替换，不能删除失败门禁。
+
+## T2/D35：2026-10-21原TLS依赖最小补丁
+
+全量扫描实际命中[RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382.html)与[RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381.html)：旧验证器可能接受被撤信的emSign中间公钥路径，旧根数据仍包含相关根。按CHG-2026-0003先登记再修复，使用Cargo生成的包条目，仅更新rustls-webpki **0.103.15→0.103.16**、webpki-roots **1.0.9→1.0.10**及其checksum；不连带更新其他依赖边、不切TLS后端、不忽略公告、不关闭证书验证。原Provider、HTTP工具和Host共用同一TLS链。
+
+已从实际下载的0.103.16包核对ISC式许可证；roots1.0.10实际LICENSE为CDLA-Permissive-2.0，全文SHA-256仍为`e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8`，与旧原文相同。新原文单独保存，旧版本资料保留；deny.toml仅将原精确例外移至1.0.10，通知同步新包来源，不增加全局允许项。新版本例外仍随T2接受非作者审核，不自填批准。
+
+无用户数据或公共Rust类型迁移。完整workspace、MSRV1.88和安全扫描必须针对最终补丁重新运行；结果以CHG专用验证记录为准。不要仅回退这两个补丁来获得旧构建，回退会重新暴露上述公告；旧二进制退出使用后保留数据备份。

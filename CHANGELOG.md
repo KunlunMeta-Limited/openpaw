@@ -38,4 +38,5 @@
 - D11：Todo原JSONL增加真正只读结构API、原OS锁完整事务、同目录原子替换；损坏/权限错误不伪装空列表，失败保留旧文件。
 - D34：原SandboxedCommand字面参数不能注入另一条命令；不支持的cmd参数及env覆盖执行前明确拒绝，修正此前静默忽略env的行为。
 - Rust兼容：ToolExecutor/Environment新增带默认实现的方法，旧实现可继续编译，但取消及时性由实现负责。ApprovalRequest新增serde可选binding，旧构造函数/JSON兼容，外部直接struct literal需补binding字段。新增ToolCallContext是可信进程内接口，不是远程认证或防重放服务。Todo格式不迁移，Session格式不变化。
-- 工具继承必要系统环境，模型/Office密钥不自动传入；依赖只复用锁定的tokio-util和tempfile，无新增包版本。Office任何文件均未修改；协议适配仍在T3以后。
+- 工具继承必要系统环境，模型/Office密钥不自动传入；执行能力复用锁定的tokio-util和tempfile，不增加包族；D35另对现有TLS传递依赖作必要补丁升级。Office任何文件均未修改；协议适配仍在T3以后。
+- D35：修复全量扫描发现的emSign信任公告，rustls-webpki升级0.103.16、webpki-roots升级1.0.10；保持证书/公告校验，核对实际许可证并同步精确版本通知。
