@@ -29,6 +29,7 @@ pub mod error;
 pub mod file_lock;
 mod platform;
 pub mod policy;
+mod process;
 
 pub use approval::{
     AllowAlwaysSandboxCallback, AllowOnceSandboxCallback, DenySandboxCallback, FnSandboxCallback,
@@ -80,10 +81,15 @@ impl Sandbox {
         })
     }
 
-    /// Set an interactive approval callback.
-    ///
-    /// When set, commands that would be blocked by sandbox policy trigger
-    /// the callback, allowing the user to AllowOnce, AllowAlways, or Deny.
+    /// 功能：保留旧审批回调配置入口
+    /// 参数：callback为旧回调实现
+    /// 返回：更新配置后的Sandbox
+    /// 错误：无
+    /// 状态：仅保存引用，当前exec不调用它来改变策略
+    /// 并发与取消：线程安全引用，不等待
+    /// 权限：工具批准通过核心上下文；回调不能解除请求的隔离
+    /// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+    /// Stability: unstable.
     pub fn with_approval_callback(
         mut self,
         callback: std::sync::Arc<dyn approval::SandboxApprovalCallback>,
@@ -92,83 +98,38 @@ impl Sandbox {
         self
     }
 
-    /// Execute a command inside the sandbox.
-    ///
-    /// The command runs with the restrictions defined by the sandbox policy.
-    /// If sandbox execution fails and no approval callback is set, the
-    /// command is blocked (fail-closed) and an error is returned.
-    ///
-    /// If an approval callback is set and the sandbox would block the command,
-    /// the callback is invoked first to give the user a choice.
+    /// 功能：使用原后端执行命令，限制不可用时拒绝
+    /// 参数：command/cwd为命令和工作目录
+    /// 返回：真实输出与审计
+    /// 错误：后端不可用或执行失败
+    /// 状态：委托可取消入口
+    /// 并发与取消：无外部token时仍托管进程并等待回收
+    /// 权限：审批回调/白名单不能解除调用者请求的隔离
+    /// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+    /// Stability: unstable.
     pub async fn exec(
         &self,
         command: &str,
         cwd: Option<&std::path::Path>,
     ) -> Result<SandboxResult, SandboxError> {
-        // Check whitelist first (AllowAlways rules)
-        let is_whitelisted = {
-            let wl = self.whitelist.lock().unwrap_or_else(|e| e.into_inner());
-            wl.is_allowed(command)
-        };
-        if is_whitelisted {
-            return self.exec_unrestricted(command, cwd).await;
-        }
-
-        // Try sandboxed execution
-        let result = platform::exec_sandboxed(&self.policy, command, cwd).await;
-
-        match result {
-            Ok(sandbox_result) => Ok(sandbox_result),
-            Err(SandboxError::ExecutionFailed(_)) | Err(SandboxError::PlatformUnavailable(_)) => {
-                // Sandbox blocked or unavailable — ask for approval if callback is set
-                if let Some(ref callback) = self.approval_callback {
-                    let ctx = approval::SandboxApprovalContext {
-                        command: command.to_string(),
-                        policy: format!("{:?}", self.policy),
-                        cwd: cwd.map(|p| p.to_path_buf()),
-                        reason: "sandbox policy would block this command".to_string(),
-                    };
-
-                    match callback.on_sandbox_block(ctx).await {
-                        approval::SandboxApprovalDecision::AllowOnce => {
-                            self.exec_unrestricted(command, cwd).await
-                        }
-                        approval::SandboxApprovalDecision::AllowAlways { pattern } => {
-                            {
-                                let mut wl =
-                                    self.whitelist.lock().unwrap_or_else(|e| e.into_inner());
-                                wl.add_rule(&pattern);
-                            }
-                            self.exec_unrestricted(command, cwd).await
-                        }
-                        approval::SandboxApprovalDecision::Deny { reason } => {
-                            Err(SandboxError::ExecutionFailed(format!(
-                                "denied by interactive approval: {reason}"
-                            )))
-                        }
-                    }
-                } else {
-                    // No callback set — fail closed: do not bypass the sandbox
-                    Err(SandboxError::ExecutionFailed(format!(
-                        "sandbox blocked command '{}' and no approval callback is configured",
-                        command
-                    )))
-                }
-            }
-            Err(e) => Err(e),
-        }
+        platform::exec_sandboxed(&self.policy, command, cwd).await
     }
-
-    /// Execute a command without sandbox restrictions.
-    async fn exec_unrestricted(
+    /// 功能：贯通调用取消到原平台后端
+    /// 参数：command/cwd为输入，cancel为调用token
+    /// 返回：清理完成的真实结果
+    /// 错误：限制不可落实、取消或系统错误
+    /// 状态：不读取白名单以降级受限请求
+    /// 并发与取消：取消杀进程树且等待实际回收
+    /// 权限：人工批准不能变更请求的隔离级别
+    /// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+    /// Stability: unstable.
+    pub async fn exec_cancellable(
         &self,
         command: &str,
         cwd: Option<&std::path::Path>,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> Result<SandboxResult, SandboxError> {
-        // Use a None-policy sandbox which just runs the command locally
-        let none_sandbox =
-            platform::exec_sandboxed(&policy::SandboxPolicy::None, command, cwd).await;
-        none_sandbox
+        platform::exec_sandboxed_cancellable(&self.policy, command, cwd, cancel).await
     }
 
     /// Get a reference to the current sandbox policy.

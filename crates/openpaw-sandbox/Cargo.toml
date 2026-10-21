@@ -15,6 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 dirs.workspace = true
 regex.workspace = true
 
@@ -35,3 +36,7 @@ tempfile.workspace = true
 # the workspace stays on `forbid`, this crate locally downgrades to `allow`,
 # mirroring the upstream sandbox crate's lint setup.
 unsafe_code = "allow"
+
+[[test]]
+name = "managed_process_regressions"
+path = "tests/regressions/managed_process.rs"

@@ -1,14 +1,18 @@
+//! 职责：复用Windows token/ACL/Job，提供普通进程托管和受限能力明确拒绝。
+//! 输入输出：命令/工作区/取消到真实输出、退出码或错误。
+//! 依赖：原Win32创建、Job、句柄和管道API。
+//! 禁止职责：不将环境变量或防火墙尽力提示宣称隔离，不实现Office协议。
 //! Windows sandbox implementation using Restricted Token + Capability SID + Job Object.
 //!
 //! Reference: OpenAI Codex windows-sandbox-rs approach
 //! - CreateRestrictedToken with DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED
 //! - Random Capability SID for file access control via ACL
 //! - Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-//! - Firewall rules for network isolation (netsh fallback)
+//! - 当前网络限制不可验证，受限策略在ACL/进程副作用前拒绝
 //!
 //! CreateRestrictedToken + Capability SID
 //! ACL on writable paths via Capability SID
-//! Job Object with KILL_ON_JOB_CLOSE + firewall rules for network isolation
+//! Job Object负责本地进程树清理；保留token/ACL原实现，不宣称已提供网络隔离
 
 use std::mem;
 use std::path::Path;
@@ -19,7 +23,6 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Security::Authorization::*;
 use windows::Win32::Security::*;
 use windows::Win32::Storage::FileSystem::*;
-use windows::Win32::System::Console::*;
 use windows::Win32::System::JobObjects::*;
 use windows::Win32::System::Pipes::*;
 use windows::Win32::System::Threading::*;
@@ -136,6 +139,30 @@ impl JobGuard {
         }
     }
 
+    fn terminate_and_wait(&self) -> Result<(), SandboxError> {
+        // SAFETY：本守卫拥有有效Job；无breakaway标记，子孙不能正常脱离Job。
+        unsafe {
+            TerminateJobObject(self.raw(), 1)
+                .map_err(|e| SandboxError::JobObject(e.to_string()))?;
+        }
+        loop {
+            let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { mem::zeroed() };
+            unsafe {
+                QueryInformationJobObject(
+                    Some(self.raw()),
+                    JobObjectBasicAccountingInformation,
+                    (&mut info as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                    mem::size_of_val(&info) as u32,
+                    None,
+                )
+                .map_err(|e| SandboxError::JobObject(e.to_string()))?;
+            }
+            if info.ActiveProcesses == 0 {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
     fn raw(&self) -> HANDLE {
         self.handle.as_ref().map_or(HANDLE::default(), |h| h.raw())
     }
@@ -143,6 +170,7 @@ impl JobGuard {
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
+        let _ = self.terminate_and_wait();
         // Drop the handle, which closes it and kills child processes
         // (because KILL_ON_JOB_CLOSE is set)
         self.handle.take();
@@ -649,216 +677,344 @@ fn apply_network_isolation(
 // Process creation with restricted token
 // ---------------------------------------------------------------------------
 
-/// Create a process using the restricted token.
-///
-/// Uses `CreateProcessAsUserW` to start the command with the restricted token,
-/// capturing stdout and stderr via pipes.
+// STARTUPINFOEX只继承本次管道，避免并发Run继承彼此写端而无法EOF。
+struct AttributeList {
+    initialized: bool,
+    storage: Vec<usize>,
+}
+impl AttributeList {
+    fn raw(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        LPPROC_THREAD_ATTRIBUTE_LIST(self.storage.as_mut_ptr().cast())
+    }
+    fn new(handles: &[HANDLE]) -> Result<Self, SandboxError> {
+        let mut bytes = 0;
+        // SAFETY：第一次空指针调用仅查询缓冲区大小；第二次提供usize对齐的稳定内存。
+        unsafe {
+            let _ = InitializeProcThreadAttributeList(None, 1, None, &mut bytes);
+        }
+        if bytes == 0 {
+            return Err(SandboxError::ExecutionFailed(
+                "attribute list size unavailable".into(),
+            ));
+        }
+        let mut list = Self {
+            initialized: false,
+            storage: vec![0; bytes.div_ceil(mem::size_of::<usize>())],
+        };
+        unsafe {
+            InitializeProcThreadAttributeList(Some(list.raw()), 1, None, &mut bytes)
+                .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?;
+            list.initialized = true;
+            UpdateProcThreadAttribute(
+                list.raw(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(handles.as_ptr().cast()),
+                mem::size_of_val(handles),
+                None,
+                None,
+            )
+            .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?;
+        }
+        Ok(list)
+    }
+}
+impl Drop for AttributeList {
+    fn drop(&mut self) {
+        // SAFETY：成功初始化的list拥有稳定存储，删除不释放Vec本身。
+        if self.initialized {
+            unsafe {
+                DeleteProcThreadAttributeList(self.raw());
+            }
+        }
+    }
+}
+// cmd遇到UNC当前目录会静默改用Windows目录，不能在错误工作区执行已批准命令。
+fn cmd_cwd(cwd: Option<&Path>) -> Result<Option<std::path::PathBuf>, SandboxError> {
+    use std::path::{Component, Prefix};
+    let Some(cwd) = cwd else { return Ok(None) };
+    let reject_unc = |path: &Path| {
+        matches!(path.components().next(), Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..) | Prefix::Verbatim(..)))
+    };
+    if reject_unc(cwd) {
+        return Err(SandboxError::ExecutionFailed(
+            "cmd does not support UNC/device working directories; refusing directory fallback"
+                .into(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(cwd)?;
+    if reject_unc(&canonical) {
+        return Err(SandboxError::ExecutionFailed(
+            "cmd does not support UNC/device working directories; refusing directory fallback"
+                .into(),
+        ));
+    }
+    let mut components = canonical.components();
+    if let Some(Component::Prefix(prefix)) = components.next() {
+        if let Prefix::VerbatimDisk(drive) = prefix.kind() {
+            let mut path = std::path::PathBuf::from(format!("{}:", char::from(drive)));
+            path.extend(components);
+            return Ok(Some(path));
+        }
+    }
+    Ok(Some(canonical))
+}
 fn create_process_with_token(
-    token: HANDLE,
+    token: Option<HANDLE>,
     command: &str,
     cwd: Option<&Path>,
 ) -> Result<ProcessContext, SandboxError> {
-    // Create pipes for stdout and stderr
-    let mut stdout_read = HANDLE::default();
-    let mut stdout_write = HANDLE::default();
-    let mut stderr_read = HANDLE::default();
-    let mut stderr_write = HANDLE::default();
-
+    if command.contains('\0') {
+        return Err(SandboxError::ExecutionFailed("command contains NUL".into()));
+    }
+    let cwd = cmd_cwd(cwd)?;
+    let cwd = cwd.as_deref();
     let sa = SECURITY_ATTRIBUTES {
         nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
         bInheritHandle: windows::core::BOOL(1),
     };
-
-    // SAFETY: This block creates inheritable pipes and spawns the sandboxed
-    // process. Invariants:
-    //  - `sa` is a valid `SECURITY_ATTRIBUTES` (nLength set, null DACL, inheritable)
-    //    and is passed by reference only for the duration of the CreatePipe calls.
-    //  - The four `HANDLE` out-params are stack locals; on success each receives a
-    //    valid handle. The read ends are made non-inheritable; the write ends stay
-    //    inheritable so the child can use them.
-    //  - `startup_info` / `process_info` are plain-old-data structs; an all-zero
-    //    bit pattern is valid, and `cb` is set to the struct size as required.
-    //  - `cmd_line` is a NUL-terminated UTF-16 buffer; `as_mut_ptr()` is valid and
-    //    the buffer outlives `CreateProcessAsUserW` (same scope). The API is
-    //    documented to possibly mutate the buffer in place, which is acceptable as
-    //    it is not reused afterwards.
-    //  - `token` is a valid, owned restricted-token handle (caller-owned, alive for
-    //    this call). `cwd_wide`, when present, is NUL-terminated UTF-16.
-    //  - On success, `process_info.hProcess`/`hThread` and the read pipe ends are
-    //    wrapped in `OwnedHandle` (closed on drop); the parent's write ends are
-    //    explicitly closed here. No handle leaks on either path.
-    unsafe {
-        CreatePipe(&mut stdout_read, &mut stdout_write, Some(&sa), 0).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("CreatePipe (stdout) failed: {e}"))
-        })?;
-
-        CreatePipe(&mut stderr_read, &mut stderr_write, Some(&sa), 0).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("CreatePipe (stderr) failed: {e}"))
-        })?;
-
-        // Make the read ends non-inheritable
-        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("SetHandleInformation failed: {e}"))
-        })?;
-        SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).map_err(|e| {
-            SandboxError::ExecutionFailed(format!("SetHandleInformation failed: {e}"))
-        })?;
-
-        // Prepare startup info
-        let mut startup_info: STARTUPINFOW = mem::zeroed();
-        startup_info.cb = mem::size_of::<STARTUPINFOW>() as u32;
-        startup_info.dwFlags = STARTF_USESTDHANDLES;
-        startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE).unwrap_or_default();
-        startup_info.hStdOutput = stdout_write;
-        startup_info.hStdError = stderr_write;
-
-        // Prepare command line (cmd /C <command>)
-        //
-        // Security: This function intentionally uses cmd /C to support shell
-        // builtins, pipes, and redirection. The security boundary is the
-        // restricted token (CreateRestrictedToken), not command parsing.
-        // Metacharacter interpretation by cmd.exe is expected behavior.
-        // Even Command::new("cmd").args(["/C", cmd]) would be concatenated
-        // into a single string by the Rust stdlib on Windows, so the result
-        // is identical. The upstream guardrail and sandbox approval layers
-        // filter dangerous commands before they reach this point.
-        let full_cmd = format!("cmd /C {command}");
-        let mut cmd_line: Vec<u16> = full_cmd.encode_utf16().chain(std::iter::once(0)).collect();
-
-        // Prepare cwd
-        let cwd_wide = cwd.and_then(|p| p.to_str()).map(to_wide);
-
-        let mut process_info: PROCESS_INFORMATION = mem::zeroed();
-
-        let result = CreateProcessAsUserW(
-            Some(token),
-            None,
-            Some(windows::core::PWSTR(cmd_line.as_mut_ptr())),
-            None,
-            None,
-            true, // inherit handles
-            CREATE_NO_WINDOW | CREATE_SUSPENDED,
-            None,
-            cwd_wide
-                .as_ref()
-                .map(|w| windows::core::PCWSTR(w.as_ptr()))
-                .unwrap_or(windows::core::PCWSTR::null()),
-            &startup_info,
-            &mut process_info,
-        );
-
-        // Close write ends of pipes in the parent
-        let _ = CloseHandle(stdout_write);
-        let _ = CloseHandle(stderr_write);
-
-        result.map_err(|e| {
-            SandboxError::ExecutionFailed(format!("CreateProcessAsUserW failed: {e}"))
-        })?;
-
-        Ok(ProcessContext {
-            process_handle: OwnedHandle::new(process_info.hProcess),
-            thread_handle: OwnedHandle::new(process_info.hThread),
-            stdout_read: OwnedHandle::new(stdout_read),
-            stderr_read: OwnedHandle::new(stderr_read),
-        })
+    fn pipe(sa: &SECURITY_ATTRIBUTES) -> Result<(OwnedHandle, OwnedHandle), SandboxError> {
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        // SAFETY：两个输出句柄成功返回后立刻分别纳入RAII；后续失败不会泄漏。
+        unsafe {
+            CreatePipe(&mut read, &mut write, Some(sa), 0)
+                .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?;
+        }
+        let read = OwnedHandle::new(read);
+        let write = OwnedHandle::new(write);
+        unsafe {
+            SetHandleInformation(read.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+                .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?;
+        }
+        Ok((read, write))
     }
+    let (stdout_read, stdout_write) = pipe(&sa)?;
+    let (stderr_read, stderr_write) = pipe(&sa)?;
+    // SAFETY：NUL为系统空设备；继承句柄由本次handle list限定，成功立即拥有。
+    let stdin = OwnedHandle::new(unsafe {
+        CreateFileW(
+            windows::core::w!("NUL"),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&sa),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?
+    });
+    let inherited = [stdin.raw(), stdout_write.raw(), stderr_write.raw()];
+    let mut attributes = AttributeList::new(&inherited)?;
+    let mut startup: STARTUPINFOEXW = unsafe { mem::zeroed() };
+    startup.StartupInfo.cb = mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdin.raw();
+    startup.StartupInfo.hStdOutput = stdout_write.raw();
+    startup.StartupInfo.hStdError = stderr_write.raw();
+    startup.lpAttributeList = attributes.raw();
+    // 固定系统cmd，不依赖PATH/Git Bash；/D禁用AutoRun，/V:OFF禁用延迟展开。
+    let shell = std::path::PathBuf::from(
+        std::env::var_os("SystemRoot")
+            .ok_or_else(|| SandboxError::ExecutionFailed("SystemRoot is unavailable".into()))?,
+    )
+    .join("System32/cmd.exe");
+    use std::os::windows::ffi::OsStrExt;
+    let application: Vec<u16> = shell.as_os_str().encode_wide().chain([0]).collect();
+    let mut cmd_line = to_wide(&format!(
+        "\"{}\" /D /V:OFF /S /C \"{command}\"",
+        shell.display()
+    ));
+    let cwd_wide = cwd.map(|p| p.as_os_str().encode_wide().chain([0]).collect::<Vec<_>>());
+    let mut env = crate::process::tool_environment();
+    env.sort_by_key(|(k, _)| k.to_uppercase());
+    let environment: Vec<u16> = env
+        .iter()
+        .flat_map(|(k, v)| {
+            format!("{k}={v}")
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>()
+        })
+        .chain([0])
+        .collect();
+    let cwd_ptr = cwd_wide
+        .as_ref()
+        .map_or(windows::core::PCWSTR::null(), |v| {
+            windows::core::PCWSTR(v.as_ptr())
+        });
+    let flags = CREATE_NO_WINDOW
+        | CREATE_SUSPENDED
+        | CREATE_UNICODE_ENVIRONMENT
+        | EXTENDED_STARTUPINFO_PRESENT;
+    let mut info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+    // SAFETY：所有UTF16/环境/属性/句柄存储均在系统调用期间有效；API可以改写cmd_line。
+    let result = unsafe {
+        match token {
+            Some(token) => CreateProcessAsUserW(
+                Some(token),
+                windows::core::PCWSTR(application.as_ptr()),
+                Some(windows::core::PWSTR(cmd_line.as_mut_ptr())),
+                None,
+                None,
+                true,
+                flags,
+                Some(environment.as_ptr().cast()),
+                cwd_ptr,
+                &startup.StartupInfo,
+                &mut info,
+            ),
+            None => CreateProcessW(
+                windows::core::PCWSTR(application.as_ptr()),
+                Some(windows::core::PWSTR(cmd_line.as_mut_ptr())),
+                None,
+                None,
+                true,
+                flags,
+                Some(environment.as_ptr().cast()),
+                cwd_ptr,
+                &startup.StartupInfo,
+                &mut info,
+            ),
+        }
+    };
+    result.map_err(|e| SandboxError::ExecutionFailed(format!("create suspended cmd: {e}")))?;
+    Ok(ProcessContext {
+        process_handle: OwnedHandle::new(info.hProcess),
+        thread_handle: OwnedHandle::new(info.hThread),
+        stdout_read,
+        stderr_read,
+    })
 }
-
-/// Context for a created process with pipe handles.
 struct ProcessContext {
     process_handle: OwnedHandle,
     thread_handle: OwnedHandle,
     stdout_read: OwnedHandle,
     stderr_read: OwnedHandle,
 }
-
+impl Drop for ProcessContext {
+    fn drop(&mut self) {
+        // SAFETY：失败路径（含加入Job前）也必须终止挂起进程并等待leader，不能仅close句柄。
+        unsafe {
+            if WaitForSingleObject(self.process_handle.raw(), 0) != WAIT_OBJECT_0 {
+                let _ = TerminateProcess(self.process_handle.raw(), 1);
+                let _ = WaitForSingleObject(self.process_handle.raw(), INFINITE);
+            }
+        }
+    }
+}
+struct PipeCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+    eof: bool,
+}
+impl PipeCapture {
+    fn new() -> Self {
+        Self {
+            bytes: vec![],
+            truncated: false,
+            eof: false,
+        }
+    }
+    fn drain(&mut self, handle: HANDLE) -> Result<(), SandboxError> {
+        if self.eof {
+            return Ok(());
+        }
+        // 每次有界排空后处理另一管道及取消，防止连续写stdout饿死stderr。
+        for _ in 0..16 {
+            let mut available = 0;
+            // SAFETY：本函数是该管道唯一reader；仅在Peek报告字节可用后同步ReadFile，不阻塞等进程结束。
+            let peek = unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut available), None) };
+            if let Err(e) = peek {
+                if e.code() == ERROR_BROKEN_PIPE.to_hresult() {
+                    self.eof = true;
+                    break;
+                }
+                return Err(SandboxError::ExecutionFailed(format!("PeekNamedPipe: {e}")));
+            }
+            if available == 0 {
+                break;
+            }
+            let mut chunk = [0u8; 8192];
+            let take = (available as usize).min(chunk.len());
+            let mut read = 0;
+            unsafe {
+                ReadFile(handle, Some(&mut chunk[..take]), Some(&mut read), None)
+                    .map_err(|e| SandboxError::ExecutionFailed(format!("ReadFile: {e}")))?;
+            }
+            if read == 0 {
+                self.eof = true;
+                break;
+            }
+            let keep = (read as usize).min(crate::process::OUTPUT_LIMIT - self.bytes.len());
+            self.bytes.extend_from_slice(&chunk[..keep]);
+            self.truncated |= keep < read as usize;
+        }
+        Ok(())
+    }
+    fn text(self) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.truncated {
+            text.push_str("\n[output truncated; remaining bytes drained]");
+        }
+        text
+    }
+}
 impl ProcessContext {
     fn process_raw(&self) -> HANDLE {
         self.process_handle.raw()
     }
-
-    /// Resume the suspended process and wait for completion.
-    fn resume_and_wait(&self) -> Result<i32, SandboxError> {
-        // SAFETY: `self.thread_handle.raw()` and `self.process_handle.raw()`
-        // are valid, owned handles (alive for the duration of `&self`). The process
-        // was created suspended, so `ResumeThread` on its main thread is the
-        // documented way to start it. `WaitForSingleObject` blocks on the process
-        // handle until the process exits. `exit_code` is a stack-local out-param
-        // whose address is passed to `GetExitCodeProcess`; on success it receives
-        // the process exit code.
-        unsafe {
-            // Resume the main thread (process was created suspended)
-            ResumeThread(self.thread_handle.raw());
-
-            // Wait for the process to complete
-            let wait_result = WaitForSingleObject(self.process_handle.raw(), INFINITE);
-
-            if wait_result != WAIT_OBJECT_0 {
+    fn resume_and_collect(
+        &self,
+        job: &JobGuard,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(i32, String, String), SandboxError> {
+        // SAFETY：主线程由本调用以挂起方式创建，句柄由self拥有。
+        if unsafe { ResumeThread(self.thread_handle.raw()) } == u32::MAX {
+            return Err(SandboxError::ExecutionFailed("ResumeThread failed".into()));
+        }
+        let mut stdout = PipeCapture::new();
+        let mut stderr = PipeCapture::new();
+        let mut cleanup = false;
+        let mut cancelled = false;
+        loop {
+            stdout.drain(self.stdout_read.raw())?;
+            stderr.drain(self.stderr_read.raw())?;
+            let wait = unsafe { WaitForSingleObject(self.process_handle.raw(), 0) };
+            if wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT {
                 return Err(SandboxError::ExecutionFailed(format!(
-                    "WaitForSingleObject returned {wait_result:?}"
+                    "wait process: {wait:?}"
                 )));
             }
-
-            // Get exit code
-            let mut exit_code: u32 = 0;
-            GetExitCodeProcess(self.process_handle.raw(), &mut exit_code).map_err(|e| {
-                SandboxError::ExecutionFailed(format!("GetExitCodeProcess failed: {e}"))
-            })?;
-
-            Ok(exit_code as i32)
+            if !cleanup && (wait == WAIT_OBJECT_0 || cancel.is_cancelled()) {
+                cancelled = cancel.is_cancelled();
+                job.terminate_and_wait()?;
+                cleanup = true;
+            }
+            if cleanup && stdout.eof && stderr.eof {
+                unsafe {
+                    let wait = WaitForSingleObject(self.process_handle.raw(), INFINITE);
+                    if wait != WAIT_OBJECT_0 {
+                        return Err(SandboxError::ExecutionFailed("process wait failed".into()));
+                    }
+                }
+                if cancelled || cancel.is_cancelled() {
+                    return Err(SandboxError::ExecutionFailed(
+                        "command cancelled; Job processes reaped".into(),
+                    ));
+                }
+                let mut code = 0;
+                unsafe {
+                    GetExitCodeProcess(self.process_handle.raw(), &mut code)
+                        .map_err(|e| SandboxError::ExecutionFailed(e.to_string()))?;
+                }
+                return Ok((code as i32, stdout.text(), stderr.text()));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
-
-    /// Read stdout and stderr from the pipe handles.
-    fn read_output(&self) -> (String, String) {
-        let stdout = read_pipe(self.stdout_read.raw());
-        let stderr = read_pipe(self.stderr_read.raw());
-        (stdout, stderr)
-    }
-}
-
-/// Maximum bytes read from a sandboxed process pipe to prevent OOM.
-const MAX_PIPE_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
-
-/// Read all data from a pipe handle.
-///
-/// Caps total output at [`MAX_PIPE_OUTPUT_BYTES`] to prevent a malicious
-/// sandboxed process from triggering OOM by writing GB-level data.
-fn read_pipe(handle: HANDLE) -> String {
-    let mut buffer = Vec::with_capacity(4096);
-    let mut temp = [0u8; 4096];
-    let mut bytes_read: u32 = 0;
-
-    loop {
-        // SAFETY: `handle` is a valid, owned anonymous-pipe read handle.
-        // `temp` is a stack-local 4096-byte buffer passed as a mutable slice;
-        // `bytes_read` is a stack-local `u32` whose address is the out-param.
-        // `lpOverlapped` is `None`, so the read is synchronous. The buffer is
-        // only read up to `bytes_read` after the call returns.
-        let result = unsafe {
-            ReadFile(
-                handle,
-                Some(&mut temp),
-                Some(&mut bytes_read as *mut u32),
-                None,
-            )
-        };
-
-        if result.is_err() || bytes_read == 0 {
-            break;
-        }
-
-        buffer.extend_from_slice(&temp[..bytes_read as usize]);
-
-        // Stop reading and truncate when the output exceeds the limit.
-        if buffer.len() >= MAX_PIPE_OUTPUT_BYTES {
-            buffer.truncate(MAX_PIPE_OUTPUT_BYTES);
-            break;
-        }
-    }
-
-    String::from_utf8_lossy(&buffer).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -908,151 +1064,111 @@ impl Drop for SdGuard {
 // Main entry point
 // ---------------------------------------------------------------------------
 
-/// Execute a command with Windows restricted token sandboxing.
-///
-/// Attempts the full restricted-token implementation first. If the restricted
-/// token approach fails (e.g., insufficient privileges), falls back to basic
-/// execution with environment variable hints.
-pub async fn exec_restricted(
+/// 功能：在原token后端执行受限命令，不允许普通执行兜底
+/// 参数：policy/command/cwd为输入，cancel为token
+/// 返回：清理后的结果
+/// 错误：当前无可验证网络隔离，受限组合明确拒绝
+/// 状态：拒绝发生在创建进程或修改ACL前
+/// 并发与取消：被支持后端必须使用同一Job/管道回收路径
+/// 权限：token或环境提示不能证明NoAccess/AllowDomains已落实
+/// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+/// Stability: unstable.
+pub(crate) async fn exec_restricted_cancellable(
     policy: &SandboxPolicy,
     command: &str,
     cwd: Option<&Path>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<SandboxResult, SandboxError> {
-    // For unrestricted policies, just run normally
-    if !policy.is_restricted() {
-        return crate::command::exec_unrestricted(command, cwd).await;
-    }
-
-    let start = Instant::now();
-    let policy_name = format!("{policy:?}");
-
-    // Try full restricted token approach
-    match exec_with_restricted_token(policy, command, cwd) {
-        Ok((exit_code, stdout, stderr)) => {
-            let duration_ms = start.elapsed().as_millis() as u64;
-            let mut audit = AuditLog::new(command, cwd, &policy_name, "restricted_token");
-            audit.exit_code = exit_code;
-            audit.duration_ms = duration_ms;
-
-            Ok(SandboxResult {
-                stdout,
-                stderr,
-                exit_code,
-                audit,
-            })
-        }
-        Err(_e) => {
-            // Restricted token approach may fail in non-elevated contexts
-            // (e.g., CreateProcessAsUserW requires SE_ASSIGNPRIMARYTOKEN_NAME).
-            // Gracefully fall back to basic execution with env hints.
-            exec_basic_fallback(policy, command, cwd, &policy_name).await
-        }
-    }
+    ensure_supported_policy(policy)?;
+    let policy = policy.clone();
+    let command = command.to_owned();
+    let cwd = cwd.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        let start = Instant::now();
+        let name = format!("{policy:?}");
+        let (exit_code, stdout, stderr) =
+            exec_with_restricted_token(&policy, &command, cwd.as_deref(), &cancel)?;
+        let mut audit = AuditLog::new(&command, cwd.as_deref(), &name, "restricted_token");
+        audit.exit_code = exit_code;
+        audit.duration_ms = start.elapsed().as_millis() as u64;
+        Ok(SandboxResult {
+            stdout,
+            stderr,
+            exit_code,
+            audit,
+        })
+    })
+    .await
+    .map_err(|e| SandboxError::ExecutionFailed(format!("managed Windows task: {e}")))?
 }
-
-/// Full restricted token execution.
-///
-/// Returns (exit_code, stdout, stderr).
+fn ensure_supported_policy(policy: &SandboxPolicy) -> Result<(), SandboxError> {
+    if policy.is_restricted() {
+        return Err(SandboxError::PlatformUnavailable("Windows token/ACL backend cannot enforce requested network isolation; refusing execution".into()));
+    }
+    Ok(())
+}
 fn exec_with_restricted_token(
     policy: &SandboxPolicy,
     command: &str,
     cwd: Option<&Path>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(i32, String, String), SandboxError> {
-    // Step 1: Generate Capability SID
+    if cancel.is_cancelled() {
+        return Err(SandboxError::ExecutionFailed(
+            "command cancelled before spawn".into(),
+        ));
+    }
     let cap_sid = generate_capability_sid()?;
-
-    // Step 2: Build restricting SIDs for the token
-    let sid_and_attr = SID_AND_ATTRIBUTES {
+    let token = create_restricted_token(&[SID_AND_ATTRIBUTES {
         Sid: cap_sid.raw(),
         Attributes: 0,
-    };
-
-    // Step 3: Create restricted token with our SID as restricting SID
-    let token = create_restricted_token(&[sid_and_attr])?;
-
-    // Step 4: Apply ACL on writable paths
-    let _acl_guards = apply_writable_acls(policy, cap_sid.raw())?;
-
-    // Step 5: Create Job Object
+    }])?;
+    let _acls = apply_writable_acls(policy, cap_sid.raw())?;
     let job = create_job_object()?;
-
-    // Step 6: Create process with restricted token
-    let ctx = create_process_with_token(token.raw(), command, cwd)?;
-
-    // Step 7: Assign process to Job Object
-    assign_to_job_object(job.raw(), ctx.process_raw())?;
-
-    // Step 8: Apply network isolation
-    let _firewall_guard = apply_network_isolation_fallback(policy);
-
-    // Step 9: Resume and wait for process
-    let exit_code = ctx.resume_and_wait()?;
-
-    // Step 10: Read output
-    let (stdout, stderr) = ctx.read_output();
-
-    Ok((exit_code, stdout, stderr))
+    let process = create_process_with_token(Some(token.raw()), command, cwd)?;
+    assign_to_job_object(job.raw(), process.process_raw())?;
+    process.resume_and_collect(&job, cancel)
 }
 
-/// Apply network isolation as a best-effort fallback.
-///
-/// For NoAccess policy, sets environment variable hints.
-/// Firewall rules require admin privileges and are handled separately.
-fn apply_network_isolation_fallback(_policy: &SandboxPolicy) -> Option<FirewallGuard> {
-    // Network isolation for NoAccess is enforced by the WRITE_RESTRICTED token
-    // plus ACL path; firewall rules require admin privileges and are handled
-    // separately.
-    None
-}
-
-/// Basic fallback execution with environment variable hints (Phase 1).
-///
-/// Used when the restricted token approach is unavailable.
-async fn exec_basic_fallback(
-    policy: &SandboxPolicy,
+/// 功能：使用原挂起进程/Job实现普通用户本地执行
+/// 参数：command/cwd为输入，cancel为调用token
+/// 返回：清理完成的输出与审计
+/// 错误：创建/Job分配/回收或取消错误
+/// 状态：普通用户CreateProcessW，不申请受限token权限
+/// 并发与取消：工作线程轮询token并杀Job等待真实退出，不只spawn_blocking
+/// 权限：明确普通执行，不声称文件或网络隔离
+/// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+/// Stability: unstable.
+pub(crate) async fn exec_local(
     command: &str,
     cwd: Option<&Path>,
-    policy_name: &str,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<SandboxResult, SandboxError> {
-    let start = Instant::now();
-
-    let mut cmd = tokio::process::Command::new("cmd");
-    cmd.args(["/C", command]);
-
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    // For ReadOnly policy, set read-only env hint
-    if matches!(policy.fs_policy(), FileSystemPolicy::ReadOnly) {
-        cmd.env("OPENPAW_SANDBOX_FS", "readonly");
-    }
-
-    // For NoAccess network policy, set env hint
-    if matches!(policy.net_policy(), NetworkPolicy::NoAccess) {
-        cmd.env("OPENPAW_SANDBOX_NET", "noaccess");
-    }
-
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| SandboxError::ExecutionFailed(format!("failed to execute command: {e}")))?;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    let mut audit = AuditLog::new(command, cwd, policy_name, "basic_fallback");
-    audit.exit_code = output.status.code().unwrap_or(-1);
-    audit.duration_ms = duration_ms;
-
-    Ok(SandboxResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: audit.exit_code,
-        audit,
+    let command = command.to_owned();
+    let cwd = cwd.map(Path::to_path_buf);
+    tokio::task::spawn_blocking(move || {
+        if cancel.is_cancelled() {
+            return Err(SandboxError::ExecutionFailed(
+                "command cancelled before spawn".into(),
+            ));
+        }
+        let start = Instant::now();
+        let job = create_job_object()?;
+        let process = create_process_with_token(None, &command, cwd.as_deref())?;
+        assign_to_job_object(job.raw(), process.process_raw())?;
+        let (exit_code, stdout, stderr) = process.resume_and_collect(&job, &cancel)?;
+        let mut audit = AuditLog::new(&command, cwd.as_deref(), "None", "job_object");
+        audit.exit_code = exit_code;
+        audit.duration_ms = start.elapsed().as_millis() as u64;
+        Ok(SandboxResult {
+            stdout,
+            stderr,
+            exit_code,
+            audit,
+        })
     })
+    .await
+    .map_err(|e| SandboxError::ExecutionFailed(format!("managed Windows task: {e}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,5 +1264,34 @@ mod tests {
 
         // Clean up
         remove_write_acl(path, sid.raw()).ok();
+    }
+    #[test]
+    fn failed_job_assignment_reaps_the_suspended_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let process =
+            create_process_with_token(None, "echo invalid > should-not-run", Some(dir.path()))
+                .unwrap();
+        let mut duplicate = HANDLE::default();
+        // SAFETY：观察用副本延长句柄而非进程生命周期，ctx析构后检查真实结束。
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                process.process_raw(),
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+            .unwrap();
+        }
+        let duplicate = OwnedHandle::new(duplicate);
+        assert!(assign_to_job_object(HANDLE::default(), process.process_raw()).is_err());
+        drop(process);
+        assert_eq!(
+            unsafe { WaitForSingleObject(duplicate.raw(), 0) },
+            WAIT_OBJECT_0
+        );
+        assert!(!dir.path().join("should-not-run").exists());
     }
 }

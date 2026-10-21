@@ -75,6 +75,24 @@ pub trait ToolExecutor: Send + Sync {
         }
         self.call(name, args).await
     }
+    /// 功能：传递调用级授权并等待真实工具清理，兼容旧执行器
+    /// 参数：name/args为最终输入，context为绑定及取消信号
+    /// 返回：实际工具结果
+    /// 错误：绑定、取消、观察器或执行错误
+    /// 状态：默认实现记录开始后委托原call_cancellable
+    /// 并发与取消：取消不丢弃调用；资源包装器须重载并在取锁重验后通知开始
+    /// 权限：只携带本次授权，不永久放开工具
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    /// Stability: unstable.
+    async fn call_with_context(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        context: crate::ToolCallContext,
+    ) -> Result<ToolCallOutcome> {
+        context.execution_started(name, &args).await?;
+        self.call_cancellable(name, args, context.cancel()).await
+    }
 }
 
 /// Input validation runs before guardrails; failures short-circuit the

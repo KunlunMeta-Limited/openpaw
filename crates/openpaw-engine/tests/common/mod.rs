@@ -224,12 +224,23 @@ struct DemoHost {
 #[async_trait::async_trait]
 impl openpaw_core::ToolExecutor for DemoHost {
     async fn list_tools(&self) -> openpaw_core::Result<Vec<ToolSpec>> {
-        Ok(vec![
-            ToolSpec::new("echo_tool", "echoes text"),
-            ToolSpec::new("grep", "search"),
-            ToolSpec::new("glob", "list files"),
-            ToolSpec::new("bash", "run shell"),
-        ])
+        Ok([
+            ("echo_tool", "echoes text"),
+            ("grep", "search"),
+            ("glob", "list files"),
+            ("bash", "run shell"),
+        ]
+        .into_iter()
+        .map(|(name, description)| {
+            let mut spec = ToolSpec::new(name, description);
+            spec.concurrency = Some(if name == "bash" {
+                openpaw_core::ToolConcurrency::NeverParallel
+            } else {
+                openpaw_core::ToolConcurrency::ParallelSafe
+            });
+            spec
+        })
+        .collect())
     }
 
     async fn call(

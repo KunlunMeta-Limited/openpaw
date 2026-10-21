@@ -51,12 +51,43 @@ pub use semantics::{check_semantics, SemanticResult};
 /// - `regex_check`: A closure that checks if a command string is dangerous
 ///   via regex. Called per-subcommand for `Simple` results, and on the whole
 ///   command for `ParseUnavailable`.
+///
+/// 功能：按自动检测入口保留原命令分析行为
+/// 参数：command为原命令，regex_check为原危险子命令判定
+/// 返回：安全、危险或需确认
+/// 错误：解析异常保守需确认
+/// 状态：只读分析
+/// 并发与取消：受原解析预算限制，无异步等待
+/// 权限：实际执行工具使用显式shell入口
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
 pub fn analyze_command_safety<F>(command: &str, regex_check: F) -> CommandSafety
 where
     F: Fn(&str) -> bool,
 {
-    let parsed = parse_for_security(command);
+    judge_parsed(command, parse_for_security(command), regex_check)
+}
 
+/// 功能：使用实际shell而非文本猜测进行安全分析
+/// 参数：command为原文，shell与执行器保持一致
+/// 返回：原CommandSafety判定
+/// 错误：解析不可用转审批
+/// 状态：只读，不执行工具
+/// 并发与取消：复用原解析预算
+/// 权限：不降低危险命令，cmd无grammar保守审批
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
+pub fn analyze_command_safety_for_shell(command: &str, shell: ShellType) -> CommandSafety {
+    judge_parsed(command, parser::parse_for_shell(command, shell), |sub| {
+        destructive_rm_verdict(sub).is_some()
+    })
+}
+
+fn judge_parsed<F: Fn(&str) -> bool>(
+    command: &str,
+    parsed: ParseResult,
+    regex_check: F,
+) -> CommandSafety {
     match parsed {
         ParseResult::Simple { commands } => {
             // Semantic check — every shell type goes through the shared

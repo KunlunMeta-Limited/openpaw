@@ -137,7 +137,29 @@ fn is_unicode_whitespace(c: char) -> bool {
 /// Dispatches to the appropriate tree-sitter grammar based on detected
 /// shell type (bash, PowerShell, cmd.exe). Unknown shell types return
 /// `ParseUnavailable`. Internal panics are caught via `catch_unwind`.
+/// 功能：兼容原自动探测shell的解析入口
+/// 参数：command为待分析命令
+/// 返回：原解析结果
+/// 错误：失败返回ParseUnavailable
+/// 状态：只读分析
+/// 并发与取消：使用原长度/节点/时间预算
+/// 权限：工具执行必须使用parse_for_shell绑定实际launcher
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
 pub fn parse_for_security(command: &str) -> ParseResult {
+    parse_for_shell(command, detect_shell_type(command))
+}
+
+/// 功能：按实际执行shell复用原解析链
+/// 参数：command为原文，shell为实际launcher类型
+/// 返回：解析结果或不可解析
+/// 错误：内部异常转为不可解析
+/// 状态：只读分析，不执行
+/// 并发与取消：有原长度/节点预算；无异步取消
+/// 权限：未知或缺grammar不能判安全
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
+pub(crate) fn parse_for_shell(command: &str, shell: ShellType) -> ParseResult {
     if command.is_empty() {
         return ParseResult::Simple { commands: vec![] };
     }
@@ -145,8 +167,7 @@ pub fn parse_for_security(command: &str) -> ParseResult {
     if let Some(result) = precheck(command) {
         return result;
     }
-    let shell_type = detect_shell_type(command);
-    match shell_type {
+    match shell {
         ShellType::Bash => parse_bash(command),
         // Plan D-2 / Phase 3: tree-sitter-pwsh is not part of this workspace,
         // so PowerShell syntax cannot be AST-analyzed here. Fail closed →

@@ -53,10 +53,14 @@ struct SearchHost {
 #[async_trait::async_trait]
 impl openpaw_core::ToolExecutor for SearchHost {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
-        Ok(vec![
-            ToolSpec::new("grep", "search"),
-            ToolSpec::new("glob", "list files"),
-        ])
+        Ok([("grep", "search"), ("glob", "list files")]
+            .into_iter()
+            .map(|(name, description)| {
+                let mut spec = ToolSpec::new(name, description);
+                spec.concurrency = Some(openpaw_core::ToolConcurrency::ParallelSafe);
+                spec
+            })
+            .collect())
     }
 
     async fn call(

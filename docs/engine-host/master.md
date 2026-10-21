@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-状态：T0 实施中，尚未获得非作者批准并合入；T1—T8 未开始。修订日期：2026-10-20。
+状态：T0、T1 已获用户审核并合入；T2实施与验证中，M2未通过；T3—T8未开始。修订日期：2026-10-21。
 
 本文件同时服务人工评审和 coding agent：先明确真实协议、用户行为与系统边界，再定义实现方法、产物、测试和 PR 交接。下文均是待实施要求；不能将设计、fixture 通过或 feature 连线描述为功能已交付。用户提供的 master-plan 仅作为参考材料。
 
@@ -24,7 +24,7 @@
 | 对象 | 固定基线 | 用途与状态 |
 |---|---|---|
 | OpenPaw 初始审核 | 60a531a51172d14fc3db1a8e7eb6762c2c8369d8 | 引擎、Provider、工具、存储可复用；Host 当时只有占位说明 |
-| OpenPaw T0 已提交工作 | PR #4 当前 head | 已有构建/测试基线修正；未合入，不能开始 T1；当前工作区文档不等于已提交版本 |
+| OpenPaw 当前集成基线 | ac1b58285fb6c73dce6363ce88fe62100199bb73 | T0 #4、T1 #5已合入；T2从该基线开发；当前状态见14.1，不以工作区文档代替提交验证 |
 | Office | b221a44ce22fe08956356b5002d17df59a6a4f50 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
 | OpenCode SDK | @opencode-ai/sdk 1.18.15 | 精确版本、integrity、lockfile 和真实 v1 类型 |
 | 集成分支 | merge/ai-ofice-react-overagent | OpenPaw Tx PR 的目标分支，保留现有 ofice 拼写 |
@@ -1044,8 +1044,8 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 | 里程碑/Tx | 用户或开发者应取得的成果 | 验收入口及必须满足的结果 | 当前状态 | PR与批准/合入证据 |
 |---|---|---|---|---|
 | M0 / T0 | 产品/协议/工程治理可直接指导后续开发 | [T0任务卡](#tx-t0)；官方Schema/SDK、治理、完整双平台基线；[提PR前核查](#milestone-gate) | 已完成：用户于2026-10-20会话确认审核通过，PR已合入 | [OpenPaw #4](https://github.com/KunlunMeta-Limited/openpaw/pull/4)，合入76e2ee2f5881afd5daab13cca3ca3460a561f023；GitHub无独立Review，审核证据为用户会话确认；[逐项核查](../verification/CHG-2026-0001/T0核查.md)、[验证记录](../verification/CHG-2026-0001/验证记录.md) |
-| M1 / T1 | 正确模型、可信停止和完整历史可复用 | [T1任务卡](#tx-t1)；D01—D04回归、真实Provider请求捕获、存储/取消边界、CLI兼容 | 技术核查通过：CHG-2026-0002；实质交付eeaeeed，Linux26/26及原生CI13/13；最终登记head仍验 | 未创建；最终登记head复验后提PR，审核/合入待发生 |
-| M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、cmd/sh、大输出/路径/原子Todo原生证据 | 待实施 | 未创建；批准/合入待发生 |
+| M1 / T1 | 正确模型、可信停止和完整历史可复用 | [T1任务卡](#tx-t1)；D01—D04回归、真实Provider请求捕获、存储/取消边界、CLI兼容 | 已完成：用户2026-10-21确认T1审核通过；PR #5已合入 | [OpenPaw #5](https://github.com/KunlunMeta-Limited/openpaw/pull/5)，最终head 383d0922eba3d069794015e1f280668a690c482c；合入ac1b58285fb6c73dce6363ce88fe62100199bb73；[最终push CI](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39416514821)13/13；PR事件另轮CI因账单未启动，保留历史失败，不虚称全部事件成功 |
+| M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、D34、cmd/sh、大输出/路径/原子Todo原生证据 | 实施与验证中；M2尚未通过 | [CHG-2026-0003](../changes/CHG-2026-0003.md)、[验证](../verification/CHG-2026-0003/验证记录.md)；未创建PR；原生Windows/全量门禁满足后再提，T3不开始 |
 | M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；真实Host客户端两Session/重启/查询，复用T0 D16回归 | 待实施 | 未创建；批准/合入待发生 |
 | M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；聊天+任务/白板+真实账本及快照恢复 | 待实施 | 未创建；批准/合入待发生 |
 | M5 / T5 | 常规产品闭环：审批写产物、详情、交接与发言 | [演示步骤3—6](#product-demo)、[T5任务卡](#tx-t5)；文件哈希、call/审批、真浏览器动画/详情可交叉核对 | 待实施 | 未创建；批准/合入待发生 |
@@ -1230,3 +1230,10 @@ T1实现细则与T2交接见[设计说明的T1章节](../design/软件设计说�
 
 
 2026-10-20，M1/T1技术核查：实质交付`eeaeeed361ece22116850978eec64f5eff39c72c`的全部必需产物通过，[完整逐项核查与失败整改](../verification/CHG-2026-0002/验证记录.md)、[原生双平台CI13/13](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39415492490)。Linux完整26/26，默认929/全feature941通过，两项既有ignored单列；Office/Host产品功能尚待后续。最终核查登记head仍验全部套件/原生CI后才提PR；当前没有T1人审批准或合入，M1未标完成，T2未开始。
+
+
+2026-10-21，前置完成与T2开工登记：用户明确“T1的PR审核通过了”，已核实[PR #5](https://github.com/KunlunMeta-Limited/openpaw/pull/5)合入集成分支，实际为merge commit `ac1b58285fb6c73dce6363ce88fe62100199bb73`，不将建议的squash方式写成事实。不修改历史待审报告；上文2026-10-20的技术核查为当时状态。当前以14.1为准。T2分支`fix/engine-host-t2`，主CHG-2026-0003；修复范围D05—D11及同一命令builder出口新发现的D34，不修改Office。T1各次CI独立记录，PR事件账单阻塞不冒充测试失败或通过。
+
+T2详细实现与交接：见[DES-OP-004/005](../design/软件设计说明.md#t2工具授权与托管执行des-op-004005)、[执行能力矩阵](../verification/CHG-2026-0003/执行能力矩阵.md)。实际新增`core::ToolCallContext`/`ToolExecutionObserver`，复用原审批器、原工具、Environment和平台后端；最终完整JSON精确绑定，非截断摘要。`ToolUseStart`仍是提议，`execution_started`在最终校验后、Todo获取原OS锁后可等待写入真实开始，记录失败使Run失败。默认旧执行器保留；其默认取消只等待原执行，不宣称能即时中断。T3必须在Host统一资源包装中获取根锁后重验并接入观察器，不能把T2的批次metadata屏障或Todo专用锁称为跨Session调度，也不能依赖同步event callback保存事实。
+
+Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2任务queued/running/blocked/终态；具体对照见T2验证记录。T2只交付通用授权和实际执行缝隙，T3完成共享服务、T5映射菜单/快照/动画。Windows固定系统cmd，未知语法保守审批；UNC/device工作目录明确拒绝而不允许cmd静默切目录；普通执行复用Job并不声称隔离，当前受限组合不能验证网络限制则拒绝。M2通过、独立PR获批并合入后才进入T3，未将本段视作完成声明。

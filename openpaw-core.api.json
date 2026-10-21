@@ -61,8 +61,15 @@
     },
     {
       "methods": [
+        "async fn started (& self , binding : & ToolCallBinding) -> Result < () >"
+      ],
+      "name": "ToolExecutionObserver"
+    },
+    {
+      "methods": [
         "async fn call (& self , name : & str , args : serde_json :: Value) -> Result < ToolCallOutcome >",
         "async fn call_cancellable (& self , name : & str , args : serde_json :: Value , cancel : tokio_util :: sync :: CancellationToken ,) -> Result < ToolCallOutcome >",
+        "async fn call_with_context (& self , name : & str , args : serde_json :: Value , context : crate :: ToolCallContext ,) -> Result < ToolCallOutcome >",
         "async fn list_tools (& self) -> Result < Vec < ToolSpec > >"
       ],
       "name": "ToolExecutor"
@@ -138,6 +145,8 @@
     "struct SessionMeta",
     "struct SystemPromptBlocks",
     "struct ToolAnnotations",
+    "struct ToolCallBinding",
+    "struct ToolCallContext",
     "struct ToolCallOutcome",
     "struct ToolSpec",
     "struct Transcript",

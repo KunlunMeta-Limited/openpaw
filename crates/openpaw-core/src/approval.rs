@@ -6,7 +6,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// A request for the user to approve (or deny) a guarded action.
+/// 用途：用户批准或拒绝最终工具输入的请求。
+/// 字段：工具、输入、原因和可选精确绑定。
+/// 来源去向：引擎到既有ApprovalManager。
+/// 约束：旧构造不带绑定，新调用必须与执行上下文一致。
+/// 稳定性：保留旧构造，struct literal调用者需补binding。
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
 ///
 /// Stability: stable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,14 +20,33 @@ pub struct ApprovalRequest {
     pub input: Value,
     /// Why the approval is needed (guardrail `Confirm` reason).
     pub reason: String,
+    /// 用途：可选的精确调用关联
+    /// 字段：Run/call/最终输入
+    /// 来源去向：引擎到审批器
+    /// 约束：旧构造为空；不能信任客户端自行发送批准
+    /// 稳定性：新增协议无关接口
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    /// Stability: unstable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<crate::ToolCallBinding>,
 }
 
 impl ApprovalRequest {
+    /// 功能：创建兼容旧调用方的审批请求
+    /// 参数：tool_name/input/reason为最终工具内容和原因
+    /// 返回：无绑定请求，新的引擎会附精确绑定
+    /// 错误：无
+    /// 状态：不执行工具，也不授予权限
+    /// 并发与取消：无等待
+    /// 权限：实际审批仍由ApprovalManager决定
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    /// Stability: unstable.
     pub fn new(tool_name: impl Into<String>, input: Value, reason: impl Into<String>) -> Self {
         Self {
             tool_name: tool_name.into(),
             input,
             reason: reason.into(),
+            binding: None,
         }
     }
 }

@@ -180,8 +180,13 @@ fn lock_inner(file: &File, exclusive: bool) -> io::Result<()> {
     // non-blocking so contention is reported as an error instead of blocking.
     let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
     unsafe {
-        LockFileEx(handle, flags, None, u32::MAX, u32::MAX, &mut overlapped)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        LockFileEx(handle, flags, None, u32::MAX, u32::MAX, &mut overlapped).map_err(|e| {
+            if e.code() == windows::Win32::Foundation::ERROR_LOCK_VIOLATION.to_hresult() {
+                io::Error::new(io::ErrorKind::WouldBlock, e.to_string())
+            } else {
+                io::Error::from_raw_os_error(e.code().0 & 0xffff)
+            }
+        })?;
     }
     Ok(())
 }

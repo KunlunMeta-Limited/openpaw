@@ -27,3 +27,7 @@ workspace = true
 [[test]]
 name = "lifecycle_regressions"
 path = "tests/regressions/lifecycle.rs"
+
+[[test]]
+name = "tool_execution_regressions"
+path = "tests/regressions/tool_execution.rs"
