@@ -191,6 +191,13 @@ impl RunObserver for NoopObserver {
 /// 关联：需求/设计 DES-OP-002。
 #[derive(Clone)]
 pub(crate) struct RunControl {
+    /// 用途：调用授权的运行关联
+    /// 字段：运行标识run_id
+    /// 来源去向：RunContext到工具
+    /// 约束：每次独立运行保持稳定
+    /// 稳定性：新增协议无关接口
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    pub(crate) run_id: String,
     /// 用途：本Run子取消信号
     /// 字段：运行配置
     /// 来源去向：上下文到工具

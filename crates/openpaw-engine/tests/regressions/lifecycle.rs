@@ -701,7 +701,14 @@ struct ParallelCleanup {
 #[async_trait]
 impl ToolExecutor for ParallelCleanup {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
-        Ok(vec![])
+        Ok(["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let mut spec = ToolSpec::new(name, "cleanup regression");
+                spec.concurrency = Some(openpaw_core::ToolConcurrency::ParallelSafe);
+                spec
+            })
+            .collect())
     }
     async fn call(&self, _: &str, _: serde_json::Value) -> Result<ToolCallOutcome> {
         panic!("必须传递取消上下文")

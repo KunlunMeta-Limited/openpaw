@@ -17,9 +17,7 @@
 //! Runtime isolation is provided by bwrap.
 
 use std::path::Path;
-use std::time::Instant;
 
-use crate::audit::AuditLog;
 use crate::error::SandboxError;
 use crate::policy::{FileSystemPolicy, NetworkPolicy, SandboxPolicy};
 use crate::SandboxResult;
@@ -113,15 +111,21 @@ fn which_bwrap() -> Option<std::path::PathBuf> {
 /// 并发与取消：异步等待输出，尚未提供调用级取消与进程树清理保证。
 /// 权限：调用前需批准；域名白名单仅提示，不能当严格隔离保证。
 /// 关联：沙箱平台分派和后续执行环境缺陷修复。
-pub async fn exec_bwrap(
+pub(crate) async fn exec_bwrap_cancellable(
     policy: &SandboxPolicy,
     command: &str,
     cwd: Option<&Path>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<SandboxResult, SandboxError> {
+    // bwrap不能实施域名白名单；提示变量不是网络隔离，必须先拒绝再创建目录。
+    if matches!(policy.net_policy(), NetworkPolicy::AllowDomains(_)) {
+        return Err(SandboxError::PlatformUnavailable(
+            "bwrap cannot enforce domain allowlist".into(),
+        ));
+    }
     let bwrap_path =
         which_bwrap().ok_or_else(|| SandboxError::ToolNotFound("bwrap".to_string()))?;
 
-    let start = Instant::now();
     let policy_name = format!("{policy:?}");
 
     let mut args = vec![
@@ -178,17 +182,6 @@ pub async fn exec_bwrap(
         args.push("--share-net".to_string());
     }
 
-    // Add domain restrictions hint via environment variable
-    if let NetworkPolicy::AllowDomains(domains) = policy.net_policy() {
-        if !domains.is_empty() {
-            // bwrap doesn't natively support domain whitelisting;
-            // set env hint for application-level enforcement
-            args.push("--setenv".to_string());
-            args.push("OPENPAW_ALLOWED_DOMAINS".to_string());
-            args.push(domains.join(","));
-        }
-    }
-
     // Clear all inherited environment variables to prevent API key
     // leakage (OPENAI_API_KEY, ANTHROPIC_API_KEY, OPENPAW_SIGNING_KEY,
     // etc.). Only essential variables are explicitly re-set below.
@@ -210,30 +203,7 @@ pub async fn exec_bwrap(
     let mut cmd = tokio::process::Command::new(&bwrap_path);
     cmd.args(&args);
 
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| SandboxError::ExecutionFailed(format!("bwrap execution failed: {e}")))?;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    let mut audit = AuditLog::new(command, cwd, &policy_name, "bubblewrap");
-    audit.exit_code = output.status.code().unwrap_or(-1);
-    audit.duration_ms = duration_ms;
-
-    Ok(SandboxResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: audit.exit_code,
-        audit,
-    })
+    crate::process::run_command(cmd, command, cwd, &policy_name, "bubblewrap", cancel).await
 }
 
 /// Get the list of available sandbox backends on Linux.

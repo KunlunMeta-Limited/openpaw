@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-状态：T0 实施中，尚未获得非作者批准并合入；T1—T8 未开始。修订日期：2026-10-20。
+状态：T0、T1 已获用户审核并合入；T2准确交付8fa0b6d于2026-10-21获用户验收，PR #6已创建、待平台审核及合入；Windows原生验证本轮经用户决定暂缓。T3—T8未开始。T0治理补充修订已批准，随T3交付。修订日期：2026-10-21。
 
 本文件同时服务人工评审和 coding agent：先明确真实协议、用户行为与系统边界，再定义实现方法、产物、测试和 PR 交接。下文均是待实施要求；不能将设计、fixture 通过或 feature 连线描述为功能已交付。用户提供的 master-plan 仅作为参考材料。
 
@@ -24,7 +24,7 @@
 | 对象 | 固定基线 | 用途与状态 |
 |---|---|---|
 | OpenPaw 初始审核 | 60a531a51172d14fc3db1a8e7eb6762c2c8369d8 | 引擎、Provider、工具、存储可复用；Host 当时只有占位说明 |
-| OpenPaw T0 已提交工作 | PR #4 当前 head | 已有构建/测试基线修正；未合入，不能开始 T1；当前工作区文档不等于已提交版本 |
+| OpenPaw 当前集成基线 | ac1b58285fb6c73dce6363ce88fe62100199bb73 | T0 #4、T1 #5已合入；T2从该基线开发；当前状态见14.1，不以工作区文档代替提交验证 |
 | Office | b221a44ce22fe08956356b5002d17df59a6a4f50 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
 | OpenCode SDK | @opencode-ai/sdk 1.18.15 | 精确版本、integrity、lockfile 和真实 v1 类型 |
 | 集成分支 | merge/ai-ofice-react-overagent | OpenPaw Tx PR 的目标分支，保留现有 ofice 拼写 |
@@ -82,7 +82,7 @@ audit/r1-chat/handoff 已同步为条件提案；达到扩展体验需要修改�
 | 断网或重启后继续使用 | 保留真实记录和最新任务；未完 Run 说明中断；Office恢复最新完整快照 | JSONL/Host恢复 + initialize/snapshot/read；T3/T6 | 不自动重放工具；v1不能接回原生成，重试属于新的用户请求 |
 | 点击任务的开始/暂停/完成/改派 | 返回准确的能力说明与可用操作建议 | ui.next + detail-v1；T5 | 首期不实现旧 Run 重放、可恢复暂停、手动伪完成、执行所有权迁移；按钮不是已支持命令 |
 
-里程碑状态及PR追踪统一见[第14节](#milestones)，当前没有已完成Tx；[第14.2节](#protocol-checklist)给出Tx到官方文档/实施章节/验收证据的核查表。
+里程碑状态及PR追踪统一见[第14节](#milestones)，当前T0/T1已完成、T2待PR审核；[第14.2节](#protocol-checklist)给出Tx到官方文档/实施章节/验收证据的核查表。
 
 基础版的“能展示”要求 T4 和 T5 的两条用户旅程都通过，T6 加固故障恢复，T8 完成原生双平台交付。T7 是另一客户端的 SDK 兼容工作，不是 Office 产品闭环的前提。不能以“聊天通了”或“可以播放演示动画”替代 T5 的产品验收。
 
@@ -1044,8 +1044,8 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 | 里程碑/Tx | 用户或开发者应取得的成果 | 验收入口及必须满足的结果 | 当前状态 | PR与批准/合入证据 |
 |---|---|---|---|---|
 | M0 / T0 | 产品/协议/工程治理可直接指导后续开发 | [T0任务卡](#tx-t0)；官方Schema/SDK、治理、完整双平台基线；[提PR前核查](#milestone-gate) | 已完成：用户于2026-10-20会话确认审核通过，PR已合入 | [OpenPaw #4](https://github.com/KunlunMeta-Limited/openpaw/pull/4)，合入76e2ee2f5881afd5daab13cca3ca3460a561f023；GitHub无独立Review，审核证据为用户会话确认；[逐项核查](../verification/CHG-2026-0001/T0核查.md)、[验证记录](../verification/CHG-2026-0001/验证记录.md) |
-| M1 / T1 | 正确模型、可信停止和完整历史可复用 | [T1任务卡](#tx-t1)；D01—D04回归、真实Provider请求捕获、存储/取消边界、CLI兼容 | 技术核查通过：CHG-2026-0002；实质交付eeaeeed，Linux26/26及原生CI13/13；最终登记head仍验 | 未创建；最终登记head复验后提PR，审核/合入待发生 |
-| M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、cmd/sh、大输出/路径/原子Todo原生证据 | 待实施 | 未创建；批准/合入待发生 |
+| M1 / T1 | 正确模型、可信停止和完整历史可复用 | [T1任务卡](#tx-t1)；D01—D04回归、真实Provider请求捕获、存储/取消边界、CLI兼容 | 已完成：用户2026-10-21确认T1审核通过；PR #5已合入 | [OpenPaw #5](https://github.com/KunlunMeta-Limited/openpaw/pull/5)，最终head 383d0922eba3d069794015e1f280668a690c482c；合入ac1b58285fb6c73dce6363ce88fe62100199bb73；[最终push CI](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39416514821)13/13；PR事件另轮CI因账单未启动，保留历史失败，不虚称全部事件成功 |
+| M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、D34/D35、cmd/sh、大输出/路径/原子Todo原生证据 | 待PR审核：用户2026-10-21已验收8fa0b6d，Windows原生验证本轮暂缓；尚未合入，不标已完成 | [OpenPaw #6](https://github.com/KunlunMeta-Limited/openpaw/pull/6)，base merge/ai-ofice-react-overagent；创建head 72fd8dc的Linux26/26；[CHG-2026-0003](../changes/CHG-2026-0003.md)第1/12节及[验证记录](../verification/CHG-2026-0003/验证记录.md)记录准确验收、PR和CI未启动事实；平台批准/合入待发生 |
 | M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；真实Host客户端两Session/重启/查询，复用T0 D16回归 | 待实施 | 未创建；批准/合入待发生 |
 | M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；聊天+任务/白板+真实账本及快照恢复 | 待实施 | 未创建；批准/合入待发生 |
 | M5 / T5 | 常规产品闭环：审批写产物、详情、交接与发言 | [演示步骤3—6](#product-demo)、[T5任务卡](#tx-t5)；文件哈希、call/审批、真浏览器动画/详情可交叉核对 | 待实施 | 未创建；批准/合入待发生 |
@@ -1143,6 +1143,8 @@ PR关闭未合入、批准后又有实质变更、必需跨仓PR只合入一方�
 
 ### 14.7 M2 / T2：授权工具和双平台执行可信
 
+**本轮验证安排：**用户于2026-10-21明确“暂时由于环境问题，不检查windows这个部分”，本轮T2依此暂缓原生Windows验证，按Linux证据先进行0003交付验收；Windows暂缓不作为本轮第14.3节提PR前的环境阻塞，不代表验证通过、交付已获批准或T2已完成。CI/测试不改为skip，原未启动记录保留。仅本轮T2适用，不自动扩展其他Tx，不取消Windows支持目标和T8原生产品验收；原生补验项及当前准确版本见0003第12节。
+
 **实施入口：**[第10节T2任务卡](#tx-t2)；[协议对照](#protocol-checklist)；[提PR前核查表](#milestone-gate)。当前状态与PR只维护[14.1台账](#milestones)，本小节不保存第二份状态。
 
 - 产物核查：最终输入审批、调用上下文、Environment、真正执行观察、进程树/输出排空、shell策略/隔离fail-closed、Todo原子更新。
@@ -1230,3 +1232,14 @@ T1实现细则与T2交接见[设计说明的T1章节](../design/软件设计说�
 
 
 2026-10-20，M1/T1技术核查：实质交付`eeaeeed361ece22116850978eec64f5eff39c72c`的全部必需产物通过，[完整逐项核查与失败整改](../verification/CHG-2026-0002/验证记录.md)、[原生双平台CI13/13](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39415492490)。Linux完整26/26，默认929/全feature941通过，两项既有ignored单列；Office/Host产品功能尚待后续。最终核查登记head仍验全部套件/原生CI后才提PR；当前没有T1人审批准或合入，M1未标完成，T2未开始。
+
+
+2026-10-21，前置完成与T2开工登记：用户明确“T1的PR审核通过了”，已核实[PR #5](https://github.com/KunlunMeta-Limited/openpaw/pull/5)合入集成分支，实际为merge commit `ac1b58285fb6c73dce6363ce88fe62100199bb73`，不将建议的squash方式写成事实。不修改历史待审报告；上文2026-10-20的技术核查为当时状态。当前以14.1为准。T2分支`fix/engine-host-t2`，主CHG-2026-0003；修复范围D05—D11及同一命令builder出口新发现的D34，不修改Office。T1各次CI独立记录，PR事件账单阻塞不冒充测试失败或通过。
+
+T2详细实现与交接：见[DES-OP-004/005](../design/软件设计说明.md#t2工具授权与托管执行des-op-004005)、[执行能力矩阵](../verification/CHG-2026-0003/执行能力矩阵.md)。实际新增`core::ToolCallContext`/`ToolExecutionObserver`，复用原审批器、原工具、Environment和平台后端；最终完整JSON精确绑定，非截断摘要。`ToolUseStart`仍是提议，`execution_started`在最终校验后、Todo获取原OS锁后可等待写入真实开始，记录失败使Run失败。默认旧执行器保留；其默认取消只等待原执行，不宣称能即时中断。T3必须在Host统一资源包装中获取根锁后重验并接入观察器，不能把T2的批次metadata屏障或Todo专用锁称为跨Session调度，也不能依赖同步event callback保存事实。
+
+Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2任务queued/running/blocked/终态；具体对照见T2验证记录。T2只交付通用授权和实际执行缝隙，T3完成共享服务、T5映射菜单/快照/动画。Windows固定系统cmd，未知语法保守审批；UNC/device工作目录明确拒绝而不允许cmd静默切目录；普通执行复用Job并不声称隔离，当前受限组合不能验证网络限制则拒绝。M2通过、独立PR获批并合入后才进入T3，未将本段视作完成声明。
+
+2026-10-21 M2增量核查：D35原TLS两包安全补丁与精确许可证通知同步后，70d0385干净副本Linux26/26完整通过（默认961/全feature973，既有ignored各2单列），[详细证据](../verification/CHG-2026-0003/验证记录.md)。Windows push CI [39530378011](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39530378011)13作业因付款/额度未启动，非代码失败或通过；当前原生进程/Job/路径验证缺失，M2保持阻塞。恢复Actions可用额度或提供原生Windows验证环境后验最终head；按门禁尚不提PR、不进入T3。
+
+2026-10-21 M2当前登记：用户验收准确交付`8fa0b6dc1ad296140203e3b4845e55d87db14b5d`后，已创建[PR #6](https://github.com/KunlunMeta-Limited/openpaw/pull/6)，目标`merge/ai-ofice-react-overagent`；创建head `72fd8dc888b1be59ad9e3986aff729655c8fbb78`的Linux完整26/26，Windows本轮暂缓。当前Open、待非作者平台审核和合入，不自动进入T3。0001治理补充未纳入；上文“M2阻塞/未提PR”保留为此前事实，当前以14.1及0003首页为准。

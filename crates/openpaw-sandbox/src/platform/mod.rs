@@ -11,6 +11,15 @@ use crate::policy::SandboxPolicy;
 use crate::SandboxResult;
 
 /// Check if native sandboxing is available on this platform.
+/// 功能：探测当前平台受限后端的基本可用性
+/// 参数：无
+/// 返回：Linux具备bwrap时为真；Windows受限网络尚不可验证返回假
+/// 错误：探测不可用返回假
+/// 状态：只读探测
+/// 并发与取消：同步，不提供取消
+/// 权限：可用不代表任意策略已落实，执行时仍严格验证
+/// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+/// Stability: unstable.
 pub fn is_sandbox_available() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -22,8 +31,8 @@ pub fn is_sandbox_available() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        // Windows sandbox is always available (uses built-in APIs)
-        true
+        // 现有token/ACL不能落实策略要求的网络隔离；本地Job执行不等于受限能力。
+        false
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
@@ -69,45 +78,46 @@ pub async fn exec_sandboxed(
     command: &str,
     cwd: Option<&Path>,
 ) -> Result<SandboxResult, SandboxError> {
-    // If the policy is unrestricted, run without sandbox
-    if !policy.is_restricted() {
-        return crate::command::exec_unrestricted(command, cwd).await;
-    }
+    exec_sandboxed_cancellable(
+        policy,
+        command,
+        cwd,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
 
-    // Try platform-specific sandboxing
+/// 功能：把取消与隔离策略分派到原平台
+/// 参数：policy/command/cwd为输入，cancel为token
+/// 返回：实际执行结果
+/// 错误：缺后端或无法落实限制时拒绝
+/// 状态：不创建额外执行器
+/// 并发与取消：下游持有token并等待清理
+/// 权限：不以环境提示代替隔离
+/// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+/// Stability: unstable.
+pub(crate) async fn exec_sandboxed_cancellable(
+    policy: &SandboxPolicy,
+    command: &str,
+    cwd: Option<&Path>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<SandboxResult, SandboxError> {
+    if !policy.is_restricted() {
+        return crate::command::exec_unrestricted_cancellable(command, cwd, cancel).await;
+    }
     #[cfg(target_os = "linux")]
     {
-        if linux::is_bwrap_available() {
-            return linux::exec_bwrap(policy, command, cwd).await;
-        }
-        // Fail closed: cannot enforce a restricted policy without bwrap
-        Err(SandboxError::PlatformUnavailable(
-            "bwrap not found on Linux; cannot enforce restricted sandbox policy".to_string(),
-        ))
+        linux::exec_bwrap_cancellable(policy, command, cwd, cancel).await
     }
-
-    #[cfg(target_os = "macos")]
+    #[cfg(windows)]
     {
-        if macos::is_seatbelt_available() {
-            return macos::exec_seatbelt(policy, command, cwd).await;
-        }
-        // Fail closed: cannot enforce a restricted policy without sandbox-exec
-        Err(SandboxError::PlatformUnavailable(
-            "sandbox-exec not found on macOS; cannot enforce restricted sandbox policy".to_string(),
-        ))
+        windows::exec_restricted_cancellable(policy, command, cwd, cancel).await
     }
-
-    #[cfg(target_os = "windows")]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
-        windows::exec_restricted(policy, command, cwd).await
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    {
-        // Fail closed: no sandbox support on this platform
+        let _ = (policy, command, cwd, cancel);
         Err(SandboxError::PlatformUnavailable(
-            "no sandbox support on this platform; cannot enforce restricted sandbox policy"
-                .to_string(),
+            "restricted managed backend unavailable on this platform".into(),
         ))
     }
 }
@@ -121,4 +131,8 @@ mod linux;
 mod macos;
 
 #[cfg(target_os = "windows")]
-mod windows;
+/// 职责：复用Windows token、ACL与Job执行机制。
+/// 输入输出：命令/策略到实际进程结果。
+/// 依赖：系统句柄与Job/管道API。
+/// 禁止职责：不把环境提示当隔离，不降级普通执行。
+pub(crate) mod windows;

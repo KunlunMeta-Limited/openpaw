@@ -22,6 +22,12 @@ pub mod approval;
 pub mod budget;
 pub mod error;
 pub mod guardrail;
+/// 职责：不可变的最终工具调用绑定。
+/// 输入输出：审批调用到执行观察上下文。
+/// 依赖：原core契约与取消token。
+/// 禁止职责：不包含宿主调度和协议路由。
+/// Stability: unstable.
+pub mod invocation;
 pub mod memory_provider;
 pub mod message;
 pub mod policy;
@@ -40,6 +46,7 @@ pub use guardrail::{
     AllowlistGuardrail, CheckContext, GuardrailChain, GuardrailDecision, PermissiveGuardrail,
     ToolGuardrail,
 };
+pub use invocation::{ToolCallBinding, ToolCallContext, ToolExecutionObserver};
 pub use memory_provider::{
     InMemoryProvider, MemoryEntry, MemoryProvider, MemorySearchQuery, MemorySearchResult,
 };

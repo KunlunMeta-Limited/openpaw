@@ -18,14 +18,33 @@ fn workspace() -> PathBuf {
     path
 }
 
+// 成功路径在Windows必须使用本次真实授权；cmd没有可用语法解析器，不能改判Safe。
+async fn approved_shell(
+    workspace: &std::path::Path,
+    command: &str,
+) -> openpaw_core::ToolCallOutcome {
+    use openpaw_core::{ToolCallContext, ToolExecutor};
+    let args = serde_json::json!({"command": command});
+    let context = ToolCallContext::new(
+        "exec-e2e",
+        "approved-call",
+        "bash",
+        &args,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .approve();
+    openpaw_tools::ToolRegistry::new(workspace)
+        .call_with_context("bash", args, context)
+        .await
+        .unwrap()
+}
+
 // ── bash ─────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn bash_contract_echo_output() {
     let ws = workspace();
-    let out = bash::run(&ws, serde_json::json!({"command": "echo exec-e2e-ok"}))
-        .await
-        .unwrap();
+    let out = approved_shell(&ws, "echo exec-e2e-ok").await;
     assert!(!out.is_error, "got: {}", out.content);
     assert!(out.content.contains("exec-e2e-ok"), "got: {}", out.content);
     assert!(
@@ -39,9 +58,7 @@ async fn bash_contract_echo_output() {
 async fn bash_nonzero_exit_code_is_error_outcome() {
     let ws = workspace();
     // `exit 3` works in both cmd /C and sh -c.
-    let out = bash::run(&ws, serde_json::json!({"command": "exit 3"}))
-        .await
-        .unwrap();
+    let out = approved_shell(&ws, "exit 3").await;
     assert!(out.is_error, "got: {}", out.content);
     assert!(
         out.content.contains("[exit code: 3]"),
@@ -154,8 +171,7 @@ async fn local_environment_exec_echo_contract() {
 
 #[test]
 fn sandboxed_environment_construction_and_policy() {
-    // Construction surface only: restricted/isolated execution paths are
-    // covered by the sandbox crate's own (ignored) integration tests.
+    // 此处只验证构造；受限能力拒绝与本地托管进程在专用回归中真实执行。
     let ws = workspace();
     let restricted = SandboxedEnvironment::new(SandboxPolicy::Restricted, ws);
     assert_eq!(restricted.name(), "sandboxed-restricted");
@@ -164,4 +180,22 @@ fn sandboxed_environment_construction_and_policy() {
     let none = SandboxedEnvironment::new(SandboxPolicy::None, PathBuf::from("nowhere"));
     assert_eq!(none.name(), "local");
     assert_eq!(none.policy(), &SandboxPolicy::None);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_raw_cmd_requires_approval_even_for_echo() {
+    let ws = workspace();
+    let out = bash::run(
+        &ws,
+        serde_json::json!({"command":"echo unapproved > denied.txt"}),
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.is_error && out.content.contains("approval"),
+        "{}",
+        out.content
+    );
+    assert!(!ws.join("denied.txt").exists());
 }

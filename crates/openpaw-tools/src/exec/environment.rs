@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use async_trait::async_trait;
 use openpaw_core::{Error, Result};
@@ -37,8 +38,55 @@ pub fn exit_code_from(status: &std::process::ExitStatus) -> i32 {
 }
 
 #[async_trait]
+/// 用途：原工具的可注入执行环境
+/// 字段：命令执行、文件复制、健康与shell类型
+/// 来源去向：原bash工具到本地或受限后端
+/// 约束：取消后等待实际执行结束；默认扩展兼容旧实现
+/// 稳定性：新增协议无关接口
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
 pub trait Environment: Send + Sync {
     async fn exec(&self, command: &str, cwd: Option<&Path>) -> EnvironmentResult;
+    /// 功能：可取消执行的兼容入口
+    /// 参数：command/cwd为输入，cancel为调用token
+    /// 返回：实际执行结果
+    /// 错误：通过结果stderr/非零退出码报告
+    /// 状态：默认兼容旧exec，不提前丢弃副作用
+    /// 并发与取消：旧实现等待原exec；受控后端重载以杀树并等待
+    /// 权限：不因取消或审批降低环境策略
+    /// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+    /// Stability: unstable.
+    async fn exec_cancellable(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        cancel: CancellationToken,
+    ) -> EnvironmentResult {
+        if cancel.is_cancelled() {
+            return EnvironmentResult {
+                stdout: String::new(),
+                stderr: "command cancelled before execution".into(),
+                exit_code: -1,
+            };
+        }
+        self.exec(command, cwd).await
+    }
+    /// 功能：声明执行时实际使用的shell
+    /// 参数：无
+    /// 返回：明确shell类型
+    /// 错误：无
+    /// 状态：只读
+    /// 并发与取消：无等待
+    /// 权限：注入其他launcher的环境必须重载，不能按文本猜测
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    /// Stability: unstable.
+    fn shell_type(&self) -> crate::bashast::ShellType {
+        if cfg!(windows) {
+            crate::bashast::ShellType::Cmd
+        } else {
+            crate::bashast::ShellType::Bash
+        }
+    }
     async fn push_file(&self, local: &Path, remote: &Path) -> Result<()>;
     async fn pull_file(&self, remote: &Path, local: &Path) -> Result<()>;
     async fn health_check(&self) -> bool;
@@ -47,37 +95,34 @@ pub trait Environment: Send + Sync {
 
 /// Runs commands directly on the host — the historical bash tool path
 /// (`cmd /C` on Windows, `sh -c` elsewhere) with the workspace as cwd, null
-/// stdin and kill-on-drop, so a timed-out command cannot outlive the
-/// caller's timeout.
+/// stdin and a managed process group / Job Object; cancellation waits for actual cleanup.
+/// 用途：原普通本地执行环境
+/// 字段：无
+/// 来源去向：工具命令到原Sandbox普通托管执行
+/// 约束：管理进程树不表示文件/网络隔离
+/// 稳定性：保留原构造，延展取消行为
+/// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+/// Stability: unstable.
 pub struct LocalEnvironment;
 
 #[async_trait]
 impl Environment for LocalEnvironment {
     async fn exec(&self, command: &str, cwd: Option<&Path>) -> EnvironmentResult {
-        let mut cmd = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
-        cmd.arg(if cfg!(windows) { "/C" } else { "-c" })
-            .arg(command)
-            // Null stdin so the command cannot inherit and block on the parent's.
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            // Killed when the caller's timeout drops the child.
-            .kill_on_drop(true);
-        if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
-        }
-        match cmd.output().await {
-            Ok(output) => EnvironmentResult {
-                stdout: decode_output(&output.stdout),
-                stderr: decode_output(&output.stderr),
-                exit_code: exit_code_from(&output.status),
-            },
-            Err(e) => EnvironmentResult {
-                stdout: String::new(),
-                stderr: format!("bash exec error: {e}"),
-                exit_code: -1,
-            },
-        }
+        self.exec_cancellable(command, cwd, CancellationToken::new())
+            .await
+    }
+    async fn exec_cancellable(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        cancel: CancellationToken,
+    ) -> EnvironmentResult {
+        sandbox_result(
+            openpaw_sandbox::Sandbox::new(openpaw_sandbox::SandboxPolicy::None)
+                .expect("sandbox construction is infallible")
+                .exec_cancellable(command, cwd, cancel)
+                .await,
+        )
     }
 
     async fn push_file(&self, local: &Path, remote: &Path) -> Result<()> {
@@ -103,12 +148,21 @@ impl Environment for LocalEnvironment {
     }
 }
 
-/// Decode command output bytes as UTF-8 with lossy fallback.
-fn decode_output(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
+fn sandbox_result(
+    result: std::result::Result<openpaw_sandbox::SandboxResult, openpaw_sandbox::SandboxError>,
+) -> EnvironmentResult {
+    match result {
+        Ok(result) => EnvironmentResult {
+            stdout: result.stdout,
+            stderr: result.stderr,
+            exit_code: result.exit_code,
+        },
+        Err(e) => EnvironmentResult {
+            stdout: String::new(),
+            stderr: format!("command execution failed: {e}"),
+            exit_code: -1,
+        },
     }
-    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Execution isolation level requested for an environment.
@@ -127,40 +181,6 @@ pub enum SandboxPolicy {
     Restricted,
     /// Read-only sandbox without network access.
     Isolated,
-}
-
-/// Stub environment that always refuses to execute commands. Used when an
-/// isolated policy is requested but the sandbox backend is unavailable —
-/// fail closed rather than silently executing unsandboxed.
-struct FailClosedEnvironment {
-    reason: String,
-}
-
-#[async_trait]
-impl Environment for FailClosedEnvironment {
-    async fn exec(&self, _command: &str, _cwd: Option<&Path>) -> EnvironmentResult {
-        EnvironmentResult {
-            stdout: String::new(),
-            stderr: self.reason.clone(),
-            exit_code: -1,
-        }
-    }
-
-    async fn push_file(&self, _local: &Path, _remote: &Path) -> Result<()> {
-        Err(Error::ToolHost(self.reason.clone()))
-    }
-
-    async fn pull_file(&self, _remote: &Path, _local: &Path) -> Result<()> {
-        Err(Error::ToolHost(self.reason.clone()))
-    }
-
-    async fn health_check(&self) -> bool {
-        false
-    }
-
-    fn name(&self) -> &str {
-        "fail-closed"
-    }
 }
 
 /// Environment that delegates restricted/isolated execution to the local
@@ -263,38 +283,34 @@ impl SandboxedEnvironment {
 #[async_trait]
 impl Environment for SandboxedEnvironment {
     async fn exec(&self, command: &str, cwd: Option<&Path>) -> EnvironmentResult {
-        let effective_cwd = cwd.unwrap_or(&self.workspace);
-
-        match self.policy {
-            SandboxPolicy::None => LocalEnvironment.exec(command, Some(effective_cwd)).await,
-            SandboxPolicy::Restricted | SandboxPolicy::Isolated => {
-                // The sandbox crate itself fails closed: if the command is
-                // blocked by policy or the backend is unavailable, `exec`
-                // returns an error instead of running the command unsandboxed.
-                match openpaw_sandbox::Sandbox::new(self.sandbox_policy.clone()) {
-                    Ok(sandbox) => match sandbox.exec(command, Some(effective_cwd)).await {
-                        Ok(result) => EnvironmentResult {
-                            stdout: result.stdout,
-                            stderr: result.stderr,
-                            exit_code: result.exit_code,
-                        },
-                        Err(e) => EnvironmentResult {
-                            stdout: String::new(),
-                            stderr: format!("sandbox exec failed: {e}"),
-                            exit_code: -1,
-                        },
-                    },
-                    Err(e) => EnvironmentResult {
-                        stdout: String::new(),
-                        stderr: format!("sandbox init failed: {e}"),
-                        exit_code: -1,
-                    },
-                }
+        self.exec_cancellable(command, cwd, CancellationToken::new())
+            .await
+    }
+    async fn exec_cancellable(
+        &self,
+        command: &str,
+        cwd: Option<&Path>,
+        cancel: CancellationToken,
+    ) -> EnvironmentResult {
+        let cwd = cwd.unwrap_or(&self.workspace);
+        match openpaw_sandbox::Sandbox::new(self.sandbox_policy.clone()) {
+            Ok(sandbox) => {
+                sandbox_result(sandbox.exec_cancellable(command, Some(cwd), cancel).await)
             }
+            Err(e) => EnvironmentResult {
+                stdout: String::new(),
+                stderr: format!("sandbox init failed: {e}"),
+                exit_code: -1,
+            },
         }
     }
 
     async fn push_file(&self, local: &Path, remote: &Path) -> Result<()> {
+        if self.policy == SandboxPolicy::Isolated {
+            return Err(Error::ToolHost(
+                "isolated environment forbids file writes".into(),
+            ));
+        }
         self.validate_writable_path(local).await?;
         self.validate_writable_path(remote).await?;
         self.check_no_symlink(local).await?;
@@ -309,6 +325,11 @@ impl Environment for SandboxedEnvironment {
     }
 
     async fn pull_file(&self, remote: &Path, local: &Path) -> Result<()> {
+        if self.policy == SandboxPolicy::Isolated {
+            return Err(Error::ToolHost(
+                "isolated environment forbids file writes".into(),
+            ));
+        }
         self.validate_writable_path(remote).await?;
         self.validate_writable_path(local).await?;
         self.check_no_symlink(remote).await?;
@@ -347,36 +368,19 @@ pub enum EnvironmentKind {
     Sandbox(SandboxPolicy),
 }
 
+/// 功能：直接构造指定环境，不嵌套阻塞runtime也不降级
+/// 参数：kind为请求策略，workspace为根目录
+/// 返回：对应环境；执行时验证实际后端
+/// 错误：构造不探测运行能力，执行失败明确返回
+/// 状态：无命令、目录或权限副作用
+/// 并发与取消：适用current-thread和multi-thread runtime
+/// 权限：受限请求永远不返回LocalEnvironment
+/// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+/// Stability: unstable.
 pub fn create_environment(kind: EnvironmentKind, workspace: PathBuf) -> Arc<dyn Environment> {
     match kind {
         EnvironmentKind::Local => Arc::new(LocalEnvironment),
-        EnvironmentKind::Sandbox(policy) => {
-            let sandboxed = SandboxedEnvironment::new(policy.clone(), workspace);
-            // Handle the case where we might already be inside a tokio
-            // runtime: `block_in_place` avoids "cannot start a runtime from
-            // within a runtime" panics.
-            let health_ok = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    tokio::task::block_in_place(|| handle.block_on(sandboxed.health_check()))
-                }
-                Err(_) => match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt.block_on(sandboxed.health_check()),
-                    Err(_) => false,
-                },
-            };
-            if health_ok {
-                Arc::new(sandboxed)
-            } else {
-                // Fail closed for Isolated: do not silently downgrade to
-                // unsandboxed local execution.
-                match policy {
-                    SandboxPolicy::Isolated => Arc::new(FailClosedEnvironment {
-                        reason: "Isolated sandbox unavailable: health check failed".to_string(),
-                    }),
-                    _ => Arc::new(LocalEnvironment),
-                }
-            }
-        }
+        EnvironmentKind::Sandbox(policy) => Arc::new(SandboxedEnvironment::new(policy, workspace)),
     }
 }
 

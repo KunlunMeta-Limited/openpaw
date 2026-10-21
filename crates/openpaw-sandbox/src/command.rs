@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::audit::AuditLog;
 use crate::error::SandboxError;
 use crate::policy::SandboxPolicy;
 use crate::SandboxResult;
@@ -69,19 +68,36 @@ impl SandboxedCommand {
     }
 
     /// Get the full command string (command + args).
+    /// 功能：将builder参数安全表示为shell字面值
+    /// 参数：self包含已授权命令文本和字面参数
+    /// 返回：拼好的命令文本；Windows不支持的参数由exec拒绝
+    /// 错误：无，执行前另作支持性检查
+    /// 状态：不执行任何进程
+    /// 并发与取消：同步，无取消
+    /// 权限：command本身是有意脚本文本；args不能注入新命令
+    /// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+    /// Stability: unstable.
     pub fn full_command(&self) -> String {
-        let mut cmd = self.command.clone();
+        let mut command = self.command.clone();
         for arg in &self.args {
-            cmd.push(' ');
-            if arg.contains(' ') || arg.contains('"') {
-                cmd.push('"');
-                cmd.push_str(&arg.replace('"', "\\\""));
-                cmd.push('"');
+            command.push(' ');
+            if !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_./:-".contains(c))
+            {
+                command.push_str(arg);
+            } else if cfg!(windows) {
+                command.push('"');
+                command.push_str(arg);
+                command.push('"');
             } else {
-                cmd.push_str(arg);
+                command.push('\'');
+                command.push_str(&arg.replace('\'', "'\"'\"'"));
+                command.push('\'');
             }
         }
-        cmd
+        command
     }
 
     /// Get a reference to the policy.
@@ -90,66 +106,82 @@ impl SandboxedCommand {
     }
 
     /// Execute the command in the sandbox.
+    /// 功能：运行构建好的命令并落实超时清理
+    /// 参数：self为命令配置
+    /// 返回：真实输出与审计
+    /// 错误：执行失败或超时；超时也等实际清理
+    /// 状态：启动原平台执行
+    /// 并发与取消：超时发送token后等待，而不drop副作用future
+    /// 权限：请求隔离不可绕过
+    /// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+    /// Stability: unstable.
     pub async fn exec(self) -> Result<SandboxResult, SandboxError> {
-        let full_command = self.full_command();
-        let cwd = self.cwd.as_deref();
-        let timeout = self.timeout;
-
-        // Enforce timeout during execution, not after.
-        // Previously, the command ran to completion and the timeout was
-        // checked post-hoc, making it ineffective for limiting runtime.
-        let exec_fut = crate::platform::exec_sandboxed(&self.policy, &full_command, cwd);
-
-        match timeout {
-            Some(t) => match tokio::time::timeout(t, exec_fut).await {
-                Ok(result) => result,
-                Err(_) => Err(SandboxError::Timeout(t.as_millis() as u64)),
-            },
-            None => exec_fut.await,
+        if !self.env.is_empty() {
+            return Err(SandboxError::ExecutionFailed(
+                "builder env overrides are not supported; refusing to ignore them".into(),
+            ));
+        }
+        #[cfg(windows)]
+        if self
+            .args
+            .iter()
+            .any(|arg| arg.chars().any(|c| "&|<>^%!\"\r\n\0".contains(c)))
+        {
+            return Err(SandboxError::ExecutionFailed(
+                "cmd builder cannot safely represent these literal arguments".into(),
+            ));
+        }
+        let command = self.full_command();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let execution = crate::platform::exec_sandboxed_cancellable(
+            &self.policy,
+            &command,
+            self.cwd.as_deref(),
+            cancel.clone(),
+        );
+        tokio::pin!(execution);
+        if let Some(timeout) = self.timeout {
+            tokio::select! { biased;
+                _=tokio::time::sleep(timeout)=> {cancel.cancel(); let _=execution.await; Err(SandboxError::Timeout(timeout.as_millis().try_into().unwrap_or(u64::MAX)))},
+                result=&mut execution=>result,
+            }
+        } else {
+            execution.await
         }
     }
 }
 
-/// Execute a command without any sandbox (fallback).
-///
-/// This is used when the platform doesn't support native sandboxing
-/// or when the policy is `None`/`FullAccess`.
-pub(crate) async fn exec_unrestricted(
+/// 功能：复用托管进程实现普通本地命令
+/// 参数：command/cwd为命令和根目录，cancel为token
+/// 返回：真实输出和审计
+/// 错误：创建、取消或回收错误
+/// 状态：仅普通策略使用
+/// 并发与取消：进程组或Job托管，取消等待清理
+/// 权限：普通执行不声称有文件/网络隔离
+/// 关联：需求/设计 DES-OP-005；REQ-OP-006。
+/// Stability: unstable.
+pub(crate) async fn exec_unrestricted_cancellable(
     command: &str,
     cwd: Option<&Path>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> Result<SandboxResult, SandboxError> {
-    let start = std::time::Instant::now();
-
-    let mut cmd = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" });
-    if cfg!(windows) {
-        cmd.args(["/C", command]);
-    } else {
+    #[cfg(unix)]
+    {
+        let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", command]);
+        crate::process::run_command(cmd, command, cwd, "None", "process_group", cancel).await
     }
-
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
+    #[cfg(windows)]
+    {
+        crate::platform::windows::exec_local(command, cwd, cancel).await
     }
-
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| SandboxError::ExecutionFailed(format!("failed to execute command: {e}")))?;
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    let mut audit = AuditLog::new(command, cwd, "None", crate::platform::backend_name());
-    audit.duration_ms = duration_ms;
-
-    Ok(SandboxResult {
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code().unwrap_or(-1),
-        audit,
-    })
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (command, cwd, cancel);
+        Err(SandboxError::PlatformUnavailable(
+            "managed execution unavailable".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -173,7 +205,14 @@ mod tests {
     #[test]
     fn full_command_with_spaces() {
         let cmd = SandboxedCommand::new("echo", SandboxPolicy::None).arg("hello world");
-        assert_eq!(cmd.full_command(), "echo \"hello world\"");
+        assert_eq!(
+            cmd.full_command(),
+            if cfg!(windows) {
+                "echo \"hello world\""
+            } else {
+                "echo 'hello world'"
+            }
+        );
     }
 
     #[test]

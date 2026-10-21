@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use openpaw_core::{
     classify_api_error, ApprovalManager, ApprovalRequest, CheckContext, CompletionRequest,
     ContentBlock, Error, GuardrailDecision, IterationBudget, LlmProvider, Message, Result,
@@ -280,6 +280,7 @@ impl AgentLoop {
         }
         let _active = Active(&self.cancel_token);
         let control = RunControl {
+            run_id: context.run_id.clone(),
             parent: self.parent_cancel.clone(),
             cancel: token.clone(),
             deadline: context
@@ -517,7 +518,7 @@ impl AgentLoop {
                 });
             }
             let mut tool_events = Vec::new();
-            let results = self
+            let (results, execution_failure) = self
                 .execute_tools(
                     tool_uses,
                     &mut |event| {
@@ -556,6 +557,9 @@ impl AgentLoop {
                 .record(SessionEvent::Message(message.clone()))
                 .await?;
             session.messages.push(message);
+            if let Some(error) = execution_failure {
+                return Err(error);
+            }
             control.check()?;
         }
     }
@@ -647,425 +651,352 @@ impl AgentLoop {
         }
     }
 
-    /// Tool dispatcher: >1 call with parallel_tools → phased three-stage
-    /// path; otherwise sequential. (Upstream also routes orchestration and
-    /// ctx_inspect tools to dedicated paths — none exist in E1.)
+    // D05：串行和并行都先经过同一准备步骤；未知/写入工具保守作为并发屏障。
     async fn execute_tools(
         &self,
         tool_uses: Vec<ToolUseCall>,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         control: &RunControl,
-    ) -> Vec<ContentBlock> {
-        if tool_uses.is_empty() {
-            return Vec::new();
-        }
-        if self.parallel_tools && tool_uses.len() > 1 {
-            self.execute_tools_phased(tool_uses, event_sink, control)
-                .await
-        } else {
-            self.execute_tools_sequential(tool_uses, event_sink, control)
-                .await
-        }
-    }
-
-    fn check_context(&self) -> CheckContext {
-        CheckContext::default()
-    }
-
-    /// Three-stage phased execution:
-    /// 1. classify all calls (guardrail) — Deny → error result immediately;
-    /// 2. `Allow` calls run concurrently;
-    /// 3. `Confirm` calls run serially through the approval manager.
-    async fn execute_tools_phased(
-        &self,
-        tool_uses: Vec<ToolUseCall>,
-        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
-        control: &RunControl,
-    ) -> Vec<ContentBlock> {
-        let ctx = self.check_context();
-
-        // ── Phase 1: classify ──────────────────────────────────────────
-        let mut denied: Vec<ContentBlock> = Vec::new();
-        let mut safe: Vec<ToolUseCall> = Vec::new();
-        let mut confirm: Vec<ToolUseCall> = Vec::new();
-
+    ) -> (Vec<ContentBlock>, Option<Error>) {
+        let specs = match control.wait(self.tool_host.list_tools()).await {
+            Ok(Ok(specs)) => specs,
+            error => {
+                return (
+                    tool_uses
+                        .into_iter()
+                        .map(|(id, name, _)| {
+                            emit_tool_result(
+                                id,
+                                name,
+                                ToolCallOutcome::error(format!(
+                                    "cannot load tool metadata: {error:?}"
+                                )),
+                                None,
+                                event_sink,
+                            )
+                        })
+                        .collect(),
+                    None,
+                )
+            }
+        };
+        let mut failure = None;
+        let mut results = Vec::with_capacity(tool_uses.len());
+        let mut parallel = Vec::new();
         for (id, name, input) in tool_uses {
-            event_sink(AgentEvent::ClassifierStatus {
-                tool_use_id: id.clone(),
-                status: ClassifierStatus::Checking,
-            });
-            let decision = match control
-                .wait(self.guardrail.check_with_context(&name, &input, &ctx))
+            let spec = specs.iter().find(|s| s.name == name);
+            let parallel_safe = self.parallel_tools
+                && spec.is_some_and(|s| {
+                    s.concurrency == Some(openpaw_core::ToolConcurrency::ParallelSafe)
+                });
+            // NeverParallel、PathScoped和未知声明均不与任何前序调用重叠。
+            if !parallel_safe {
+                self.finish_parallel(
+                    &mut parallel,
+                    &mut results,
+                    &mut failure,
+                    event_sink,
+                    control,
+                )
+                .await;
+            }
+            match self
+                .prepare_tool(&id, &name, input, spec, event_sink, control)
                 .await
             {
-                Ok(decision) => decision,
-                Err(e) => GuardrailDecision::Deny(e.to_string()),
-            };
-            match decision {
-                GuardrailDecision::Deny(reason) => {
-                    event_sink(AgentEvent::ClassifierStatus {
-                        tool_use_id: id.clone(),
-                        status: ClassifierStatus::AutoDenied {
-                            reason: reason.clone(),
-                        },
-                    });
-                    event_sink(AgentEvent::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: format!("blocked by guardrail: {reason}"),
-                        is_error: true,
-                        name: Some(name.clone()),
-                        duration_ms: None,
-                    });
-                    denied.push(ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content: format!("blocked by guardrail: {reason}"),
-                        is_error: true,
-                        name: Some(name),
-                        protected: false,
-                    });
-                }
-                GuardrailDecision::Allow => {
-                    event_sink(AgentEvent::ClassifierStatus {
-                        tool_use_id: id.clone(),
-                        status: ClassifierStatus::AutoApproved {
-                            reason: "guardrail allowed".into(),
-                        },
-                    });
-                    safe.push((id, name, input));
-                }
-                GuardrailDecision::Confirm(reason) => {
-                    event_sink(AgentEvent::ClassifierStatus {
-                        tool_use_id: id.clone(),
-                        status: ClassifierStatus::SuggestConfirm { reason },
-                    });
-                    confirm.push((id, name, input));
-                }
-            }
-        }
-
-        // ── Phase 2: run safe calls concurrently ───────────────────────
-        let mut results: Vec<ContentBlock> = denied;
-        if !safe.is_empty() {
-            // tokio::spawn per call: real concurrency even for tools whose
-            // hosts block their executor thread (upstream parity).
-            let host = Arc::clone(&self.tool_host);
-            let ctx = ctx.clone();
-            let hook_chain = self.hook_chain.clone();
-            let control = control.clone();
-            let handles = safe.into_iter().map(|(id, name, input)| {
-                let host = Arc::clone(&host);
-                let ctx = ctx.clone();
-                let hooks = hook_chain.clone();
-                let control = control.clone();
-                tokio::spawn(async move {
+                Ok(call) if parallel_safe => parallel.push(call),
+                Ok(call) => {
                     let started = Instant::now();
-                    let outcome =
-                        execute_with_hooks(hooks.as_deref(), &*host, &name, input, &ctx, &control)
-                            .await;
-                    (id, name, started, outcome)
-                })
-            });
-            let done = futures::future::join_all(handles).await;
-            for joined in done {
-                let (id, name, started, outcome) = joined.unwrap_or_else(|e| {
-                    (
-                        "unknown".to_string(),
-                        "unknown".to_string(),
-                        Instant::now(),
-                        ToolCallOutcome::error(format!("tool task failed: {e}")),
-                    )
-                });
-                let duration_ms =
-                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-                event_sink(AgentEvent::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: outcome.content.clone(),
-                    is_error: outcome.is_error,
-                    name: Some(name.clone()),
-                    duration_ms,
-                });
-                results.push(ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content: outcome.content,
-                    is_error: outcome.is_error,
-                    name: Some(name),
-                    protected: false,
-                });
-            }
-        }
-
-        // ── Phase 3: confirm calls, serially, behind the approval gate ──
-        for (id, name, input) in confirm {
-            let started = Instant::now();
-            let response = control
-                .wait(self.approval.request(ApprovalRequest::new(
-                    name.clone(),
-                    input.clone(),
-                    "guardrail confirm",
-                )))
-                .await
-                .unwrap_or_else(|e| openpaw_core::ApprovalResponse::Denied {
-                    reason: e.to_string(),
-                });
-            let outcome = match response {
-                openpaw_core::ApprovalResponse::Approved => {
-                    execute_with_hooks(
+                    let outcome = std::panic::AssertUnwindSafe(execute_prepared(
                         self.hook_chain.as_deref(),
                         &*self.tool_host,
-                        &name,
-                        input,
-                        &ctx,
+                        &call,
                         control,
-                    )
+                    ))
+                    .catch_unwind()
                     .await
-                }
-                openpaw_core::ApprovalResponse::Denied { reason } => {
-                    ToolCallOutcome::error(format!("denied by user: {reason}"))
-                }
-            };
-            let duration_ms =
-                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-            event_sink(AgentEvent::ToolResult {
-                tool_use_id: id.clone(),
-                content: outcome.content.clone(),
-                is_error: outcome.is_error,
-                name: Some(name.clone()),
-                duration_ms,
-            });
-            results.push(ContentBlock::ToolResult {
-                tool_use_id: id,
-                content: outcome.content,
-                is_error: outcome.is_error,
-                name: Some(name),
-                protected: false,
-            });
-        }
-
-        results
-    }
-
-    /// Serial path: validate → classify → approve → call, one tool at a
-    /// time. A failure produces an error result, never aborts the batch.
-    async fn execute_tools_sequential(
-        &self,
-        tool_uses: Vec<ToolUseCall>,
-        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
-        control: &RunControl,
-    ) -> Vec<ContentBlock> {
-        let ctx = self.check_context();
-        let mut results = Vec::with_capacity(tool_uses.len());
-
-        for (id, name, input) in tool_uses {
-            let started = Instant::now();
-
-            if let Err(reason) = control
-                .wait(self.tool_host.validate_input(&name, &input))
-                .await
-                .unwrap_or_else(|e| Err(e.to_string()))
-            {
-                let content = format!("invalid input: {reason}");
-                event_sink(AgentEvent::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: content.clone(),
-                    is_error: true,
-                    name: Some(name.clone()),
-                    duration_ms: None,
-                });
-                results.push(ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content,
-                    is_error: true,
-                    name: Some(name),
-                    protected: false,
-                });
-                continue;
-            }
-
-            event_sink(AgentEvent::ClassifierStatus {
-                tool_use_id: id.clone(),
-                status: ClassifierStatus::Checking,
-            });
-            let decision = match control
-                .wait(self.guardrail.check_with_context(&name, &input, &ctx))
-                .await
-            {
-                Ok(decision) => decision,
-                Err(e) => GuardrailDecision::Deny(e.to_string()),
-            };
-
-            let outcome = match decision {
-                GuardrailDecision::Deny(reason) => {
-                    event_sink(AgentEvent::ClassifierStatus {
-                        tool_use_id: id.clone(),
-                        status: ClassifierStatus::AutoDenied {
-                            reason: reason.clone(),
-                        },
-                    });
-                    ToolCallOutcome::error(format!("blocked by guardrail: {reason}"))
-                }
-                GuardrailDecision::Confirm(reason) => {
-                    event_sink(AgentEvent::ClassifierStatus {
-                        tool_use_id: id.clone(),
-                        status: ClassifierStatus::SuggestConfirm {
-                            reason: reason.clone(),
-                        },
-                    });
-                    let response = control
-                        .wait(self.approval.request(ApprovalRequest::new(
-                            name.clone(),
-                            input.clone(),
-                            reason,
-                        )))
-                        .await
-                        .unwrap_or_else(|e| openpaw_core::ApprovalResponse::Denied {
-                            reason: e.to_string(),
-                        });
-                    match response {
-                        openpaw_core::ApprovalResponse::Approved => {
-                            execute_with_hooks(
-                                self.hook_chain.as_deref(),
-                                &*self.tool_host,
-                                &name,
-                                input,
-                                &ctx,
-                                control,
-                            )
-                            .await
-                        }
-                        openpaw_core::ApprovalResponse::Denied { reason } => {
-                            ToolCallOutcome::error(format!("denied by user: {reason}"))
-                        }
+                    .unwrap_or_else(|_| Ok(ToolCallOutcome::error("tool task panicked")));
+                    let outcome = capture_execution_failure(outcome, &mut failure, control);
+                    let duration =
+                        Some(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX));
+                    let cascade = self.tool_host.should_cascade_on_error(&call.name, &outcome);
+                    results.push(emit_tool_result(
+                        call.id, call.name, outcome, duration, event_sink,
+                    ));
+                    if cascade {
+                        control.cancel.cancel();
                     }
                 }
-                GuardrailDecision::Allow => {
-                    event_sink(AgentEvent::ClassifierStatus {
-                        tool_use_id: id.clone(),
-                        status: ClassifierStatus::AutoApproved {
-                            reason: "guardrail allowed".into(),
-                        },
-                    });
-                    execute_with_hooks(
-                        self.hook_chain.as_deref(),
-                        &*self.tool_host,
-                        &name,
-                        input,
-                        &ctx,
-                        control,
-                    )
-                    .await
-                }
-            };
+                Err(outcome) => results.push(emit_tool_result(id, name, outcome, None, event_sink)),
+            }
+        }
+        self.finish_parallel(
+            &mut parallel,
+            &mut results,
+            &mut failure,
+            event_sink,
+            control,
+        )
+        .await;
+        (results, failure)
+    }
 
-            let duration_ms =
-                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-            event_sink(AgentEvent::ToolResult {
-                tool_use_id: id.clone(),
-                content: outcome.content.clone(),
-                is_error: outcome.is_error,
-                name: Some(name.clone()),
-                duration_ms,
+    async fn prepare_tool(
+        &self,
+        id: &str,
+        name: &str,
+        mut input: serde_json::Value,
+        spec: Option<&ToolSpec>,
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        control: &RunControl,
+    ) -> std::result::Result<PreparedTool, ToolCallOutcome> {
+        if let Some(chain) = &self.hook_chain {
+            let payload = serde_json::json!({"tool_name":name,"input":input});
+            match control
+                .wait(chain.run(HookPoint::BeforeToolCall, payload))
+                .await
+            {
+                Ok(HookDecision::Continue) => {}
+                Ok(HookDecision::Skip) => return Err(ToolCallOutcome::error("blocked by hook")),
+                Ok(HookDecision::Replace(value)) => {
+                    // Hook不能偷偷改工具名；改输入必须重新走完整安全链。
+                    if value
+                        .get("tool_name")
+                        .is_some_and(|n| n.as_str() != Some(name))
+                    {
+                        return Err(ToolCallOutcome::error("hook cannot change tool name"));
+                    }
+                    input = value
+                        .get("input")
+                        .cloned()
+                        .ok_or_else(|| ToolCallOutcome::error("hook replacement missing input"))?;
+                }
+                Err(e) => return Err(ToolCallOutcome::error(e.to_string())),
+            }
+        }
+        control
+            .wait(self.tool_host.validate_input(name, &input))
+            .await
+            .map_err(|e| ToolCallOutcome::error(e.to_string()))?
+            .map_err(|e| ToolCallOutcome::error(format!("invalid input: {e}")))?;
+        event_sink(AgentEvent::ClassifierStatus {
+            tool_use_id: id.into(),
+            status: ClassifierStatus::Checking,
+        });
+        let decision = control
+            .wait(
+                self.guardrail
+                    .check_with_context(name, &input, &CheckContext::default()),
+            )
+            .await
+            .map_err(|e| ToolCallOutcome::error(e.to_string()))?;
+        let decision = match decision {
+            GuardrailDecision::Allow if spec.is_some_and(|s| s.requires_approval) => {
+                GuardrailDecision::Confirm("tool metadata requires approval".into())
+            }
+            other => other,
+        };
+        let mut context = openpaw_core::ToolCallContext::new(
+            &control.run_id,
+            id,
+            name,
+            &input,
+            control.cancel.child_token(),
+        );
+        match decision {
+            GuardrailDecision::Deny(reason) => {
+                event_sink(AgentEvent::ClassifierStatus {
+                    tool_use_id: id.into(),
+                    status: ClassifierStatus::AutoDenied {
+                        reason: reason.clone(),
+                    },
+                });
+                return Err(ToolCallOutcome::error(format!(
+                    "blocked by guardrail: {reason}"
+                )));
+            }
+            GuardrailDecision::Allow => event_sink(AgentEvent::ClassifierStatus {
+                tool_use_id: id.into(),
+                status: ClassifierStatus::AutoApproved {
+                    reason: "guardrail allowed".into(),
+                },
+            }),
+            GuardrailDecision::Confirm(reason) => {
+                event_sink(AgentEvent::ClassifierStatus {
+                    tool_use_id: id.into(),
+                    status: ClassifierStatus::SuggestConfirm {
+                        reason: reason.clone(),
+                    },
+                });
+                let mut request = ApprovalRequest::new(name, input.clone(), reason);
+                request.binding = Some(context.binding().clone());
+                let response = control
+                    .wait(self.approval.request(request))
+                    .await
+                    .map_err(|e| ToolCallOutcome::error(e.to_string()))?;
+                match response {
+                    openpaw_core::ApprovalResponse::Approved => context = context.approve(),
+                    openpaw_core::ApprovalResponse::Denied { reason } => {
+                        return Err(ToolCallOutcome::error(format!("denied by user: {reason}")))
+                    }
+                }
+            }
+        }
+        control
+            .check()
+            .map_err(|e| ToolCallOutcome::error(e.to_string()))?;
+        Ok(PreparedTool {
+            id: id.into(),
+            name: name.into(),
+            input,
+            context,
+        })
+    }
+
+    async fn finish_parallel(
+        &self,
+        calls: &mut Vec<PreparedTool>,
+        results: &mut Vec<ContentBlock>,
+        failure: &mut Option<Error>,
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        control: &RunControl,
+    ) {
+        let mut pending = futures::stream::FuturesUnordered::new();
+        for call in calls.drain(..) {
+            let host = Arc::clone(&self.tool_host);
+            let hooks = self.hook_chain.clone();
+            let control = control.clone();
+            // 关联ID留在JoinHandle外，panic不能把结果关联变成unknown。
+            let id = call.id.clone();
+            let name = call.name.clone();
+            let task = tokio::spawn(async move {
+                let started = Instant::now();
+                let outcome = execute_prepared(hooks.as_deref(), &*host, &call, &control).await;
+                (
+                    outcome,
+                    started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                )
             });
-            results.push(ContentBlock::ToolResult {
-                tool_use_id: id,
-                content: outcome.content,
-                is_error: outcome.is_error,
-                name: Some(name),
-                protected: false,
+            pending.push(async move {
+                let (outcome, duration) = match task.await {
+                    Ok((outcome, duration)) => (outcome, Some(duration)),
+                    Err(error) => (
+                        Ok(ToolCallOutcome::error(format!("tool task failed: {error}"))),
+                        None,
+                    ),
+                };
+                (id, name, outcome, duration)
             });
         }
-
-        results
+        // D06：每个完成即报告；取消后继续join，直到所有实际清理结束。
+        while let Some((id, name, outcome, duration)) = pending.next().await {
+            let outcome = capture_execution_failure(outcome, failure, control);
+            let cascade = self.tool_host.should_cascade_on_error(&name, &outcome);
+            results.push(emit_tool_result(id, name, outcome, duration, event_sink));
+            if cascade {
+                control.cancel.cancel();
+            }
+        }
     }
 }
 
-/// Hook-aware wrapper around [`execute_one`].
-///
-/// Decision mapping — payload shape `{"tool_name", "input"}` (the
-/// AfterToolCall payload adds `"result"`):
-/// - `BeforeToolCall`: `Skip` → the host is never invoked and an error
-///   outcome (`"blocked by hook"`) is returned; `Continue` → run as-is;
-///   `Replace(val)` → run with `val["input"]` as the input.
-/// - `AfterToolCall`: `Replace(val)` rewrites `result.content` /
-///   `result.is_error` when present; any other shape is ignored.
-///
-/// Zero-overhead short-circuit: with no chain attached, or when no hooks
-/// are registered at either point, this is exactly [`execute_one`].
-async fn execute_with_hooks(
-    hook_chain: Option<&HookChain>,
-    host: &dyn ToolHost,
-    name: &str,
+struct PreparedTool {
+    id: String,
+    name: String,
     input: serde_json::Value,
-    ctx: &CheckContext,
+    context: openpaw_core::ToolCallContext,
+}
+
+fn emit_tool_result(
+    id: String,
+    name: String,
+    outcome: ToolCallOutcome,
+    duration_ms: Option<u64>,
+    event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+) -> ContentBlock {
+    event_sink(AgentEvent::ToolResult {
+        tool_use_id: id.clone(),
+        content: outcome.content.clone(),
+        is_error: outcome.is_error,
+        name: Some(name.clone()),
+        duration_ms,
+    });
+    ContentBlock::ToolResult {
+        tool_use_id: id,
+        content: outcome.content,
+        is_error: outcome.is_error,
+        name: Some(name),
+        protected: false,
+    }
+}
+
+// 普通工具错误可反馈模型；可靠开始记录失败则停止整Run，仍收齐每个call的结果。
+fn capture_execution_failure(
+    result: Result<ToolCallOutcome>,
+    failure: &mut Option<Error>,
     control: &RunControl,
 ) -> ToolCallOutcome {
-    let Some(chain) = hook_chain else {
-        return execute_one(host, name, input, ctx, control).await;
-    };
-    let has_before = chain.hook_count(HookPoint::BeforeToolCall) > 0;
-    let has_after = chain.hook_count(HookPoint::AfterToolCall) > 0;
-    if !has_before && !has_after {
-        return execute_one(host, name, input, ctx, control).await;
-    }
-
-    // BeforeToolCall: block, rewrite the input, or proceed unchanged.
-    let input = if has_before {
-        let payload = serde_json::json!({ "tool_name": name, "input": input.clone() });
-        match control
-            .wait(chain.run(HookPoint::BeforeToolCall, payload))
-            .await
-        {
-            Err(e) => return ToolCallOutcome::error(e.to_string()),
-            Ok(HookDecision::Skip) => return ToolCallOutcome::error("blocked by hook"),
-            Ok(HookDecision::Continue) => input,
-            Ok(HookDecision::Replace(val)) => val["input"].clone(),
-        }
-    } else {
-        input
-    };
-
-    let mut outcome = execute_one(host, name, input.clone(), ctx, control).await;
-
-    // AfterToolCall: observers may rewrite the outcome.
-    if has_after {
-        let payload = serde_json::json!({
-            "tool_name": name,
-            "input": input,
-            "result": {
-                "content": outcome.content.clone(),
-                "is_error": outcome.is_error,
-            },
-        });
-        if let Ok(HookDecision::Replace(val)) = control
-            .wait(chain.run(HookPoint::AfterToolCall, payload))
-            .await
-        {
-            if let Some(content) = val.pointer("/result/content").and_then(|c| c.as_str()) {
-                outcome.content = content.to_string();
+    match result {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let content = error.to_string();
+            if failure.is_none() {
+                *failure = Some(error);
             }
-            if let Some(is_error) = val.pointer("/result/is_error").and_then(|e| e.as_bool()) {
-                outcome.is_error = is_error;
-            }
+            control.cancel.cancel();
+            ToolCallOutcome::error(content)
         }
     }
-    outcome
 }
 
-/// Validate → call, converting transport errors into error outcomes so a
-/// single failing tool never aborts the batch.
+async fn execute_prepared(
+    hooks: Option<&HookChain>,
+    host: &dyn ToolHost,
+    call: &PreparedTool,
+    control: &RunControl,
+) -> Result<ToolCallOutcome> {
+    // 审批等待中外部文件可能改变，不能用旧的前置校验替代这里的重验。
+    if let Err(e) = control
+        .wait(host.validate_input(&call.name, &call.input))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+    {
+        return Ok(ToolCallOutcome::error(format!(
+            "invalid input before execution: {e}"
+        )));
+    }
+    let mut outcome = execute_one(host, call, control).await?;
+    if let Some(chain) = hooks {
+        if chain.hook_count(HookPoint::AfterToolCall) > 0 {
+            let payload = serde_json::json!({"tool_name":call.name,"input":call.input,"result":{"content":outcome.content,"is_error":outcome.is_error}});
+            if let Ok(HookDecision::Replace(value)) = control
+                .wait(chain.run(HookPoint::AfterToolCall, payload))
+                .await
+            {
+                if let Some(text) = value.pointer("/result/content").and_then(|v| v.as_str()) {
+                    outcome.content = text.into();
+                }
+                // 已发生失败不能被展示Hook改成成功；允许把成功降为错误。
+                if value.pointer("/result/is_error").and_then(|v| v.as_bool()) == Some(true) {
+                    outcome.is_error = true;
+                }
+            }
+        }
+    }
+    Ok(outcome)
+}
+
 async fn execute_one(
     host: &dyn ToolHost,
-    name: &str,
-    input: serde_json::Value,
-    ctx: &CheckContext,
+    call: &PreparedTool,
     control: &RunControl,
-) -> ToolCallOutcome {
-    let _ = ctx; // context-aware hosts arrive with E2 depth
+) -> Result<ToolCallOutcome> {
     if let Err(e) = control.check() {
-        return ToolCallOutcome::error(e.to_string());
+        return Ok(ToolCallOutcome::error(e.to_string()));
     }
-    let call_cancel = control.cancel.child_token();
-    let call = host.call_cancellable(name, input, call_cancel.clone());
-    tokio::pin!(call);
+    let call_cancel = call.context.cancel();
+    let future = host.call_with_context(&call.name, call.input.clone(), call.context.clone());
+    tokio::pin!(future);
     let timeout = async {
         match control.tool_timeout {
             Some(d) => tokio::time::sleep(d).await,
@@ -1074,22 +1005,14 @@ async fn execute_one(
     };
     let result = tokio::select! {
         biased;
-        e = control.interrupted() => {
-            call_cancel.cancel();
-            // 通知后等待真实call结束：不能丢弃future，尤其不能释放仍有副作用的工作区锁。
-            let _ = e;
-            match call.await { Ok(outcome) => return outcome, Err(error) => return ToolCallOutcome::error(error.to_string()) }
-        },
-        _ = timeout => {
-            call_cancel.cancel();
-            control.expired.cancel();
-            match call.await { Ok(outcome) => return outcome, Err(error) => return ToolCallOutcome::error(error.to_string()) }
-        },
-        result = &mut call => result,
+        _=control.interrupted()=> { call_cancel.cancel(); future.await },
+        _=timeout=> { call_cancel.cancel();control.expired.cancel();future.await },
+        result=&mut future=>result,
     };
     match result {
-        Ok(outcome) => outcome,
-        Err(e) => ToolCallOutcome::error(e.to_string()),
+        // 观察器将记录失败统一为Store；不能作为普通模型工具错误吞掉。
+        Err(error @ Error::Store(_)) => Err(error),
+        other => Ok(other.unwrap_or_else(|e| ToolCallOutcome::error(e.to_string()))),
     }
 }
 

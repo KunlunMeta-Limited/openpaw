@@ -19,13 +19,31 @@ use crate::web::{web_extract, web_fetch, web_search};
 
 /// The builtin tool host: static registry + name dispatch over the landed
 /// tool set.
+/// 用途：原工具注册和分派表
+/// 字段：工作区、原spec、注入环境与可等待观察器
+/// 来源去向：引擎到已有工具主体
+/// 约束：不复制工具实现，不保存永久批准
+/// 稳定性：新增协议无关接口
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
 pub struct ToolRegistry {
     workspace: PathBuf,
+    environment: Arc<dyn crate::exec::environment::Environment>,
+    observer: Option<Arc<dyn openpaw_core::ToolExecutionObserver>>,
     specs: Vec<ToolSpec>,
 }
 
 impl ToolRegistry {
     /// Register the landed tool set for a workspace.
+    /// 功能：注册现有工具并使用默认本地环境
+    /// 参数：workspace为调用方已授权根目录
+    /// 返回：原工具注册表
+    /// 错误：无；路径在调用时验证
+    /// 状态：只注册声明，不创建工作区文件
+    /// 并发与取消：注册后可共享，运行上下文不共享
+    /// 权限：不进行人工批准；上下文由既有引擎传入
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    /// Stability: unstable.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         let mut specs = vec![
             read::spec(),
@@ -47,12 +65,59 @@ impl ToolRegistry {
         specs.push(web_fetch::spec());
         specs.push(web_search::spec());
         specs.push(web_extract::spec());
+        // 原写工具已有分类/破坏标记；注册时落实批准要求，不能仅展示metadata。
+        for spec in &mut specs {
+            if spec.is_destructive == Some(true)
+                || matches!(
+                    spec.category,
+                    Some(
+                        openpaw_core::ToolCategory::Write | openpaw_core::ToolCategory::Destructive
+                    )
+                )
+            {
+                spec.requires_approval = true;
+            }
+        }
         Self {
             workspace: workspace.into(),
+            environment: Arc::new(crate::exec::environment::LocalEnvironment),
+            observer: None,
             specs,
         }
     }
 
+    /// 功能：注入原命令Environment，避免注册表固定本地执行
+    /// 参数：environment为调用方选定后端
+    /// 返回：当前注册表
+    /// 错误：无
+    /// 状态：只更新后端引用
+    /// 并发与取消：共享线程安全环境，不共享Run授权
+    /// 权限：受限策略失败不能退回本地
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    /// Stability: unstable.
+    pub fn with_environment(
+        mut self,
+        environment: Arc<dyn crate::exec::environment::Environment>,
+    ) -> Self {
+        self.environment = environment;
+        self
+    }
+    /// 功能：注入真正执行前的可靠观察器
+    /// 参数：observer为宿主存储接口
+    /// 返回：当前注册表
+    /// 错误：无
+    /// 状态：只保存观察引用
+    /// 并发与取消：每次执行等待观察写入完成；失败不执行
+    /// 权限：不提供授权，不能改写输入
+    /// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+    /// Stability: unstable.
+    pub fn with_execution_observer(
+        mut self,
+        observer: Arc<dyn openpaw_core::ToolExecutionObserver>,
+    ) -> Self {
+        self.observer = Some(observer);
+        self
+    }
     /// Specs of the registered tools.
     pub fn tool_names(&self) -> Vec<String> {
         self.specs.iter().map(|s| s.name.clone()).collect()
@@ -74,7 +139,7 @@ impl ToolExecutor for ToolRegistry {
             "notebook_edit" => notebook_edit::run(&ws, args).await,
             "grep" => grep::run(&ws, args).await,
             "glob" => glob::run(&ws, args).await,
-            "bash" => bash::run(&ws, args).await,
+            "bash" => bash::run_with_env(&ws, args, &*self.environment).await,
             "clipboard" => clipboard::run(&ws, args).await,
             "sleep" => sleep::run(&ws, args).await,
             "web_fetch" => web_fetch::run(&ws, args).await,
@@ -89,10 +154,147 @@ impl ToolExecutor for ToolRegistry {
             other => Err(Error::ToolHost(format!("unknown tool: {other}"))),
         }
     }
+    async fn call_cancellable(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ToolCallOutcome> {
+        let context = openpaw_core::ToolCallContext::new("legacy", "legacy", name, &args, cancel);
+        self.call_with_context(name, args, context).await
+    }
+    async fn call_with_context(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        mut context: openpaw_core::ToolCallContext,
+    ) -> Result<ToolCallOutcome> {
+        self.validate_input(name, &args)
+            .await
+            .map_err(Error::ToolHost)?;
+        if let Some(spec) = self.specs.iter().find(|s| s.name == name) {
+            if spec.requires_approval && !context.is_approved_for(name, &args) {
+                return Err(Error::ToolHost(
+                    "this invocation requires approval for its exact input".into(),
+                ));
+            }
+        }
+        if name == "bash" {
+            if let Err(outcome) = bash::check_call(&args, &*self.environment, Some(&context)) {
+                return Ok(outcome);
+            }
+        }
+        if let Some(observer) = &self.observer {
+            context = context.with_observer(Arc::clone(observer));
+        }
+        if !matches!(name, "todo_add" | "todo_update") {
+            context.execution_started(name, &args).await?;
+        }
+        match name {
+            "bash" => {
+                bash::run_with_context(
+                    &self.workspace,
+                    args,
+                    &*self.environment,
+                    Some(&context),
+                    context.cancel(),
+                )
+                .await
+            }
+            "todo_add" | "todo_update" | "todo_list" => {
+                todo::run_cancellable(
+                    &self.workspace,
+                    name,
+                    args,
+                    context.cancel(),
+                    Some(&context),
+                )
+                .await
+            }
+            "sleep" => {
+                tokio::select! {biased;_=context.cancel().cancelled_owned()=>Err(Error::Cancelled),result=self.call(name,args)=>result}
+            }
+            _ => self.call(name, args).await,
+        }
+    }
 }
 
 #[async_trait]
-impl ToolHostValidator for ToolRegistry {}
+impl ToolHostValidator for ToolRegistry {
+    async fn validate_input(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        let spec = self
+            .specs
+            .iter()
+            .find(|s| s.name == name)
+            .ok_or_else(|| format!("unknown tool: {name}"))?;
+        validate_schema(&spec.input_schema, input)?;
+        if matches!(
+            name,
+            "read_file" | "write_file" | "edit_file" | "notebook_edit" | "grep" | "glob"
+        ) {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            crate::safety::resolve(&self.workspace, path).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+// 仅校验原内置工具Schema使用的关键字；不是另一个通用JSON Schema实现。
+fn validate_schema(
+    schema: &serde_json::Value,
+    input: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    if let Some(kind) = schema.get("type").and_then(|v| v.as_str()) {
+        let valid = match kind {
+            "object" => input.is_object(),
+            "string" => input.is_string(),
+            "integer" => input.as_i64().is_some() || input.as_u64().is_some(),
+            "boolean" => input.is_boolean(),
+            "array" => input.is_array(),
+            _ => false,
+        };
+        if !valid {
+            return Err(format!("expected {kind}"));
+        }
+    }
+    if let Some(options) = schema.get("enum").and_then(|v| v.as_array()) {
+        if !options.contains(input) {
+            return Err("value is not in enum".into());
+        }
+    }
+    for key in ["minimum", "maximum"] {
+        if let (Some(bound), Some(value)) =
+            (schema.get(key).and_then(|v| v.as_f64()), input.as_f64())
+        {
+            if (key == "minimum" && value < bound) || (key == "maximum" && value > bound) {
+                return Err(format!("value violates {key}"));
+            }
+        }
+    }
+    if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
+        for key in required.iter().filter_map(|v| v.as_str()) {
+            if input.get(key).is_none() {
+                return Err(format!("missing required field {key}"));
+            }
+        }
+    }
+    if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
+        for (key, schema) in properties {
+            if let Some(value) = input.get(key) {
+                validate_schema(schema, value).map_err(|e| format!("{key}: {e}"))?;
+            }
+        }
+    }
+    if let (Some(items), Some(values)) = (schema.get("items"), input.as_array()) {
+        for value in values {
+            validate_schema(items, value)?;
+        }
+    }
+    Ok(())
+}
 
 /// Convenience constructor matching the engine's `Arc<dyn ToolHost>` seam.
 pub fn arc_registry(workspace: impl Into<PathBuf>) -> Arc<dyn ToolHost> {

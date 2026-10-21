@@ -16,7 +16,8 @@ use openpaw_core::{Result, ToolCallOutcome, ToolCategory, ToolConcurrency, ToolS
 use serde::Deserialize;
 
 use super::environment::{Environment, LocalEnvironment};
-use crate::bashast::{analyze_command_safety, destructive_rm_verdict, CommandSafety};
+use crate::bashast::{analyze_command_safety_for_shell, CommandSafety};
+use tokio_util::sync::CancellationToken;
 
 /// Default timeout for a single command: 120s.
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -68,77 +69,120 @@ pub async fn run(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOu
     run_with_env(workspace, args, &env).await
 }
 
-/// Executes `args` through the given [`Environment`]. The AST safety chain
-/// runs before the command reaches the environment (judge first, then enter).
+/// 功能：通过注入环境执行未经外部审批的命令
+/// 参数：workspace为根，args为原输入，env为指定环境
+/// 返回：工具结果
+/// 错误：无效输入/危险或待审批命令为错误结果
+/// 状态：复用调用上下文执行入口
+/// 并发与取消：内部超时通知环境并等待回收
+/// 权限：复杂命令没有本次批准则不能执行
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
 pub async fn run_with_env(
     workspace: &Path,
     args: serde_json::Value,
     env: &dyn Environment,
 ) -> Result<ToolCallOutcome> {
-    let a: Args = match serde_json::from_value(args) {
-        Ok(a) => a,
-        Err(e) => return Ok(ToolCallOutcome::error(format!("bash: bad args: {e}"))),
-    };
+    run_with_context(workspace, args, env, None, CancellationToken::new()).await
+}
 
-    // Bash AST safety chain: block outright, demand approval, or proceed.
-    // The per-subcommand predicate is itself AST-driven (semantic rm
-    // verdict) — no regex fallback from the upstream guardrail.
-    let safety = analyze_command_safety(&a.command, |sub| destructive_rm_verdict(sub).is_some());
+/// 功能：在真正执行前判断危险和调用授权
+/// 参数：args为最终输入，env提供实际shell，context为可选本次批准
+/// 返回：校验通过或错误工具结果
+/// 错误：不解析/危险时拒绝，不调用环境
+/// 状态：只读分析
+/// 并发与取消：取消上下文不能批准
+/// 权限：危险命令仍拒绝；批准必须精确匹配完整输入
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
+pub(crate) fn check_call(
+    args: &serde_json::Value,
+    env: &dyn Environment,
+    context: Option<&openpaw_core::ToolCallContext>,
+) -> std::result::Result<(), ToolCallOutcome> {
+    let a: Args = serde_json::from_value(args.clone())
+        .map_err(|e| ToolCallOutcome::error(format!("bash: bad args: {e}")))?;
+    if a.command.contains('\0') {
+        return Err(ToolCallOutcome::error("bash: command contains NUL"));
+    }
+    let safety = analyze_command_safety_for_shell(&a.command, env.shell_type());
     match safety {
-        CommandSafety::Safe => {}
+        CommandSafety::Safe => Ok(()),
         CommandSafety::Dangerous(reason) => {
-            return Ok(ToolCallOutcome::error(format!("blocked: {reason}")))
+            Err(ToolCallOutcome::error(format!("blocked: {reason}")))
         }
-        CommandSafety::RequiresApproval(reason) => {
-            return Ok(ToolCallOutcome::error(format!(
+        CommandSafety::RequiresApproval(reason)
+            if !context.is_some_and(|c| c.is_approved_for("bash", args)) =>
+        {
+            Err(ToolCallOutcome::error(format!(
                 "requires approval: {reason}"
             )))
         }
+        CommandSafety::RequiresApproval(_) => Ok(()),
     }
-
-    execute_in_env(&a.command, workspace, a.timeout_ms, env).await
 }
 
-async fn execute_in_env(
-    command: &str,
+/// 功能：用原Environment执行本次已绑定的命令
+/// 参数：workspace/args/env为原输入，context为本次授权，cancel为token
+/// 返回：清理完成的工具结果
+/// 错误：无效输入、危险、取消或环境失败
+/// 状态：仅本次调用可能启动进程
+/// 并发与取消：超时/取消通知token后等待原future完成，不drop实际进程
+/// 权限：审批只覆盖本次完整JSON，不能改判危险命令
+/// 关联：需求/设计 DES-OP-004；REQ-OP-005。
+/// Stability: unstable.
+pub(crate) async fn run_with_context(
     workspace: &Path,
-    timeout_ms: u64,
+    args: serde_json::Value,
     env: &dyn Environment,
+    context: Option<&openpaw_core::ToolCallContext>,
+    cancel: CancellationToken,
 ) -> Result<ToolCallOutcome> {
-    let timeout = Duration::from_millis(timeout_ms.min(MAX_TIMEOUT_MS));
-
-    let result = tokio::time::timeout(timeout, env.exec(command, Some(workspace))).await;
-
-    match result {
-        Ok(env_result) => {
-            let mut out = String::new();
-            if !env_result.stdout.is_empty() {
-                out.push_str(&env_result.stdout);
-            }
-            if !env_result.stderr.is_empty() {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str("[stderr]\n");
-                out.push_str(&env_result.stderr);
-            }
-            if out.is_empty() {
-                out.push_str("(no output)");
-            }
-            out.push_str(&format!("\n[exit code: {}]", env_result.exit_code));
-
-            let content = truncate_output(out);
-            if env_result.exit_code != 0 {
-                Ok(ToolCallOutcome::error(content))
-            } else {
-                Ok(ToolCallOutcome::ok(content))
-            }
-        }
-        Err(_) => Ok(ToolCallOutcome::error(format!(
-            "bash timeout after {}ms",
-            timeout.as_millis()
-        ))),
+    if let Err(outcome) = check_call(&args, env, context) {
+        return Ok(outcome);
     }
+    let a: Args =
+        serde_json::from_value(args).map_err(|e| openpaw_core::Error::ToolHost(e.to_string()))?;
+    let timeout = Duration::from_millis(a.timeout_ms.min(MAX_TIMEOUT_MS));
+    let execution_cancel = cancel.child_token();
+    let execution = env.exec_cancellable(&a.command, Some(workspace), execution_cancel.clone());
+    tokio::pin!(execution);
+    let (result, timed_out) = tokio::select! {biased;
+        _=cancel.cancelled()=>{execution_cancel.cancel();let _=execution.await;return Err(openpaw_core::Error::Cancelled);},
+        _=tokio::time::sleep(timeout)=>{execution_cancel.cancel();(execution.await,true)},
+        result=&mut execution=>(result,false),
+    };
+    if timed_out {
+        return Ok(ToolCallOutcome::error(format!(
+            "bash timeout after {}ms; execution cleanup completed",
+            timeout.as_millis()
+        )));
+    }
+    if cancel.is_cancelled() {
+        return Err(openpaw_core::Error::Cancelled);
+    }
+    let mut out = result.stdout;
+    if !result.stderr.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("[stderr]\n");
+        out.push_str(&result.stderr);
+    }
+    if out.is_empty() {
+        out.push_str("(no output)");
+    }
+    // 退出原因始终可见，不能被展示截断吞掉。
+    let content = format!(
+        "{}\n[exit code: {}]",
+        truncate_output(out),
+        result.exit_code
+    );
+    Ok(if result.exit_code == 0 {
+        ToolCallOutcome::ok(content)
+    } else {
+        ToolCallOutcome::error(content)
+    })
 }
 
 /// Truncate a string to at most `max` characters on a char boundary.

@@ -11,7 +11,7 @@ packages are used without source modifications in this change.
 | Package | Upstream source archive | License text | SHA-256 of license text |
 |---|---|---|---|
 | option-ext 0.2.0 (via dirs-sys) | https://static.crates.io/crates/option-ext/option-ext-0.2.0.crate | [MPL-2.0](third-party-licenses/option-ext-0.2.0-MPL-2.0.txt) | `66a3107d5ad6a058aab753eaac2047ccb2ed0e39465dd0fe5844da3e300d5172` |
-| webpki-roots 1.0.9 (TLS root data) | https://static.crates.io/crates/webpki-roots/webpki-roots-1.0.9.crate | [CDLA-Permissive-2.0](third-party-licenses/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt) | `e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8` |
+| webpki-roots 1.0.10 (TLS root data) | https://static.crates.io/crates/webpki-roots/webpki-roots-1.0.10.crate | [CDLA-Permissive-2.0](third-party-licenses/webpki-roots-1.0.10-CDLA-Permissive-2.0.txt) | `e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8` |
 
 Source code for the MPL-covered package can be obtained from the exact upstream
 source archive linked above. If that covered code is modified or redistributed,
@@ -21,3 +21,7 @@ complete license texts control the applicable terms.
 Upgrading either package requires reviewing the actual new license and updating
 the version-scoped exception and these notices together. The licenses are not
 added to the global allow list and security advisory checks remain enabled.
+
+T2/D35 updates the current TLS root data to 1.0.10 after reviewing its actual
+license from the exact published crate. The 1.0.9 license file remains for
+historical reports; it is not an additional current dependency exception.

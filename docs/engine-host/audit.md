@@ -23,7 +23,7 @@
 
 ## 已识别缺陷
 
-D01—D11 状态统一为“已定位、未修复”，直到对应缺陷 PR 有回归证据。T0 不修业务缺陷；新增 D12—D15 是建立可验证基线的编译、测试清理和 lint 修正，各独立提交。
+初始审核时D01—D11为“已定位、未修复”。当前D01—D04随T1 #5合入；D05—D11按下述T2增量跟踪，未完成验收/PR不得宣称关闭。T0 不修业务缺陷；新增 D12—D15 是建立可验证基线的编译、测试清理和 lint 修正，各独立提交。
 
 | ID | 具体证据（基线源码） | 修复要求/关键注释 | 必须验证 | 阶段 |
 |---|---|---|---|---|
@@ -58,7 +58,7 @@ D16历史观察（根因尚未查明时的原始记录）：默认 workspace 一
 | D23 | parity 确定性测试与场景测试同时写读相同 fixture 文件，可读到截断瞬间空内容 | 回放测试独立 temp 输出目录，保留确定性断言及并行场景；生产引擎不改；T0 |
 | D24 | MCP 熔断器测试假定 10ms sleep 必在 50ms 冷却前恢复，macOS 调度延迟导致假失败 | 公共方法保留真实 Instant，私有状态转换显式传时间；原断言加精确边界/新期限验证，不扩大冷却值或重试；T0 |
 
-每项缺陷独立逻辑提交、原因、回归和审核；关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D31 起登记；不把功能缺失硬当 bug。
+每项缺陷独立跟踪原因、回归和审核；相关修复可按完整逻辑整合提交，关键代码注释描述不变量和失败原因，可关联 D 编号，不铺满无意义编号。新增缺陷以 D31 起登记；不把功能缺失硬当 bug。
 
 ## 能力缺口和已知风险（不伪装已修复）
 
@@ -132,3 +132,32 @@ D01：默认模型改取Provider真实默认，显式值优先，共享llm装配
 
 
 T1/D04 Windows整改：原生CI 5a9cc0f的Store两项尾损恢复在set_len返回OS5/Access denied；append句柄只有追加写权限。本轮复用原SessionWriter，先read+write备份修复，再重开append继续写，调用方独占所有权要求不变。现有两个失败用例及备份失败无损用例均保留，准确原生日志见CHG-2026-0002验证记录，新提交重验后才能关闭该交付阻塞。
+
+## T2新增阻塞缺陷D34：命令builder参数与配置
+
+源码核查：sandbox::SandboxedCommand::full_command直接拼接包含shell元字符的参数，部分含空格参数仅双引号包裹而未阻止替换；env builder收集后未使用。此入口目前无产品调用者，但属于T2正在修改的统一执行出口。D34在T2修复：Unix按字面量引用每个必要参数；Windows无法可靠字面化的元字符参数在exec前明确拒绝；未支持的env覆盖明确拒绝，不静默忽略。原bash工具接收的完整命令保持原授权语义，不把builder参数与有意脚本混为一谈。回归与兼容证据见CHG-2026-0003。
+
+
+## T2缺陷实现增量（CHG-2026-0003，M2尚未通过）
+
+以下为本阶段源码修改，最终关闭需当前双平台全量/M2及独立PR批准合入；不是Office功能完成。专用回归入口由所属Cargo.toml显式注册，原始修复前/后摘要见专用验证记录。
+
+| ID | 修改与关键不变量 | 回归定位 |
+| --- | --- | --- |
+| D05 | 原prepare_tool统一Hook最终输入、校验、metadata、分类审批和执行前重验；完整Value绑定；实际开始记录失败不得执行或假完成 | engine工具回归d05_*；tools观察器失败零写入 |
+| D06 | 原调度按ParallelSafe/屏障；FuturesUnordered即时发、task内计时、外保ID、取消join清理 | engine d06_*及原lifecycle取消等待 |
+| D07 | 原ToolRegistry注入Environment和本次上下文，bash精确批准仅覆盖最终输入，危险仍阻止 | tools d07_*，exec_e2e批准后真实echo/exit |
+| D08 | sandbox统一原普通/受限托管路径；Linux进程组、Windows挂起Job与即时RAII；双管道超限持续排空 | managed_process d08_*、Windows failed_job_assignment_reaps_the_suspended_process |
+| D09 | 删除工厂/平台失败本地兜底；不可落实域名/Windows网络限制建目录/ACL/启动前拒绝 | d09_*；能力矩阵不虚称受限成功 |
+| D10 | actual shell显式解析、Windows系统cmd未知须批准；UNC/device cwd拒绝目录回退 | exec_e2e Windows raw cmd、managed_process UNC、原bashast解析 |
+| D11 | 原Todo结构只读、严格错误、OS锁完整事务、可取消锁等待、原子替换与大小上限 | tools d11_*：48并发、损坏/权限/锁/超大/链接、Windows大小写/盘符/junction/占用 |
+| D34 | 原builder字面参数安全引用，不支持env/Windows字符明确拒绝，不静默忽略 | managed_process d34_*；ac1b582原实现三项真实失败 |
+
+共享根资源锁、Run/Approval CAS和Office DTO属于T3/T5；T2不以复制实现抢跑。Linux普通进程组不保证恶意脱组隔离；当前Windows受限组合明确不可用，原生本地Job执行与受限拒绝分别验收。
+
+
+### D35：T2全量扫描发现的原TLS依赖公告
+
+当前cargo-deny真实命中RUSTSEC-2026-0382/rustls-webpki0.103.15与RUSTSEC-2026-0381/webpki-roots1.0.9，可能信任已撤销emSign中间证书。原Provider/HTTP工具使用同一TLS链，阻塞全量。计划最小补丁升为0.103.16/1.0.10；保留TLS实现/验证和全部公告门禁，复核精确新版本许可证/来源，不加全局例外或新backend。CHG范围已先登记；完成证据见验证记录，未通过当前双平台前不关闭。
+
+D35修复结果：0.103.16/1.0.10已锁定，原两包许可证实核、精确例外/分发通知同步；70d0385 Linux全量26/26（含cargo-deny与MSRV1.88）通过。原生Windows仍被GitHub付款/额度阻塞；D35及T2其他D项不提前标已关闭/合入，M2/非作者PR审核仍未完成。
