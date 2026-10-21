@@ -1793,11 +1793,17 @@ mod tests {
                 let latest = messages.iter().rposition(|message|message["role"] == "user").unwrap_or(0);
                 let tools = messages[latest..].iter().filter(|message| message["role"] == "tool").count();
                 let parent = body["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "delegate_task");
-                if scenario == "delegate-resume" {
+                if scenario == "delegate-capacity" && parent && tools == 0 {
+                    let tasks: Vec<serde_json::Value> = serde_json::from_str(messages[latest]["content"].as_str().unwrap()).unwrap();
+                    let calls = tasks.into_iter().enumerate().map(|(index,args)|serde_json::json!({"index":index,"id":format!("capacity-{index}"),"type":"function","function":{"name":"delegate_task","arguments":args.to_string()}})).collect::<Vec<_>>();
+                    let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+                    return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
+                }
+                if scenario == "delegate-resume" || scenario == "delegate-capacity" {
                     let task = messages[latest]["content"].as_str().unwrap_or("");
                     let call = if parent && tools == 0 {
                         Some(("delegate_task",serde_json::from_str::<serde_json::Value>(task).unwrap()))
-                    } else if !parent && tools == 0 && task == "读取首轮秘密" {
+                    } else if !parent && tools == 0 && (task == "读取首轮秘密" || task.starts_with("容量员工")) {
                         Some(("read_file",serde_json::json!({"path":"README.md"})))
                     } else if !parent && tools == 0 && task == "继续，使用上轮工具信息写入文件" {
                         let previous = messages[..latest].iter().find(|message|message["role"] == "tool")
@@ -2322,6 +2328,466 @@ mod tests {
         } else {
             serde_json::from_slice(&bytes).unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn office_member_capacity_reserves_last_slot_before_parallel_child_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-capacity", "confirm").await;
+        let parent = child_test_json(&fixture.app, "POST", "/session", serde_json::json!({})).await
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // 预置已有办公室的199人（含主员工），再像真正重启一样加载；新委派全部走公开接口。
+        let registry = fixture.home.path().join("offices/registry.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        let record = &mut saved[&fixture.team];
+        record["session"] = serde_json::json!(parent);
+        record["conversation"] = serde_json::json!("fixture");
+        let mut employees = vec![
+            serde_json::json!({"id":parent,"sceneActorId":"office-lead","name":"王明","role":"主 Agent","online":false}),
+        ];
+        for index in 0..198 {
+            employees.push(serde_json::json!({"id":format!("existing-{index}"),"sceneActorId":"","name":format!("已有员工{index}"),"role":"子 Agent","online":false}));
+        }
+        record["snapshot"]["employees"] = serde_json::json!(employees);
+        std::fs::write(&registry, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut state = AppState::new(fixture.state.config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            fixture.home.path(),
+            fixture.workspace.path(),
+            Some(
+                std::env::var("OPENPAW_OPENAI_BASE_URL")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .to_string(),
+            ),
+        );
+        state.office.attach_main(&state.main_office);
+        let app = build_router(state.clone());
+        let tasks = (0..8).map(|index|serde_json::json!({"task":"读取首轮秘密","name":format!("竞争员工{index}")})).collect::<Vec<_>>();
+        child_test_json(
+            &app,
+            "POST",
+            &format!("/session/{parent}/message"),
+            serde_json::json!({"text":serde_json::to_string(&tasks).unwrap()}),
+        )
+        .await;
+        let sessions = child_test_json(&app, "GET", "/session", serde_json::json!({})).await;
+        let children = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|session| session["parentID"] == parent)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            children.len(),
+            1,
+            "仅剩一个成员名额时，竞争失败不得生成隐藏子会话"
+        );
+        let child = children[0]["id"].as_str().unwrap();
+        let history = child_test_json(
+            &app,
+            "GET",
+            &format!("/session/{parent}/message"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            history
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|message| message["parts"].as_array().unwrap())
+                .filter(|part| part["tool"] == "delegate_task" && part.to_string().contains("200"))
+                .count(),
+            7,
+            "容量不足明确回传模型"
+        );
+        assert_eq!(
+            state.main_office.record(&fixture.team).unwrap().snapshot["employees"]
+                .as_array()
+                .unwrap()
+                .len(),
+            200
+        );
+        assert_eq!(
+            fixture
+                .model_seen
+                .lock()
+                .await
+                .iter()
+                .filter(|request| !request["tools"].to_string().contains("delegate_task"))
+                .count(),
+            2,
+            "仅一个子员工完成模型/工具循环"
+        );
+        let requests = fixture.model_seen.lock().await.len();
+        child_test_json(&app,"POST",&format!("/session/{parent}/message"),serde_json::json!({"text":serde_json::json!([{"task":"满员续办","task_id":child}]).to_string()})).await;
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            requests + 3,
+            "已有身份续办不占成员容量"
+        );
+        assert_eq!(
+            child_test_json(&app, "GET", "/session", serde_json::json!({}))
+                .await
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        eprintln!(
+            "T04 capacity evidence: {}",
+            serde_json::json!({"seededMembersIncludingLeader":199,"parallelNewRequests":8,"createdChildren":children,"members":200,"rejectedBeforeChildModel":7,"resumedAtCapacity":child})
+        );
+    }
+
+    #[tokio::test]
+    async fn office_six_child_employees_keep_five_actors_and_sixth_readonly_history() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-resume", "confirm").await;
+        let mut parent = String::new();
+        let mut sixth_start = 0;
+        let mut identities = Vec::new();
+        for index in 0..6 {
+            std::fs::write(
+                fixture.workspace.path().join("README.md"),
+                format!("独立成果-{index}"),
+            )
+            .unwrap();
+            let task = serde_json::json!({"task":format!("容量员工{index}"),"name":format!("独立员工{index}")}).to_string();
+            if index == 0 {
+                let response = fixture
+                    .app
+                    .clone()
+                    .oneshot(fixture.chat(&task))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), 200_000).await.unwrap();
+                parent = fixture
+                    .state
+                    .main_office
+                    .record(&fixture.team)
+                    .unwrap()
+                    .session
+                    .unwrap();
+            } else {
+                if index == 5 {
+                    sixth_start = fixture.seen.lock().await.len();
+                }
+                child_test_json(
+                    &fixture.app,
+                    "POST",
+                    &format!("/session/{parent}/message"),
+                    serde_json::json!({"text":task}),
+                )
+                .await;
+            }
+            let record = fixture.state.main_office.record(&fixture.team).unwrap();
+            let members = record.snapshot["employees"].as_array().unwrap();
+            assert_eq!(members.len(), index + 2);
+            for (offset, actor) in [
+                "code-agent",
+                "file-agent",
+                "app-agent",
+                "review-agent",
+                "data-agent",
+                "",
+            ]
+            .iter()
+            .take(index + 1)
+            .enumerate()
+            {
+                assert_eq!(
+                    members[offset + 1]["sceneActorId"],
+                    *actor,
+                    "已经空闲的人物仍属于原员工"
+                );
+            }
+            identities.push(members[index + 1].clone());
+            // 等待真实外部 gateway 接收到本轮末尾快照，避免跨轮队列影响动作归属判断。
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if fixture.seen.lock().await.iter().any(|message| {
+                        message["type"] == "office.snapshot"
+                            && message["snapshot"]["seq"] == record.snapshot["seq"]
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let children = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|session| session["parentID"] == parent)
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 6);
+        for index in 0..6 {
+            let child = children
+                .iter()
+                .find(|child| child["title"] == format!("独立员工{index}"))
+                .unwrap();
+            let history = child_test_json(
+                &fixture.app,
+                "GET",
+                &format!("/session/{}/message", child["id"].as_str().unwrap()),
+                serde_json::json!({}),
+            )
+            .await
+            .to_string();
+            assert!(history.contains(&format!("独立成果-{index}")));
+            for other in 0..6 {
+                if other != index {
+                    assert!(!history.contains(&format!("独立成果-{other}")));
+                }
+            }
+        }
+        let seen = fixture.seen.lock().await;
+        for message in &seen[sixth_start..] {
+            let command = &message["command"];
+            assert!(
+                command["capability"] != "office.visit",
+                "无场景人物的第六员工不借其他人物汇报"
+            );
+            if command["actorId"] != "office-lead" && command["type"] == "actor.presentation.set" {
+                assert_eq!(
+                    command["status"], "idle",
+                    "第六员工工具不能投影为其他员工活动"
+                );
+            }
+        }
+        drop(seen);
+        let models = fixture.model_seen.lock().await.len();
+        let sixth = &identities[5];
+        let details = fixture.ui(serde_json::json!({"id":"sixth-employee","teamId":fixture.team,"action":"employee.inspect","employeeId":sixth["id"]})).await;
+        assert_eq!(details["template"], "detail-v1");
+        assert!(details.to_string().contains("容量员工5"));
+        let tools = fixture
+            .button("sixth-employee", "sixth-tools", &details, "工具")
+            .await;
+        assert!(
+            tools.to_string().contains("read_file") && tools.to_string().contains("独立成果-5")
+        );
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            models,
+            "第六员工详情只读"
+        );
+        eprintln!(
+            "T04 six employee evidence: {}",
+            serde_json::json!({"employees":identities,"sessions":children,"sixthTools":tools,"modelLimit":1})
+        );
+    }
+
+    #[tokio::test]
+    async fn office_snapshot_byte_capacity_rejects_before_hidden_child_creation() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-resume", "confirm").await;
+        let parent = child_test_json(&fixture.app, "POST", "/session", serde_json::json!({})).await
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let registry = fixture.home.path().join("offices/registry.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        let record = &mut saved[&fixture.team];
+        record["session"] = serde_json::json!(parent);
+        record["conversation"] = serde_json::json!("fixture");
+        let mut employees = vec![
+            serde_json::json!({"id":parent,"sceneActorId":"office-lead","name":"王明","role":"主 Agent","online":false}),
+        ];
+        for index in 0..198 {
+            employees.push(serde_json::json!({"id":format!("existing-{index}"),"sceneActorId":"","name":"员".repeat(76),"role":"子 Agent","online":false}));
+        }
+        record["snapshot"]["employees"] = serde_json::json!(employees);
+        assert!(serde_json::to_vec(&serde_json::json!({"type":"offices.initialize","offices":[record["snapshot"].clone()]})).unwrap().len() < 65536,"原有快照仍可提交，新增执行需要预留发布空间");
+        std::fs::write(&registry, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut state = AppState::new(fixture.state.config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            fixture.home.path(),
+            fixture.workspace.path(),
+            Some(
+                std::env::var("OPENPAW_OPENAI_BASE_URL")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .to_string(),
+            ),
+        );
+        state.office.attach_main(&state.main_office);
+        let app = build_router(state);
+        child_test_json(&app,"POST",&format!("/session/{parent}/message"),serde_json::json!({"text":serde_json::json!({"task":"读取首轮秘密","name":"容量边界"}).to_string()})).await;
+        let sessions = child_test_json(&app, "GET", "/session", serde_json::json!({})).await;
+        assert_eq!(
+            sessions.as_array().unwrap().len(),
+            1,
+            "发布预算不足时不能创建隐藏身份"
+        );
+        let history = child_test_json(
+            &app,
+            "GET",
+            &format!("/session/{parent}/message"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(history.to_string().contains("64 KiB"));
+        assert_eq!(
+            fixture
+                .model_seen
+                .lock()
+                .await
+                .iter()
+                .filter(|request| !request["tools"].to_string().contains("delegate_task"))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn office_child_registration_disk_failure_keeps_identity_without_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-resume", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                fixture.chat(&serde_json::json!({"task":"初始化员工","name":"原员工"}).to_string()),
+            )
+            .await
+            .unwrap();
+        to_bytes(response.into_body(), 200_000).await.unwrap();
+        let parent = fixture
+            .state
+            .main_office
+            .record(&fixture.team)
+            .unwrap()
+            .session
+            .unwrap();
+        let registry = fixture.home.path().join("offices/registry.json");
+        let previous_registry = std::fs::read(&registry).unwrap();
+        std::fs::remove_file(&registry).unwrap();
+        std::fs::create_dir(&registry).unwrap();
+        let before = fixture
+            .model_seen
+            .lock()
+            .await
+            .iter()
+            .filter(|request| !request["tools"].to_string().contains("delegate_task"))
+            .count();
+        child_test_json(&fixture.app,"POST",&format!("/session/{parent}/message"),serde_json::json!({"text":serde_json::json!({"task":"读取首轮秘密","name":"登记失败员工"}).to_string()})).await;
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["title"] == "登记失败员工")
+            .expect("已持久化的子身份仍可公开查询");
+        let child_id = child["id"].as_str().unwrap();
+        assert_eq!(
+            child_test_json(
+                &fixture.app,
+                "GET",
+                &format!("/session/{child_id}/turns"),
+                serde_json::json!({})
+            )
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+            0,
+            "登记失败不得接收子执行"
+        );
+        assert_eq!(
+            fixture
+                .model_seen
+                .lock()
+                .await
+                .iter()
+                .filter(|request| !request["tools"].to_string().contains("delegate_task"))
+                .count(),
+            before
+        );
+        let history = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{parent}/message"),
+            serde_json::json!({}),
+        )
+        .await
+        .to_string();
+        assert!(
+            history.contains(child_id)
+                && history.contains("未启动")
+                && history.contains("办公室记录提交失败")
+        );
+        assert_eq!(
+            fixture
+                .state
+                .main_office
+                .record(&fixture.team)
+                .unwrap()
+                .snapshot["employees"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3,
+            "事实已保存的员工不能静默从内存消失"
+        );
+        // 恢复临时文件路径后重新启动：员工身份必须能由父会话事实恢复，仍无新执行。
+        std::fs::remove_dir(&registry).unwrap();
+        std::fs::write(&registry, previous_registry).unwrap();
+        let mut reloaded_state = AppState::new(fixture.state.config.clone());
+        Arc::get_mut(&mut reloaded_state).unwrap().main_office = crate::office::MainOffice::new(
+            fixture.home.path(), fixture.workspace.path(), Some(std::env::var("OPENPAW_OPENAI_BASE_URL").unwrap().trim_end_matches("/v1").to_string()));
+        reloaded_state.office.attach_main(&reloaded_state.main_office);
+        let reloaded = build_router(reloaded_state);
+        assert_eq!(
+            child_test_json(
+                &reloaded,
+                "GET",
+                &format!("/session/{child_id}/message"),
+                serde_json::json!({})
+            )
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+            0
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.seen.lock().await.iter().any(|message| message["type"] == "offices.initialize" && message["offices"].as_array().into_iter().flatten().any(|snapshot|snapshot["employees"].as_array().is_some_and(|employees|employees.len() == 3))) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("旧办公室文件通过已提交父会话事实恢复第三个员工，原协议初始化可见");
+        eprintln!(
+            "T04 registration fault evidence: {}",
+            serde_json::json!({"unstartedSession":child,"childModelRequestsAdded":0,"acceptedChildTurns":0,"persistedMemberIdentities":3})
+        );
     }
 
     #[tokio::test]

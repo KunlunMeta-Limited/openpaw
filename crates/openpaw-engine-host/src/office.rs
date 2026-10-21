@@ -41,6 +41,9 @@ pub(crate) struct MainOfficeRecord {
     pub(crate) snapshot: Value,
     #[serde(default)]
     child_tasks: std::collections::BTreeMap<String, String>,
+    // 尚未创建会话的本地容量，不持久化也不投影为已存在员工。
+    #[serde(skip)]
+    child_reservations: usize,
     // 人物工作状态是活动展示，不作为恢复后仍在执行的依据。
     #[serde(skip)]
     presentations: std::collections::BTreeMap<String, (String, String)>,
@@ -77,6 +80,52 @@ struct MainProjection {
     expires: tokio::time::Instant,
     cancel: tokio_util::sync::CancellationToken,
     allow_cancelled: bool,
+}
+
+/// 功能：保留一个办公室新员工名额，防止并发创建超出协议容量。
+/// 字段/变体语义：office 与 parent 定位唯一已绑定办公室；不包含工具或模型许可。
+/// 数据来源：MainOffice::reserve_child 的原子本地检查。
+/// 数据去向：登记成功后转换为持久员工；丢弃时释放临时计数。
+/// 约束：仅适用于新身份，既有 task_id 续办不申请。
+/// 稳定性：Host 内部类型，不改变 Office 或 Session 线协议。
+/// 关联：CHG-2026-0037、T04。
+pub(crate) struct MainChildReservation {
+    office: Arc<MainOffice>,
+    parent: String,
+}
+
+impl MainChildReservation {
+    /// 功能：在子回合执行前可靠登记真实员工及稳定人物绑定。
+    /// 参数：child 为真实子会话 ID，employee 为其兼容展示空间身份，name 为已校验展示名。
+    /// 返回：事实及快照都已提交时成功。
+    /// 错误：持久化错误明确返回子身份；事实已落盘时仍保留身份以供恢复。
+    /// 状态：新增员工但不伪造执行状态、任务或交接；预留随后由 Drop 释放。
+    /// 并发与取消：共享办公室短锁，不访问网络；登记完成前不接收子回合。
+    /// 权限：仅 runtime 的真实子创建路径调用，不授予任何执行权限。
+    /// 关联：CHG-2026-0037、record_main_fact。
+    pub(crate) fn commit(self, child: &str, employee: &str, name: &str) -> Result<(), String> {
+        self.office
+            .register_child(&self.parent, employee, name)
+            .map_err(|error| format!("子会话 {child} 未启动：{error}"))
+    }
+}
+
+impl Drop for MainChildReservation {
+    fn drop(&mut self) {
+        let mut guard = self
+            .office
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Ok(records) = guard.as_mut() {
+            if let Some(record) = records
+                .values_mut()
+                .find(|record| record.session.as_deref() == Some(&self.parent))
+            {
+                record.child_reservations = record.child_reservations.saturating_sub(1);
+            }
+        }
+    }
 }
 
 impl MainOffice {
@@ -302,12 +351,125 @@ impl MainOffice {
                 session: None,
                 snapshot,
                 child_tasks: std::collections::BTreeMap::new(),
+                child_reservations: 0,
                 presentations: std::collections::BTreeMap::new(),
             },
         );
         self.save(&next)?;
         *records = next;
         Ok(())
+    }
+
+    /// 功能：在创建子会话前原子预留已绑定办公室的成员容量。
+    /// 参数：parent 为可信父会话身份。
+    /// 返回：main 绑定父返回预留 guard；原 feature/OpenWork 独立父返回 None。
+    /// 错误：记录不可读、成员已达200或完整目录无法保留64KiB发布预算时明确拒绝。
+    /// 状态：仅增加暂存计数，既有员工包含主员工，不改变模型/进程额度。
+    /// 并发与取消：所有创建使用原 records 锁；失败、取消和 future 丢弃释放 guard。
+    /// 权限：不查询远端 Office，不因网络故障放开或拒绝名额。
+    /// 关联：CHG-2026-0037、T04。
+    pub(crate) fn reserve_child(
+        self: &Arc<Self>,
+        parent: &str,
+    ) -> Result<Option<MainChildReservation>, String> {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let records = guard.as_mut().map_err(|error| error.clone())?;
+        let directory_bytes = serde_json::to_vec(&serde_json::json!({"type":"offices.initialize","offices":records.values().map(|record|record.snapshot.clone()).collect::<Vec<_>>()})).map_err(|_|"办公室目录编码失败")?.len();
+        let pending = records
+            .values()
+            .map(|record| record.child_reservations)
+            .sum::<usize>();
+        let Some(record) = records
+            .values_mut()
+            .find(|record| record.session.as_deref() == Some(parent))
+        else {
+            return Ok(None);
+        };
+        let employees = record.snapshot["employees"]
+            .as_array()
+            .ok_or("办公室人员记录损坏")?;
+        let leader = usize::from(!employees.iter().any(|employee| employee["id"] == parent));
+        if employees.len() + leader + record.child_reservations >= 200 {
+            return Err("办公室成员容量已达200人（包含主员工），未创建或执行新子 Agent".into());
+        }
+        // 协议同时限制成员数和整个请求字节数；预留新成员/任务及最多四个在途子回合的状态开销。
+        // 不裁剪身份、清除业务事实或放大 main 的64KiB合同。
+        if directory_bytes + (pending + 1) * 1000 + 4096 > 65536 {
+            return Err("办公室快照发布容量不足（64 KiB），未创建或执行新子 Agent".into());
+        }
+        record.child_reservations += 1;
+        Ok(Some(MainChildReservation {
+            office: self.clone(),
+            parent: parent.into(),
+        }))
+    }
+
+    fn register_child(&self, parent: &str, child: &str, name: &str) -> Result<(), String> {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let records = guard.as_mut().map_err(|error| error.clone())?;
+        let mut next = records.clone();
+        let (team, record) = next
+            .iter_mut()
+            .find(|(_, record)| record.session.as_deref() == Some(parent))
+            .ok_or("办公室绑定已失效")?;
+        let revision = record.snapshot["seq"]
+            .as_u64()
+            .filter(|seq| *seq < 9_007_199_254_740_991)
+            .ok_or("办公室快照版本已耗尽")?
+            + 1;
+        let employees = record.snapshot["employees"]
+            .as_array_mut()
+            .ok_or("办公室人员记录损坏")?;
+        if !employees.iter().any(|employee| employee["id"] == parent) {
+            employees.push(serde_json::json!({"id":parent,"sceneActorId":"office-lead","name":"王明","role":"主 Agent","online":false}));
+        }
+        if employees.len() >= 200 || record.child_reservations == 0 {
+            return Err("办公室成员预留失效".into());
+        }
+        let actor = [
+            "code-agent",
+            "file-agent",
+            "app-agent",
+            "review-agent",
+            "data-agent",
+        ]
+        .into_iter()
+        .find(|actor| {
+            !employees
+                .iter()
+                .any(|employee| employee["sceneActorId"] == *actor)
+        })
+        .unwrap_or("");
+        employees.push(serde_json::json!({"id":child,"sceneActorId":actor,"name":name,"role":"子 Agent","online":false}));
+        record.snapshot["seq"] = Value::from(revision);
+        record.snapshot["events"] = serde_json::json!([]);
+        let handle = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(parent)
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or("父会话写入器不可用")?;
+        crate::runtime::record_main_fact(
+            &handle,
+            serde_json::json!({"seq":revision,"employees":record.snapshot["employees"],"tasks":record.snapshot["tasks"]}),
+        )?;
+        let projection = MainProjection {
+            team: team.clone(),
+            snapshot: record.snapshot.clone(),
+            commands: Vec::new(),
+            expires: tokio::time::Instant::now() + Duration::from_secs(3),
+            cancel: Default::default(),
+            allow_cancelled: true,
+        };
+        let result = self.save(&next);
+        // 已提交的会话事实不可因为办公室快照保存失败而从本机视图消失。
+        *records = next;
+        drop(guard);
+        if result.is_ok() {
+            let _ = self.projection_tx.try_send(projection);
+        }
+        result
     }
 
     /// 功能：读取当前完整办公室快照目录。
@@ -996,14 +1158,12 @@ impl MainOffice {
         });
     }
 
-    fn child_begin(&self, session: &str, child: &str, name: &str) {
+    fn child_begin(&self, session: &str, child: &str, _name: &str) {
         self.update(session,|team,record| {
             let employees = record.snapshot["employees"].as_array_mut().expect("owned employees");
-            if employees.len() >= 200 { return Vec::new(); }
             if !employees.iter().any(|employee| employee["id"] == child) {
-                let actor = ["code-agent","file-agent","app-agent","review-agent","data-agent"].into_iter()
-                    .find(|actor| !employees.iter().any(|employee| employee["sceneActorId"] == *actor)).unwrap_or("");
-                employees.push(serde_json::json!({"id":child,"sceneActorId":actor,"name":name.chars().take(80).collect::<String>(),"role":"子 Agent","online":true}));
+                // main 子身份必须在 runtime 执行前通过容量预留和可靠登记。
+                return Vec::new();
             } else if let Some(employee) = employees.iter_mut().find(|employee| employee["id"] == child) {
                 employee["online"] = Value::Bool(true);
             }
