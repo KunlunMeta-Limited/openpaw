@@ -1,6 +1,6 @@
 [package]
 name = "openpaw-engine-host"
-description = "OpenCode-compatible public engine interface adapter (M5b, gated behind a validation checkpoint)."
+description = "Optional local HTTP host for OpenPaw client adapters."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,12 @@ authors.workspace = true
 
 [features]
 default = []
-engine-host = []
+engine-host = ["dep:axum", "dep:serde_json", "dep:tokio"]
+
+[dependencies]
+axum = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["net"] }
 
 [lints]
 workspace = true

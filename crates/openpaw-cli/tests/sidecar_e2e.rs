@@ -7,6 +7,7 @@
 //! pattern as `chat_e2e.rs`) are enough to exercise the protocol surface —
 //! initialize → capabilities → tools/list → tools/call round-trips.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -17,6 +18,7 @@ struct SidecarProc {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    pending: HashMap<i64, Value>,
 }
 
 impl SidecarProc {
@@ -37,6 +39,7 @@ impl SidecarProc {
             child,
             stdin: Some(stdin),
             stdout,
+            pending: HashMap::new(),
         }
     }
 
@@ -61,10 +64,16 @@ impl SidecarProc {
     /// Frames until the response with `id` arrives (defensive skip of
     /// anything else the server might emit first).
     fn recv_response(&mut self, id: i64) -> Value {
+        if let Some(frame) = self.pending.remove(&id) {
+            return frame;
+        }
         loop {
             let frame = self.recv();
-            if frame.get("id").and_then(Value::as_i64) == Some(id) {
-                return frame;
+            if let Some(frame_id) = frame.get("id").and_then(Value::as_i64) {
+                if frame_id == id {
+                    return frame;
+                }
+                self.pending.insert(frame_id, frame);
             }
         }
     }

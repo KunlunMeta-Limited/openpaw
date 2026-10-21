@@ -27,6 +27,27 @@ fn default_workspace() -> PathBuf {
 
 fn main() {
     let cli = Cli::parse();
+    #[cfg(all(feature = "engine-host", feature = "sidecar"))]
+    if cli.engine_host && cli.sidecar {
+        eprintln!("error: --engine-host and --sidecar cannot run together");
+        std::process::exit(2);
+    }
+    #[cfg(feature = "engine-host")]
+    if cli.engine_host {
+        if cli.command.is_some() {
+            eprintln!("error: --engine-host cannot be combined with a subcommand");
+            std::process::exit(2);
+        }
+        let address =
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, cli.engine_host_port));
+        let config = openpaw_engine_host::HostConfig::new(address)
+            .expect("CLI host address is always loopback");
+        if let Err(error) = openpaw_engine_host::http::run_blocking(config) {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // `--sidecar` short-circuits subcommands: the MCP server runs in-process.
     #[cfg(feature = "sidecar")]
     if cli.sidecar {
