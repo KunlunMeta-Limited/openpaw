@@ -68,6 +68,18 @@
     "D33",
     "CHG-2026-0003",
     "D34",
-    "D35"
+    "D35",
+    "CHG-2026-0004",
+    "API-HOST-CONFIG",
+    "API-HOST-SESSION",
+    "API-HOST-RUN",
+    "API-HOST-VIEW",
+    "API-HOST-APPROVAL",
+    "API-HOST-QUERY",
+    "API-HOST-LIFECYCLE",
+    "API-HOST-HEALTH",
+    "API-HOST-SKILLS",
+    "API-HOST-GOALS",
+    "API-HOST-TEXT"
   ]
 }

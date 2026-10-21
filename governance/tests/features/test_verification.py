@@ -11,6 +11,49 @@ import verify
 import check
 
 class RunnerTests(unittest.TestCase):
+    def test_source_selection_uses_actual_dirty_and_untracked_content(self):
+        with tempfile.TemporaryDirectory(prefix='openpaw-source-') as temp:
+            root=Path(temp)
+            def git(*args):
+                return subprocess.check_output(['git',*args],cwd=root).decode().strip()
+            git('init','-q')
+            git('config','user.name','夹具')
+            git('config','user.email','fixture@example.invalid')
+            (root/'data.txt').write_text('已提交',encoding='utf-8')
+            git('add','data.txt');git('commit','-qm','原版本')
+            first=git('rev-parse','HEAD')
+            self.assertEqual(verify.source_context(root,'head',first)['requested_head'],first)
+            (root/'data.txt').write_text('当前未提交',encoding='utf-8')
+            (root/'untracked.txt').write_text('未跟踪',encoding='utf-8')
+            self.assertTrue(verify.source_context(root,'worktree',first)['dirty'])
+            with self.assertRaisesRegex(ValueError,'干净'):verify.source_context(root,'head',first)
+            output=root/'logs';output.mkdir()
+            command={'id':'TEST-SOURCE','cwd':'.','argv':['{python}','-c',
+                "from pathlib import Path; print(Path('data.txt').read_text(encoding='utf-8')+Path('untracked.txt').read_text(encoding='utf-8'))"]}
+            result=verify.run_one(command,root,output,10,{'{python}':sys.executable},'worktree','proposal')
+            self.assertEqual(result['exit_code'],0)
+            self.assertIn('当前未提交未跟踪',(output/'TEST-SOURCE.stdout.log').read_text(encoding='utf-8'))
+            before=verify.metadata(root)['worktree_sha256']
+            (root/'untracked.txt').write_text('新增修改',encoding='utf-8')
+            self.assertNotEqual(before,verify.metadata(root)['worktree_sha256'])
+            git('add','data.txt','untracked.txt');git('commit','-qm','后续版本')
+            with self.assertRaisesRegex(ValueError,'指定提交'):verify.source_context(root,'head',first)
+
+    def test_all_registered_scope_commands_share_source_and_stage(self):
+        import json
+        commands=json.loads((ROOT/'governance/commands.json').read_text(encoding='utf-8'))['commands']
+        self.assertEqual(len(commands),26)
+        for command in commands:
+            actual=verify.command_argv(command,{'{python}':sys.executable,'{head}':'fixed-sha','{base}':'base'},'worktree','delivery')
+            if command['id'] in {'TEST-COMMENTS','TEST-GOV-DIFF'}:
+                self.assertIn('--worktree',actual)
+                self.assertNotIn('--head',actual)
+            if command['id'] in {'TEST-GOV-DIFF','TEST-GOV-VALIDATE'}:
+                self.assertEqual(actual[-2:],['--stage','delivery'])
+            clean=verify.command_argv(command,{'{head}':'fixed-sha'},'head','implementation')
+            if '--head' in clean:
+                self.assertEqual(clean[clean.index('--head')+1],'fixed-sha')
+
     def test_registry_cannot_overwrite_or_escape_evidence(self):
         command={'id':'TEST-ONE','argv':['python','-V'],'suite':'governance','platforms':['linux','windows']}
         verify.validate_registry([command])

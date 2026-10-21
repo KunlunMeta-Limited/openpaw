@@ -80,6 +80,58 @@ impl FsGoalStore {
         }
     }
 
+    /// 功能：严格只读扫描目标，保留旧列表的容错语义。
+    /// 参数：self为显式目标目录的原Store。
+    /// 返回：按目标ID排序的原frontmatter文档。
+    /// 错误：扫描、读取、解析和根外链接错误不伪装空数据。
+    /// 状态：不创建目标目录或.events，不调度目标。
+    /// 并发与取消：同步只读；调用方等待读取完成。
+    /// 权限：解析前验证每个目标文件仍在显式根内。
+    /// 关联：需求/设计REQ-OP-014；DES-OP-006。
+    pub fn list_readonly_checked(&self) -> Result<Vec<FrontmatterDoc<GoalFrontmatter>>> {
+        let entries = match std::fs::read_dir(&self.goals_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(GoalError::Io {
+                    path: self.goals_dir.clone(),
+                    source,
+                })
+            }
+        };
+        let root = std::fs::canonicalize(&self.goals_dir).map_err(|source| GoalError::Io {
+            path: self.goals_dir.clone(),
+            source,
+        })?;
+        let mut docs = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| GoalError::Io {
+                path: self.goals_dir.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let target = std::fs::canonicalize(&path).map_err(|source| GoalError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !target.starts_with(&root) {
+                return Err(GoalError::Io {
+                    path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "goal path escapes root",
+                    ),
+                });
+            }
+            docs.push(read_doc::<GoalFrontmatter>(&target)?);
+        }
+        docs.sort_by(|a, b| a.frontmatter.id.cmp(&b.frontmatter.id));
+        Ok(docs)
+    }
+
     /// File name format: `<YYYY-MM-DD>-<id-prefix>.md`
     fn filename_for(fm: &GoalFrontmatter) -> String {
         let date = fm.created.format("%Y-%m-%d");

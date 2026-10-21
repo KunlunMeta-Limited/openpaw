@@ -348,3 +348,45 @@ async fn d11_permission_error_is_not_an_empty_list() {
         "test must execute as ordinary user with real access denial"
     );
 }
+
+#[tokio::test]
+async fn t3_bounded_preview_preserves_read_file_lines_and_rejects_binary_large_escape() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("中文 space.txt");
+    std::fs::write(&file, "第一行\nsecond\n").unwrap();
+    let plain =
+        openpaw_tools::fs::read::read_text_bounded(root.path(), "中文 space.txt", 256 * 1024)
+            .await
+            .unwrap();
+    assert_eq!(plain, "第一行\nsecond\n");
+    let read =
+        openpaw_tools::fs::read::run(root.path(), serde_json::json!({"path":"中文 space.txt"}))
+            .await
+            .unwrap();
+    assert!(read.content.contains("    1\t第一行\n"));
+    std::fs::write(&file, vec![b'a'; 256 * 1024]).unwrap();
+    assert_eq!(
+        openpaw_tools::fs::read::read_text_bounded(root.path(), "中文 space.txt", 256 * 1024)
+            .await
+            .unwrap()
+            .len(),
+        256 * 1024
+    );
+    std::fs::write(&file, vec![b'a'; 256 * 1024 + 1]).unwrap();
+    assert!(
+        openpaw_tools::fs::read::read_text_bounded(root.path(), "中文 space.txt", 256 * 1024)
+            .await
+            .is_err()
+    );
+    std::fs::write(&file, b"binary\0text").unwrap();
+    assert!(
+        openpaw_tools::fs::read::read_text_bounded(root.path(), "中文 space.txt", 256 * 1024)
+            .await
+            .is_err()
+    );
+    assert!(
+        openpaw_tools::fs::read::read_text_bounded(root.path(), "../escape", 256 * 1024)
+            .await
+            .is_err()
+    );
+}

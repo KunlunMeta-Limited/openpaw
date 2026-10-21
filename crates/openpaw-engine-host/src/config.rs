@@ -1,0 +1,305 @@
+//! 职责：读取显式Host配置并校验允许根与启动参数。
+//! 输入输出：本机TOML到运行配置；密钥只引用环境变量名。
+//! 依赖：原Provider装配和路径安全，不使用全局CWD或home切换。
+//! 禁止职责：不接受客户端任意目录、不回显密钥。
+use crate::{HostError, HostResult};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// 用途：显式本机启动配置。
+/// 字段：下列成员或状态由宿主统一管理。
+/// 来源去向：可信适配器、共享运行服务及原存储。
+/// 约束：不作为远程授权凭据，不复制核心执行逻辑。
+/// 稳定性：T3新增，协议无关Rust接口。
+/// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
+pub struct HostConfig {
+    /// 用途：显式Host数据根，必须与所有工作根互不包含。
+    /// 字段：PathBuf，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub home: PathBuf,
+    /// 用途：允许根标识到既存绝对目录，同一真实根合并资源。
+    /// 字段：BTreeMap<String, PathBuf>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub roots: BTreeMap<String, PathBuf>,
+    /// 用途：办公室槽到允许根标识的固定映射。
+    /// 字段：BTreeMap<String, String>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub slots: BTreeMap<String, String>,
+    #[serde(default = "four")]
+    /// 用途：活动Run硬容量，默认四个，满时返回容量错误。
+    /// 字段：usize，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub max_active_runs: usize,
+    #[serde(default = "echo")]
+    /// 用途：原Provider装配类型，不在Host重写选择逻辑。
+    /// 字段：String，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub provider: String,
+    /// 用途：可选显式模型，优先于原Provider默认模型。
+    /// 字段：Option<String>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub model: Option<String>,
+    /// 用途：可选模型端点，沿用原装配的无嵌入凭据校验。
+    /// 字段：Option<String>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub base_url: Option<String>,
+    /// 用途：模型密钥环境变量名，不能使用工具保留的系统变量。
+    /// 字段：Option<String>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub api_key_env: Option<String>,
+    /// 用途：未来SDK认证用户名变量名，须与密码成对配置。
+    /// 字段：Option<String>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub basic_username_env: Option<String>,
+    /// 用途：未来SDK认证密码变量名，值不进入诊断或工具环境。
+    /// 字段：Option<String>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub basic_password_env: Option<String>,
+    #[serde(default = "default_tools")]
+    /// 用途：工具提议、审批、真正执行与结果的事实投影。
+    /// 字段：Vec<String>，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub tools: Vec<String>,
+    #[serde(default = "total")]
+    /// 用途：Run总预算秒数，到期仍等待实际清理。
+    /// 字段：u64，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub run_timeout_secs: u64,
+    #[serde(default = "idle")]
+    /// 用途：Provider流空闲预算秒数，与总预算分开。
+    /// 字段：u64，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub stream_idle_secs: u64,
+    #[serde(default = "tool")]
+    /// 用途：单工具预算秒数，到期通知原执行器取消。
+    /// 字段：u64，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub tool_timeout_secs: u64,
+    #[serde(default = "approval")]
+    /// 用途：人工审批有效秒数，过期保持拒绝。
+    /// 字段：u64，宿主类型字段。
+    /// 来源去向：共享Host内部与可信Rust适配器。
+    /// 约束：只在已授权会话及配置根内使用。
+    /// 稳定性：T3新增中性字段。
+    /// 关联：需求/设计DES-OP-006。
+    pub approval_timeout_secs: u64,
+}
+fn four() -> usize {
+    4
+}
+fn echo() -> String {
+    "echo".into()
+}
+fn total() -> u64 {
+    1800
+}
+fn idle() -> u64 {
+    60
+}
+fn tool() -> u64 {
+    300
+}
+fn approval() -> u64 {
+    300
+}
+fn default_tools() -> Vec<String> {
+    ["read_file", "glob", "grep", "todo_list", "think"]
+        .map(str::to_owned)
+        .to_vec()
+}
+impl HostConfig {
+    /// 功能：读取并验证显式本机TOML。
+    /// 参数：path为已授权配置文件。
+    /// 返回：校验后的HostConfig。
+    /// 错误：非法范围、状态冲突或存储故障明确上报；无失败分支的读取不产生错误。
+    /// 状态：只读配置，不回显解析原文。
+    /// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
+    /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
+    /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
+    pub fn load(path: &Path) -> HostResult<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|_| HostError::new("invalid_input", "无法读取Host配置"))?;
+        let config: Self = toml::from_str(&text)
+            .map_err(|_| HostError::new("invalid_input", "Host配置格式或字段不合法"))?;
+        config.validate()?;
+        Ok(config)
+    }
+    /// 功能：校验目录、槽、预算、工具和凭据引用。
+    /// 参数：self为待启动配置。
+    /// 返回：合法返回成功。
+    /// 错误：非法范围、状态冲突或存储故障明确上报；无失败分支的读取不产生错误。
+    /// 状态：不创建目录、不修改环境变量。
+    /// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
+    /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
+    /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
+    pub fn validate(&self) -> HostResult<()> {
+        if !self.home.is_absolute()
+            || self.roots.is_empty()
+            || self.slots.is_empty()
+            || self.max_active_runs == 0
+            || self.max_active_runs > 256
+            || [
+                self.run_timeout_secs,
+                self.stream_idle_secs,
+                self.tool_timeout_secs,
+                self.approval_timeout_secs,
+            ]
+            .contains(&0)
+        {
+            return Err(HostError::new(
+                "invalid_input",
+                "配置需要绝对home、授权根、办公室槽和正数预算/容量（最多256）",
+            ));
+        }
+        for (id, path) in &self.roots {
+            valid_id(id)?;
+            if !path.is_absolute() || !path.is_dir() {
+                return Err(HostError::new(
+                    "invalid_input",
+                    "授权根必须是已存在绝对目录",
+                ));
+            }
+        }
+        for (id, root) in &self.slots {
+            valid_id(id)?;
+            if !self.roots.contains_key(root) {
+                return Err(HostError::new("invalid_input", "办公室引用未知根"));
+            }
+        }
+        for name in [
+            &self.api_key_env,
+            &self.basic_username_env,
+            &self.basic_password_env,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let system = [
+                "PATH",
+                "HOME",
+                "USER",
+                "LANG",
+                "LC_ALL",
+                "TERM",
+                "TMPDIR",
+                "TEMP",
+                "TMP",
+                "SYSTEMROOT",
+                "WINDIR",
+                "COMSPEC",
+                "PATHEXT",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+            ];
+            if name.is_empty()
+                || system.contains(&name.to_ascii_uppercase().as_str())
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(HostError::new(
+                    "invalid_input",
+                    "凭据变量名不合法或与工具系统环境冲突",
+                ));
+            }
+        }
+        let allowed = [
+            "read_file",
+            "glob",
+            "grep",
+            "todo_list",
+            "think",
+            "sleep",
+            "write_file",
+            "edit_file",
+            "notebook_edit",
+            "todo_add",
+            "todo_update",
+            "bash",
+        ];
+        if self.tools.iter().any(|t| !allowed.contains(&t.as_str())) {
+            return Err(HostError::new("unsupported", "工具白名单包含未支持项"));
+        }
+        let user = self
+            .basic_username_env
+            .as_ref()
+            .and_then(|n| std::env::var(n).ok())
+            .filter(|s| !s.is_empty());
+        let pass = self
+            .basic_password_env
+            .as_ref()
+            .and_then(|n| std::env::var(n).ok())
+            .filter(|s| !s.is_empty());
+        if self.basic_username_env.is_some() != self.basic_password_env.is_some()
+            || user.is_some() != pass.is_some()
+            || (self.basic_username_env.is_some() && user.is_none())
+        {
+            return Err(HostError::new(
+                "invalid_input",
+                "Basic用户名和密码必须同时配置且有效",
+            ));
+        }
+        Ok(())
+    }
+}
+/// 功能：验证绑定标识的非空、长度及控制符。
+/// 参数：id为可信适配器提供的标识。
+/// 返回：合法返回成功。
+/// 错误：非法范围、状态冲突或存储故障明确上报；无失败分支的读取不产生错误。
+/// 状态：无状态变化。
+/// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
+/// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
+/// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
+pub(crate) fn valid_id(id: &str) -> HostResult<()> {
+    if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+        Err(HostError::new("invalid_input", "标识为空、过长或含控制符"))
+    } else {
+        Ok(())
+    }
+}

@@ -256,6 +256,66 @@ impl FsSkillStore {
         Ok(Self::new(user, project))
     }
 
+    /// 功能：严格只读列出显式根的技能，项目同名项覆盖用户项。
+    /// 参数：self为已有显式根Store。
+    /// 返回：按技能名排序的原LoadedSkill。
+    /// 错误：目录读取、坏frontmatter、根外链接返回原存储错误。
+    /// 状态：不创建目录、不更新遥测或生命周期。
+    /// 并发与取消：同步读取；宿主在阻塞任务内调用并等待完成。
+    /// 权限：每个文件规范化后必须留在对应显式技能根内。
+    /// 关联：需求/设计REQ-OP-014；DES-OP-006。
+    pub fn list_readonly_checked(&self) -> Result<Vec<LoadedSkill>> {
+        let mut result = std::collections::BTreeMap::new();
+        for (root, scope) in std::iter::once((&self.user_root, Scope::User))
+            .chain(self.project_root.as_ref().map(|r| (r, Scope::Project)))
+        {
+            let entries = match std::fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(SkillStoreError::Io {
+                        path: root.clone(),
+                        source,
+                    })
+                }
+            };
+            let canonical = std::fs::canonicalize(root).map_err(|source| SkillStoreError::Io {
+                path: root.clone(),
+                source,
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|source| SkillStoreError::Io {
+                    path: root.clone(),
+                    source,
+                })?;
+                let path = entry.path();
+                let resolved =
+                    std::fs::canonicalize(&path).map_err(|source| SkillStoreError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                if !resolved.starts_with(&canonical) {
+                    return Err(SkillStoreError::Config("skill path escapes root".into()));
+                }
+                if !resolved.is_dir() {
+                    continue;
+                }
+                let file = path.join(SKILL_FILE);
+                let resolved = match std::fs::canonicalize(&file) {
+                    Ok(p) => p,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(source) => return Err(SkillStoreError::Io { path: file, source }),
+                };
+                if !resolved.starts_with(&canonical) {
+                    return Err(SkillStoreError::Config("skill file escapes root".into()));
+                }
+                let skill = Self::load_one(&resolved, scope)?;
+                result.insert(skill.name().to_owned(), skill);
+            }
+        }
+        Ok(result.into_values().collect())
+    }
+
     fn root_for(&self, scope: Scope) -> Option<&Path> {
         match scope {
             Scope::User => Some(&self.user_root),

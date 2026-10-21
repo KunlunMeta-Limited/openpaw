@@ -28,6 +28,8 @@ authors = ["OpenPaw contributors"]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util", "time", "process"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+same-file = "1.0.6"
 async-trait = "0.1"
 futures = "0.3"
 

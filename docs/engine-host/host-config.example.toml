@@ -1,0 +1,25 @@
+# Linux示例：先建立独立目录/home/user/openpaw-data和/home/user/project。
+# Windows原生：使用正斜杠路径，例如home = "C:/Users/user/openpaw-data"，root = "C:/Users/user/project"。
+# home与所有工作根互不包含；不能把项目根设成用户整个home或磁盘根。
+home = "/home/user/openpaw-data"
+provider = "echo" # 离线演示；真实模型改为openai或anthropic
+# model = "gpt-4o"
+# api_key_env = "OPENAI_API_KEY" # 只填环境变量名，不能填密钥
+# base_url = "https://api.openai.com/v1"
+max_active_runs = 4
+run_timeout_secs = 1800
+stream_idle_secs = 60
+tool_timeout_secs = 300
+approval_timeout_secs = 300
+# 写入和bash需显式加入；每次调用仍必须通过Host持久审批。
+tools = ["read_file", "glob", "grep", "todo_list", "think"]
+# T7预留：必须成对配置，当前T3只开放健康接口。
+# basic_username_env = "OPENPAW_HOST_USER"
+# basic_password_env = "OPENPAW_HOST_PASSWORD"
+[roots]
+project = "/home/user/project"
+[slots]
+office-1 = "project"
+office-2 = "project"
+office-3 = "project"
+office-4 = "project"

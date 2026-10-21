@@ -31,3 +31,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "read_only_queries"
+path = "tests/features/read_only_queries.rs"
