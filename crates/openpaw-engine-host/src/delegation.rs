@@ -255,6 +255,7 @@ impl DelegationContext {
                     )));
                 }
                 if let Some(cached) = &record.completed {
+                    self.office.reused_main_result(&self.parent_session_id);
                     return Ok(ToolCallOutcome {
                         media: Vec::new(),
                         content: cached.content.clone(),

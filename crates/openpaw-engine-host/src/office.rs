@@ -17,7 +17,889 @@ use tokio::sync::mpsc;
 
 const MAX_SUBAGENT_OUTPUT_CHARS: usize = 20_000;
 const SUBAGENT_OUTPUT_CHUNK_CHARS: usize = 96;
+
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+/// 功能：保存一个实际工作目录的办公室身份、聊天绑定与完整业务快照。
+/// 字段/变体语义：绑定字段同时存在或同时缺省；child_tasks 仅记录当前子执行。
+/// 数据来源：runtime 验证后的工作目录和实际执行事实。
+/// 数据去向：同一 OPENPAW_HOME 下的 offices/registry.json。
+/// 约束：teamId、会话绑定及递增 seq 不由浏览器覆盖。
+/// 稳定性：Host 内部版本；不改变已有 Session 格式。
+/// 关联：CHG-2026-0033、T1-12、T1-13。
+pub(crate) struct MainOfficeRecord {
+    /// runtime 验证并规范化的实际工作目录。
+    pub(crate) workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 办公室首次有效提交所绑定的 main 对话身份。
+    pub(crate) conversation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 由 runtime 创建的独立主会话身份。
+    pub(crate) session: Option<String>,
+    /// 已提交的完整业务快照和递增版本。
+    pub(crate) snapshot: Value,
+    #[serde(default)]
+    child_tasks: std::collections::BTreeMap<String, String>,
+}
+
+/// 功能：管理 main 的持久办公室目录、七消息与有界展示投影。
+/// 字段/变体语义：records 保存快照；会话历史仍归 runtime/Store。
+/// 数据来源：Host 配置、工作目录与真实 Agent 生命周期。
+/// 数据去向：同根持久卷及固定 main gateway。
+/// 约束：展示失败不改变 AgentLoop 结果，不重放历史动作。
+/// 稳定性：Host 内部实现，原 main 协议保持不变。
+/// 关联：CHG-2026-0033、T1-01、T1-10。
+pub(crate) struct MainOffice {
+    /// 串行化首次绑定与聊天准入，不覆盖实际 runtime 执行锁。
+    pub(crate) admission: tokio::sync::Mutex<()>,
+    records: Mutex<Result<std::collections::BTreeMap<String, MainOfficeRecord>, String>>,
+    path: PathBuf,
+    /// 仅服务端配置的固定 main gateway 地址。
+    pub(crate) url: Option<Url>,
+    key: String,
+    /// 复用连接且禁止重定向的客户端；页面代理不附业务 Bearer。
+    pub(crate) client: Client,
+    started: std::sync::atomic::AtomicBool,
+    projection_tx: mpsc::Sender<MainProjection>,
+    projection_rx: Mutex<Option<mpsc::Receiver<MainProjection>>>,
+    sessions: Mutex<HashMap<String, std::sync::Weak<crate::runtime::SessionHandle>>>,
+}
+
+struct MainProjection {
+    team: String,
+    snapshot: Value,
+    commands: Vec<Value>,
+    expires: tokio::time::Instant,
+    cancel: tokio_util::sync::CancellationToken,
+    allow_cancelled: bool,
+}
+
+impl MainOffice {
+    /// 功能：加载办公室目录或为配置的工作目录创建稳定身份。
+    /// 参数：home、workspace 和可选受控 gateway 地址。
+    /// 返回：共享目录，加载失败保留错误并拒绝聊天。
+    /// 错误：错误延迟由目录/绑定操作返回，不清除已有状态。
+    /// 状态：只在无历史记录时创建初始快照。
+    /// 并发与取消：短同步锁保护原子记录；聊天准入另行串行。
+    /// 权限：只读取服务端地址与密钥，不接受浏览器上游配置。
+    /// 关联：CHG-2026-0033、T1-13。
+    pub(crate) fn new(home: &Path, workspace: &Path, url: Option<String>) -> Arc<Self> {
+        let path = home.join("offices").join("registry.json");
+        let records = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "办公室记录损坏".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(std::collections::BTreeMap::new())
+            }
+            Err(_) => Err("办公室记录读取失败".into()),
+        };
+        let (projection_tx, projection_rx) = mpsc::channel(32);
+        let this = Arc::new(Self {
+            admission: tokio::sync::Mutex::new(()),
+            records: Mutex::new(records),
+            path,
+            url: url
+                .and_then(|value| Url::parse(&value).ok())
+                .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some()),
+            key: std::env::var("OPENPAW_MAIN_API_KEY").unwrap_or_default(),
+            client: Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("HTTP client"),
+            started: std::sync::atomic::AtomicBool::new(false),
+            projection_tx,
+            projection_rx: Mutex::new(Some(projection_rx)),
+            sessions: Mutex::new(HashMap::new()),
+        });
+        if let Err(error) = this.register(workspace) {
+            *this.records.lock().unwrap_or_else(|e| e.into_inner()) = Err(error);
+        }
+        if let Err(error) = this.recover(home) {
+            *this.records.lock().unwrap_or_else(|e| e.into_inner()) = Err(error);
+        }
+        this
+    }
+
+    /// 功能：关联 runtime 会话，事实写入继续由 runtime 管理。
+    /// 参数：handle 为原 SessionHandle。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：仅保存弱引用，不创建新历史存储。
+    /// 并发与取消：短锁，不跨 await。
+    /// 权限：仅内部调用，办公室限制不影响其他 OpenWork 会话。
+    /// 关联：T1-12。
+    pub(crate) fn attach_session(&self, handle: &Arc<crate::runtime::SessionHandle>) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(handle.id.clone(), Arc::downgrade(handle));
+    }
+
+    fn recover(&self, home: &Path) -> Result<(), String> {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let records = guard.as_mut().map_err(|error| error.clone())?;
+        let mut next = records.clone();
+        for (team, record) in &mut next {
+            if record.snapshot["workspace"]["id"] != *team
+                || record.conversation.is_some() != record.session.is_some()
+                || !Self::valid_facts(&record.snapshot)
+            {
+                return Err("办公室记录结构损坏".into());
+            }
+            let Some(session) = &record.session else {
+                continue;
+            };
+            let previous = record.snapshot.clone();
+            let mut revision = record.snapshot["seq"].as_u64().ok_or("办公室版本损坏")?;
+            if let Some(fact) = crate::runtime::latest_main_fact(home, session)? {
+                if !Self::valid_facts(&fact) {
+                    return Err("办公室执行事实损坏".into());
+                }
+                revision = revision.max(fact["seq"].as_u64().ok_or("办公室事实版本损坏")?);
+                record.snapshot["employees"] = fact["employees"].clone();
+                record.snapshot["tasks"] = fact["tasks"].clone();
+            }
+            record.child_tasks.clear();
+            record.snapshot["events"] = serde_json::json!([]);
+            for employee in record.snapshot["employees"]
+                .as_array_mut()
+                .ok_or("办公室人员记录损坏")?
+            {
+                employee["online"] = Value::Bool(false);
+            }
+            for task in record.snapshot["tasks"]
+                .as_array_mut()
+                .ok_or("办公室任务记录损坏")?
+            {
+                if matches!(
+                    task["status"].as_str(),
+                    Some("running" | "queued" | "blocked")
+                ) {
+                    task["status"] = Value::from("failed");
+                    task["summary"] = Value::from("重启中断，未自动继续执行");
+                    task["updatedAt"] = Value::from(chrono::Utc::now().to_rfc3339());
+                }
+            }
+            if previous != record.snapshot || revision > previous["seq"].as_u64().unwrap_or(0) {
+                if revision >= 9_007_199_254_740_991 {
+                    return Err("办公室快照版本已耗尽".into());
+                }
+                record.snapshot["seq"] = Value::from(revision + 1);
+            }
+        }
+        if *records != next {
+            self.save(&next)?;
+            *records = next;
+        }
+        Ok(())
+    }
+
+    fn valid_facts(fact: &Value) -> bool {
+        let Some(employees) = fact["employees"].as_array() else {
+            return false;
+        };
+        let Some(tasks) = fact["tasks"].as_array() else {
+            return false;
+        };
+        fact["seq"]
+            .as_u64()
+            .is_some_and(|seq| (1..=9_007_199_254_740_991).contains(&seq))
+            && employees.len() <= 200
+            && tasks.len() <= 1000
+            && employees.iter().all(|employee| {
+                employee.is_object()
+                    && employee["id"].is_string()
+                    && employee["sceneActorId"].is_string()
+                    && employee["name"].is_string()
+                    && employee["online"].is_boolean()
+            })
+            && tasks.iter().all(|task| {
+                task.is_object()
+                    && task["id"].is_string()
+                    && task["assigneeId"].as_str().is_some_and(|owner| {
+                        owner.is_empty() || employees.iter().any(|employee| employee["id"] == owner)
+                    })
+                    && matches!(
+                        task["status"].as_str(),
+                        Some("queued" | "running" | "blocked" | "completed" | "failed")
+                    )
+            })
+    }
+
+    fn save(
+        &self,
+        records: &std::collections::BTreeMap<String, MainOfficeRecord>,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let parent = self.path.parent().ok_or("办公室存储路径无效")?;
+        std::fs::create_dir_all(parent).map_err(|_| "办公室目录创建失败")?;
+        let temporary = parent.join(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(|_| "办公室记录创建失败")?;
+            let bytes = serde_json::to_vec(records).map_err(|_| "办公室记录编码失败")?;
+            file.write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|_| "办公室记录写入失败")?;
+            std::fs::rename(&temporary, &self.path).map_err(|_| "办公室记录提交失败")?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)
+                .and_then(|f| f.sync_all())
+                .map_err(|_| "办公室目录提交失败")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temporary);
+        }
+        result
+    }
+
+    /// 功能：为实际工作目录登记稳定办公室。
+    /// 参数：workspace 为 runtime 已验证的规范路径。
+    /// 返回：无；已有目录保持原身份。
+    /// 错误：磁盘错误或目录不存在。
+    /// 状态：只新增目录映射，不创建聊天或回合。
+    /// 并发与取消：短锁与原子提交，无网络。
+    /// 权限：仅由服务端 runtime 调用。
+    /// 关联：办公室对应工作目录。
+    pub(crate) fn register(&self, workspace: &Path) -> Result<(), String> {
+        let workspace = std::fs::canonicalize(workspace).map_err(|_| "办公室工作目录不存在")?;
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let records = guard.as_mut().map_err(|e| e.clone())?;
+        if records.values().any(|record| record.workspace == workspace) {
+            return Ok(());
+        }
+        if records.len() >= 100 {
+            return Err("办公室数量已达上限".into());
+        }
+        let team = format!("office-{}", uuid::Uuid::new_v4().simple());
+        let name = workspace
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .take(80)
+            .collect::<String>();
+        let snapshot = serde_json::json!({"schemaVersion":"1.0","seq":1,
+            "workspace":{"id":team,"name":if name.is_empty(){"工作空间"}else{&name}},
+            "employees":[],"tasks":[],"events":[],
+            "system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1},
+            "whiteboard":{"template":"task-board-v1","title":"","status":"queued","tagline":"","description":"","note":"","link":{"label":"","url":""},"steps":[]}});
+        let mut next = records.clone();
+        next.insert(
+            team,
+            MainOfficeRecord {
+                workspace,
+                conversation: None,
+                session: None,
+                snapshot,
+                child_tasks: std::collections::BTreeMap::new(),
+            },
+        );
+        self.save(&next)?;
+        *records = next;
+        Ok(())
+    }
+
+    /// 功能：读取当前完整办公室快照目录。
+    /// 参数：无。
+    /// 返回：按稳定 teamId 排列的快照。
+    /// 错误：记录不可读时拒绝而非返回空目录。
+    /// 状态：只读。
+    /// 并发与取消：同步短锁，无网络。
+    /// 权限：仅供 Host 内部受控出站使用。
+    /// 关联：offices.initialize。
+    pub(crate) fn directory(&self) -> Result<Vec<Value>, String> {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|records| {
+                records
+                    .values()
+                    .map(|record| record.snapshot.clone())
+                    .collect()
+            })
+            .map_err(Clone::clone)
+    }
+
+    /// 功能：读取经过验证的办公室绑定。
+    /// 参数：team 为浏览器提供的已登记办公室 ID。
+    /// 返回：实际目录和稳定会话关联。
+    /// 错误：未知身份或持久化错误。
+    /// 状态：只读。
+    /// 并发与取消：同步短锁，不跨 await。
+    /// 权限：浏览器不能指定任意工作目录。
+    /// 关联：T1-13。
+    pub(crate) fn record(&self, team: &str) -> Result<MainOfficeRecord, String> {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_err(Clone::clone)?
+            .get(team)
+            .cloned()
+            .ok_or_else(|| "办公室不存在".into())
+    }
+
+    /// 功能：在执行前提交首次 conversation 和 runtime Session 绑定。
+    /// 参数：team、conversation、session 的稳定身份。
+    /// 返回：已落盘后返回成功。
+    /// 错误：拒绝覆盖已有绑定；磁盘失败不执行模型。
+    /// 状态：原子更新目录记录。
+    /// 并发与取消：由调用方持有准入锁；写入在短同步锁下完成。
+    /// 权限：不接收浏览器指定的 Session。
+    /// 关联：T1-13、T1-12。
+    pub(crate) fn bind(&self, team: &str, conversation: &str, session: &str) -> Result<(), String> {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let records = guard.as_mut().map_err(|e| e.clone())?;
+        let mut next = records.clone();
+        let record = next.get_mut(team).ok_or("办公室不存在")?;
+        if record.conversation.is_some() {
+            return Err("本轮暂不支持新对话".into());
+        }
+        record.conversation = Some(conversation.into());
+        record.session = Some(session.into());
+        self.save(&next)?;
+        *records = next;
+        Ok(())
+    }
+
+    /// 功能：向固定 main gateway 发送原协议消息并保留实际状态及完整 data。
+    /// 参数：message 为原合同 JSON；timeout 为含等待菜单期限的 HTTP 预算。
+    /// 返回：实际 HTTP 状态和未裁剪的 data；错误 envelope 仍保留业务分类。
+    /// 错误：网络结果不明、超限、null、code 不匹配及非法 envelope 返回安全错误。
+    /// 状态：不自动重试，不将 cached/ignored 当作已应用。
+    /// 并发与取消：丢弃 future 即关闭该 HTTP 请求，用于撤销待决卡片。
+    /// 权限：仅附服务端 Bearer，不接受浏览器上游 URL。
+    /// 关联：main 七消息合同、T1-01。
+    pub(crate) async fn message(
+        &self,
+        message: Value,
+        timeout: Duration,
+    ) -> Result<(u16, Value), String> {
+        fn valid(value: &Value, depth: usize) -> bool {
+            depth <= 64
+                && match value {
+                    Value::Null => false,
+                    Value::Array(values) => values.iter().all(|v| valid(v, depth + 1)),
+                    Value::Object(values) => values
+                        .iter()
+                        .all(|(key, v)| key != "__proto__" && valid(v, depth + 1)),
+                    _ => true,
+                }
+        }
+        let bytes = serde_json::to_vec(&message).map_err(|_| "main 消息编码失败")?;
+        if bytes.len() > 65536 || !valid(&message, 0) {
+            return Err("main 消息超限或包含非法值".into());
+        }
+        let url = self
+            .url
+            .as_ref()
+            .ok_or("main gateway 未配置")?
+            .join("/api/pawoffice/messages")
+            .map_err(|_| "main 地址无效")?;
+        let mut response = self
+            .client
+            .post(url)
+            .bearer_auth(&self.key)
+            .timeout(timeout)
+            .json(&message)
+            .send()
+            .await
+            .map_err(|_| "main 请求结果不明")?;
+        let status = response.status().as_u16();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| "main 响应中断")? {
+            if bytes.len() + chunk.len() > 4_000_000 {
+                return Err("main 响应超限".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| "main 响应不是合法 JSON")?;
+        if !valid(&value, 0)
+            || value["code"].as_u64() != Some(u64::from(status))
+            || !value["msg"].is_string()
+            || !value["data"].is_object()
+        {
+            return Err("main 响应 envelope 不合法".into());
+        }
+        let data = value["data"].clone();
+        if status >= 400
+            && (!data["reasonCode"].is_string()
+                || !data["details"].is_object()
+                || !data["issues"].is_array())
+        {
+            return Err("main 错误响应不合法".into());
+        }
+        if status < 400 {
+            let directory = || {
+                data["offices"].as_array().is_some_and(|offices| {
+                    offices.iter().all(|office| {
+                        office["id"].is_string()
+                            && office["name"].is_string()
+                            && office["seq"].as_u64().is_some()
+                            && office["runtimeReady"].is_boolean()
+                            && office["taskCount"].as_u64().is_some()
+                    })
+                }) && data["actors"].is_array()
+                    && data["supportedMessages"].is_array()
+                    && data["sceneCommandProtocol"] == "2.0"
+                    && data["ui"].is_object()
+            };
+            let matches_contract = match message["type"].as_str() {
+                Some("office.capabilities") => {
+                    status == 200
+                        && data["scene"].is_object()
+                        && data["ui"].is_object()
+                        && data["requests"].is_object()
+                        && data["responses"]["success"].is_object()
+                        && data["responses"]["error"].is_object()
+                }
+                Some("offices.initialize") => matches!(status, 200 | 202) && directory(),
+                Some("office.read") if message["teamId"].as_str().is_none_or(str::is_empty) => {
+                    status == 200 && directory()
+                }
+                Some("office.read") => {
+                    status == 200
+                        && data["snapshot"]["workspace"]["id"] == message["teamId"]
+                        && Self::valid_facts(&data["snapshot"])
+                        && data["scene"].is_object()
+                        && data["pendingDecisions"].is_array()
+                }
+                Some("office.snapshot") => {
+                    data["teamId"] == message["teamId"]
+                        && (data["seq"] == message["snapshot"]["seq"]
+                            && (status == 202 && data["status"] == "cached"
+                                || status == 200 && data["status"] == "applied")
+                            || status == 200
+                                && data["status"] == "ignored"
+                                && data["seq"]
+                                    .as_u64()
+                                    .zip(message["snapshot"]["seq"].as_u64())
+                                    .is_some_and(|(actual, sent)| actual >= sent)
+                                && matches!(
+                                    data["reasonCode"].as_str(),
+                                    Some("STALE_SEQ" | "DUPLICATE_SEQ")
+                                ))
+                }
+                Some("ui.next") => {
+                    status == 200
+                        && data["actions"].as_array().is_some_and(|actions| {
+                            actions.len() <= 1
+                                && actions.iter().all(|action| {
+                                    action["id"].is_string()
+                                        && action["teamId"].is_string()
+                                        && action["action"].is_string()
+                                })
+                        })
+                }
+                Some("ui.respond") => {
+                    status == 200
+                        && data["interactionId"] == message["interactionId"]
+                        && data["delivered"] == true
+                }
+                Some("decision.request") => {
+                    status == 200
+                        && data["teamId"] == message["teamId"]
+                        && data["decisionId"] == message["decision"]["id"]
+                        && data["choiceId"].is_string()
+                        && data["label"].is_string()
+                }
+                _ => status == 200 && data["forwarded"].as_u64().is_some(),
+            };
+            if !matches_contract {
+                return Err("main 响应字段与原请求不匹配".into());
+            }
+        }
+        Ok((status, data))
+    }
+
+    fn clear_transient_events(&self) -> Result<(), String> {
+        let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let records = guard.as_mut().map_err(|error| error.clone())?;
+        let mut next = records.clone();
+        for record in next.values_mut() {
+            if record.snapshot["events"]
+                .as_array()
+                .is_some_and(|events| !events.is_empty())
+            {
+                let seq = record.snapshot["seq"].as_u64().ok_or("办公室版本损坏")?;
+                if seq >= 9_007_199_254_740_991 {
+                    return Err("办公室版本已耗尽".into());
+                }
+                record.snapshot["events"] = serde_json::json!([]);
+                record.snapshot["seq"] = Value::from(seq + 1);
+            }
+        }
+        if next != *records {
+            self.save(&next)?;
+            *records = next;
+        }
+        Ok(())
+    }
+
+    /// 功能：启动办公室当前状态同步及原 UI 操作领取，单个 Host 只启动一次。
+    /// 参数：shutdown 为 Host 关闭令牌。
+    /// 返回：无。
+    /// 错误：仅安全日志，离线不改变模型回合结果。
+    /// 状态：有限间隔重试目录与当前快照，不恢复执行或历史动画。
+    /// 并发与取消：两个独立任务，UI 长轮询不阻塞快照；关闭时丢弃 HTTP future。
+    /// 权限：任务操作只给出未开放说明，不启动后续 PR 业务。
+    /// 关联：T1-01、T1-08、T1-10。
+    pub(crate) fn start(self: &Arc<Self>, shutdown: tokio_util::sync::CancellationToken) {
+        use std::sync::atomic::Ordering;
+        if self.url.is_none() || self.started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let stop = shutdown.clone();
+        let mut receiver = self
+            .projection_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("single main worker");
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let projection = tokio::select! { biased;
+                    _ = stop.cancelled() => break,
+                    projection = receiver.recv() => match projection {Some(projection)=>Some(projection),None=>break},
+                    _ = interval.tick() => None,
+                };
+                let Some(office) = weak.upgrade() else {
+                    break;
+                };
+                let sync = async {
+                    if let Some(projection) = projection {
+                        if tokio::time::Instant::now() > projection.expires {
+                            return Ok(());
+                        }
+                        if projection.cancel.is_cancelled() && !projection.allow_cancelled {
+                            return Ok(());
+                        }
+                        let request = office.message(serde_json::json!({"type":"office.snapshot","teamId":projection.team,"snapshot":projection.snapshot}),Duration::from_secs(2));
+                        let (status, data) = tokio::select! { biased;
+                            _ = projection.cancel.cancelled(), if !projection.allow_cancelled => return Ok(()),
+                            _ = tokio::time::sleep_until(projection.expires) => return Ok(()),
+                            result = request => result?,
+                        };
+                        if !matches!(status, 200 | 202)
+                            || !matches!(
+                                data["status"].as_str(),
+                                Some("applied" | "cached" | "ignored")
+                            )
+                        {
+                            return Err("main 快照未同步".into());
+                        }
+                        if status == 200
+                            && data["status"] == "applied"
+                            && tokio::time::Instant::now() <= projection.expires
+                        {
+                            for command in projection.commands {
+                                if projection.cancel.is_cancelled() && !projection.allow_cancelled {
+                                    break;
+                                }
+                                let request = office.message(
+                                    serde_json::json!({"teamId":projection.team,"command":command}),
+                                    Duration::from_secs(1),
+                                );
+                                tokio::select! { biased;
+                                    _ = projection.cancel.cancelled(), if !projection.allow_cancelled => break,
+                                    _ = tokio::time::sleep_until(projection.expires) => break,
+                                    result = request => { result?; },
+                                }
+                            }
+                        }
+                        return Ok(());
+                    }
+                    let (status, capabilities) = office
+                        .message(
+                            serde_json::json!({"type":"office.capabilities"}),
+                            Duration::from_secs(5),
+                        )
+                        .await?;
+                    if status != 200
+                        || !capabilities["scene"].is_object()
+                        || !capabilities["ui"].is_object()
+                        || !capabilities["requests"].is_object()
+                        || !capabilities["responses"].is_object()
+                    {
+                        return Err("main 能力合同不匹配".to_string());
+                    }
+                    // 离线恢复只发送当前状态。交接事件超过投影期限后以新版本清除，
+                    // 避免 gateway 重启后把历史事件当成一次新的拜访。
+                    office.clear_transient_events()?;
+                    let (status, _) = office.message(serde_json::json!({"type":"offices.initialize","offices":office.directory()?}),Duration::from_secs(3)).await?;
+                    if !matches!(status, 200 | 202) {
+                        return Err("main 初始化被拒绝".into());
+                    }
+                    office
+                        .message(
+                            serde_json::json!({"type":"office.read"}),
+                            Duration::from_secs(5),
+                        )
+                        .await?;
+                    Ok::<_, String>(())
+                };
+                tokio::select! { _ = stop.cancelled() => break, result = sync => {
+                    if result.is_err() { tracing::warn!("main 当前状态同步未完成，将按间隔重试"); }
+                }}
+            }
+        });
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let Some(office) = weak.upgrade() else {
+                    break;
+                };
+                let result = tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    result = office.message(serde_json::json!({"type":"ui.next","timeoutMs":1000}),Duration::from_secs(3)) => result,
+                };
+                if let Ok((200, data)) = result {
+                    if let Some(actions) = data["actions"].as_array() {
+                        for action in actions.iter().take(1) {
+                            let Some(id) = action["id"].as_str() else {
+                                continue;
+                            };
+                            let Some(team) = action["teamId"].as_str() else {
+                                continue;
+                            };
+                            let Ok(record) = office.record(team) else {
+                                continue;
+                            };
+                            let description = match action["action"].as_str() {
+                                Some("actor.inspect"|"employee.inspect") => "人员状态由实际 Agent 执行同步。当前版本仅开放聊天和工具单次审批。",
+                                _ => "此操作尚未开放，未启动或修改任务。",
+                            };
+                            let response = serde_json::json!({"type":"ui.respond","interactionId":id,
+                                "presentation":{"target":"dialog","content":{"template":"detail-v1",
+                                "title":record.snapshot["workspace"]["name"],"description":description,"fields":[],"actions":[]}}});
+                            tokio::select! { _ = shutdown.cancelled() => return,
+                            _ = office.message(response,Duration::from_secs(5)) => {} }
+                        }
+                    }
+                }
+                tokio::select! { _ = shutdown.cancelled() => break, _ = tokio::time::sleep(Duration::from_millis(250)) => {} }
+            }
+        });
+    }
+}
 const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。可将职责清晰、可独立执行的任务通过 delegate_task 交给真实子 Agent，简单问答无需委派。当用户明确要求多 Agent、子 Agent、多空间协作且存在多个独立职责时，必须先调用 delegate_task；失败时说明原因，不能静默退化为单 Agent。按任务实际依赖安排协作，不套用固定领域角色或阶段模板。name 由你根据本次职责选择，优先使用清晰简短的中文功能名称；必要的 API、SQL 等技术标识可以保留。相同职责继续使用稳定 name，不要为近义职责重复创建空间。主 Agent 负责整合真实结果。每轮结束发送有效最终答复，严格遵循用户指定语言、格式和详略；允许纯文本、Markdown、JSON、XML等，不强制章节、文件清单或“无”占位。只有确实需要交付文件时，写入独立文件并调用 register_artifact 登记用户应查看的真实相对路径；shell或子Agent生成的成品也可登记，不登记检索脚本、临时数据和调试文件。子Agent过程文件保留在子空间。图示和图表只是可选展示能力，按用户需要选择合适格式，不因回答涉及某个主题就额外生成图表或强制使用Mermaid。可选图表文件.chart.json支持type为bar、bar3d、line、area、pie、donut、radar，以及title、categories、series[{name,data}]字段；数值必须真实、分类与系列等长，超过预览能力可交付其他通用格式。不得编造文件、工具执行或验证结果。"#;
+
+impl MainOffice {
+    fn update(
+        &self,
+        session: &str,
+        change: impl FnOnce(&str, &mut MainOfficeRecord) -> Vec<Value>,
+    ) {
+        let projection = {
+            let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            let Ok(records) = guard.as_mut() else {
+                return;
+            };
+            let mut next = records.clone();
+            let Some((team, record)) = next
+                .iter_mut()
+                .find(|(_, record)| record.session.as_deref() == Some(session))
+            else {
+                return;
+            };
+            let seq = record.snapshot["seq"].as_u64().unwrap_or(1);
+            if seq >= 9_007_199_254_740_991 {
+                tracing::error!("main 快照版本已耗尽");
+                return;
+            }
+            record.snapshot["seq"] = Value::from(seq + 1);
+            record.snapshot["events"] = serde_json::json!([]);
+            let commands = change(team, record);
+            let allow_cancelled = record.snapshot["events"]
+                .as_array()
+                .is_some_and(|events| events.is_empty())
+                && commands.iter().all(|command| command["status"] == "idle");
+            let handle = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(session)
+                .and_then(std::sync::Weak::upgrade);
+            let cancel = handle
+                .as_ref()
+                .map(|handle| handle.main_cancel_token())
+                .unwrap_or_default();
+            if cancel.is_cancelled() && !allow_cancelled {
+                return;
+            }
+            let projection = MainProjection {
+                team: team.clone(),
+                snapshot: record.snapshot.clone(),
+                commands,
+                expires: tokio::time::Instant::now() + Duration::from_secs(3),
+                cancel,
+                allow_cancelled,
+            };
+            if let Some(handle) = handle {
+                let fact = serde_json::json!({"seq":record.snapshot["seq"],"employees":record.snapshot["employees"],"tasks":record.snapshot["tasks"]});
+                if crate::runtime::record_main_fact(&handle, fact).is_err() {
+                    tracing::error!("main 会话事实持久化失败，未发布人物状态");
+                    return;
+                }
+            }
+            if self.save(&next).is_err() {
+                *records = next;
+                tracing::error!("main 快照持久化失败，会话事实已保留，未发送新版本");
+                return;
+            }
+            *records = next;
+            projection
+        };
+        let _ = self.projection_tx.try_send(projection);
+    }
+
+    fn command(team: &str, actor: &str, state: &str, title: &str, revision: u64) -> Value {
+        serde_json::json!({"protocolVersion":"2.0","sceneId":team,
+            "commandId":format!("cmd-{}",uuid::Uuid::new_v4().simple()),"type":"actor.presentation.set",
+            "actorId":actor,"status":state,"title":title,"sourceRevision":revision})
+    }
+
+    fn begin(&self, session: &str) {
+        self.update(session,|team,record| {
+            let snapshot = &mut record.snapshot;
+            let employees = snapshot["employees"].as_array_mut().expect("owned snapshot");
+            if let Some(lead) = employees.iter_mut().find(|employee| employee["id"] == session) {
+                lead["online"] = Value::Bool(true);
+            } else {
+                employees.push(serde_json::json!({"id":session,"sceneActorId":"office-lead","name":"王明","role":"主 Agent","online":true}));
+            }
+            vec![Self::command(team,"office-lead","thinking","处理当前请求",snapshot["seq"].as_u64().unwrap_or(1))]
+        });
+    }
+
+    fn activity(&self, session: &str, owner: &str, event: &AgentEvent) {
+        let state = match event {
+            AgentEvent::ToolExecutionStart { .. } => "working",
+            AgentEvent::ToolResult { .. } => "thinking",
+            _ => return,
+        };
+        self.update(session, |team, record| {
+            let actor = record.snapshot["employees"]
+                .as_array()
+                .and_then(|employees| employees.iter().find(|employee| employee["id"] == owner))
+                .and_then(|employee| employee["sceneActorId"].as_str())
+                .unwrap_or("");
+            if actor.is_empty() {
+                return Vec::new();
+            }
+            vec![Self::command(
+                team,
+                actor,
+                state,
+                if state == "working" {
+                    "执行工具"
+                } else {
+                    "正在思考"
+                },
+                record.snapshot["seq"].as_u64().unwrap_or(1),
+            )]
+        });
+    }
+
+    fn finish(&self, session: &str) {
+        self.update(session, |team, record| {
+            let revision = record.snapshot["seq"].as_u64().unwrap_or(1);
+            record.snapshot["employees"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|employee| {
+                    let actor = employee["sceneActorId"].as_str()?;
+                    (!actor.is_empty()).then(|| Self::command(team, actor, "idle", "", revision))
+                })
+                .collect()
+        });
+    }
+
+    fn cancel(&self, session: &str) {
+        self.update(session, |team, record| {
+            record.child_tasks.clear();
+            for task in record.snapshot["tasks"]
+                .as_array_mut()
+                .expect("owned tasks")
+            {
+                if task["status"] == "running" {
+                    task["status"] = Value::from("failed");
+                    task["summary"] = Value::from("执行已取消；已发生的工具副作用不自动回滚");
+                    task["updatedAt"] = Value::from(chrono::Utc::now().to_rfc3339());
+                }
+            }
+            record.snapshot["employees"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|employee| {
+                    let actor = employee["sceneActorId"].as_str()?;
+                    (!actor.is_empty()).then(|| {
+                        Self::command(
+                            team,
+                            actor,
+                            "idle",
+                            "",
+                            record.snapshot["seq"].as_u64().unwrap_or(1),
+                        )
+                    })
+                })
+                .collect()
+        });
+    }
+
+    fn child_begin(&self, session: &str, child: &str, name: &str) {
+        self.update(session,|_,record| {
+            let employees = record.snapshot["employees"].as_array_mut().expect("owned employees");
+            if employees.len() >= 200 { return Vec::new(); }
+            if !employees.iter().any(|employee| employee["id"] == child) {
+                let actor = ["code-agent","file-agent","app-agent","review-agent","data-agent"].into_iter()
+                    .find(|actor| !employees.iter().any(|employee| employee["sceneActorId"] == *actor)).unwrap_or("");
+                employees.push(serde_json::json!({"id":child,"sceneActorId":actor,"name":name.chars().take(80).collect::<String>(),"role":"子 Agent","online":true}));
+            } else if let Some(employee) = employees.iter_mut().find(|employee| employee["id"] == child) {
+                employee["online"] = Value::Bool(true);
+            }
+            let task = format!("exec-{}",uuid::Uuid::new_v4().simple());
+            record.child_tasks.insert(child.into(),task.clone());
+            let tasks = record.snapshot["tasks"].as_array_mut().expect("owned tasks");
+            if tasks.len() >= 1000 { tasks.retain(|task| task["status"] == "running"); }
+            let now = chrono::Utc::now().to_rfc3339();
+            tasks.push(serde_json::json!({"id":task,"title":"执行子任务","assigneeId":child,"status":"running","progress":-1,"updatedAt":now,"summary":"真实子 Agent 执行"}));
+            record.snapshot["events"] = serde_json::json!([{"id":format!("assigned-{task}"),"kind":"task.assigned",
+                "summary":"主 Agent 向子 Agent 交接任务","occurredAt":now,"taskId":task,"employeeId":child,"fromEmployeeId":session}]);
+            Vec::new()
+        });
+    }
+
+    fn child_end(&self, session: &str, child: &str, completed: bool) {
+        self.update(session,|team,record| {
+            let Some(task_id) = record.child_tasks.remove(child) else { return Vec::new(); };
+            if let Some(task) = record.snapshot["tasks"].as_array_mut().expect("owned tasks").iter_mut().find(|task| task["id"] == task_id) {
+                task["status"] = Value::from(if completed {"completed"}else{"failed"});
+                task["updatedAt"] = Value::from(chrono::Utc::now().to_rfc3339());
+                task["summary"] = Value::from(if completed {"真实执行已返回结果"}else{"执行未成功完成"});
+            }
+            let Some(actor) = record.snapshot["employees"].as_array().expect("owned employees").iter()
+                .find(|employee| employee["id"] == child).and_then(|employee| employee["sceneActorId"].as_str()) else { return Vec::new(); };
+            if actor.is_empty() { return Vec::new(); }
+            let mut commands = vec![Self::command(team,actor,"idle","",record.snapshot["seq"].as_u64().unwrap_or(1))];
+            if completed {
+                commands.push(serde_json::json!({"protocolVersion":"2.0","sceneId":team,"commandId":format!("return-{task_id}"),
+                    "type":"activity.start","capability":"office.visit","participants":[{"entityId":actor,"role":"visitor"},{"entityId":"office-lead","role":"host"}],
+                    "params":{"stops":[{"hostId":"office-lead","message":"子任务已完成，请查收结果。"}]}}));
+            }
+            commands
+        });
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -181,6 +1063,7 @@ pub struct OfficeDispatcher {
     scopes: Arc<Mutex<HashMap<String, OfficeScope>>>,
     removed_sessions: Arc<Mutex<HashSet<String>>>,
     enabled: bool,
+    main: Arc<Mutex<std::sync::Weak<MainOffice>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +1108,7 @@ impl OfficeDispatcher {
                 scopes: Arc::new(Mutex::new(HashMap::new())),
                 removed_sessions: Arc::new(Mutex::new(HashSet::new())),
                 enabled: false,
+                main: Arc::new(Mutex::new(std::sync::Weak::new())),
             },
             rx,
         )
@@ -283,6 +1167,7 @@ impl OfficeDispatcher {
             scopes: Arc::new(Mutex::new(HashMap::new())),
             removed_sessions,
             enabled,
+            main: Arc::new(Mutex::new(std::sync::Weak::new())),
         }
     }
 
@@ -295,7 +1180,59 @@ impl OfficeDispatcher {
     /// 权限：不按请求内容自动启用。
     /// 关联：Q8。
     pub(crate) fn is_enabled(&self) -> bool {
-        self.enabled
+        self.enabled || self.main().is_some_and(|main| main.url.is_some())
+    }
+
+    /// 功能：关联 main 投影，不改变 feature 出站协议。
+    /// 参数：main 为同根持久化目录。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：只保存弱引用，避免后台任务引用环。
+    /// 并发与取消：同步短锁，关闭随 AppState 释放。
+    /// 权限：绑定仅由 Host 初始化执行。
+    /// 关联：CHG-2026-0033。
+    pub(crate) fn attach_main(&self, main: &Arc<MainOffice>) {
+        *self.main.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(main);
+    }
+
+    /// 功能：投影 main 取消状态并使原令牌对应的迟到工作动作失效。
+    /// 参数：session 为取消的父会话。
+    /// 返回：无。
+    /// 错误：投影失败不改变取消结果。
+    /// 状态：保留已发生事实，清理活动子任务展示。
+    /// 并发与取消：同步有界入队，不等待动画。
+    /// 权限：不取消其他办公室，不回滚工具副作用。
+    /// 关联：T1-09。
+    pub(crate) fn cancel_main(&self, session: &str) {
+        if let Some(main) = self.main() {
+            main.cancel(session);
+        }
+    }
+
+    /// 功能：标记旧子任务结果复用，避免伪造新交接。
+    /// 参数：session 为父会话。
+    /// 返回：无。
+    /// 错误：投影失败只记录日志。
+    /// 状态：新增脱敏 note，不创建子成员或执行任务。
+    /// 并发与取消：同步短锁，不等待网络。
+    /// 权限：不向 main 发送缓存正文。
+    /// 关联：T1-07。
+    pub(crate) fn reused_main_result(&self, session: &str) {
+        if let Some(main) = self.main() {
+            main.update(session,|_,record| {
+                record.snapshot["events"] = serde_json::json!([{"id":format!("reuse-{}",uuid::Uuid::new_v4().simple()),"kind":"note",
+                    "summary":"复用已完成的子任务结果，未启动新子执行","occurredAt":chrono::Utc::now().to_rfc3339(),
+                    "taskId":"","employeeId":"","fromEmployeeId":""}]);
+                Vec::new()
+            });
+        }
+    }
+
+    fn main(&self) -> Option<Arc<MainOffice>> {
+        self.main
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
     }
 
     /// 功能：取得 Office 模式的可视化指导。
@@ -307,7 +1244,7 @@ impl OfficeDispatcher {
     /// 权限：不改变独立 CLI 或关闭 Office 的 Host。
     /// 关联：Q8。
     pub(crate) fn system_prompt(&self) -> Option<String> {
-        self.enabled
+        self.is_enabled()
             .then(|| OFFICE_VISUAL_SYSTEM_PROMPT.to_string())
     }
 
@@ -424,6 +1361,9 @@ impl OfficeDispatcher {
 
     /// 清理指定 session 仍持有的全部角色；用于 abort、panic 或任务被外部终止后的兜底路径。
     pub fn clear_owner(&self, owner: &str) {
+        if let Some(main) = self.main() {
+            main.finish(owner);
+        }
         let released_roles = {
             let mut owners = self
                 .owners
@@ -478,6 +1418,9 @@ impl OfficeDispatcher {
     /// 权限：不改变工具权限或审批状态。
     /// 关联：`REQ-B-OFFICE-003`、`EVT-HOST-SESSION-001`。
     pub fn turn_started(&self, owner: &str, working: &mut HashSet<u8>) {
+        if let Some(main) = self.main() {
+            main.begin(owner);
+        }
         if !self
             .scopes
             .lock()
@@ -511,6 +1454,9 @@ impl OfficeDispatcher {
         tool_failed: &mut bool,
         active_tools: &mut HashMap<String, ActiveToolProjection>,
     ) {
+        if let Some(main) = self.main() {
+            main.activity(&self.scope(owner).session_id, owner, event);
+        }
         match event {
             AgentEvent::ToolExecutionStart {
                 tool_use_id,
@@ -657,6 +1603,9 @@ impl OfficeDispatcher {
         workspace_name: &str,
         workspace: &Path,
     ) -> SubagentOfficeTurn {
+        if let Some(main) = self.main() {
+            main.child_begin(parent_session_id, workspace_id, workspace_name);
+        }
         self.register_scope(
             workspace_id,
             OfficeScope {
@@ -786,6 +1735,13 @@ impl OfficeDispatcher {
         mut turn: SubagentOfficeTurn,
         completed: bool,
     ) {
+        if let Some(main) = self.main() {
+            main.child_end(
+                parent_session_id,
+                workspace_id,
+                completed && !turn.tool_failed,
+            );
+        }
         if !turn.model_output.is_empty() {
             let scope = self.scope(workspace_id);
             self.send(OfficeAction::WorkspaceOutput {

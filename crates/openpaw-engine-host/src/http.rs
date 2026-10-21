@@ -46,6 +46,7 @@ const HOST_FORCE_HARVEST_MARGIN: Duration = Duration::from_millis(100);
 /// 权限：所有路由统一经过 Basic Authentication 中间件。
 /// 关联：`API-HOST-*`、`REQ-B-HOST-003`。
 pub fn build_router(state: Arc<AppState>) -> Router {
+    state.main_office.start(state.shutdown_token());
     let router = Router::new()
         .route("/global/health", get(health))
         .route("/session", get(list_sessions).post(create_session))
@@ -98,6 +99,21 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/project", get(empty_array))
         .route("/agent", get(empty_array))
         .route("/find/file", get(empty_array))
+        .route(
+            "/api/chat",
+            post(main_chat).layer(axum::extract::DefaultBodyLimit::max(500_000)),
+        )
+        .route("/office", get(main_proxy))
+        .route("/office/", get(main_proxy))
+        .route("/office/{*path}", get(main_proxy))
+        .route("/assets/{*path}", get(main_proxy))
+        .route("/farm-assets/{*path}", get(main_proxy))
+        .route("/brand/{*path}", get(main_proxy))
+        .route("/characters/{*path}", get(main_proxy))
+        .route("/pawoffice-config.js", get(main_proxy))
+        .route("/api/pawoffice/events", get(main_proxy))
+        .route("/api/pawoffice/reply", post(main_proxy))
+        .route("/api/pawoffice/ui", post(main_proxy))
         .with_state(state.clone());
     router.layer(middleware::from_fn_with_state(state, auth_middleware))
 }
@@ -260,6 +276,461 @@ async fn auth_middleware(
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"healthy":true}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct MainChatRequest {
+    version: String,
+    team_id: String,
+    conversation_id: String,
+    messages: Vec<MainChatMessage>,
+}
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MainChatMessage {
+    role: String,
+    content: String,
+}
+
+async fn main_proxy(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
+    let Some(mut url) = state.main_office.url.clone() else {
+        return bad(StatusCode::SERVICE_UNAVAILABLE, "main gateway 未配置");
+    };
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .is_some_and(|value| value == "cross-site")
+    {
+        return bad(StatusCode::FORBIDDEN, "请使用同源入口");
+    }
+    if let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let expected = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if ![format!("http://{expected}"), format!("https://{expected}")]
+            .contains(&origin.to_string())
+        {
+            return bad(StatusCode::FORBIDDEN, "请使用同源入口");
+        }
+    }
+    url.set_path(request.uri().path());
+    url.set_query(request.uri().query());
+    let mut upstream = state
+        .main_office
+        .client
+        .request(request.method().clone(), url.clone())
+        .header(header::ORIGIN, url.origin().ascii_serialization());
+    for name in [
+        header::CONTENT_TYPE,
+        header::ACCEPT,
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+    ] {
+        if let Some(value) = request.headers().get(&name) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    let bytes = match axum::body::to_bytes(request.into_body(), 524_288).await {
+        Ok(bytes) => bytes,
+        Err(_) => return bad(StatusCode::PAYLOAD_TOO_LARGE, "请求体超出限制"),
+    };
+    let response =
+        match tokio::time::timeout(Duration::from_secs(65), upstream.body(bytes).send()).await {
+            Ok(Ok(response)) => response,
+            _ => return bad(StatusCode::BAD_GATEWAY, "main gateway 暂不可用"),
+        };
+    let mut result = Response::builder().status(response.status());
+    for name in [
+        header::CONTENT_TYPE,
+        header::CACHE_CONTROL,
+        header::ETAG,
+        header::LAST_MODIFIED,
+    ] {
+        if let Some(value) = response.headers().get(&name) {
+            result = result.header(name, value);
+        }
+    }
+    result
+        .body(Body::from_stream(response.bytes_stream()))
+        .expect("upstream headers")
+}
+
+fn main_history(handle: &SessionHandle) -> Vec<MainChatMessage> {
+    let messages = handle
+        .message_cache
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut history = Vec::new();
+    for outcome in handle
+        .turn_outcomes()
+        .iter()
+        .filter(|outcome| outcome.state == TurnState::Completed)
+    {
+        let Some(user) = messages
+            .iter()
+            .find(|message| message.uuid.as_deref() == Some(&outcome.user_message_id))
+        else {
+            continue;
+        };
+        let prefix = format!("msg_{}_{}_assistant", handle.id, outcome.turn_id);
+        let answer: String = messages
+            .iter()
+            .filter(|message| {
+                message.role == openpaw_core::Role::Assistant
+                    && message
+                        .uuid
+                        .as_deref()
+                        .is_some_and(|id| id == prefix || id.starts_with(&format!("{prefix}_")))
+            })
+            .map(openpaw_core::Message::text)
+            .collect();
+        if !answer.is_empty() {
+            history.push(MainChatMessage {
+                role: "user".into(),
+                content: user.text(),
+            });
+            history.push(MainChatMessage {
+                role: "assistant".into(),
+                content: answer,
+            });
+        }
+    }
+    while history.len() > 20
+        || history
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>()
+            > 100_000
+    {
+        history.drain(..2);
+    }
+    history
+}
+
+async fn main_chat(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MainChatRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(mut body)) = body else {
+        return bad(StatusCode::BAD_REQUEST, "聊天请求格式错误");
+    };
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 100
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_.:-".contains(&byte))
+    };
+    if body.version != "1.0"
+        || !valid_id(&body.team_id)
+        || !valid_id(&body.conversation_id)
+        || body.messages.is_empty()
+        || body.messages.len() > 21
+        || body.messages.len() % 2 != 1
+        || body
+            .messages
+            .iter()
+            .enumerate()
+            .any(|(i, message)| message.role != if i % 2 == 0 { "user" } else { "assistant" })
+    {
+        return bad(StatusCode::BAD_REQUEST, "聊天请求字段错误");
+    }
+    let latest = body.messages.pop().expect("validated input");
+    if latest.content.trim().is_empty()
+        || latest.content.chars().count() > 4000
+        || body
+            .messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>()
+            > 100_000
+    {
+        return bad(StatusCode::BAD_REQUEST, "聊天输入超出限制");
+    }
+    let _admission = state.main_office.admission.lock().await;
+    let record = match state.main_office.record(&body.team_id) {
+        Ok(record) => record,
+        Err(error) => return bad(StatusCode::BAD_REQUEST, error),
+    };
+    if record
+        .conversation
+        .as_deref()
+        .is_some_and(|id| id != body.conversation_id)
+    {
+        return bad(StatusCode::CONFLICT, "本轮暂不支持新对话");
+    }
+    let handle = if let Some(session) = record.session {
+        match state.get_typed(&session).await {
+            Ok(handle) => handle,
+            Err(error) => return session_load_error(error),
+        }
+    } else {
+        if !body.messages.is_empty() {
+            return bad(StatusCode::CONFLICT, "对话历史与服务端不一致");
+        }
+        match state
+            .create_session(None, None, Some(record.workspace), Some("Office main"))
+            .await
+        {
+            Ok(handle) => {
+                if let Err(error) =
+                    state
+                        .main_office
+                        .bind(&body.team_id, &body.conversation_id, &handle.id)
+                {
+                    return bad(StatusCode::INTERNAL_SERVER_ERROR, error);
+                }
+                handle
+            }
+            Err(error) => return bad(StatusCode::INTERNAL_SERVER_ERROR, error),
+        }
+    };
+    if handle.is_active() {
+        return bad(StatusCode::CONFLICT, "会话已有正在执行的回合");
+    }
+    if main_history(&handle) != body.messages {
+        return bad(StatusCode::CONFLICT, "对话历史与服务端不一致");
+    }
+    let receiver = state.global_events.subscribe();
+    let permissions = state.global_events.subscribe();
+    let response = schedule_turn(
+        state.clone(),
+        handle.id.clone(),
+        MessageRequest {
+            text: Some(latest.content),
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    if response.status() != StatusCode::NO_CONTENT {
+        return response;
+    }
+    let turn = response.headers()[OPENPAW_TURN_ID]
+        .to_str()
+        .expect("internal turn id")
+        .to_string();
+    let stop = CancellationToken::new();
+    main_approval_bridge(
+        state.main_office.clone(),
+        body.team_id,
+        handle.clone(),
+        permissions,
+        stop.clone(),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let (timer_handle, timer_turn, timer_stop) = (handle.clone(), turn.clone(), stop.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = timer_stop.cancelled() => {},
+            _ = tokio::time::sleep_until(deadline) => {timer_handle.cancel_main_turn(&timer_turn);timer_stop.cancel();}
+        }
+    });
+    let stream = MainChatStream {
+        receiver,
+        handle,
+        turn,
+        deadline,
+        stop,
+        pending: std::collections::VecDeque::from([
+            serde_json::json!({"type":"status","phase":"thinking"}),
+        ]),
+        terminal: false,
+        characters: 0,
+    };
+    let stream = futures::stream::unfold(stream, |mut stream| async move {
+        loop {
+            if let Some(event) = stream.pending.pop_front() {
+                let line = format!("{}\n", event);
+                return Some((Ok::<_, Infallible>(line), stream));
+            }
+            if stream.terminal {
+                return None;
+            }
+            let received = tokio::time::timeout_at(stream.deadline, stream.receiver.recv()).await;
+            match received {
+                Ok(Ok(event))
+                    if event.properties["sessionID"].as_str() == Some(&stream.handle.id) =>
+                {
+                    let prefix = format!("prt_{}_{}_text", stream.handle.id, stream.turn);
+                    if event.event_type == "message.part.delta"
+                        && event.properties["partID"]
+                            .as_str()
+                            .is_some_and(|id| id == prefix || id.starts_with(&format!("{prefix}_")))
+                    {
+                        if let Some(text) = event.properties["delta"].as_str() {
+                            stream.characters += text.chars().count();
+                            if stream.characters > 50_000 {
+                                stream.fail("回复超出长度限制");
+                                continue;
+                            }
+                            let chars: Vec<_> = text.chars().collect();
+                            for chunk in chars.chunks(2000) {
+                                stream.pending.push_back(serde_json::json!({"type":"delta","text":chunk.iter().collect::<String>()}));
+                            }
+                        }
+                    }
+                    if event.event_type == "session.idle" {
+                        let outcome = stream
+                            .handle
+                            .turn_outcomes()
+                            .into_iter()
+                            .find(|outcome| outcome.turn_id == stream.turn);
+                        if outcome.is_some_and(|outcome| outcome.state == TurnState::Completed)
+                            && stream.characters > 0
+                        {
+                            stream.terminal = true;
+                            stream.pending.push_back(serde_json::json!({"type":"done"}));
+                        } else {
+                            stream.fail("本轮执行未完成，请检查会话状态");
+                        }
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => stream.fail("聊天事件连接中断"),
+                Err(_) => stream.fail("聊天超过 180 秒，已取消"),
+            }
+        }
+    });
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+struct MainChatStream {
+    receiver: broadcast::Receiver<OpenCodeEvent>,
+    handle: Arc<SessionHandle>,
+    turn: String,
+    deadline: tokio::time::Instant,
+    pending: std::collections::VecDeque<serde_json::Value>,
+    terminal: bool,
+    characters: usize,
+    stop: CancellationToken,
+}
+impl MainChatStream {
+    fn fail(&mut self, message: &str) {
+        self.stop.cancel();
+        self.handle.cancel_main_turn(&self.turn);
+        self.terminal = true;
+        self.pending
+            .push_back(serde_json::json!({"type":"error","message":message}));
+    }
+}
+impl Drop for MainChatStream {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.handle.cancel_main_turn(&self.turn);
+    }
+}
+
+fn main_approval_bridge(
+    office: Arc<crate::office::MainOffice>,
+    team: String,
+    handle: Arc<SessionHandle>,
+    mut receiver: broadcast::Receiver<OpenCodeEvent>,
+    stop: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let mut pending = std::collections::HashMap::<String, CancellationToken>::new();
+        loop {
+            let event = tokio::select! { _ = stop.cancelled() => break, event = receiver.recv() => match event {Ok(event)=>event,Err(_)=>break} };
+            if event.properties["sessionID"].as_str() != Some(&handle.id) {
+                continue;
+            }
+            if event.event_type == "permission.replied" {
+                if let Some(id) = event.properties["requestID"].as_str() {
+                    if let Some(cancel) = pending.remove(id) {
+                        cancel.cancel();
+                    }
+                }
+            }
+            if event.event_type != "permission.asked" {
+                continue;
+            }
+            let Some(id) = event.properties["id"].as_str().map(str::to_string) else {
+                continue;
+            };
+            if pending.contains_key(&id) {
+                continue;
+            }
+            let tool = event.properties["permission"]
+                .as_str()
+                .unwrap_or("工具")
+                .chars()
+                .take(80)
+                .collect::<String>();
+            let owner = event.properties["metadata"]["workspaceID"]
+                .as_str()
+                .unwrap_or(&handle.id);
+            let employee = office.record(&team).ok().and_then(|record| {
+                record.snapshot["employees"]
+                    .as_array()
+                    .and_then(|employees| employees.iter().find(|employee| employee["id"] == owner))
+                    .cloned()
+            });
+            let actor = employee
+                .as_ref()
+                .and_then(|employee| employee["sceneActorId"].as_str())
+                .filter(|actor| !actor.is_empty());
+            let name = employee
+                .as_ref()
+                .and_then(|employee| employee["name"].as_str())
+                .unwrap_or("执行 Agent");
+            let summary = crate::office::tool_activity_summary(&tool, &event.properties["input"]);
+            let mut decision = serde_json::json!({"id":id,"kind":"confirmation","title":format!("批准 {tool}？"),
+                "description":format!("{name}：{summary}。仅授权本次工具调用。"),"confirmLabel":"允许本次","rejectLabel":"拒绝"});
+            if let Some(actor) = actor {
+                decision["actorId"] = serde_json::Value::from(actor);
+            }
+            let cancel = stop.child_token();
+            pending.insert(id.clone(), cancel.clone());
+            let (office, team, handle) = (office.clone(), team.clone(), handle.clone());
+            tokio::spawn(async move {
+                let request = serde_json::json!({"type":"decision.request","teamId":team,"timeoutMs":60000,"decision":decision});
+                let result = tokio::select! { _ = cancel.cancelled() => return,
+                result = office.message(request,Duration::from_secs(65)) => result };
+                if cancel.is_cancelled() {
+                    return;
+                }
+                let approved = result.is_ok_and(|(status, data)| {
+                    status == 200
+                        && data["teamId"] == team
+                        && data["decisionId"] == id
+                        && data["choiceId"] == "confirm"
+                        && data["label"] == "允许本次"
+                });
+                handle
+                    .approvals
+                    .reply(
+                        &id,
+                        approved,
+                        if approved {
+                            "main 单次批准"
+                        } else {
+                            "main 拒绝或未取得批准"
+                        }
+                        .into(),
+                    )
+                    .await;
+            });
+        }
+        for (_, cancel) in pending {
+            cancel.cancel();
+        }
+    });
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1142,6 +1613,833 @@ mod tests {
     use tower::ServiceExt;
 
     static PROVIDER_ENV_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    struct MainFixture {
+        app: Router,
+        state: Arc<AppState>,
+        team: String,
+        home: tempfile::TempDir,
+        workspace: tempfile::TempDir,
+        seen: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        model_seen: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+        servers: Vec<tokio::task::JoinHandle<()>>,
+        env: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        release_model: Arc<tokio::sync::Notify>,
+    }
+    impl Drop for MainFixture {
+        fn drop(&mut self) {
+            for server in &self.servers {
+                server.abort();
+            }
+            for (key, value) in &self.env {
+                if let Some(value) = value {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+    impl MainFixture {
+        fn chat(&self, text: &str) -> Request<Body> {
+            Request::builder().method("POST").uri("/api/chat").header("content-type","application/json")
+                .body(Body::from(serde_json::json!({"version":"1.0","teamId":self.team,"conversationId":"fixture",
+                    "messages":[{"role":"user","content":text}]}).to_string())).unwrap()
+        }
+    }
+    async fn main_fixture(scenario: &'static str, choice: &'static str) -> MainFixture {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let model_seen = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let gateway_seen = seen.clone();
+        let models = model_seen.clone();
+        let release_model = Arc::new(tokio::sync::Notify::new());
+        let model_gate = release_model.clone();
+        let server = Router::new().route("/api/pawoffice/messages",post(move |headers:HeaderMap,Json(body):Json<serde_json::Value>| {
+            let seen = gateway_seen.clone();
+            async move {
+                assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
+                seen.lock().await.push(body.clone());
+                let data = match body["type"].as_str() {
+                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":{},"responses":{"success":{},"error":{}}}),
+                    Some("offices.initialize"|"office.read") => serde_json::json!({"offices":[],"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}}),
+                    Some("office.snapshot") => serde_json::json!({"teamId":body["teamId"],"seq":body["snapshot"]["seq"],"status":"applied"}),
+                    Some("ui.next") => { tokio::time::sleep(Duration::from_millis(20)).await; serde_json::json!({"actions":[]}) },
+                    Some("decision.request") => {
+                        if choice == "pending" || choice == "child-pending" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") { std::future::pending::<()>().await; }
+                        let chosen = if choice == "child-pending" {"confirm"}else{choice};
+                        serde_json::json!({"teamId":body["teamId"],"decisionId":body["decision"]["id"],"choiceId":chosen,
+                            "label":if chosen == "confirm" {"允许本次"} else {"拒绝"}})
+                    },
+                    _ => serde_json::json!({"forwarded":1}),
+                };
+                Json(serde_json::json!({"code":200,"msg":"OK","data":data}))
+            }
+        })).route("/v1/chat/completions",post(move |Json(body):Json<serde_json::Value>| {
+            let seen = models.clone();
+            let gate = model_gate.clone();
+            async move {
+                seen.lock().await.push(body.clone());
+                let tools = body["messages"].as_array().unwrap().iter().filter(|message| message["role"] == "tool").count();
+                let parent = body["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "delegate_task");
+                if scenario == "recover" && parent && tools == 0 { gate.notified().await; }
+                let call = if (scenario.starts_with("delegate") || scenario == "recover") && parent && tools == 0 {
+                    Some(("delegate_task",serde_json::json!({"name":"资料检索","task":"读取 README.md 并汇报"})))
+                } else if tools < if scenario == "tools" {2} else {1} {
+                    Some(if scenario == "write" || scenario == "delegate-write" {("write_file",serde_json::json!({"path":"approved.txt","content":"approved once"}))}
+                        else {("read_file",serde_json::json!({"path":"README.md"}))})
+                } else { None };
+                let chunk = if let Some((name,args)) = call {
+                    serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("call-{tools}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
+                } else { serde_json::json!({"choices":[{"delta":{"content":if parent {"parent integrated"}else{"tool results integrated"}},"finish_reason":"stop"}]}) };
+                ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n"))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let servers = vec![tokio::spawn(async move {
+            axum::serve(listener, server).await.unwrap();
+        })];
+        let values = [
+            ("OPENAI_API_KEY", "fixture-model-key".into()),
+            ("OPENPAW_OPENAI_BASE_URL", format!("http://{address}/v1")),
+            ("OPENPAW_OPENAI_MODEL", "fixture-model".into()),
+            ("OPENPAW_MAIN_API_KEY", "fixture-gateway-key".into()),
+            (
+                "OPENPAW_ENGINE_PERMISSIONS",
+                if scenario == "write" || scenario == "delegate-write" {
+                    "manual"
+                } else {
+                    "auto"
+                }
+                .into(),
+            ),
+        ];
+        let env = values
+            .iter()
+            .map(|(key, _)| (*key, std::env::var_os(key)))
+            .collect();
+        for (key, value) in values {
+            std::env::set_var(key, value);
+        }
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("README.md"), "actual tool content").unwrap();
+        let config = HostConfig {
+            home: home.path().into(),
+            workspace: workspace.path().into(),
+            provider: "openai".into(),
+            ..Default::default()
+        };
+        let mut state = AppState::new(config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            &config.home,
+            &config.workspace,
+            Some(format!("http://{address}")),
+        );
+        state.office.attach_main(&state.main_office);
+        let team = state.main_office.directory().unwrap()[0]["workspace"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let app = build_router(state.clone());
+        MainFixture {
+            app,
+            state,
+            team,
+            home,
+            workspace,
+            seen,
+            model_seen,
+            servers,
+            env,
+            release_model,
+        }
+    }
+
+    #[tokio::test]
+    async fn main_tools_reenter_model_without_creating_fake_employees() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("tools", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("read twice"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            to_bytes(response.into_body(), 200_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"type\":\"done\""));
+        let requests = fixture.model_seen.lock().await;
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("actual tool content")));
+        let record = fixture.state.main_office.record(&fixture.team).unwrap();
+        assert_eq!(record.snapshot["employees"].as_array().unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen = fixture.seen.lock().await;
+        assert!(seen
+            .iter()
+            .any(|message| message["command"]["actorId"] == "office-lead"
+                && message["command"]["status"] == "working"));
+        assert!(!seen
+            .iter()
+            .any(|message| message["command"]["capability"] == "office.visit"));
+    }
+
+    #[tokio::test]
+    async fn main_alone_delegates_real_child_and_projects_one_assignment_and_return() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("delegate actual reading"))
+            .await
+            .unwrap();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            to_bytes(response.into_body(), 200_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("parent integrated"));
+        let record = fixture.state.main_office.record(&fixture.team).unwrap();
+        assert_eq!(record.snapshot["employees"].as_array().unwrap().len(), 2);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen = fixture.seen.lock().await;
+        let assignments: Vec<_> = seen
+            .iter()
+            .flat_map(|message| {
+                message["snapshot"]["events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|event| event["kind"] == "task.assigned")
+            .collect();
+        assert_eq!(assignments.len(), 1);
+        assert!(seen
+            .iter()
+            .any(|message| message["command"]["capability"] == "office.visit"
+                && message["command"]["participants"][1]["entityId"] == "office-lead"));
+        assert_eq!(fixture.model_seen.lock().await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn main_single_tool_decision_approves_once_and_http_200_reject_never_writes() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for choice in ["confirm", "reject"] {
+            let fixture = main_fixture("write", choice).await;
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(fixture.chat("write with approval"))
+                .await
+                .unwrap();
+            let bytes = tokio::time::timeout(
+                Duration::from_secs(3),
+                to_bytes(response.into_body(), 200_000),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("\"type\":\"done\""));
+            assert_eq!(
+                fixture.workspace.path().join("approved.txt").exists(),
+                choice == "confirm"
+            );
+            let seen = fixture.seen.lock().await;
+            let decisions: Vec<_> = seen
+                .iter()
+                .filter(|message| message["type"] == "decision.request")
+                .collect();
+            assert_eq!(decisions.len(), 1);
+            assert_eq!(decisions[0]["decision"]["confirmLabel"], "允许本次");
+            assert_eq!(decisions[0]["decision"]["rejectLabel"], "拒绝");
+            let requests = fixture.model_seen.lock().await;
+            assert_eq!(requests.len(), 2);
+            let result = requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|message| message["role"] == "tool")
+                .unwrap();
+            assert!(!result["content"].as_str().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn main_parent_approval_does_not_authorize_child_and_disconnect_cancels_both() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-write", "child-pending").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("delegate controlled write"))
+            .await
+            .unwrap();
+        let decision = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let seen = fixture.seen.lock().await;
+                let decisions: Vec<_> = seen
+                    .iter()
+                    .filter(|message| message["type"] == "decision.request")
+                    .cloned()
+                    .collect();
+                if decisions.len() == 2 {
+                    break decisions;
+                }
+                drop(seen);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(decision[0]["decision"]["id"], decision[1]["decision"]["id"]);
+        assert_eq!(decision[0]["decision"]["actorId"], "office-lead");
+        assert_ne!(decision[1]["decision"]["actorId"], "office-lead");
+        assert!(!fixture.workspace.path().join("approved.txt").exists());
+        drop(response);
+        let record = fixture.state.main_office.record(&fixture.team).unwrap();
+        let id = record.session.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let response = fixture
+                    .app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/session/status")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let value: serde_json::Value =
+                    serde_json::from_slice(&to_bytes(response.into_body(), 200_000).await.unwrap())
+                        .unwrap();
+                if value[&id]["type"] != "busy" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/permission")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let permissions: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 200_000).await.unwrap())
+                .unwrap();
+        assert_eq!(permissions, serde_json::json!([]));
+        let late = decision[1]["decision"]["id"].as_str().unwrap();
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/permission/{late}/reply"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"reply":"once"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(!fixture.workspace.path().join("approved.txt").exists());
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/session/{id}/turns"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let turns: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 200_000).await.unwrap())
+                .unwrap();
+        assert!(turns.to_string().contains("cancelled"));
+        assert!(fixture.home.path().join("offices/registry.json").exists());
+    }
+
+    #[tokio::test]
+    async fn main_restart_rebuilds_current_snapshot_from_committed_session_facts_without_actions() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("recover", "confirm").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("delegate before projection crash"))
+            .await
+            .unwrap();
+        let registry = fixture.home.path().join("offices/registry.json");
+        let checkpoint = std::fs::read(&registry).unwrap();
+        // 模拟事实已提交而业务投影发布失败。保留绑定检查点，不改会话历史。
+        std::fs::remove_file(&registry).unwrap();
+        std::fs::create_dir(&registry).unwrap();
+        fixture.release_model.notify_one();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(3),
+            to_bytes(response.into_body(), 200_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"type\":\"done\""));
+        std::fs::remove_dir(&registry).unwrap();
+        std::fs::write(&registry, checkpoint).unwrap();
+        let config = fixture.state.config.clone();
+        let recovered = AppState::new(config);
+        let record = recovered.main_office.record(&fixture.team).unwrap();
+        assert_eq!(record.snapshot["employees"].as_array().unwrap().len(), 2);
+        assert!(record.snapshot["employees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|employee| employee["online"] == false));
+        assert!(record.snapshot["events"].as_array().unwrap().is_empty());
+        assert_eq!(record.snapshot["tasks"][0]["status"], "completed");
+        assert!(record.snapshot["seq"].as_u64().unwrap() > 1);
+        assert_eq!(fixture.model_seen.lock().await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn main_gateway_proxy_preserves_stream_and_separates_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gateway = Router::new()
+            .route(
+                "/office/",
+                get(|headers: HeaderMap| async move {
+                    assert!(headers.get(header::AUTHORIZATION).is_none());
+                    ([(header::CONTENT_TYPE, "text/html")], "original main")
+                }),
+            )
+            .route(
+                "/api/pawoffice/events",
+                get(|headers: HeaderMap| async move {
+                    assert!(headers.get(header::AUTHORIZATION).is_none());
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        "data: {\"type\":\"office.sync.start\"}\n\n",
+                    )
+                }),
+            );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, gateway).await.unwrap();
+        });
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let config = HostConfig {
+            home: home.path().into(),
+            workspace: workspace.path().into(),
+            username: Some("user".into()),
+            password: Some("password".into()),
+            ..Default::default()
+        };
+        let mut state = AppState::new(config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            &config.home,
+            &config.workspace,
+            Some(format!("http://{address}")),
+        );
+        let app = build_router(state);
+        assert_eq!(
+            app.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/office/")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for path in ["/office/", "/api/pawoffice/events?workspace=1"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNzd29yZA==")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let content = to_bytes(response.into_body(), 1000).await.unwrap();
+            assert!(!content.is_empty());
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn main_wire_distinguishes_cached_ignored_timeout_and_invalid_identity() {
+        use std::collections::VecDeque;
+        let cases = vec![
+            (
+                serde_json::json!({"type":"office.snapshot","teamId":"a","snapshot":{"seq":4}}),
+                202,
+                serde_json::json!({"teamId":"a","seq":4,"status":"cached"}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"office.snapshot","teamId":"a","snapshot":{"seq":4}}),
+                200,
+                serde_json::json!({"teamId":"a","seq":5,"status":"ignored","reasonCode":"STALE_SEQ"}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"office.snapshot","teamId":"a","snapshot":{"seq":4}}),
+                200,
+                serde_json::json!({"teamId":"b","seq":4,"status":"applied"}),
+                false,
+            ),
+            (
+                serde_json::json!({"type":"ui.next","timeoutMs":1000}),
+                200,
+                serde_json::json!({"actions":[]}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"ui.respond","interactionId":"ui-1"}),
+                200,
+                serde_json::json!({"interactionId":"ui-1","delivered":true}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"decision.request","teamId":"a","decision":{"id":"d"}}),
+                408,
+                serde_json::json!({"reasonCode":"REQUEST_TIMEOUT","details":{},"issues":[]}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"decision.request","teamId":"a","decision":{"id":"d"}}),
+                200,
+                serde_json::json!({"teamId":"a","decisionId":"other","choiceId":"confirm","label":"允许本次"}),
+                false,
+            ),
+            (
+                serde_json::json!({"type":"ui.next"}),
+                200,
+                serde_json::json!({"actions":null}),
+                false,
+            ),
+        ];
+        let replies = Arc::new(tokio::sync::Mutex::new(
+            cases
+                .iter()
+                .map(|(_, code, data, _)| (*code, data.clone()))
+                .collect::<VecDeque<_>>(),
+        ));
+        let gateway = Router::new().route(
+            "/api/pawoffice/messages",
+            post(move || {
+                let replies = replies.clone();
+                async move {
+                    let (code, data) = replies.lock().await.pop_front().unwrap();
+                    (
+                        StatusCode::from_u16(code).unwrap(),
+                        Json(serde_json::json!({"code":code,"msg":"fixture","data":data})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, gateway).await.unwrap() });
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let office = crate::office::MainOffice::new(
+            home.path(),
+            workspace.path(),
+            Some(format!("http://{address}")),
+        );
+        for (message, code, data, valid) in cases {
+            let result = office.message(message, Duration::from_secs(1)).await;
+            if valid {
+                assert_eq!(result.unwrap(), (code, data));
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn main_first_binding_race_rejects_extra_conversations_and_isolates_workspaces() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("recover", "confirm").await;
+        let make_request = |conversation: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                "version":"1.0","teamId":fixture.team,"conversationId":conversation,
+                "messages":[{"role":"user","content":"work"}]})
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let (left, right) = tokio::join!(
+            fixture.app.clone().oneshot(make_request("left")),
+            fixture.app.clone().oneshot(make_request("right"))
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(
+            [left.status(), right.status()]
+                .into_iter()
+                .filter(|status| *status == StatusCode::OK)
+                .count(),
+            1
+        );
+        let (winner, loser) = if left.status() == StatusCode::OK {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        assert_eq!(loser.status(), StatusCode::CONFLICT);
+        let binding = fixture.state.main_office.record(&fixture.team).unwrap();
+        assert_eq!(
+            std::fs::read_dir(fixture.home.path().join("sessions"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl"))
+                .count(),
+            1
+        );
+        let duplicate = fixture
+            .app
+            .clone()
+            .oneshot(make_request(binding.conversation.as_ref().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        let other = tempdir().unwrap();
+        fixture.state.main_office.register(other.path()).unwrap();
+        let second = fixture
+            .state
+            .main_office
+            .directory()
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot["workspace"]["id"] != fixture.team)
+            .unwrap();
+        let second_team = second["workspace"]["id"].as_str().unwrap();
+        // 使用同一 AppState 的公开 OpenWork 会话入口，确认未绑定会话不会继承 main 历史。
+        let independent = fixture
+            .state
+            .create_session(
+                Some("echo"),
+                None,
+                Some(other.path().into()),
+                Some("OpenWork"),
+            )
+            .await
+            .unwrap();
+        assert!(main_history(&independent).is_empty());
+        assert!(fixture
+            .state
+            .main_office
+            .record(second_team)
+            .unwrap()
+            .conversation
+            .is_none());
+        assert_ne!(Some(independent.id.clone()), binding.session);
+        fixture.release_model.notify_one();
+        let bytes = to_bytes(winner.into_body(), 200_000).await.unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"type\":\"done\""));
+        assert!(fixture
+            .state
+            .main_office
+            .record(second_team)
+            .unwrap()
+            .snapshot["employees"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn main_chat_keeps_context_and_binding_after_restart() {
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let config = HostConfig {
+            home: home.path().into(),
+            workspace: workspace.path().into(),
+            provider: "echo".into(),
+            ..Default::default()
+        };
+        let mut state = AppState::new(config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office =
+            crate::office::MainOffice::new(&config.home, &config.workspace, None);
+        let team = state.main_office.directory().unwrap()[0]["workspace"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let app = build_router(state);
+        let chat = |conversation: &str, messages: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/chat")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"version":"1.0", "teamId":team,
+                    "conversationId":conversation,"messages":messages})
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(chat(
+                "first",
+                serde_json::json!([
+            {"role":"user","content":"hello"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        let bytes = to_bytes(response.into_body(), 200_000).await.unwrap();
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.last().unwrap()["type"], "done");
+        let answer: String = events
+            .iter()
+            .filter(|e| e["type"] == "delta")
+            .map(|e| e["text"].as_str().unwrap())
+            .collect();
+        assert!(!answer.is_empty());
+        let restarted = build_router(AppState::new(config));
+        let response = restarted
+            .clone()
+            .oneshot(chat(
+                "other",
+                serde_json::json!([
+            {"role":"user","content":"new"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(String::from_utf8(
+            to_bytes(response.into_body(), 200_000)
+                .await
+                .unwrap()
+                .to_vec()
+        )
+        .unwrap()
+        .contains("本轮暂不支持新对话"));
+        let response = restarted
+            .clone()
+            .oneshot(chat(
+                "first",
+                serde_json::json!([
+            {"role":"user","content":"hello"},{"role":"assistant","content":answer},
+            {"role":"user","content":"hello"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 200_000).await.unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"type\":\"done\""));
+        let response = restarted
+            .clone()
+            .oneshot(chat(
+                "first",
+                serde_json::json!([
+            {"role":"user","content":"changed"},{"role":"assistant","content":"wrong"},
+            {"role":"user","content":"next"}]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = restarted
+            .oneshot(
+                Request::builder()
+                    .uri("/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sessions: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 200_000).await.unwrap())
+                .unwrap();
+        assert_eq!(sessions.as_array().unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn client_message_identity_survives_replay_and_restart() {

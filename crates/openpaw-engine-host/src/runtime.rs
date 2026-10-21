@@ -174,6 +174,46 @@ pub struct SessionActivity {
     pub task: String,
 }
 impl SessionHandle {
+    /// 功能：读取当前执行取消代际，供非阻塞 main 投影丢弃旧动作。
+    /// 参数：无。
+    /// 返回：当前回合的原取消令牌副本。
+    /// 错误：无。
+    /// 状态：只读，不创建第二套执行取消机制。
+    /// 并发与取消：短锁读取；reserve_turn 为下一轮替换令牌。
+    /// 权限：仅 Host 内部使用。
+    /// 关联：T1-09、T1-15。
+    pub(crate) fn main_cancel_token(&self) -> CancellationToken {
+        self.turn_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    /// 功能：仅取消 main 响应流所属的仍活动回合。
+    /// 参数：turn_id 为响应接收时确定的回合身份。
+    /// 返回：无。
+    /// 错误：无；已完成或已换回合时忽略。
+    /// 状态：取消模型、独立子执行及其审批等待。
+    /// 并发与取消：与 reserve/abort 共用 turn_gate，迟到 Drop 不取消下一轮。
+    /// 权限：只能取消已认证聊天对应的会话回合。
+    /// 关联：CHG-2026-0033、T1-09。
+    pub(crate) fn cancel_main_turn(&self, turn_id: &str) {
+        let _gate = self.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let current = self.current_turn.lock().unwrap_or_else(|e| e.into_inner());
+        if current
+            .as_ref()
+            .is_none_or(|turn| turn.outcome.turn_id != turn_id)
+        {
+            return;
+        }
+        self.cancel_requested.store(true, Ordering::Release);
+        self.turn_cancel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
+        self.agent.cancel();
+        self.approvals.abort_all();
+        self.office.cancel_main(&self.id);
+    }
     /// 并发与取消：使用 acquire 顺序读取原子状态。
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::Acquire)
@@ -212,6 +252,7 @@ impl SessionHandle {
                 .cancel();
             self.agent.cancel();
             self.approvals.abort_all();
+            self.office.cancel_main(&self.id);
         }
     }
     /// 功能：原子保留当前 session 的一个活动回合。
@@ -476,6 +517,8 @@ pub struct AppState {
     pub sessions: RwLock<HashMap<String, Arc<SessionHandle>>>,
     pub office: OfficeDispatcher,
     pub global_events: broadcast::Sender<OpenCodeEvent>,
+    /// main 办公室关联与持久快照；与会话共用 home，不保存第二套聊天历史。
+    pub(crate) main_office: Arc<crate::office::MainOffice>,
     pub(crate) scheduler: Arc<TurnScheduler>,
     delegation_shared: Arc<DelegationShared>,
     session_slots: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -541,12 +584,19 @@ impl AppState {
         let office = OfficeDispatcher::new(config.office_url.clone());
         let delegation_shared = DelegationShared::from_env();
         let (global_events, _) = broadcast::channel(512);
+        let main_office = crate::office::MainOffice::new(
+            &config.home,
+            &config.workspace,
+            std::env::var("OPENPAW_MAIN_URL").ok(),
+        );
+        office.attach_main(&main_office);
         Arc::new(Self {
             ai_pc: desktop::Registrations::default(),
             config,
             sessions: RwLock::new(HashMap::new()),
             office,
             global_events,
+            main_office,
             scheduler: TurnScheduler::new(scheduler_config.into()),
             delegation_shared,
             session_slots: Mutex::new(HashMap::new()),
@@ -1107,6 +1157,9 @@ impl AppState {
         }
         let workspace =
             absolute_workspace(workspace.unwrap_or_else(|| self.config.workspace.clone()))?;
+        if self.main_office.url.is_some() {
+            self.main_office.register(&workspace)?;
+        }
         let id = Uuid::new_v4().simple().to_string();
         let mut session = Session::new(model_name.clone(), provider.name());
         session.meta.id = id.clone();
@@ -1189,7 +1242,7 @@ impl AppState {
         let id = session.meta.id.clone();
         let created_at = unix_millis(session.meta.created_at);
         let updated_at = session_file_updated_at(&session_path, created_at);
-        Arc::new(SessionHandle {
+        let handle = Arc::new(SessionHandle {
             id,
             session_provider: session.meta.provider.clone(),
             session_model: session.meta.model.clone(),
@@ -1223,7 +1276,9 @@ impl AppState {
             turn_gate: std::sync::Mutex::new(()),
             turn_cancel: std::sync::Mutex::new(CancellationToken::new()),
             desktop_registrations: self.ai_pc.clone(),
-        })
+        });
+        self.main_office.attach_session(&handle);
+        handle
     }
     pub async fn wire_session(&self, handle: &SessionHandle) -> SessionWire {
         wire_session_snapshot(handle)
@@ -3058,6 +3113,49 @@ fn append_event(handle: &SessionHandle, event: &SessionEvent) -> Result<(), Stri
         .lock()
         .map_err(|_| "会话写入器锁状态异常".to_string())?;
     journal::append(&mut writer, event)
+}
+
+/// 功能：将 main 的会话所属人员及子执行事实写入原 Session 日志。
+/// 参数：handle 为已创建的会话；fact 不含办公室白板、完整业务快照或聊天正文。
+/// 返回：事实已提交后返回成功。
+/// 错误：沿用 writer 写入错误，不创建替代会话。
+/// 状态：只追加已登记 Unknown 记录；不修改模型消息。
+/// 并发与取消：共享 writer 串行写入；不重入 turn_gate，不等待外部服务。
+/// 权限：只允许 main 内部投影调用，不暴露为 HTTP 写入接口。
+/// 关联：CHG-2026-0033、T1-12。
+pub(crate) fn record_main_fact(
+    handle: &SessionHandle,
+    fact: serde_json::Value,
+) -> Result<(), String> {
+    append_event(
+        handle,
+        &openpaw_store::transcript::encode(&fact, "main_office_fact_v1"),
+    )
+}
+
+/// 功能：读取已提交的最新 main 会话事实，供办公室状态重建。
+/// 参数：home 为原会话根目录；session 为已登记 Session ID。
+/// 返回：不存在事实时 None；否则保留原事实字段。
+/// 错误：非法 ID、不可读或损坏历史拒绝恢复。
+/// 状态：只读，不修复、不删历史、不启动执行。
+/// 并发与取消：仅在 Host 状态构造时同步读取。
+/// 权限：路径仅由 home/sessions 与经验证的内部身份组成。
+/// 关联：T1-10、T1-12。
+pub(crate) fn latest_main_fact(
+    home: &std::path::Path,
+    session: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    if !valid_session_id(session) {
+        return Err("办公室会话身份无效".into());
+    }
+    let read = SessionReader::read(&home.join("sessions").join(format!("{session}.jsonl")))
+        .map_err(|_| "办公室会话历史不可读")?;
+    Ok(read.events.iter().rev().find_map(|event| match event {
+        SessionEvent::Unknown(value) if value["type"] == "main_office_fact_v1" => {
+            Some((**value).clone())
+        }
+        _ => None,
+    }))
 }
 fn persist_finish_transaction(
     handle: &SessionHandle,
