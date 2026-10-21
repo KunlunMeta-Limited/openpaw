@@ -107,6 +107,8 @@ pub(crate) enum AcceptTurnResult {
     Replay(RequestAdmission),
     IdempotencyConflict,
     Busy,
+    /// 明确子续办已归档，拒绝且不创建替代身份。
+    Archived,
     Deleting,
     QueueFull,
     TemporarilyBusy,
@@ -578,16 +580,17 @@ impl AppState {
     }
 
     /// 功能：通过普通接收、执行及 writer 完成一次前台子委派。
-    /// 参数：child 为可信父关系与展示身份，其余为工作目录、任务、模型、父取消与审批。
+    /// 参数：task_id 为可选真实子身份，child 为可信父关系与新建展示身份，其余为目录、任务、模型、取消和审批。
     /// 返回：包含真实子编号和结果的工具结果。
     /// 错误：登记或持久化失败返回错误，未登记不执行。
-    /// 状态：建立普通子会话并提交完整成功历史。
+    /// 状态：明确 ID 续用自己的历史，否则建立普通子会话；只返回本轮结果。
     /// 并发与取消：继承父整体回合授权，模型额度和工作区写锁继续共享；父取消传播。
     /// 权限：子仅使用工作区工具和自己的审批，不继承桌面或父上下文。
     /// 关联：CHG-2026-0034、ADR-003、ADR-006。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_delegated(
         self: &Arc<Self>,
+        task_id: Option<String>,
         child: ChildSession,
         workspace: PathBuf,
         task: String,
@@ -598,19 +601,40 @@ impl AppState {
     ) -> futures::future::BoxFuture<'static, Result<openpaw_core::ToolCallOutcome, String>> {
         let state = self.clone();
         Box::pin(async move {
-            let handle = state
-                .create_session_from_provider(
-                    provider.clone(),
-                    model.clone(),
-                    workspace,
-                    Some(&child.name),
-                    Some(child.clone()),
-                )
-                .await?;
-            handle.emit(events::session_changed(
-                "session.created",
-                &wire_session_snapshot(&handle),
-            ));
+            let handle = if let Some(id) = task_id {
+                let handle = state
+                    .get_typed(&id)
+                    .await
+                    .map_err(|_| "task_id 对应的子会话不存在或不可读".to_string())?;
+                let existing = handle.child.as_ref().ok_or("task_id 不是可续办子会话")?;
+                if existing.parent_id != child.parent_id {
+                    return Err("task_id 不属于当前父会话".into());
+                }
+                if std::fs::canonicalize(&handle.workspace)
+                    .ok()
+                    .zip(std::fs::canonicalize(&workspace).ok())
+                    .is_none_or(|(actual, requested)| actual != requested)
+                {
+                    return Err("task_id 不属于当前工作目录或目录不可用".into());
+                }
+                handle
+            } else {
+                let handle = state
+                    .create_session_from_provider(
+                        provider.clone(),
+                        model.clone(),
+                        workspace,
+                        Some(&child.name),
+                        Some(child.clone()),
+                    )
+                    .await?;
+                handle.emit(events::session_changed(
+                    "session.created",
+                    &wire_session_snapshot(&handle),
+                ));
+                handle
+            };
+            let child = handle.child.as_ref().ok_or("子会话身份缺失")?.clone();
             let turn_id = format!("turn_{}", Uuid::new_v4().simple());
             let user_message_id = format!("msg_{}_{}_user", handle.id, turn_id);
             let mut message = openpaw_core::Message::user_text(&task);
@@ -627,6 +651,9 @@ impl AppState {
             ) {
                 AcceptTurnResult::Accepted(accepted) => accepted,
                 AcceptTurnResult::PersistenceFailed(error) => return Err(error),
+                AcceptTurnResult::Archived => return Err("task_id 对应子会话已归档".into()),
+                AcceptTurnResult::Busy => return Err("task_id 对应子会话正在执行".into()),
+                AcceptTurnResult::Deleting => return Err("task_id 对应子会话已删除".into()),
                 _ => return Err("子会话暂时不能接收任务".into()),
             };
             let cancel = parent_cancel.child_token();
@@ -664,7 +691,12 @@ impl AppState {
                     .unwrap_or_else(|e| e.into_inner())
                     .iter()
                     .rev()
-                    .find(|message| message.role == openpaw_core::Role::Assistant)
+                    .find(|message| {
+                        message.role == openpaw_core::Role::Assistant
+                            && message.uuid.as_ref().is_some_and(|id| {
+                                id.starts_with(&format!("msg_{}_{}_", handle.id, turn_id))
+                            })
+                    })
                     .map(openpaw_core::Message::text)
                     .unwrap_or_else(|| "子 Agent 已完成任务，但没有返回文本结果。".into())
             } else {
@@ -2034,6 +2066,36 @@ impl AppState {
         .await
         .unwrap_or_default()
     }
+
+    /// 功能：从统一持久会话目录读取当前父会话可续办的员工清单。
+    /// 参数：parent 为可信父身份，workspace 为实际工作目录。
+    /// 返回：存在同目录未归档子会话时返回包含真实 task_id 的提示。
+    /// 错误：目录或单项读取失败跳过，不伪造可用身份。
+    /// 状态：只读会话关系，不恢复执行或旧结果缓存。
+    /// 并发与取消：阻塞扫描在 spawn_blocking 中运行，无跨 await 锁。
+    /// 权限：只列出匹配父关系与规范目录的子会话。
+    /// 关联：CHG-2026-0035、ADR-003。
+    pub(crate) async fn child_context(
+        &self,
+        parent: &str,
+        workspace: &std::path::Path,
+    ) -> Option<String> {
+        let home = self.config.home.clone();
+        let parent = parent.to_string();
+        let workspace = std::fs::canonicalize(workspace).ok()?;
+        tokio::task::spawn_blocking(move || {
+            let mut children = Vec::new();
+            for id in openpaw_store::catalog::discover(&home).ok()? {
+                let Ok(read) = openpaw_store::catalog::read(&home,&id) else {continue};
+                let Some(child) = session_child(&read.events) else {continue};
+                if child.parent_id != parent || read.transcript.mutation.archived.is_some_and(|value|value>0) {continue;}
+                if std::fs::canonicalize(session_workspace(&read.events,&workspace)).ok().as_ref() != Some(&workspace) {continue;}
+                children.push(serde_json::json!({"task_id":id,"name":child.name}));
+            }
+            children.sort_by_key(|child|child["task_id"].as_str().unwrap_or("").to_string());
+            (!children.is_empty()).then(||format!("可继续工作的真实子员工如下；继续时明确传 task_id。name 仅展示，不传 task_id 会新建员工，不会读取旧答案缓存：{}",serde_json::Value::Array(children)))
+        }).await.ok().flatten()
+    }
 }
 fn absolute_workspace(path: PathBuf) -> Result<PathBuf, String> {
     if path.is_absolute() {
@@ -2517,6 +2579,16 @@ fn accept_turn_with_policy(
     if handle.deleting.load(Ordering::Acquire) {
         return AcceptTurnResult::Deleting;
     }
+    if inherited
+        && handle
+            .mutation
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .archived
+            .is_some_and(|value| value > 0)
+    {
+        return AcceptTurnResult::Archived;
+    }
     if handle
         .active
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -2953,7 +3025,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     } else {
         let prompts = [
             handle.office.system_prompt(),
-            handle.delegation.context_prompt(),
+            handle.delegation.context_prompt().await,
         ]
         .into_iter()
         .flatten()
@@ -3708,12 +3780,22 @@ mod tests {
             Err(SessionMutationError::Persistence(_))
         ));
         assert!(state.wire_session(&handle).await.revert.is_none());
-        assert!(handle.delegation.context_prompt().is_none());
+        assert!(!handle
+            .delegation
+            .context_prompt()
+            .await
+            .unwrap_or_default()
+            .contains("可证实的旧结果"));
         std::fs::remove_dir(&file).unwrap();
         std::fs::write(&file, saved).unwrap();
         let reverted = state.revert_session(&handle.id, "input").await.unwrap();
         assert!(reverted.revert.is_some());
-        assert!(handle.delegation.context_prompt().is_none());
+        assert!(!handle
+            .delegation
+            .context_prompt()
+            .await
+            .unwrap_or_default()
+            .contains("可证实的旧结果"));
         state.unrevert_session(&handle.id).await.unwrap();
         let snapshot: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
@@ -3728,7 +3810,12 @@ mod tests {
         drop(state);
         let restored = AppState::new(config);
         let handle = restored.get(&id).await.unwrap();
-        assert!(handle.delegation.context_prompt().is_none());
+        assert!(!handle
+            .delegation
+            .context_prompt()
+            .await
+            .unwrap_or_default()
+            .contains("可证实的旧结果"));
     }
 
     #[tokio::test]
