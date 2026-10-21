@@ -248,9 +248,9 @@ impl HostApprovalManager {
     /// 参数：id、决定、session 授权开关、安全原因。
     /// 返回：成功交付为 true，失效为 false。
     /// 错误：无。
-    /// 状态：同工具授权可跨当前 session 回合；重启失效。
+    /// 状态：根会话同工具授权可跨回合；真实子会话始终仅批准本次调用。
     /// 并发与取消：委托 gate 线性化。
-    /// 权限：不扩大到其他 session 或工具。
+    /// 权限：不扩大到其他 session 或工具；子身份不因持久化而延长授权寿命。
     /// 关联：原 once/always/reject 协议。
     pub async fn reply_with_scope(
         &self,
@@ -264,6 +264,7 @@ impl HostApprovalManager {
 
     fn reply_scoped(&self, id: &str, approved: bool, remember: bool, reason: String) -> bool {
         let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let remember = remember && !self.metadata["parentSessionID"].is_string();
         self.gate.reply(id, approved, remember, reason.clone())
             || children
                 .scopes
