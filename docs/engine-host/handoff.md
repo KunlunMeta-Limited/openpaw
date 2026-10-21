@@ -103,3 +103,7 @@ T4应直接Rust调用上述接口，按Office固定Schema新增自己的DTO/NDJS
 ## T3交付验收登记（2026-10-21）
 
 用户已明确“审批通过”，分别验收0004 r2及0001 r3共同交付，准确提交`4263529059234ae913da3b40a3efe3eb6e9f7f56`。该head Linux完整26/26，默认966/全feature1001 passed，既有ignored各2单列；原始持久报告见0004验证记录。Windows本轮用户明确暂缓，未验证、不计通过。原段落保留历史时点；当前PR待创建/审核，目标merge/ai-ofice-react-overagent，未合入，不作为T4开工许可。
+
+## T3 PR状态（2026-10-21）
+
+共同[PR #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)已创建，目标merge/ai-ofice-react-overagent，来源feat/engine-host-t3；创建head `b5a2c2a2a44902139ad27cf6f2cd9a2b8859e27d`。0004/0001交付验收已通过，平台非作者审核与合入尚未发生，T4仍不开始。CI平台账单未启动、本地交付门禁不能表示Windows暂缓两种情况分列于0004最新记录，不自改规则或伪填通过。PR元数据登记版本仍执行完整验证，后续获批并合入后再同步真实merge及M3完成。
