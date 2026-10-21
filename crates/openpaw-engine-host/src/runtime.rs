@@ -676,6 +676,7 @@ impl AppState {
                 }
                 handle
             } else {
+                let reservation = state.main_office.reserve_child(&child.parent_id)?;
                 child.parent_message_id = parent
                     .current_turn
                     .lock()
@@ -691,6 +692,9 @@ impl AppState {
                         Some(child.clone()),
                     )
                     .await?;
+                if let Some(reservation) = reservation {
+                    reservation.commit(&handle.id, &child.workspace_id, &child.name)?;
+                }
                 handle.emit(events::session_changed(
                     "session.created",
                     &wire_session_snapshot(&handle),
