@@ -95,3 +95,7 @@ Linux/Windows共用[配置样例](host-config.example.toml)，先建授权工作
 无Office的真实验收：`cargo run --locked -p openpaw-engine-host --features engine-host --example host_smoke -- <全新隔离临时目录>`。专用runtime/recovery/CLI测试使用原引擎、JSONL、工具、OS锁和真实子进程；不会复制用户配置进docs。普通文件/目录只读查询不应创建Skill/Goal/Todo数据。数据库一致备份须停服务后复制完整home，运行时备份不能只复制host.db而漏WAL。
 
 T4应直接Rust调用上述接口，按Office固定Schema新增自己的DTO/NDJSON/messages投影；不要再实现Run/审批或从浏览器历史覆盖Host完整账本。实际可开放读取工具为read_file/glob/grep/todo_list/think，写工具和bash只在显式本机配置且人工批准后执行。当前T3未开放Office或SDK业务HTTP，后续接口须继续遵守Rx人工批准边界。M3/两平台验证未完成时不能把本交接当作T4开工许可。
+
+### T3当前技术交接版本
+
+9ed545c准确实现head Linux完整26/26通过，旧CLI帮助测试四feature组合已适配，Host真实shell子孙进程取消/关闭、凭据环境及链接越界均有专项证据。H01—H12逐项定位、失败历史及M3核查见0004验证记录；Windows和交付验收仍缺，当前交接仅供审核，不是T4开工许可。已push开发分支，未创建PR；取得原生证据后对准确交付版本分别验收0004与0001。
