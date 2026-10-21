@@ -161,3 +161,7 @@ T1/D04 Windows整改：原生CI 5a9cc0f的Store两项尾损恢复在set_len返�
 当前cargo-deny真实命中RUSTSEC-2026-0382/rustls-webpki0.103.15与RUSTSEC-2026-0381/webpki-roots1.0.9，可能信任已撤销emSign中间证书。原Provider/HTTP工具使用同一TLS链，阻塞全量。计划最小补丁升为0.103.16/1.0.10；保留TLS实现/验证和全部公告门禁，复核精确新版本许可证/来源，不加全局例外或新backend。CHG范围已先登记；完成证据见验证记录，未通过当前双平台前不关闭。
 
 D35修复结果：0.103.16/1.0.10已锁定，原两包许可证实核、精确例外/分发通知同步；70d0385 Linux全量26/26（含cargo-deny与MSRV1.88）通过。原生Windows仍被GitHub付款/额度阻塞；D35及T2其他D项不提前标已关闭/合入，M2/非作者PR审核仍未完成。
+
+## T3开工只读复核（0004方案待审）
+
+Host仍占位。T1的llm::assemble_provider、RunObserver/SessionWriter与T2的ToolCallContext/ToolExecutionObserver、ToolRegistry/Environment可直接复用，无须改core/engine/sandbox。新增Host只负责绑定、接受/并发、持久审批、根资源和恢复。SkillManager::list_active会写telemetry，Host不能调用；FsSkillStore::list_scope与FsGoalStore::list_all旧容错列表会跳过坏记录，本次拟在原Store复用扫描/解析增加checked只读入口，不复制到Host。此为明确的能力延展，未新列D缺陷；实施发现真实缺陷另行登记。T2 PR #6已合入，但其Windows原生验证仍按原安排待补。具体逐文件原因、方法及H场景在CHG-2026-0004，尚未实施。
