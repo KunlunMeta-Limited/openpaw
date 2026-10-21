@@ -171,7 +171,18 @@ pub struct SessionHandle {
     request_admissions: std::sync::RwLock<HashMap<String, RequestAdmission>>,
     turn_gate: std::sync::Mutex<()>,
     turn_cancel: std::sync::Mutex<CancellationToken>,
+    // 子执行的所有权归父回合；工具 future 被取消时也不能丢弃子 writer 收尾。
+    foreground_children: std::sync::Mutex<ForegroundChildren>,
     desktop_registrations: desktop::Registrations,
+}
+struct ForegroundChild {
+    handle: Arc<SessionHandle>,
+    turn_id: String,
+    task: tokio::task::JoinHandle<()>,
+}
+struct ForegroundChildren {
+    accepting: bool,
+    tasks: Vec<ForegroundChild>,
 }
 #[derive(Debug, Clone)]
 struct ActiveTurn {
@@ -189,6 +200,24 @@ pub struct SessionActivity {
     pub task: String,
 }
 impl SessionHandle {
+    async fn finish_foreground_children(&self) {
+        let children = {
+            let mut registry = self
+                .foreground_children
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            registry.accepting = false;
+            std::mem::take(&mut registry.tasks)
+        };
+        for child in &children {
+            child.handle.cancel_main_turn(&child.turn_id);
+        }
+        for child in children {
+            if let Err(error) = child.task.await {
+                tracing::error!(session_id = %child.handle.id, %error, "子回合收尾异常");
+            }
+        }
+    }
     /// 功能：读取当前执行取消代际，供非阻塞 main 投影丢弃旧动作。
     /// 参数：无。
     /// 返回：当前回合的原取消令牌副本。
@@ -293,6 +322,10 @@ impl SessionHandle {
         *self.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = CancellationToken::new();
         self.cancel_requested.store(false, Ordering::Release);
         self.approvals.begin_turn();
+        self.foreground_children
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .accepting = true;
         true
     }
     /// 并发与取消：与 reserve/abort 共用 gate。
@@ -635,39 +668,54 @@ impl AppState {
                 handle
             };
             let child = handle.child.as_ref().ok_or("子会话身份缺失")?.clone();
+            let parent = state.get_typed(&child.parent_id).await.ok();
             let turn_id = format!("turn_{}", Uuid::new_v4().simple());
             let user_message_id = format!("msg_{}_{}_user", handle.id, turn_id);
             let mut message = openpaw_core::Message::user_text(&task);
             message.uuid = Some(user_message_id.clone());
-            let accepted = match accept_turn_with_policy(
-                &state,
-                &handle,
-                message,
-                turn_id.clone(),
-                user_message_id.clone(),
-                None,
-                None,
-                true,
-            ) {
-                AcceptTurnResult::Accepted(accepted) => accepted,
-                AcceptTurnResult::PersistenceFailed(error) => return Err(error),
-                AcceptTurnResult::Archived => return Err("task_id 对应子会话已归档".into()),
-                AcceptTurnResult::Busy => return Err("task_id 对应子会话正在执行".into()),
-                AcceptTurnResult::Deleting => return Err("task_id 对应子会话已删除".into()),
-                _ => return Err("子会话暂时不能接收任务".into()),
-            };
-            let cancel = parent_cancel.child_token();
-            *handle.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = cancel.clone();
-            let _approvals =
-                parent_approvals.attach_child(handle.approvals.clone(), &parent_cancel);
-            if _approvals.is_none() {
-                cancel.cancel();
-            }
-            handle.emit(events::user_message_updated(&handle.id, &user_message_id));
-            handle.emit(events::user_text_part(&handle.id, &user_message_id, &task));
-            run_turn(
-                handle.clone(),
-                ScheduledTurn {
+            let (completed, standalone) = {
+                // 与父收尾共用登记锁：父关闭登记后不能再接收一个未被 join 的子回合。
+                let mut registry = parent.as_ref().map(|parent| {
+                    parent
+                        .foreground_children
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                });
+                if parent_cancel.is_cancelled()
+                    || registry
+                        .as_ref()
+                        .is_some_and(|registry| !registry.accepting)
+                {
+                    return Err("父回合已停止，未接收子任务".into());
+                }
+                let accepted = match accept_turn_with_policy(
+                    &state,
+                    &handle,
+                    message,
+                    turn_id.clone(),
+                    user_message_id.clone(),
+                    None,
+                    None,
+                    true,
+                ) {
+                    AcceptTurnResult::Accepted(accepted) => accepted,
+                    AcceptTurnResult::PersistenceFailed(error) => return Err(error),
+                    AcceptTurnResult::Archived => return Err("task_id 对应子会话已归档".into()),
+                    AcceptTurnResult::Busy => return Err("task_id 对应子会话正在执行".into()),
+                    AcceptTurnResult::Deleting => return Err("task_id 对应子会话已删除".into()),
+                    _ => return Err("子会话暂时不能接收任务".into()),
+                };
+                let cancel = parent_cancel.child_token();
+                *handle.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = cancel.clone();
+                let _approvals =
+                    parent_approvals.attach_child(handle.approvals.clone(), &parent_cancel);
+                if _approvals.is_none() {
+                    cancel.cancel();
+                }
+                handle.emit(events::user_message_updated(&handle.id, &user_message_id));
+                handle.emit(events::user_text_part(&handle.id, &user_message_id, &task));
+                let child_handle = handle.clone();
+                let scheduled = ScheduledTurn {
                     turn_id: turn_id.clone(),
                     user_message_id,
                     text: task,
@@ -675,9 +723,32 @@ impl AppState {
                     provider,
                     model,
                     admission: accepted.admission,
-                },
-            )
-            .await;
+                };
+                // 接收后至登记之间不能 await。父 AgentLoop 丢弃工具 future 也只丢弃通知，
+                // 独立任务继续响应原取消并持久提交自己的终态；父在终态发布前 join。
+                let (done, completed) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let _approvals = _approvals;
+                    run_turn(child_handle, scheduled).await;
+                    let _ = done.send(());
+                });
+                let standalone = if let Some(registry) = registry.as_mut() {
+                    registry.tasks.push(ForegroundChild {
+                        handle: handle.clone(),
+                        turn_id: turn_id.clone(),
+                        task,
+                    });
+                    None
+                } else {
+                    Some(task)
+                };
+                (completed, standalone)
+            };
+            // 独立可信委派适配器没有已登记父回合，直接持有并等待自己的任务。
+            if let Some(task) = standalone {
+                task.await.map_err(|_| "子回合执行异常".to_string())?;
+            }
+            completed.await.map_err(|_| "子回合执行异常".to_string())?;
             let terminal = handle
                 .turn_outcomes()
                 .into_iter()
@@ -1520,6 +1591,10 @@ impl AppState {
             request_admissions: std::sync::RwLock::new(request_admissions),
             turn_gate: std::sync::Mutex::new(()),
             turn_cancel: std::sync::Mutex::new(CancellationToken::new()),
+            foreground_children: std::sync::Mutex::new(ForegroundChildren {
+                accepting: true,
+                tasks: Vec::new(),
+            }),
             desktop_registrations: self.ai_pc.clone(),
         });
         self.main_office.attach_session(&handle);
@@ -2602,6 +2677,11 @@ fn accept_turn_with_policy(
         .unwrap_or_else(|error| error.into_inner()) = CancellationToken::new();
     handle.cancel_requested.store(false, Ordering::Release);
     handle.approvals.begin_turn();
+    handle
+        .foreground_children
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .accepting = true;
     let admission = if inherited {
         None
     } else {
@@ -3214,6 +3294,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             (execution.generated_messages, result)
         }
     };
+    handle.finish_foreground_children().await;
     let snapshot = {
         let mut session = handle.session.lock().await;
         // terminal commit 与 abort 共用 turn_gate。先取得 gate 的一方决定本轮最终是
