@@ -116,12 +116,25 @@ pub(crate) enum AcceptTurnResult {
 pub(crate) struct AcceptedTurn {
     pub(crate) turn_id: String,
     pub(crate) user_message_id: String,
-    pub(crate) admission: TurnAdmission,
+    /// 根回合持有整体调度凭据，可信前台子回合沿用父授权而为无。
+    pub(crate) admission: Option<TurnAdmission>,
+}
+/// 功能：保存真实子会话与父会话、旧 Office 展示空间之间的持久关系。
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ChildSession {
+    /// 真实委派父会话编号，不表示 Fork 来源。
+    pub(crate) parent_id: String,
+    /// 兼容 Office feature 的子空间编号，与真实子会话编号分开。
+    pub(crate) workspace_id: String,
+    /// 员工显示名，不作为身份查找依据。
+    pub(crate) name: String,
 }
 /// 功能：保存单个 session 的运行时资源和并发状态。
 /// 并发与取消：`turn_gate` 线性化 reserve/abort/delete；取消同时通知 AgentLoop 和审批管理器。
 pub struct SessionHandle {
     pub id: String,
+    /// 实际子执行的父关系与展示映射；根会话为无。
+    pub(crate) child: Option<ChildSession>,
     pub session: Mutex<Session>,
     pub message_cache: std::sync::RwLock<Vec<openpaw_core::Message>>,
     /// 功能：保存与完整消息同步发布的中立展示注解。
@@ -534,6 +547,7 @@ pub struct AppState {
 }
 struct SessionHandleInit {
     session: Session,
+    child: Option<ChildSession>,
     messages: Vec<openpaw_core::Message>,
     message_presentations: HashMap<String, MessagePresentationV1>,
     writer: SessionWriter,
@@ -551,6 +565,136 @@ struct SessionHandleInit {
     request_admissions: HashMap<String, RequestAdmission>,
 }
 impl AppState {
+    /// 功能：把委派连接到当前普通会话运行时。
+    /// 参数：无。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：仅保存弱引用，不启动执行。
+    /// 并发与取消：共享短锁；不跨 await。
+    /// 权限：仅 Host 内部组装。
+    /// 关联：CHG-2026-0034。
+    pub(crate) fn bind_delegation_runtime(self: &Arc<Self>) {
+        self.delegation_shared.bind_runtime(self);
+    }
+
+    /// 功能：通过普通接收、执行及 writer 完成一次前台子委派。
+    /// 参数：child 为可信父关系与展示身份，其余为工作目录、任务、模型、父取消与审批。
+    /// 返回：包含真实子编号和结果的工具结果。
+    /// 错误：登记或持久化失败返回错误，未登记不执行。
+    /// 状态：建立普通子会话并提交完整成功历史。
+    /// 并发与取消：继承父整体回合授权，模型额度和工作区写锁继续共享；父取消传播。
+    /// 权限：子仅使用工作区工具和自己的审批，不继承桌面或父上下文。
+    /// 关联：CHG-2026-0034、ADR-003、ADR-006。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_delegated(
+        self: &Arc<Self>,
+        child: ChildSession,
+        workspace: PathBuf,
+        task: String,
+        provider: Arc<dyn LlmProvider>,
+        model: String,
+        parent_cancel: CancellationToken,
+        parent_approvals: Arc<HostApprovalManager>,
+    ) -> futures::future::BoxFuture<'static, Result<openpaw_core::ToolCallOutcome, String>> {
+        let state = self.clone();
+        Box::pin(async move {
+            let handle = state
+                .create_session_from_provider(
+                    provider.clone(),
+                    model.clone(),
+                    workspace,
+                    Some(&child.name),
+                    Some(child.clone()),
+                )
+                .await?;
+            handle.emit(events::session_changed(
+                "session.created",
+                &wire_session_snapshot(&handle),
+            ));
+            let turn_id = format!("turn_{}", Uuid::new_v4().simple());
+            let user_message_id = format!("msg_{}_{}_user", handle.id, turn_id);
+            let mut message = openpaw_core::Message::user_text(&task);
+            message.uuid = Some(user_message_id.clone());
+            let accepted = match accept_turn_with_policy(
+                &state,
+                &handle,
+                message,
+                turn_id.clone(),
+                user_message_id.clone(),
+                None,
+                None,
+                true,
+            ) {
+                AcceptTurnResult::Accepted(accepted) => accepted,
+                AcceptTurnResult::PersistenceFailed(error) => return Err(error),
+                _ => return Err("子会话暂时不能接收任务".into()),
+            };
+            let cancel = parent_cancel.child_token();
+            *handle.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = cancel.clone();
+            let _approvals =
+                parent_approvals.attach_child(handle.approvals.clone(), &parent_cancel);
+            if _approvals.is_none() {
+                cancel.cancel();
+            }
+            handle.emit(events::user_message_updated(&handle.id, &user_message_id));
+            handle.emit(events::user_text_part(&handle.id, &user_message_id, &task));
+            run_turn(
+                handle.clone(),
+                ScheduledTurn {
+                    turn_id: turn_id.clone(),
+                    user_message_id,
+                    text: task,
+                    provider_tools: handle.tools.clone(),
+                    provider,
+                    model,
+                    admission: accepted.admission,
+                },
+            )
+            .await;
+            let terminal = handle
+                .turn_outcomes()
+                .into_iter()
+                .find(|turn| turn.turn_id == turn_id)
+                .ok_or("子回合未保存终态")?;
+            let completed = terminal.state == TurnState::Completed;
+            let result = if completed {
+                handle
+                    .message_cache
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == openpaw_core::Role::Assistant)
+                    .map(openpaw_core::Message::text)
+                    .unwrap_or_else(|| "子 Agent 已完成任务，但没有返回文本结果。".into())
+            } else {
+                terminal
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.clone())
+                    .unwrap_or_else(|| "子任务未完成".into())
+            };
+            let status = if completed {
+                "completed"
+            } else if terminal.state == TurnState::Cancelled {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            Ok(openpaw_core::ToolCallOutcome {
+                media: Vec::new(),
+                is_error: !completed,
+                content: format!(
+                    "子 Agent“{}” task_id={}，status={}：\n{}",
+                    child.name, handle.id, status, result
+                ),
+                structured: Some(
+                    serde_json::json!({"task_id":handle.id,"sessionId":handle.id,"turnId":turn_id,"workspaceId":child.workspace_id,"workspaceName":child.name,"parentSessionId":child.parent_id,"status":status,"result":result}),
+                ),
+            })
+        })
+    }
+
     pub fn new(config: HostConfig) -> Arc<Self> {
         Self::new_with_scheduler(config, TurnSchedulerConfig::from_env())
     }
@@ -976,6 +1120,7 @@ impl AppState {
         approvals: Arc<HostApprovalManager>,
         provider: Arc<dyn LlmProvider>,
         model: &str,
+        child: bool,
     ) -> (Arc<DelegationContext>, Arc<dyn openpaw_core::ToolHost>) {
         let delegation = DelegationContext::new(
             id.to_string(),
@@ -986,14 +1131,18 @@ impl AppState {
             model.to_string(),
             self.delegation_shared.clone(),
         );
-        let tool_host = desktop::wrap(
-            Arc::new(DelegatingToolHost::new(
-                workspace.to_path_buf(),
-                delegation.clone(),
-            )),
-            id,
-            self.ai_pc.clone(),
-        );
+        let tool_host: Arc<dyn openpaw_core::ToolHost> = if child {
+            delegation.child_tool_host()
+        } else {
+            desktop::wrap(
+                Arc::new(DelegatingToolHost::new(
+                    workspace.to_path_buf(),
+                    delegation.clone(),
+                )),
+                id,
+                self.ai_pc.clone(),
+            )
+        };
         (delegation, tool_host)
     }
     async fn load_existing(&self, id: &str) -> Result<Arc<SessionHandle>, SessionLoadError> {
@@ -1030,17 +1179,32 @@ impl AppState {
             .ok_or(SessionLoadError::Corrupt)?;
         let mut session = Session::new(read.meta.model.clone(), read.meta.provider.clone());
         session.meta = read.meta;
-        let approvals = HostApprovalManager::new(
-            id.to_string(),
-            self.global_events.clone(),
-            CancellationToken::new(),
-        );
+        let child = session_child(&read.events);
+        session.parent_session_id = child.as_ref().map(|child| child.parent_id.clone());
+        session.agent_type = child.as_ref().map(|_| "delegated".to_string());
+        let approvals = if let Some(child) = &child {
+            HostApprovalManager::new_child(
+                id.to_string(),
+                &child.parent_id,
+                &child.workspace_id,
+                &child.name,
+                self.global_events.clone(),
+                CancellationToken::new(),
+            )
+        } else {
+            HostApprovalManager::new(
+                id.to_string(),
+                self.global_events.clone(),
+                CancellationToken::new(),
+            )
+        };
         let (delegation, tool_host) = self.session_tool_host(
             id,
             &workspace,
             approvals.clone(),
             provider.clone(),
             &session.meta.model,
+            child.is_some(),
         );
         let tools = tool_host
             .list_tools()
@@ -1058,6 +1222,7 @@ impl AppState {
         session.messages = messages;
         Ok(self.build_session_handle(SessionHandleInit {
             session,
+            child,
             messages: published_messages,
             message_presentations,
             writer,
@@ -1099,6 +1264,9 @@ impl AppState {
             .get_typed(id)
             .await
             .map_err(|_| RegistrationError::NotFound)?;
+        if handle.child.is_some() {
+            return Err(RegistrationError::Invalid);
+        }
         let slot = self.session_slot(id).await;
         let _lifecycle = slot.lock().await;
         let _gate = handle.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
@@ -1126,11 +1294,12 @@ impl AppState {
     /// 关联：CHG-2026-0026。
     pub(crate) fn ai_pc_tools(&self, handle: &SessionHandle) -> Vec<openpaw_core::ToolSpec> {
         let mut tools = handle.tools.clone();
-        if self
-            .ai_pc
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&handle.id)
+        if handle.child.is_none()
+            && self
+                .ai_pc
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&handle.id)
         {
             for spec in desktop::specs() {
                 if !tools.iter().any(|t| t.name == spec.name) {
@@ -1155,6 +1324,7 @@ impl AppState {
         workspace: Option<PathBuf>,
         title: Option<&str>,
     ) -> Result<Arc<SessionHandle>, String> {
+        self.delegation_shared.bind_runtime(self);
         let provider_tag = provider_name.unwrap_or(&self.config.provider);
         let provider = build_provider_for_model(provider_tag, model)?;
         let model_name = model.unwrap_or(provider.default_model()).trim().to_string();
@@ -1163,20 +1333,45 @@ impl AppState {
         }
         let workspace =
             absolute_workspace(workspace.unwrap_or_else(|| self.config.workspace.clone()))?;
+        self.create_session_from_provider(provider, model_name, workspace, title, None)
+            .await
+    }
+    async fn create_session_from_provider(
+        self: &Arc<Self>,
+        provider: Arc<dyn LlmProvider>,
+        model_name: String,
+        workspace: PathBuf,
+        title: Option<&str>,
+        child: Option<ChildSession>,
+    ) -> Result<Arc<SessionHandle>, String> {
         if self.main_office.url.is_some() && self.main_office.register(&workspace).is_err() {
             tracing::warn!("main 办公室登记未完成，不影响原会话入口");
         }
         let id = Uuid::new_v4().simple().to_string();
         let mut session = Session::new(model_name.clone(), provider.name());
         session.meta.id = id.clone();
+        session.parent_session_id = child.as_ref().map(|child| child.parent_id.clone());
+        session.agent_type = child.as_ref().map(|_| "delegated".to_string());
         let cancel = CancellationToken::new();
-        let approvals = HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel);
+        let approvals = if let Some(child) = &child {
+            HostApprovalManager::new_child(
+                id.clone(),
+                &child.parent_id,
+                &child.workspace_id,
+                &child.name,
+                self.global_events.clone(),
+                cancel,
+            )
+        } else {
+            HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel)
+        };
         let (delegation, tool_host) = self.session_tool_host(
             &id,
             &workspace,
             approvals.clone(),
             provider.clone(),
             &model_name,
+            child.is_some(),
         );
         let tools = tool_host.list_tools().await.map_err(|e| e.to_string())?;
         let agent = configured_agent(provider, model_name, tool_host, approvals.clone())?;
@@ -1195,6 +1390,15 @@ impl AppState {
         if let Err(error) = writer
             .append(&SessionEvent::Meta(session.meta.clone()))
             .and_then(|_| writer.append(&metadata))
+            .and_then(|_| {
+                if let Some(child) = &child {
+                    writer.append(&SessionEvent::Unknown(Box::new(
+                        serde_json::json!({"type":"session_child_v1","child":child}),
+                    )))
+                } else {
+                    Ok(())
+                }
+            })
         {
             drop(writer);
             if let Err(cleanup_error) = std::fs::remove_file(&path) {
@@ -1204,6 +1408,7 @@ impl AppState {
         }
         let handle = self.build_session_handle(SessionHandleInit {
             session,
+            child,
             messages: Vec::new(),
             message_presentations: HashMap::new(),
             writer,
@@ -1229,6 +1434,7 @@ impl AppState {
     fn build_session_handle(&self, init: SessionHandleInit) -> Arc<SessionHandle> {
         let SessionHandleInit {
             session,
+            child,
             messages,
             message_presentations,
             writer,
@@ -1250,6 +1456,7 @@ impl AppState {
         let updated_at = session_file_updated_at(&session_path, created_at);
         let handle = Arc::new(SessionHandle {
             id,
+            child,
             session_provider: session.meta.provider.clone(),
             session_model: session.meta.model.clone(),
             session: Mutex::new(session),
@@ -1506,6 +1713,7 @@ impl AppState {
                 approvals.clone(),
                 provider.clone(),
                 &model_name,
+                false,
             );
             let agent =
                 configured_agent(provider, model_name.clone(), tool_host, approvals.clone())
@@ -1549,6 +1757,7 @@ impl AppState {
                 .map_err(|_| SessionMutationError::Persistence("无法创建或发布会话分支".into()))?;
             self.build_session_handle(SessionHandleInit {
                 session,
+                child: None,
                 messages,
                 message_presentations,
                 writer,
@@ -1799,6 +2008,7 @@ impl AppState {
                     .map(|message_id| crate::protocol::SessionRevert { message_id });
                 out.push(SessionSummary {
                     session: SessionWire {
+                        parent_id: session_child(&read.events).map(|child| child.parent_id),
                         slug: meta.id.clone(),
                         id: meta.id,
                         title,
@@ -1844,6 +2054,14 @@ fn session_workspace(events: &[SessionEvent], fallback: &std::path::Path) -> Pat
             _ => None,
         })
         .unwrap_or_else(|| fallback.to_path_buf())
+}
+fn session_child(events: &[SessionEvent]) -> Option<ChildSession> {
+    events.iter().find_map(|event| match event {
+        SessionEvent::Unknown(value) if value["type"] == "session_child_v1" => {
+            serde_json::from_value(value["child"].clone()).ok()
+        }
+        _ => None,
+    })
 }
 fn valid_session_id(id: &str) -> bool {
     !id.is_empty()
@@ -2000,6 +2218,7 @@ fn wire_session_snapshot(handle: &SessionHandle) -> SessionWire {
         .clone();
     SessionWire {
         id: handle.id.clone(),
+        parent_id: handle.child.as_ref().map(|child| child.parent_id.clone()),
         title: handle
             .title
             .lock()
@@ -2246,6 +2465,28 @@ pub(crate) fn accept_turn(
     request_admission: Option<RequestAdmission>,
     presentation: Option<MessagePresentationV1>,
 ) -> AcceptTurnResult {
+    accept_turn_with_policy(
+        state,
+        handle,
+        message,
+        turn_id,
+        user_message_id,
+        request_admission,
+        presentation,
+        false,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn accept_turn_with_policy(
+    state: &AppState,
+    handle: &SessionHandle,
+    message: openpaw_core::Message,
+    turn_id: String,
+    user_message_id: String,
+    request_admission: Option<RequestAdmission>,
+    presentation: Option<MessagePresentationV1>,
+    inherited: bool,
+) -> AcceptTurnResult {
     let _gate = handle
         .turn_gate
         .lock()
@@ -2289,14 +2530,18 @@ pub(crate) fn accept_turn(
         .unwrap_or_else(|error| error.into_inner()) = CancellationToken::new();
     handle.cancel_requested.store(false, Ordering::Release);
     handle.approvals.begin_turn();
-    let admission = match state.scheduler.admit() {
-        Ok(admission) => admission,
-        Err(ScheduleError::QueueFull) => {
-            handle.active.store(false, Ordering::Release);
-            return AcceptTurnResult::QueueFull;
+    let admission = if inherited {
+        None
+    } else {
+        match state.scheduler.admit() {
+            Ok(admission) => Some(admission),
+            Err(ScheduleError::QueueFull) => {
+                handle.active.store(false, Ordering::Release);
+                return AcceptTurnResult::QueueFull;
+            }
         }
     };
-    let queued = admission.is_queued();
+    let queued = admission.as_ref().is_some_and(TurnAdmission::is_queued);
     let now = chrono::Utc::now().timestamp_millis();
     let outcome = TurnOutcome {
         turn_id: turn_id.clone(),
@@ -2318,7 +2563,7 @@ pub(crate) fn accept_turn(
             return AcceptTurnResult::TemporarilyBusy;
         }
     };
-    let queue_ticket = admission.queue_ticket();
+    let queue_ticket = admission.as_ref().and_then(TurnAdmission::queue_ticket);
     if let Err(error) = append_user_and_turn(
         handle,
         &mut session,
@@ -2553,7 +2798,8 @@ pub(crate) struct ScheduledTurn {
     pub(crate) provider_tools: Vec<openpaw_core::ToolSpec>,
     pub(crate) provider: Arc<dyn LlmProvider>,
     pub(crate) model: String,
-    pub(crate) admission: TurnAdmission,
+    /// 根回合独占的调度凭据；前台子回合通过父额度接收，不重复占槽。
+    pub(crate) admission: Option<TurnAdmission>,
 }
 /// 功能：在后台任务中执行一个完整 AgentLoop 回合。
 /// 参数：handle 为会话句柄，turn 为已持久化输入及调度凭据。
@@ -2600,7 +2846,12 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         .unwrap_or_else(|error| error.into_inner())
         .as_ref()
         .and_then(|active| active.outcome.queued_at);
-    let Some(_permit) = admission.wait(turn_cancel.clone()).await else {
+    let permit = if let Some(admission) = admission {
+        admission.wait(turn_cancel.clone()).await.map(Some)
+    } else {
+        Some(None)
+    };
+    let Some(_permit) = permit else {
         let outcome = TurnOutcome {
             turn_id,
             user_message_id,
@@ -2679,14 +2930,27 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     let mut completed_responses = HashSet::new();
     let mut response_index = 0usize;
     let mut active_response_index = 0usize;
-    let provider = handle.delegation.limit_provider(provider);
     handle
         .delegation
         .begin_turn(provider.clone(), model.clone(), turn_cancel.clone());
-    handle.office.turn_started(&handle.id, &mut roles);
+    let provider = handle.delegation.limit_provider(provider);
+    let child_office = handle.child.as_ref().map(|child| {
+        crate::delegation::SubagentOfficeGuard::new(
+            handle.office.clone(),
+            child.parent_id.clone(),
+            child.workspace_id.clone(),
+            child.name.clone(),
+            handle.workspace.clone(),
+        )
+    });
+    if child_office.is_none() {
+        handle.office.turn_started(&handle.id, &mut roles);
+    }
     handle.set_activity("thinking", None, "正在思考");
     handle.emit(events::session_status(&handle.id, "busy"));
-    let system_prompt = {
+    let system_prompt = if handle.child.is_some() {
+        Some("你是主 Agent 委派的独立子 Agent。只完成任务及明确提供的背景，必要时使用工作区工具；不得再次委派。最终给出供父 Agent 整合的真实结果。".to_string())
+    } else {
         let prompts = [
             handle.office.system_prompt(),
             handle.delegation.context_prompt(),
@@ -2743,6 +3007,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 }
                 let session_wire = SessionWire {
                     id: handle.id.clone(),
+                    parent_id: handle.child.as_ref().map(|child| child.parent_id.clone()),
                     title: title.clone(),
                     slug: handle.id.clone(),
                     directory: handle.workspace.display().to_string(),
@@ -2811,14 +3076,18 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     }
                     _ => {}
                 }
-                handle.office.observe(
-                    &handle.id,
-                    &event,
-                    &mut roles,
-                    &mut last_tool_role,
-                    &mut tool_failed,
-                    &mut active_tools,
-                );
+                if let Some(office) = &child_office {
+                    office.observe(&event);
+                } else {
+                    handle.office.observe(
+                        &handle.id,
+                        &event,
+                        &mut roles,
+                        &mut last_tool_role,
+                        &mut tool_failed,
+                        &mut active_tools,
+                    );
+                }
                 if !matches!(
                     event,
                     openpaw_engine::AgentEvent::ClassifierStatus { .. }
@@ -2995,13 +3264,17 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             intended_terminal
         };
         let office_completed = terminal.state == TurnState::Completed && !tool_failed;
-        handle.office.turn_ended(
-            &handle.id,
-            &mut roles,
-            last_tool_role,
-            successful_artifact_count,
-            office_completed,
-        );
+        if let Some(office) = &child_office {
+            office.finish(office_completed);
+        } else {
+            handle.office.turn_ended(
+                &handle.id,
+                &mut roles,
+                last_tool_role,
+                successful_artifact_count,
+                office_completed,
+            );
+        }
         cleanup.checkpoint = None;
         cleanup.message_count_before = session.messages.len();
         let mut snapshot = handle
@@ -3377,7 +3650,7 @@ mod tests {
             provider_tools: handle.tools.clone(),
             provider,
             model: "mock-1".into(),
-            admission: state.scheduler.admit().expect("test turn admission"),
+            admission: Some(state.scheduler.admit().expect("test turn admission")),
         }
     }
 
@@ -3415,6 +3688,18 @@ mod tests {
             .path()
             .join(".openpaw/engine-host-delegations")
             .join(format!("{}.json", handle.id));
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, serde_json::json!({"version":2,"records":[{
+            "logical_key":"old","workspace_id":format!("{}:agent:old",handle.id),"workspace_name":"历史审核",
+            "task_fingerprint":"old","task":"历史任务","completed":{"content":"可证实的旧结果","structured":{}}
+        }]}).to_string()).unwrap();
+        // 重新加载普通会话，使旧缓存失效路径保留实际历史 fixture。
+        let id = handle.id.clone();
+        drop(tools);
+        drop(handle);
+        drop(state);
+        let state = AppState::new(config.clone());
+        let handle = state.get(&id).await.unwrap();
         let saved = std::fs::read(&file).unwrap();
         std::fs::remove_file(&file).unwrap();
         std::fs::create_dir(&file).unwrap();
@@ -3423,7 +3708,7 @@ mod tests {
             Err(SessionMutationError::Persistence(_))
         ));
         assert!(state.wire_session(&handle).await.revert.is_none());
-        assert!(handle.delegation.context_prompt().is_some());
+        assert!(handle.delegation.context_prompt().is_none());
         std::fs::remove_dir(&file).unwrap();
         std::fs::write(&file, saved).unwrap();
         let reverted = state.revert_session(&handle.id, "input").await.unwrap();
@@ -3433,12 +3718,12 @@ mod tests {
         let snapshot: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert!(snapshot["records"][0]["completed"].is_null());
+        assert_eq!(snapshot["records"].as_array().unwrap().len(), 1);
         assert_eq!(
             snapshot["records"][0]["workspace_id"],
-            outcome.structured.unwrap()["workspaceId"]
+            format!("{}:agent:old", handle.id)
         );
         let id = handle.id.clone();
-        drop(tools);
         drop(handle);
         drop(state);
         let restored = AppState::new(config);

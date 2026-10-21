@@ -6,6 +6,12 @@
   "type": "object",
   "required": ["id", "title", "slug", "directory", "time"],
   "properties": {
+    "parentID": {
+      "title": "委派父会话编号",
+      "description": "真实子会话的父编号；普通会话和 Fork 根会话省略。",
+      "type": "string",
+      "minLength": 1
+    },
     "id": {
       "title": "会话编号",
       "description": "Host 分配的稳定会话唯一编号。",

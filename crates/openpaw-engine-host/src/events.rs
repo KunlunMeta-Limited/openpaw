@@ -379,6 +379,7 @@ mod tests {
     #[test]
     fn session_events_use_info_envelope() {
         let session = SessionWire {
+            parent_id: None,
             id: "s1".into(),
             title: "Session".into(),
             slug: "s1".into(),

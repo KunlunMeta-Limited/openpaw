@@ -221,6 +221,9 @@ pub struct SessionSummary {
 pub struct SessionWire {
     /// 会话稳定编号。
     pub id: String,
+    /// 实际委派父会话编号；普通会话与 Fork 根会话省略。
+    #[serde(rename = "parentID", default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     /// 会话标题。
     pub title: String,
     /// 与 id 相同的兼容 slug。
@@ -712,6 +715,7 @@ mod tests {
     #[test]
     fn session_wire_serializes_optional_archive_and_revert_without_parent_id() {
         let session = SessionWire {
+            parent_id: None,
             id: "s1".into(),
             title: "Session".into(),
             slug: "s1".into(),
