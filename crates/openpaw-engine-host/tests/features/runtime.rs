@@ -93,6 +93,51 @@ impl LlmProvider for Slow {
         "slow"
     }
 }
+struct BurstyWriter(MockProvider);
+#[async_trait]
+impl LlmProvider for BurstyWriter {
+    async fn complete(&self, req: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
+        self.0.complete(req).await
+    }
+    async fn stream(
+        &self,
+        req: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        let mut response = self.complete(req).await?;
+        let mut events = vec![Ok(StreamEvent::MessageStart)];
+        if response
+            .content
+            .iter()
+            .any(|part| matches!(part, openpaw_core::ContentBlock::ToolUse { .. }))
+        {
+            // 与同一次tool_use回复一同流出文本，不能用已EndTurn的另一回复假造后续工具。
+            response.content.insert(
+                0,
+                openpaw_core::ContentBlock::Text {
+                    text: "流".repeat(640),
+                },
+            );
+            for _ in 0..640 {
+                events.push(Ok(StreamEvent::TextDelta {
+                    index: 0,
+                    text: "流".into(),
+                }));
+            }
+        }
+        events.push(Ok(StreamEvent::Final(Box::new(response))));
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.0.capabilities()
+    }
+    fn default_model(&self) -> &str {
+        "test-burst"
+    }
+    fn name(&self) -> &str {
+        "burst"
+    }
+}
 #[tokio::test]
 async fn h01_h02_parallel_capacity_and_cancel_are_isolated() {
     let base = tempfile::tempdir().unwrap();
@@ -385,18 +430,41 @@ async fn h07_six_queries_do_not_create_data_and_paginate() {
 #[tokio::test]
 async fn h09_subscription_lag_recovers_committed_terminal_and_detach_does_not_cancel() {
     let base = tempfile::tempdir().unwrap();
+    let text = "流".repeat(640);
     let host = Host::with_provider(
         config(base.path()),
-        Arc::new(MockProvider::stream_text("hello", 5)),
+        Arc::new(BurstyWriter(MockProvider::scripted(vec![
+            MockMode::ToolUse {
+                tool_name: "write_file".into(),
+                input: json!({"path":"report.txt","content":"after lag"}),
+                text: "writing".into(),
+            },
+            MockMode::Fixed("done".into()),
+        ]))),
     )
     .await
     .unwrap();
     let s = scope(1);
     let b = host.open_session(s.clone()).await.unwrap();
-    let (first, rx) = host.snapshot_and_subscribe(&s).await.unwrap();
-    drop(rx);
+    let (first, mut lagged) = host.snapshot_and_subscribe(&s).await.unwrap();
+    let (_, detached) = host.snapshot_and_subscribe(&s).await.unwrap();
+    drop(detached);
     let run = host
         .submit_run(&s, &b.session_id, "input".into())
+        .await
+        .unwrap();
+    let a = pending(&host, &s).await;
+    // 故意不读640次文本通知，真实超过256容量；审批仍必须能从可靠视图恢复。
+    assert!(matches!(
+        lagged.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) if n > 0
+    ));
+    let (recovered, _) = host.snapshot_and_subscribe(&s).await.unwrap();
+    assert!(recovered.revision > first.revision);
+    assert_eq!(recovered.pending_approvals.len(), 1);
+    assert_eq!(recovered.pending_approvals[0].approval_id, a.approval_id);
+    assert!(recovered.runs[0].text.starts_with(&text));
+    host.decide_approval(&s, &a.approval_id, a.revision, a.binding, true)
         .await
         .unwrap();
     host.wait_idle().await;
@@ -404,8 +472,74 @@ async fn h09_subscription_lag_recovers_committed_terminal_and_detach_does_not_ca
     assert!(last.revision > first.revision);
     assert_eq!(last.runs[0].run_id, run.run_id);
     assert_eq!(last.runs[0].state, RunState::Completed);
-    assert_eq!(last.runs[0].text, "hello");
+    assert!(last.runs[0].text.starts_with(&text));
+    assert!(last.runs[0].text.ends_with("done"));
+    assert!(last.pending_approvals.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(base.path().join("项目 workspace/report.txt")).unwrap(),
+        "after lag"
+    );
     host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn h04_competing_decisions_and_cancel_have_one_effective_outcome() {
+    for cancel in [false, true] {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = config(base.path());
+        let root = cfg.roots["project"].clone();
+        let host = Host::with_provider(cfg, writer()).await.unwrap();
+        let s = scope(1);
+        let b = host.open_session(s.clone()).await.unwrap();
+        let run = host
+            .submit_run(&s, &b.session_id, "write".into())
+            .await
+            .unwrap();
+        let a = pending(&host, &s).await;
+        // 已取得审批前视图后持外部独占锁，保证即使批准先到也无法先写文件。
+        let guard = openpaw_sandbox::file_lock::try_lock_exclusive(
+            &root.join(".openpaw/engine-host-resource.lock"),
+        )
+        .unwrap();
+        if cancel {
+            let (approved, cancelled) = tokio::join!(
+                host.decide_approval(&s, &a.approval_id, a.revision, a.binding.clone(), true),
+                host.cancel_run(&s, &run.run_id),
+            );
+            assert!(approved.is_ok() || approved.unwrap_err().kind == "approval_conflict");
+            assert_eq!(cancelled.unwrap().state, RunState::Cancelling);
+        } else {
+            let (approved, denied) = tokio::join!(
+                host.decide_approval(&s, &a.approval_id, a.revision, a.binding.clone(), true),
+                host.decide_approval(&s, &a.approval_id, a.revision, a.binding.clone(), false),
+            );
+            assert_ne!(approved.is_ok(), denied.is_ok(), "相反决定只能有一个生效");
+            let rejected = if let Err(error) = approved {
+                error
+            } else {
+                denied.unwrap_err()
+            };
+            assert_eq!(rejected.kind, "approval_conflict");
+            host.cancel_run(&s, &run.run_id).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(3), host.wait_idle())
+            .await
+            .unwrap();
+        drop(guard);
+        let final_run = host.get_run(&s, &run.run_id).await.unwrap();
+        assert!(final_run.state.is_terminal());
+        if cancel {
+            assert_eq!(final_run.state, RunState::Cancelled);
+        }
+        assert!(!root.join("report.txt").exists());
+        assert!(final_run.tools.iter().all(|tool| tool.state != "running"));
+        assert!(host.pending_approvals(&s).await.unwrap().is_empty());
+        assert!(host
+            .decide_approval(&s, &a.approval_id, a.revision, a.binding, true)
+            .await
+            .is_err());
+        host.shutdown().await.unwrap();
+    }
 }
 #[tokio::test]
 async fn h10_configuration_scope_and_root_aliases() {
