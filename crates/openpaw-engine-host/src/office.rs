@@ -992,7 +992,7 @@ impl MainOffice {
     }
 
     fn child_begin(&self, session: &str, child: &str, name: &str) {
-        self.update(session,|_,record| {
+        self.update(session,|team,record| {
             let employees = record.snapshot["employees"].as_array_mut().expect("owned employees");
             if employees.len() >= 200 { return Vec::new(); }
             if !employees.iter().any(|employee| employee["id"] == child) {
@@ -1010,7 +1010,11 @@ impl MainOffice {
             tasks.push(serde_json::json!({"id":task,"title":"执行子任务","assigneeId":child,"status":"running","progress":-1,"updatedAt":now,"summary":"真实子 Agent 执行"}));
             record.snapshot["events"] = serde_json::json!([{"id":format!("assigned-{task}"),"kind":"task.assigned",
                 "summary":"主 Agent 向子 Agent 交接任务","occurredAt":now,"taskId":task,"employeeId":child,"fromEmployeeId":session}]);
-            Vec::new()
+            record.snapshot["employees"].as_array().into_iter().flatten()
+                .find(|employee|employee["id"] == child)
+                .and_then(|employee|employee["sceneActorId"].as_str()).filter(|actor|!actor.is_empty())
+                .map(|actor|vec![Self::command(team,actor,"thinking","处理子任务",record.snapshot["seq"].as_u64().unwrap_or(1))])
+                .unwrap_or_default()
         });
     }
 
