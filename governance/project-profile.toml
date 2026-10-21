@@ -11,6 +11,8 @@ initial_tx_phase = true
 normal_target_branch = "main"
 phase_exit_evidence = "待T0—T8约定范围全部验收后人工登记，不能由工具自动结束"
 
+chg_format = "openpaw/chg-review-v2"
+
 [owners]
 reviewer = "用户或指定非作者审核人；GitHub账号尚待人工配置"
 approval_policy = "CI不认证批准字段；以真实用户指令和当前提交PR审核为准"
@@ -173,3 +175,13 @@ pattern = "docs/engine-host/master.md"
 level = "L4"
 owner = "治理审核人"
 reason = "集成方案和权限边界"
+
+[[legacy_changes]]
+path = "docs/changes/CHG-2026-0002.md"
+ref = "383d0922eba3d069794015e1f280668a690c482c"
+reason = "仅追溯原实施；历史说明迁移须由获批主CHG列清"
+
+[[legacy_changes]]
+path = "docs/changes/CHG-2026-0003.md"
+ref = "993a7a7bc91b219bcd07f09a72a58ebbd8e3265a"
+reason = "仅追溯原实施；历史说明迁移须由获批主CHG列清"

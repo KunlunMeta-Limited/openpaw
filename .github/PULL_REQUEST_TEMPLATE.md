@@ -24,7 +24,7 @@
 - Tx / milestone M / integration base / previous approved-and-merged PR:
 - Pre-PR milestone audit: checked revision/content hash, each required output, Linux/Windows evidence, unresolved items and conclusion (master §14.3):
 - Pinned Office document/Schema section → master implementation anchor → actual code/test/evidence:
-- [ ] Required milestone outputs and pre-PR native checks passed before this PR was created (existing T0 #4 records its Draft revision history separately)
+- [ ] Required milestone outputs, pre-PR native checks and human delivery acceptance passed before this PR was created (existing T0 #4 records its Draft revision history separately)
 - Milestone state: pending / implementing / blocked / PR review / approved awaiting merge / completed; PR creation is not completion.
 - After approval and merge: master §14 milestone row, main CHG history, real approved commit/merge SHA/date and handoff are synchronized. Pending events stay pending.
 - Outputs and behavior before/after:
@@ -48,6 +48,13 @@ docs/engine-host/handoff.md. Office R1 requires its own design approval.
 
 
 ## CHG / requirements / design (all changes)
+
+- Approved proposal: CHG version / exact Git object / reviewer / date / evidence (approved before implementation):
+- Delivery acceptance: reviewer / accepted commit / date / evidence (accepted before PR creation):
+- Explicit linked revisions and separate acceptance; overlapping-file responsibilities:
+- Historical metadata or approved explanation migration, exact paths and protected original scope:
+- Verification source (worktree or clean matching head) / stage / digest / actual argv:
+
 
 - Main CHG / implementation authorization / REQ / DES:
 - Exact files and necessity; reused / extended / fixed / new:

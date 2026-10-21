@@ -4,30 +4,44 @@
 
 ## 实际命令
 
+Python3.11+标准库，无新Python依赖。Rust stable/MSRV1.88、Node24.19.0、cargo-deny0.20.2及锁定npm依赖按测试规范准备。
+
 ~~~text
-python governance/check.py validate
-python governance/check.py index
-python governance/check.py trace
-python governance/check.py index --check
-python governance/check.py trace --check
-python -m unittest discover -s governance/tests -v
-python governance/check.py pr-check --base <集成提交> --head HEAD
-cargo run --locked -p xtask -- comments --base <集成提交> --head HEAD
-python governance/verify.py --suite all --base <集成提交> --head HEAD --output <仓库外新目录>
+python3 governance/check.py validate --stage proposal
+python3 governance/check.py validate --stage implementation
+python3 governance/check.py index
+python3 governance/check.py trace
+python3 governance/check.py index --check
+python3 governance/check.py trace --check
+python3 -m unittest discover -s governance/tests -v
+python3 governance/check.py pr-check --stage implementation --base <集成提交> --worktree
+python3 governance/check.py pr-check --stage delivery --base <集成提交> --head <实际交付head>
+python3 governance/verify.py --suite all --source worktree --stage implementation --base <集成提交> --output <仓库外全新目录>
+python3 governance/verify.py --suite all --source head --stage implementation --base <集成提交> --head <已检出的提交> --output <仓库外全新目录>
 ~~~
 
-Python3.11+标准库，无新Python运行依赖。Rust stable/MSRV1.88、Node24.19.0、cargo-deny0.20.2和锁定npm依赖先按测试规范准备。commands.json是命令单一注册源；套件rust/quality/contracts/governance/all。脚本使用argv且不经shell，保存每步退出码/时长/stdout/stderr/版本/工作树摘要；超时记124，缺命令记127。失败仍保存报告并执行其余命令，全部完成且源摘要不变才通过；报告目录已存在则拒绝覆盖。源码含密钥时不得把日志/报告公开，工具不收集完整环境。验证器显式使用UTF-8输出，并向Python子命令传递UTF-8模式，避免Windows重定向管道的CP1252编码失败；其他工具的原始日志仍原字节保存。验证工具不是运行服务的取消实现。
+`validate`默认proposal，只验十二节结构、准确文件、可审说明、追踪、固定框架哈希及注册命令；不要求未来批准/结果。implementation要求当前新格式CHG的有效方案批准和一致版本，`pr-check`同时校验真实diff/必改/条件/保护。delivery再要求人工交付验收、完整提交号、两平台原生passed证据；交付版本后只允许审批元数据/追加履历和生成索引维护，代码或方案变化需重验。validate索引/追踪均从同一归一化结果读取，--check拒绝漂移。没有approve或merge入口。
 
-pr-check直接读取固定head Git对象，校验该版本CHG/文件操作/保护声明与真实base→head diff；工作区脏文件不能改变已提交检查结果。--worktree显式包括未跟踪文件和所有本地改动，越界即失败。恰好一主CHG，历史CHG不能删除/重命名；本仓profile不允许Office混入。重命名登记两端；必改缺失与新增越界失败；条件项未用输出清单。比较base/head更严格保护等级与风险。允许表只接受准确路径，不接受全仓通配。
+新CHG使用`openpaw/chg-review-v2`及稳定基础列，扩充“具体修改方向与复用方式”“完成标准与证据”。当前状态与原交付状态分离，方案、交付、PR、合入各有独立字段。非空姓名/URL不是身份认证；未知格式不会按legacy自动放行。legacy仅profile已登记的准确路径和完整历史提交，用于追溯，不授权新的代码修改。
 
-validate检查表格、唯一ID、来源哈希、命令与文档/需求/设计/代码关联。索引与追踪矩阵自动生成，--check拒绝漂移。登记ID仅在权威需求/设计/审计/CHG中有来源才有效，scrub只豁免完整登记标识的匹配片段；同一行后续非法标识仍失败。
+方案批准对象优先填写`完整提案提交:docs/changes/本CHG.md`（该提交必须已包含完整提案），也支持本地完整blob SHA；对象中的方案与当前第2—11节、介绍、提案关键字段须相同。实质修改更新提案版本重新审核；批准登记和PR/结果元数据不进入方案摘要。Git对象在CI必须可获取，本地孤立blob不等于已提交/可共享的提案证据。固化对象记录实际形成时间，不倒填成过去已提交；旧r1原文仍在0001历史中定位。
+
+共同PR由唯一主CHG明确列`关联修订=CHG编号@版本`，每份修订独立批准/验收；重叠文件用“共同修改职责”逐行解释双方工作。主CHG还可精确列“历史元数据维护”或获批“历史说明维护”路径（多项用顿号）；受限迁移不会把历史closed记录当本轮活动方案。未关联多CHG、旧范围/测试/保护变更、删除/重命名历史CHG均拒绝。Office不在本profile范围内，仍须Rx另仓预审批。
+
+commands.json保留原26项，是注册命令单一来源。verify仅按明确source/stage展开治理上下文，实际argv逐条写report.json。worktree包括所有已跟踪、未提交、未跟踪内容；comments和pr-check统一使用--worktree，不能暗中拿HEAD替代。head要求干净且HEAD等于指定提交，所有命令在该检出运行；不自动stash、删用户文件或排除越界改动。需要验证其他提交时先使用独立干净检出，安装工具/依赖后再运行，未跟踪构建产物遵循既有ignore。
+
+输出目录必须在仓库外且不能覆盖；日志保存真实stdout/stderr、参数、退出码、耗时、工具版本、source、stage及源摘要。超时124、缺命令127，执行失败仍记录其余命令；全部执行且源未变化才可能通过。UTF-8进度和Python子命令兼容Windows重定向，保留原始日志字节；不采集完整环境或模型密钥。运行途中不要改文档/代码，登记结果后形成新版本再执行最终交付验证。不能把Linux或交叉编译当Windows原生通过。
+
+pr-check的固定head模式读取Git对象，不受脏工作区影响；完整runner的head模式更严格，避免其余编译/单测仍读脏工作区。base/head取更严格保护级别；重命名登记两端，文件操作必须一致，必改缺失与新增越界都失败，条件未用列出。ID需在权威需求/设计/审计/CHG有来源。
 
 comments复用syn/quote/doc_lines，对变化的声明节点检查中文栏目；包含pub(crate)、trait定义方法、公有字段、关联项、嵌套模块。模块指纹不含私有正文，未变化的历史声明不阻断私有修改；新文件要求模块职责。--all --report-only列历史债。宏展开、重导出、trait实现继承说明、cfg运行语义需人工核查；机器只校验栏目和内容非空，无法证明文字正确或关联语义。源码解析失败直接失败，不以跳过当通过。
 
 ## 人工与机器边界
 
-没有approve命令。review/in-progress/verified可以表达已获实施授权的开发和验证进度，不等于PR批准；approved/closed还要求批准字段及平台PR引用，closed要合入SHA。引用存在不等于身份/审核已认证，真实非作者针对当前提交的审核仍以GitHub与用户指令为准，作者不能自批。原型的宽松CLI和自动批准入口均不暴露给项目流程。平台required checks/CODEOWNERS需真实账号和仓库管理员设置，尚未配置不能宣称已生效。
+方案批准、交付验收和平台PR审核是三个独立事实。机器核对结构与Git方案一致性，不从非空字段认证用户、不自动证明批准时序或文案充分。closed必须有实际合入记录，原T0完成不意味着本次修订已完成。平台required checks/CODEOWNERS仍需真实账号和管理员设置，不宣称本地文件已启用平台保护。
 
-T0—T8一阶段一主CHG、一PR，上一PR审核合入才继续；初期全部约定范围验收后正常CHG开发，取消Tx串行。届时人工登记profile.initial_tx_phase=false及阶段验收证据，normal_target_branch切换普通主分支规则；配置自身L4审核，工具不会自动结束阶段。Office任何文件改动先Rx并经人工明确批准。当前T0只实现工程基线，不实现Host业务、不修改Office、不自动合入。
+T0—T8一阶段一主CHG、一PR，上一PR审核合入才继续；初期全部约定范围验收后正常CHG开发，取消Tx串行。届时人工登记profile.initial_tx_phase=false及阶段验收证据，normal_target_branch切换普通主分支规则；配置自身L4审核，工具不会自动结束阶段。Office任何文件改动先Rx并经人工明确批准。0001本次只完善工程基线，不实现Host业务、不修改Office、不自动合入。
 
 CI依赖审计：Linux复用固定cargo-deny Action；其容器只支持Linux，Windows通过crates.io原生安装固定cargo-deny0.20.2并执行相同cargo deny --workspace check。双平台都实际扫描，不以条件跳过代替通过。
+
+CI沿用原13作业与Linux/Windows矩阵、contents:read权限；push使用implementation取技术证据，PR使用delivery检查交付。CI checkout准确head并以--source head运行，不创建平行工作流。

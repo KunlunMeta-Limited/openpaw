@@ -22,6 +22,12 @@ INDEX = CHANGE_DIR + "/INDEX.md"
 TRACE = "docs/verification/追踪矩阵.md"
 PLACEHOLDERS = {"", "无", "待审批", "待审核", "待填写", "待确认"}
 LEVELS = {"L1": 1, "L2": 2, "L3": 3, "L4": 4}
+FORMAT = "openpaw/chg-review-v2"
+STAGES = ("proposal", "implementation", "delivery")
+# 只有这些首页字段属于方案；审批/PR/实测事实不反向改变已批准方案。
+PLAN_KEYS = ("变更编号", "变更标题", "项目CHG格式", "阶段", "提案版本", "变更类型",
+             "风险等级", "负责人", "必须审核", "设计基线", "目标分支", "关联修订",
+             "历史元数据维护", "历史说明维护")
 
 
 class Failure(Exception):
@@ -44,7 +50,7 @@ def commit(root: Path, ref: str) -> str:
 def relative(path: str) -> str:
     """要求规范仓库相对路径，允许中文/空格/竖线，禁止越界与模糊通配。"""
     p = PurePosixPath(path)
-    if not path or p.is_absolute() or ".." in p.parts or "\\" in path or str(p) != path:
+    if not path or p.is_absolute() or ".." in p.parts or "\\" in path or str(p) != path or re.match(r"^[A-Za-z]:", path) or "\0" in path:
         raise Failure("无效相对路径：" + path)
     return path
 
@@ -161,13 +167,116 @@ def upstream():
     return module
 
 
-def load_chg(reader: Reader, path: str, profile: dict, tool=None) -> tuple[dict, dict]:
+def approval_fields(parsed: dict) -> dict:
+    """读取唯一审批表；重复键不能通过字典覆盖隐藏。"""
+    rows = parsed.get("## 1. 变更审批", [])
+    result = {r["审批项目"]: r["内容"] for r in rows}
+    if len(rows) != len(result):
+        raise Failure("重复审批字段")
+    return result
+
+
+def plan_digest(body: str) -> str:
+    """绑定实质方案，忽略审批事实/履历及CRLF，不忽略方法、权限与测试。"""
+    parsed = tables(body)
+    approval = approval_fields(parsed)
+    sections = re.split(r"(?m)^## ", body.replace("\r\n", "\n"))
+    plan = [section.strip() for section in sections[1:]
+            if re.match(r"(?:[2-9]|10|11)\. ", section)]
+    value = {"fields": {k: approval.get(k, "") for k in PLAN_KEYS}, "sections": plan,
+             "introduction": sections[0].strip()}
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def legacy_entry(reader: Reader, path: str, profile: dict) -> dict:
+    """有限兼容必须定位已存在的历史记录，不能通过自填legacy免审。"""
+    entries = [r for r in profile.get("legacy_changes", []) if r["path"] == path]
+    if len(entries) != 1:
+        raise Failure("未登记项目格式；旧CHG必须在profile精确登记：" + path)
+    entry = entries[0]
+    if not re.fullmatch(r"[0-9a-f]{40}", entry["ref"]):
+        raise Failure("legacy必须固定完整历史提交")
+    original = approval_fields(tables(Reader(reader.root, entry["ref"]).read(path)))
+    current = approval_fields(tables(reader.read(path)))
+    if original["变更编号"] != current["变更编号"]:
+        raise Failure("legacy历史身份不匹配")
+    return entry
+
+
+def require_fact(approval: dict, keys: tuple[str, ...]) -> None:
+    """要求可审计事实字段；非空文本本身不能认证审核人身份。"""
+    for key in keys:
+        if approval.get(key, "") in PLACEHOLDERS or approval.get(key, "").startswith("待"):
+            raise Failure("缺少审批事实：" + key)
+
+
+def check_stage(reader: Reader, path: str, meta: dict, stage: str, archived: bool = False) -> None:
+    """方案只验可审材料，实施绑定批准对象，交付另验准确版本的人工验收。"""
+    a = meta["approval"]
+    if not meta["modern"] or stage == "proposal":
+        return
+    if meta["status"] in {"draft", "review", "rejected"} or meta["status"] == "closed" and not archived:
+        raise Failure("当前修订未获有效实施批准：" + path)
+    require_fact(a, ("提案版本", "方案批准版本", "方案审核人", "方案审核时间", "方案审核证据", "方案批准对象"))
+    if a.get("方案审核状态") != "approved" or a["提案版本"] != a["方案批准版本"]:
+        raise Failure("方案未批准或批准版本不匹配：" + path)
+    ref = a["方案批准对象"]
+    if not re.fullmatch(r"[0-9a-f]{40}(?::" + re.escape(path) + r")?", ref):
+        raise Failure("方案批准对象必须为完整Git blob SHA或固定提交:本CHG路径")
+    original = git(reader.root, "cat-file", "blob", ref).decode("utf-8")
+    if plan_digest(original) != plan_digest(reader.read(path)):
+        raise Failure("方案实质变化，需重新审核批准版本：" + path)
+    if stage == "delivery":
+        require_fact(a, ("交付验收人", "交付验收时间", "交付验收证据", "交付验收提交", "验证证据"))
+        if a.get("交付验收状态") != "approved":
+            raise Failure("交付验收未通过：" + path)
+        accepted = a["交付验收提交"]
+        if not re.fullmatch(r"[0-9a-f]{40}", accepted):
+            raise Failure("交付验收必须绑定完整提交")
+        # 元数据补登允许晚于交付版本；任何代码或方案变化都需重新验收。
+        if commit(reader.root, accepted) != accepted:
+            raise Failure("无效交付提交")
+        for platform in ("Linux", "Windows"):
+            require_fact(a, (platform + "验证提交", platform + "验证结果", platform + "验证证据"))
+            if a[platform + "验证提交"] != accepted or a[platform + "验证结果"] != "passed":
+                raise Failure("缺少准确交付提交的原生验证：" + platform)
+        # 已交付记录不以未来其他CHG的代码变化推翻，但仍核对原批准/验收事实。
+        if archived:
+            return
+        diff = changes(reader.root, accepted, reader.ref)
+        for changed in diff:
+            if changed in {INDEX, TRACE}:
+                continue
+            if not changed.startswith(CHANGE_DIR + "/CHG-") or not changed.endswith(".md"):
+                raise Failure("交付验收后版本变化：" + changed)
+            prior = Reader(reader.root, accepted).read(changed)
+            if plan_digest(prior) != plan_digest(reader.read(changed)) or prior.split("## 12.", 1)[-1] not in reader.read(changed):
+                raise Failure("交付验收后方案/历史变化：" + changed)
+
+
+def load_chg(reader: Reader, path: str, profile: dict, tool=None, stage: str = "proposal") -> tuple[dict, dict]:
     """验证CHG结构和项目约束；不把自填批准字段视为人工授权。"""
     tool = tool or upstream()
     body = reader.read(path)
     parsed = tables(body)
+    approval = approval_fields(parsed)
+    modern = approval.get("项目CHG格式") == FORMAT
+    if not modern:
+        legacy_entry(reader, path, profile)
+    elif any(approval.get(key) not in {"pending", "approved", "rejected"}
+             for key in ("方案审核状态", "交付验收状态")):
+        raise Failure("独立审批状态必须为pending/approved/rejected")
     if any(section not in parsed and section not in body.splitlines() for section in tool.CHG_SECTIONS):
         raise Failure(path + "：缺少十二节")
+    # 固定框架继续验证基础格式/保护；新审批语义只在项目层处理。
+    original_frontmatter = tool.frontmatter
+    def normalized(copy):
+        metadata, text = original_frontmatter(copy)
+        if modern:
+            metadata["approved_by"] = approval.get("方案审核人", "")
+            metadata["approved_at"] = approval.get("方案审核时间", "")
+        return metadata, text
+    tool.frontmatter = normalized
     with tempfile.TemporaryDirectory(prefix="openpaw-chg-") as temp:
         copy = Path(temp) / Path(path).name
         copy.write_text(body, encoding="utf-8", newline="\n")
@@ -175,9 +284,8 @@ def load_chg(reader: Reader, path: str, profile: dict, tool=None) -> tuple[dict,
             meta = tool.validate_chg(copy, profile)
         except tool.GovernanceError as error:
             raise Failure(str(error)) from error
-    approval = {r["审批项目"]: r["内容"] for r in parsed[tool.CHG_SECTIONS[0]]}
-    if len(approval) != len(parsed[tool.CHG_SECTIONS[0]]):
-        raise Failure(path + "：重复审批字段")
+        finally:
+            tool.frontmatter = original_frontmatter
     if approval.get("实施授权来源", "") in PLACEHOLDERS:
         raise Failure(path + "：缺少真实实施授权来源；提案可填仅起草未获编码授权")
     historical_tx = re.fullmatch(r"T[0-8]", approval.get("阶段", "")) is not None
@@ -195,6 +303,13 @@ def load_chg(reader: Reader, path: str, profile: dict, tool=None) -> tuple[dict,
     for row in declared:
         if row["操作"] not in {"新增", "修改", "删除", "重命名源", "重命名目标"}:
             raise Failure("文件操作不受支持")
+        if modern:
+            for key in ("具体修改方向与复用方式", "完成标准与证据"):
+                if row.get(key, "") in PLACEHOLDERS:
+                    raise Failure("文件缺少可审核说明：" + key)
+        elif any(key in row for key in ("具体修改方向与复用方式", "完成标准与证据")):
+            if any(row.get(key, "") in PLACEHOLDERS for key in ("具体修改方向与复用方式", "完成标准与证据")):
+                raise Failure("历史说明迁移不能留空")
     protected = {r["path"]: r for r in meta["protected_paths"]}
     for row in meta["files"]:
         level = max((LEVELS[r["level"]] for r in profile.get("protected_paths", [])
@@ -205,11 +320,11 @@ def load_chg(reader: Reader, path: str, profile: dict, tool=None) -> tuple[dict,
         risks = {"low": 1, "medium": 2, "high": 3, "critical": 4}
         if risks.get(meta["risk"], 0) < risks[required]:
             raise Failure("变更风险低于保护路径要求")
-    if meta["status"] in {"approved", "closed"}:
-        if not re.fullmatch(r"https://github\.com/[^/]+/[^/]+/pull/\d+(?:[#/].*)?", approval.get("PR审核证据", "")):
-            raise Failure("批准必须引用真实平台审核；姓名日期不能证明批准")
+    # 方案批准早于PR；禁止把PR URL当方案批准的前置条件。
     if meta["status"] == "closed" and not re.fullmatch("[0-9a-f]{40}", approval.get("合入提交", "")):
         raise Failure("closed必须有合入提交")
+    if meta["status"] == "closed" and not re.fullmatch(r"https://github\.com/[^/]+/[^/]+/pull/\d+", approval.get("平台PR URL", approval.get("PR审核证据", ""))):
+        raise Failure("closed必须有真实PR引用；关闭未合入不能完成")
     commands = json.loads(reader.read("governance/commands.json"))["commands"]
     registry = {c["id"]: c for c in commands}
     for test in meta["tests"]:
@@ -238,6 +353,13 @@ def load_chg(reader: Reader, path: str, profile: dict, tool=None) -> tuple[dict,
     if not trace:
         raise Failure("缺少需求设计代码测试追踪")
     meta["approval"] = approval
+    meta["modern"] = modern
+    if modern:
+        require_fact(approval, ("提案版本",))
+        if Path(path).name != meta["id"] + ".md":
+            raise Failure("CHG编号与文件名不一致")
+    check_stage(reader, path, meta, "delivery" if modern and meta["status"] == "closed" else stage,
+                archived=modern and meta["status"] == "closed")
     return meta, parsed
 
 
@@ -246,13 +368,15 @@ def profile_for(reader: Reader) -> dict:
     profile = tomllib.loads(reader.read(PROFILE))
     if profile.get("platforms") != ["linux", "windows"] or profile.get("schema") != "ai-governance/project/v1":
         raise Failure("项目平台/schema不符合基线")
+    if profile.get("chg_format", FORMAT) != FORMAT:
+        raise Failure("项目CHG格式不符合基线")
     for path in profile["baseline"]:
         if not reader.exists(relative(path)):
             raise Failure("基线文件不存在：" + path)
     return profile
 
 
-def validate(reader: Reader) -> list[tuple[str, dict, dict]]:
+def validate(reader: Reader, stage: str = "proposal") -> list[tuple[str, dict, dict]]:
     """验证全部CHG、标识、命令和框架来源，返回单事实源。"""
     profile, tool = profile_for(reader), upstream()
     lock = tomllib.loads(reader.read("governance/framework.lock.toml"))
@@ -261,7 +385,7 @@ def validate(reader: Reader) -> list[tuple[str, dict, dict]]:
     paths = [p for p in reader.files() if p.startswith(CHANGE_DIR + "/CHG-") and p.endswith(".md")]
     result, ids = [], set()
     for path in paths:
-        meta, parsed = load_chg(reader, path, profile, tool)
+        meta, parsed = load_chg(reader, path, profile, tool, stage)
         if meta["id"] in ids:
             raise Failure("重复CHG编号：" + meta["id"])
         ids.add(meta["id"])
@@ -324,52 +448,163 @@ def changes(root: Path, base: str, head: str | None) -> dict[str, str]:
     return result
 
 
-def pr_check(root: Path, base: str, head: str | None) -> dict:
-    """技术检查不替代PR批准；读取head对象，复用base与head更严格保护级别。"""
+def sections(body: str) -> dict[str, str]:
+    """按原始章节保存历史正文，CRLF只作平台换行归一化。"""
+    result = {}
+    for part in re.split(r"(?m)^## ", body.replace("\r\n", "\n"))[1:]:
+        heading, _, content = part.partition("\n")
+        result["## " + heading] = content.strip()
+    return result
+
+
+def historical_update(before: str, after: str, explanation: bool) -> None:
+    """补登只动审批/追加履历；获批说明迁移可改原因及新增方法列，不能改历史范围。"""
+    old, new = sections(before), sections(after)
+    old_tables, new_tables = tables(before), tables(after)
+    def normalized(value):
+        # 用户对表格的列宽/分隔符排版不改变保护语义，CRLF同理。
+        return "\n".join(json.dumps(cells(line), ensure_ascii=False) if line.strip().startswith("|")
+                         and not all(re.fullmatch(r":?-{3,}:?", c) for c in cells(line))
+                         else "TABLE-SEPARATOR" if line.strip().startswith("|") else line
+                         for line in value.splitlines())
+    for key in old:
+        if key.startswith(("## 1.", "## 12.")) or explanation and key.startswith("## 4."):
+            continue
+        if key == "## 3. 涉及仓库":
+            # 仓库身份不变，PR说明属于完成事实，而非旧代码授权。
+            old_rows, new_rows = old_tables.get(key, []), new_tables.get(key, [])
+            if [r.get("仓库编号") for r in old_rows] != [r.get("仓库编号") for r in new_rows]:
+                raise Failure("历史维护改变原仓库范围")
+            left = "\n".join(line for line in old[key].splitlines() if not line.strip().startswith("|"))
+            right = "\n".join(line for line in new.get(key, "").splitlines() if not line.strip().startswith("|"))
+        else:
+            left, right = old[key], new.get(key, "")
+        if normalized(left) != normalized(right):
+            raise Failure("历史维护改变受保护章节：" + key)
+    if old.get("## 12. 验证和审批记录", "") not in new.get("## 12. 验证和审批记录", ""):
+        raise Failure("历史维护删除原验证/审批履历")
+    if explanation:
+        key = "## 4. 允许修改文件"
+        rows_old, rows_new = tables(before)[key], tables(after)[key]
+        identity = ("仓库", "操作", "文件", "模块或符号", "文件负责人", "对其他部分的影响", "必要性")
+        if [[r.get(k) for k in identity] for r in rows_old] != [[r.get(k) for k in identity] for r in rows_new]:
+            raise Failure("历史说明迁移改变原文件范围/操作/必要性")
+        for row in rows_new:
+            if any(row.get(k, "") in PLACEHOLDERS for k in ("为什么必须修改", "具体修改方向与复用方式", "完成标准与证据")):
+                raise Failure("历史说明迁移缺少原因/方法/完成标准")
+
+
+def references(value: str) -> dict[str, str]:
+    """解析显式CHG@版本关联；不从自然语言猜测交付归属。"""
+    if value in PLACEHOLDERS or value == "不涉及":
+        return {}
+    result = {}
+    for item in value.split("、"):
+        match = re.fullmatch(r"(CHG-\d{4}-\d{4})@([A-Za-z0-9._-]+)", item.strip())
+        if not match or match[1] in result:
+            raise Failure("关联修订必须唯一且写为CHG编号@提案版本")
+        result[match[1]] = match[2]
+    return result
+
+
+def maintenance_paths(value: str) -> set[str]:
+    """历史维护使用准确文件清单，不支持通配或隐式授权。"""
+    if value in PLACEHOLDERS or value == "不涉及":
+        return set()
+    return {relative(p.strip()) for p in value.split("、")}
+
+
+def pr_check(root: Path, base: str, head: str | None, stage: str = "implementation") -> dict:
+    """独立审核共同交付范围与历史补登；技术通过不认证人类或替代PR批准。"""
     base = commit(root, base)
     head = commit(root, head) if head else None
-    reader = Reader(root, head)
+    reader, base_reader = Reader(root, head), Reader(root, base)
     valid, delta = validate(reader), changes(root, base, head)
     changed_chgs = {p for p in delta if p.startswith(CHANGE_DIR + "/CHG-") and p.endswith(".md")}
-    if len(changed_chgs) != 1 or any(delta[p] in {"删除", "重命名源", "重命名目标"} for p in changed_chgs):
-        raise Failure("每PR恰好一份主CHG，不得删除或重命名历史CHG")
-    candidates = [(p, m, t) for p, m, t in valid if p in delta]
-    if len(candidates) != 1:
-        raise Failure("每个PR必须修改恰好一份主CHG；删除/无CHG均不通过")
-    path, meta, parsed = candidates[0]
-    if meta["status"] in {"draft", "rejected", "closed"}:
-        raise Failure("当前CHG状态不能作为待审核实施PR")
-    rows = {r["文件"]: r for r in parsed["## 4. 允许修改文件"]}
-    unexpected = set(delta) - rows.keys()
-    missing = {p for p, r in rows.items() if r["必要性"] == "必改"} - delta.keys()
-    if unexpected or missing:
-        raise Failure("越界文件=" + repr(sorted(unexpected)) + "；必改缺失=" + repr(sorted(missing)))
+    if not changed_chgs or any(delta[p] in {"删除", "重命名源", "重命名目标"} for p in changed_chgs):
+        raise Failure("每PR必须有主CHG，不得删除或重命名历史CHG")
+    candidates = [(p, m, t) for p, m, t in valid if p in changed_chgs]
+    primary = []
+    for candidate in candidates:
+        path, meta, _ = candidate
+        a = meta["approval"]
+        linked = references(a.get("关联修订", ""))
+        maintained = maintenance_paths(a.get("历史元数据维护", "")) | maintenance_paths(a.get("历史说明维护", ""))
+        covers = {p for p, m, _ in candidates if m["id"] in linked} | maintained | {path}
+        if changed_chgs <= covers:
+            primary.append(candidate)
+    if len(primary) != 1:
+        raise Failure("每PR必须明确一份主CHG；多CHG需显式关联修订或受限历史维护")
+    path, meta, parsed = primary[0]
+    linked = references(meta["approval"].get("关联修订", ""))
+    explanations = maintenance_paths(meta["approval"].get("历史说明维护", ""))
+    maintained = explanations | maintenance_paths(meta["approval"].get("历史元数据维护", ""))
+    if set(linked) - {m["id"] for _, m, _ in candidates}:
+        raise Failure("关联修订没有出现在本次diff")
+    if maintained & {path} or any(p not in base_reader.files() or not re.fullmatch(CHANGE_DIR + r"/CHG-\d{4}-\d{4}\.md", p) for p in maintained):
+        raise Failure("历史维护只能引用已存在的其他CHG")
+    if any(m["id"] in linked and p in maintained for p, m, _ in candidates):
+        raise Failure("关联修订不能同时作为历史维护绕过独立审核")
+    active = []
+    for candidate_path, candidate, candidate_tables in candidates:
+        if candidate_path in maintained:
+            historical_update(base_reader.read(candidate_path), reader.read(candidate_path), candidate_path in explanations)
+            continue
+        if candidate_path != path and linked.get(candidate["id"]) != candidate["approval"].get("提案版本"):
+            raise Failure("关联修订版本不匹配")
+        if stage != "proposal":
+            if candidate["status"] in {"draft", "review", "rejected", "closed"}:
+                raise Failure("当前CHG未获有效实施批准")
+            check_stage(reader, candidate_path, candidate, stage)
+            if not candidate["modern"]:
+                # 历史实施只追溯固定版本，不能借兼容入口开发新的代码。
+                entry = legacy_entry(reader, candidate_path, profile_for(reader))
+                original = Reader(root, entry["ref"])
+                historical_update(original.read(candidate_path), reader.read(candidate_path), True)
+                for changed in set(delta) - {candidate_path, INDEX, TRACE}:
+                    if not original.exists(changed) or not reader.exists(changed) or original.read(changed) != reader.read(changed):
+                        raise Failure("历史批准不能覆盖新的实施；请先审核新修订：" + changed)
+                if stage == "delivery":
+                    raise Failure("历史记录不补造新流程交付验收；需明确的新修订验收")
+        active.append((candidate_path, candidate, candidate_tables))
+    owners = {}
+    for _, candidate, candidate_tables in active:
+        rows = {r["文件"]: r for r in candidate_tables["## 4. 允许修改文件"]}
+        missing = {p for p, r in rows.items() if r["必要性"] == "必改"} - delta.keys()
+        if missing:
+            raise Failure("必改缺失=" + repr(sorted(missing)))
+        for p, row in rows.items():
+            owners.setdefault(p, []).append((candidate, row))
+    unexpected = set(delta) - owners.keys()
+    if unexpected:
+        raise Failure("越界文件=" + repr(sorted(unexpected)))
+    base_rules = tomllib.loads(base_reader.read(PROFILE)).get("protected_paths", []) if base_reader.exists(PROFILE) else []
     for p, operation in delta.items():
-        if rows[p]["操作"] != operation:
-            raise Failure("文件操作与diff不一致：" + p)
-        if any(fnmatch.fnmatchcase(p, r["path"]) for r in meta["forbidden_paths"]):
-            raise Failure("命中禁止范围：" + p)
-    base_reader = Reader(root, base)
-    if PROFILE in base_reader.files():
-        rules = tomllib.loads(base_reader.read(PROFILE))["protected_paths"]
-        declared = {r["path"]: LEVELS[r["level"]] for r in meta["protected_paths"]}
-        for p in delta:
-            level = max((LEVELS[r["level"]] for r in rules if fnmatch.fnmatchcase(p, r["pattern"])), default=1)
-            if level > 1 and declared.get(p, 0) < level:
+        entries = owners[p]
+        for candidate, row in entries:
+            if row["操作"] != operation:
+                raise Failure("文件操作与diff不一致：" + p)
+            if len(entries) > 1 and any(other["id"] not in row.get("共同修改职责", "") for other, _ in entries if other != candidate):
+                raise Failure("重叠文件缺少双方明确职责：" + p)
+            if any(fnmatch.fnmatchcase(p, r["path"]) for r in candidate["forbidden_paths"]):
+                raise Failure("命中禁止范围：" + p)
+            level = max((LEVELS[r["level"]] for r in base_rules if fnmatch.fnmatchcase(p, r["pattern"])), default=1)
+            protected = {r["path"]: LEVELS[r["level"]] for r in candidate["protected_paths"]}
+            if level > 1 and protected.get(p, 0) < level:
                 raise Failure("降低base保护级别：" + p)
-            if {"low":1,"medium":2,"high":3,"critical":4}.get(meta["risk"],0) < level:
+            if {"low":1,"medium":2,"high":3,"critical":4}.get(candidate["risk"],0) < level:
                 raise Failure("降低base风险等级：" + p)
-    return {"base": base, "head": head or "WORKTREE", "change": meta["id"],
-            "files": len(delta), "human_review": "pending: CI不能认证人审",
-            "unused_conditional": sorted(set(rows) - delta.keys())}
+    return {"base": base, "head": head or "WORKTREE", "stage": stage, "change": meta["id"],
+            "linked": linked, "historical": sorted(maintained), "files": len(delta),
+            "human_review": "技术检查不能认证人工审核", "unused_conditional": sorted(set(owners) - delta.keys())}
 
 
 def index_text(valid: list) -> str:
     """从CHG生成索引，不另存一份可手改状态。"""
     lines = ["# CHG索引", "", "由 python governance/check.py index 生成；CHG正文是唯一状态源。", "",
-             "| 编号 | 标题 | 状态 | Tx | 目标分支 |", "| --- | --- | --- | --- | --- |"]
+             "| 编号 | 标题 | 当前修订状态 | 原交付 | 方案审核 | 交付验收 | PR/合入 | Tx | 目标分支 |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     for path, meta, _ in valid:
-        lines.append(f"| [{meta['id']}]({Path(path).name}) | {meta['title']} | {meta['status']} | {meta['approval'].get('阶段','无')} | {meta['target_branch']} |")
+        lines.append(f"| [{meta['id']}]({Path(path).name}) | {meta['title']} | {meta['status']} | {meta['approval'].get('原交付状态','见CHG')} | {meta['approval'].get('方案审核状态','历史追溯')} | {meta['approval'].get('交付验收状态','历史追溯')} | {meta['approval'].get('平台PR状态','见CHG')} | {meta['approval'].get('阶段','无')} | {meta['target_branch']} |")
     return "\n".join(lines) + "\n"
 
 
@@ -407,21 +642,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("validate")
+    sub.add_parser("validate").add_argument("--stage", choices=STAGES, default="proposal")
     for name in ("index", "trace"):
         sub.add_parser(name).add_argument("--check", action="store_true")
     pr = sub.add_parser("pr-check")
     pr.add_argument("--base", required=True)
+    pr.add_argument("--stage", choices=STAGES, default="implementation")
     choice = pr.add_mutually_exclusive_group(required=True)
     choice.add_argument("--head")
     choice.add_argument("--worktree", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "pr-check":
-            print(json.dumps(pr_check(args.root, args.base, args.head), ensure_ascii=False, indent=2))
+            print(json.dumps(pr_check(args.root, args.base, args.head, args.stage), ensure_ascii=False, indent=2))
         else:
             reader = Reader(args.root)
-            valid = validate(reader)
+            valid = validate(reader, getattr(args, "stage", "proposal"))
             if args.command == "index":
                 write_generated(args.root / INDEX, index_text(valid), args.check)
             elif args.command == "trace":

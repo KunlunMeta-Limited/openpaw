@@ -178,7 +178,9 @@ jobs:
             $base = git rev-parse "$($env:REVIEW_HEAD)^"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          python governance/verify.py --suite governance --base $base --head $env:REVIEW_HEAD --output $env:REPORT_ROOT
+          $stage = 'implementation'
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') { $stage = 'delivery' }
+          python governance/verify.py --suite governance --source head --stage $stage --base $base --head $env:REVIEW_HEAD --output $env:REPORT_ROOT
           exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
