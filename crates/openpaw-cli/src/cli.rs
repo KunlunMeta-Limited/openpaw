@@ -36,19 +36,43 @@ pub struct Cli {
     pub sidecar_transport: String,
 }
 
-/// All top-level subcommands (the M5 selection).
+/// 用途：顶层CLI命令
+/// 字段：各子命令及参数
+/// 来源去向：命令行到各模块
+/// 约束：聊天显式模型优先、端点不得含密钥
+/// 稳定性：只新增可选参数
+/// 关联：需求/设计 REQ-OP-002、REQ-OP-003。
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Start an echo-model conversation. No API key, no network — the M1
     /// smoke entry point.
     Hello,
-    /// Start the agent loop conversation with tools and session
-    /// persistence (offline providers; real providers plug into the same
-    /// seam).
+    /// 用途：启动原引擎聊天。
+    /// 字段：Provider、显式模型、端点、工作区和数据根。
+    /// 来源去向：CLI到共享装配与引擎。
+    /// 约束：保留离线入口，显式模型非空，端点不得含密钥。
+    /// 稳定性：新增可选参数。
+    /// 关联：需求REQ-OP-003、REQ-OP-004。
     Chat {
         /// Offline provider: `mock` (counter replies) or `echo`.
         #[arg(long, default_value = "mock")]
         provider: String,
+        /// 用途：覆盖Provider默认模型
+        /// 字段：可选模型
+        /// 来源去向：CLI到引擎
+        /// 约束：非空
+        /// 稳定性：新增
+        /// 关联：需求/设计 REQ-OP-003。
+        #[arg(long)]
+        model: Option<String>,
+        /// 用途：配置Provider端点
+        /// 字段：URL
+        /// 来源去向：CLI到Provider
+        /// 约束：禁止密钥嵌入
+        /// 稳定性：新增
+        /// 关联：需求/设计 DES-OP-002。
+        #[arg(long)]
+        base_url: Option<String>,
         /// Workspace the tool host operates in (default: current directory).
         #[arg(long)]
         workspace: Option<PathBuf>,

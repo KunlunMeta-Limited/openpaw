@@ -139,22 +139,22 @@ async fn token_budget_disabled_never_nudges() {
 async fn cancel_still_terminates_nudged_loop() {
     let p = Arc::new(MockProvider::counter("y-"));
     let token = CancellationToken::new();
-    let l = AgentLoop::new(p)
+    let l = AgentLoop::new(p.clone())
         .with_token_budget(TokenBudgetConfig::default().with_budget(1_000_000))
         .with_cancel_token(token.clone());
-
-    // Cancel from a watcher task mid-run: the nudged loop must respect it.
-    let l2 = Arc::new(l);
-    let w = Arc::clone(&l2);
-    let canceller = tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-        w.cancel();
-    });
-
     let mut session = Session::new("tb", "mock");
     session.messages.push(Message::user_text("hi"));
-    let mut sink = |_ev: openpaw_engine::AgentEvent| {};
-    let stop = l2.run_turn(&mut session, None, &[], &mut sink).await;
-    canceller.await.unwrap();
-    assert_eq!(stop.unwrap(), StopReason::EndTurn);
+    // 在第二次Provider完成时确定性取消，不依赖30ms内模型是否已经正常停止。
+    let mut usages = 0;
+    let mut sink = |event: openpaw_engine::AgentEvent| {
+        if matches!(event, openpaw_engine::AgentEvent::TurnUsage { .. }) {
+            usages += 1;
+            if usages == 2 {
+                token.cancel();
+            }
+        }
+    };
+    let result = l.run_turn(&mut session, None, &[], &mut sink).await;
+    assert!(matches!(result, Err(openpaw_core::Error::Cancelled)));
+    assert_eq!(p.call_count(), 2);
 }

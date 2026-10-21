@@ -1026,6 +1026,7 @@ name = "openpaw-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "openpaw-core",
  "openpaw-engine",
@@ -1037,6 +1038,7 @@ dependencies = [
  "openpaw-store",
  "openpaw-tools",
  "rmcp",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -1054,6 +1056,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 

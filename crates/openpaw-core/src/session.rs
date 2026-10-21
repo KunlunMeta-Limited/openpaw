@@ -94,7 +94,12 @@ pub struct InjectionRecord {
     pub at: DateTime<Utc>,
 }
 
-/// One event in the append-only session transcript.
+/// 用途：追加式会话事实和模型上下文
+/// 字段：消息、用量、运行与快照事件
+/// 来源去向：引擎到Store
+/// 约束：新事件保留Unknown前向兼容
+/// 稳定性：仅新增类型
+/// 关联：需求/设计 REQ-OP-004。
 ///
 /// Stability: stable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +147,65 @@ pub enum SessionEvent {
         workspace_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_id: Option<String>,
+    },
+    /// 用途：替换模型上下文但保留历史事实
+    /// 字段：messages为完整上下文
+    /// 来源去向：引擎到Store
+    /// 约束：不是新的用户消息
+    /// 稳定性：新增事件
+    /// 关联：需求/设计 REQ-OP-004。
+    ContextSnapshot {
+        /// 用途：压缩后的模型输入
+        /// 字段：消息数组
+        /// 来源去向：压缩到恢复
+        /// 约束：不计为新事实
+        /// 稳定性：新增
+        /// 关联：需求/设计 DES-OP-003。
+        messages: Vec<Message>,
+    },
+    /// 用途：可靠接受一次运行
+    /// 字段：运行标识run_id
+    /// 来源去向：引擎到账本
+    /// 约束：先于副作用
+    /// 稳定性：新增事件
+    /// 关联：需求/设计 REQ-OP-003。
+    RunStarted {
+        /// 用途：关联本次执行
+        /// 字段：标识
+        /// 来源去向：调用方到账本
+        /// 约束：同一运行固定
+        /// 稳定性：新增
+        /// 关联：需求/设计 DES-OP-002。
+        run_id: String,
+    },
+    /// 用途：保存运行终态
+    /// 字段：运行标识、状态、可选诊断
+    /// 来源去向：引擎到账本
+    /// 约束：实际清理后写入
+    /// 稳定性：新增事件
+    /// 关联：需求/设计 REQ-OP-003。
+    RunFinished {
+        /// 用途：关联开始事件
+        /// 字段：标识
+        /// 来源去向：运行到账本
+        /// 约束：不能代表授权
+        /// 稳定性：新增
+        /// 关联：需求/设计 DES-OP-002。
+        run_id: String,
+        /// 用途：终态
+        /// 字段：completed/failed/cancelled/timed_out
+        /// 来源去向：引擎到恢复
+        /// 约束：不将取消当成功
+        /// 稳定性：新增
+        /// 关联：需求/设计 DES-OP-002。
+        status: String,
+        /// 用途：可选失败诊断
+        /// 字段：文本
+        /// 来源去向：错误到账本
+        /// 约束：不得含密钥
+        /// 稳定性：新增
+        /// 关联：需求/设计 DES-OP-003。
+        error: Option<String>,
     },
     /// Forward-compatibility catch-all for unknown event types.
     #[serde(untagged)]

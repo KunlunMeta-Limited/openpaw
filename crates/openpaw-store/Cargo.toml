@@ -21,3 +21,7 @@ tokio.workspace = true
 
 [lints]
 workspace = true
+
+[[test]]
+name = "session_recovery_regressions"
+path = "tests/regressions/session_recovery.rs"

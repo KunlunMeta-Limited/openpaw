@@ -43,13 +43,38 @@ impl ToolCallOutcome {
 
 use serde::{Deserialize, Serialize};
 
-/// Core tool execution trait: enumerate + call.
+/// 用途：复用工具枚举与执行
+/// 字段：调用接口
+/// 来源去向：引擎到ToolHost
+/// 约束：取消后必须等待实际结束
+/// 稳定性：新增默认方法兼容旧实现
+/// 关联：需求/设计 REQ-OP-003。
 ///
 /// Stability: stable.
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>>;
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolCallOutcome>;
+
+    /// 功能：通知工具取消并等待调用实际清理完成，兼容旧执行器。
+    /// 参数：name、args为本次工具输入，cancel为本次调用取消信号。
+    /// 返回：实际调用结果；取消前未启动则返回取消错误。
+    /// 错误：透传工具错误，不自动重试副作用。
+    /// 状态：默认实现仍等待旧call返回，受控执行器应覆盖并杀树回收。
+    /// 并发与取消：调用方必须等待此future，不能drop后宣称已清理；旧实现不保证及时中断。
+    /// 权限：不提供授权，不改变既有安全检查。
+    /// 关联：需求/设计 REQ-OP-003；DES-OP-002。
+    async fn call_cancellable(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ToolCallOutcome> {
+        if cancel.is_cancelled() {
+            return Err(crate::Error::Cancelled);
+        }
+        self.call(name, args).await
+    }
 }
 
 /// Input validation runs before guardrails; failures short-circuit the
