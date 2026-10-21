@@ -90,10 +90,22 @@ impl ModelEnvironment {
     /// 权限：返回值可能为秘密，调用方只能交给Provider或检查有无。
     /// 关联：需求/设计REQ-OP-003；DES-OP-002。
     pub fn value(&self, name: &str) -> Option<&str> {
-        self.process
-            .get(name)
-            .or_else(|| self.file.get(name))
-            .map(String::as_str)
+        self.process_value(name)
+            .or_else(|| self.file.get(name).map(String::as_str))
+    }
+    fn process_value(&self, name: &str) -> Option<&str> {
+        // Windows的原生环境查询不区分大小写；快照不能改变原std::env::var语义。
+        #[cfg(windows)]
+        {
+            self.process
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        }
+        #[cfg(not(windows))]
+        {
+            self.process.get(name).map(String::as_str)
+        }
     }
     /// 功能：返回字段来源，不包含字段值。
     /// 参数：name为字段名。
@@ -104,7 +116,7 @@ impl ModelEnvironment {
     /// 权限：来源可展示，密钥值不可展示。
     /// 关联：需求/设计REQ-OP-003；DES-OP-002。
     pub fn source(&self, name: &str) -> &'static str {
-        if self.process.contains_key(name) {
+        if self.process_value(name).is_some() {
             "系统环境"
         } else if self.file.contains_key(name) {
             ".env"
@@ -184,6 +196,20 @@ impl ModelEnvironment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_environment_names_keep_native_case_insensitivity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "OPENAI_API_KEY=file-value\n").unwrap();
+        let env = ModelEnvironment::read(
+            dir.path(),
+            None,
+            BTreeMap::from([("openai_api_key".into(), "system-value".into())]),
+        )
+        .unwrap();
+        assert_eq!(env.value("OPENAI_API_KEY"), Some("system-value"));
+        assert_eq!(env.source("OPENAI_API_KEY"), "系统环境");
+    }
     #[test]
     fn system_environment_wins_even_when_empty_and_file_secrets_stay_local() {
         let dir = tempfile::tempdir().unwrap();
