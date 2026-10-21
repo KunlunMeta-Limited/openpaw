@@ -75,6 +75,23 @@ Office任意文件修改先Rx人工批准；R1/R2/R4条件提案未批准时如�
 
 完整验证明确source与stage，复用governance/verify.py；head必须匹配干净检出，worktree不能忽略用户dirty文件。共同PR只在两部分验收都通过后创建。T0—T8结束后取消Tx串行，正常CHG/审核/测试/Rx规则仍适用。
 
-## T3专项交接（计划，尚未实现）
+## T3专项交接（已批准实施，尚未交付验收）
 
 主方案[CHG-2026-0004](../changes/CHG-2026-0004.md)第6/7节定义可直接调用的Host API/字段，第9节定义可靠顺序，第10节H01—H12定义完成标准。T4输入应包括实际签名、config/端口/health、稳定Session/Run/call、状态/游标/错误、只读工具白名单、确定性Provider及两平台证据。Office DTO/NDJSON、完整快照seq、菜单/人物动画属于T4/T5，本阶段交接不得称已接通前端。0001共同职责补充用同一0001 r3审核，不新建治理任务；双方各自批准/验收后同一个T3 PR。
+
+
+### T3实际Rust入口与启动
+
+- `Host::start(HostConfig)`复用原Provider装配；`Host::with_provider(config, Arc<dyn LlmProvider>)`用于确定性测试和可信装配，恢复后才返回。
+- `open_session(ClientScope)`返回固定SessionBinding；`get_session(&scope, id)`恢复原core模型上下文，不直接作为前端完整思考展示。
+- `submit_run(&scope, session_id, input)`保存接受后返回RunView；`get_run/cancel_run`逐项校验scope，取消返回cancelling时应继续查询到清理完成。
+- `snapshot_and_subscribe(&scope)`在同一存储序列返回HostSnapshot与有界broadcast receiver；Lagged后重取，drop仅detach。通知不包含其他scope的Run ID。
+- `pending_approvals`与`decide_approval(scope,id,revision,完整ToolCallBinding,approve)`共享持久审批；重复同决定不产生第二次执行。
+- `query(scope, QueryRequest)`支持History/ToolResults/Skills/Goals/Todo/File；默认5项，上限50，文件256KiB；history展示隐藏Thinking，原账本不改。
+- `wait_idle`等待当前活动清理；`shutdown`先拒新/取消/等待，再等待所有存储句柄关闭。
+
+Linux/Windows共用[配置样例](host-config.example.toml)，先建授权工作根，home不能落在根内。启动：`cargo run --locked -p openpaw-cli --features engine-host,sidecar -- engine-host --config <host.toml> --port 0`。ready输出`openpaw engine host listening on http://127.0.0.1:<port>`，GET /health只返回status/schemaVersion。Ctrl-C正常关闭；Linux另处理TERM。Windows原生Job/cmd仍由原Environment实现，不需要WSL。
+
+无Office的真实验收：`cargo run --locked -p openpaw-engine-host --features engine-host --example host_smoke -- <全新隔离临时目录>`。专用runtime/recovery/CLI测试使用原引擎、JSONL、工具、OS锁和真实子进程；不会复制用户配置进docs。普通文件/目录只读查询不应创建Skill/Goal/Todo数据。数据库一致备份须停服务后复制完整home，运行时备份不能只复制host.db而漏WAL。
+
+T4应直接Rust调用上述接口，按Office固定Schema新增自己的DTO/NDJSON/messages投影；不要再实现Run/审批或从浏览器历史覆盖Host完整账本。实际可开放读取工具为read_file/glob/grep/todo_list/think，写工具和bash只在显式本机配置且人工批准后执行。当前T3未开放Office或SDK业务HTTP，后续接口须继续遵守Rx人工批准边界。M3/两平台验证未完成时不能把本交接当作T4开工许可。

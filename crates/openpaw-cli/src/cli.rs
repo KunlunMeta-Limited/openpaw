@@ -44,6 +44,31 @@ pub struct Cli {
 /// 关联：需求/设计 REQ-OP-002、REQ-OP-003。
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// 用途：启动可选共享Host服务。
+    /// 字段：显式配置文件和可选本机端口。
+    /// 来源去向：命令行到Host配置和启动。
+    /// 约束：仅loopback，不能与sidecar同时启动。
+    /// 稳定性：新增可选feature命令，默认CLI不变。
+    /// 关联：需求/设计REQ-OP-002；DES-OP-006。
+    #[cfg(feature = "engine-host")]
+    EngineHost {
+        /// 用途：加载Host配置。
+        /// 字段：本机TOML文件路径。
+        /// 来源去向：命令行到HostConfig。
+        /// 约束：配置明确授权home、根和工具。
+        /// 稳定性：新增。
+        /// 关联：REQ-OP-008；DES-OP-006。
+        #[arg(long)]
+        config: PathBuf,
+        /// 用途：选择监听端口。
+        /// 字段：可选无符号端口。
+        /// 来源去向：命令行到loopback listener。
+        /// 约束：缺省或零采用系统随机端口。
+        /// 稳定性：新增。
+        /// 关联：REQ-OP-009；DES-OP-006。
+        #[arg(long)]
+        port: Option<u16>,
+    },
     /// Start an echo-model conversation. No API key, no network — the M1
     /// smoke entry point.
     Hello,

@@ -1,0 +1,131 @@
+//! 职责：统一已授权Session的六类只读查询与有界分页。
+//! 输入输出：中性查询到原存储的数据投影。
+//! 依赖：原JSONL、Skill/Goal checked接口、Todo和有界文本读取。
+//! 禁止职责：不创建知识/目标、不复制文件解析器、不触发调度。
+use crate::{
+    service::check_scope, ClientScope, Host, HostError, HostResult, QueryKind, QueryPage,
+    QueryRequest,
+};
+use tokio_util::sync::CancellationToken;
+impl Host {
+    /// 功能：按作用域提供六类真实只读查询。
+    /// 参数：scope为可信范围，request为会话、类型与分页。
+    /// 返回：默认五项的有界查询页。
+    /// 错误：非法范围、状态冲突或存储故障明确上报；无失败分支的读取不产生错误。
+    /// 状态：原解析器错误上报；查询不写生命周期或创建数据。
+    /// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
+    /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
+    /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
+    pub async fn query(&self, scope: &ClientScope, request: QueryRequest) -> HostResult<QueryPage> {
+        let id = request.session_id.clone();
+        let scope = scope.clone();
+        let binding = self
+            .inner
+            .store
+            .call(move |db| {
+                let b = db.binding(&id)?;
+                check_scope(&b, &scope)?;
+                Ok(b)
+            })
+            .await?;
+        let root = self
+            .inner
+            .roots
+            .get(&binding.root_id)
+            .cloned()
+            .ok_or_else(|| HostError::new("scope_denied", "查询根未授权"))?;
+        let file_query = matches!(&request.kind, QueryKind::File { .. });
+        let _guard = if matches!(&request.kind, QueryKind::History | QueryKind::ToolResults) {
+            None
+        } else {
+            Some(root.acquire(false, &CancellationToken::new()).await?)
+        };
+        let mut items = match request.kind {
+            QueryKind::History | QueryKind::ToolResults => {
+                let tools = matches!(request.kind, QueryKind::ToolResults);
+                let id = binding.session_id;
+                self.inner
+                    .store
+                    .call(move |db| {
+                        db.events(&id)?
+                            .into_iter()
+                            .filter(|event| match event {
+                                openpaw_core::SessionEvent::Message(m) => {
+                                    !tools
+                                        || m.content.iter().any(|b| {
+                                            matches!(
+                                                b,
+                                                openpaw_core::ContentBlock::ToolResult { .. }
+                                                    | openpaw_core::ContentBlock::ToolUse { .. }
+                                            )
+                                        })
+                                }
+                                _ => false,
+                            })
+                            .map(|mut event| {
+                                if let openpaw_core::SessionEvent::Message(m) = &mut event {
+                                    m.content.retain(|b| {
+                                        !matches!(b, openpaw_core::ContentBlock::Thinking { .. })
+                                    });
+                                }
+                                serde_json::to_value(event).map_err(HostError::storage)
+                            })
+                            .collect::<HostResult<Vec<_>>>()
+                    })
+                    .await?
+            }
+            QueryKind::File { path } => vec![
+                serde_json::json!({"path":path,"text":openpaw_tools::fs::read::read_text_bounded(&root.path,&path,256*1024).await.map_err(|_|HostError::new("invalid_input","文件越界、非文本、过大或不可读取"))?}),
+            ],
+            kind => {
+                let home = self.inner.config.home.clone();
+                tokio::task::spawn_blocking(move||{
+                    // 在原Store扫描前校验显式目录，不能把根目录自身的链接当新的授权。
+                    let values=match kind {
+                        QueryKind::Skills=>{
+                            openpaw_tools::safety::resolve(&home,"skills").map_err(|_|HostError::new("scope_denied","用户技能根越界"))?;
+                            openpaw_tools::safety::resolve(&root.path,".openpaw/skills").map_err(|_|HostError::new("scope_denied","项目技能根越界"))?;
+                            root.skills.list_readonly_checked().map_err(|_|HostError::new("invalid_input","技能数据损坏、越界或不可读取"))?.into_iter().map(|s|serde_json::json!({"frontmatter":s.frontmatter,"body":bounded(&s.body)})).collect()
+                        },
+                        QueryKind::Goals=>{
+                            openpaw_tools::safety::resolve(&root.path,".openpaw/goals").map_err(|_|HostError::new("scope_denied","目标根越界"))?;
+                            root.goals.list_readonly_checked().map_err(|_|HostError::new("invalid_input","目标数据损坏、越界或不可读取"))?.into_iter().map(|d|serde_json::json!({"frontmatter":d.frontmatter,"body":bounded(&d.body)})).collect()
+                        },
+                        QueryKind::Todo=>openpaw_tools::meta::todo::read(&root.path).map_err(|_|HostError::new("invalid_input","Todo数据损坏或不可读取"))?.into_iter().map(|t|serde_json::to_value(t).map_err(HostError::storage)).collect::<HostResult<Vec<_>>>()?,
+                        _=>return Err(HostError::new("unsupported","未知查询类型")),
+                    };Ok::<Vec<serde_json::Value>,HostError>(values)
+                }).await.map_err(HostError::storage)??
+            }
+        };
+        let start = request.offset.min(items.len());
+        let end = start
+            .saturating_add(if request.limit == 0 {
+                5
+            } else {
+                request.limit.min(50)
+            })
+            .min(items.len());
+        let next_cursor = (end < items.len()).then_some(end);
+        items = items
+            .drain(start..end)
+            .map(|mut value| {
+                if !file_query {
+                    bound_json(&mut value);
+                }
+                value
+            })
+            .collect();
+        Ok(QueryPage { items, next_cursor })
+    }
+}
+fn bounded(s: &str) -> String {
+    s.chars().take(32 * 1024).collect()
+}
+fn bound_json(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) => *s = bounded(s),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(bound_json),
+        serde_json::Value::Object(o) => o.values_mut().for_each(bound_json),
+        _ => {}
+    }
+}

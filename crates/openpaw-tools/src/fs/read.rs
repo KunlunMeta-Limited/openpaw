@@ -35,41 +35,22 @@ pub fn spec() -> ToolSpec {
     }
 }
 
+/// 功能：复用有界文本读取并返回原带行号工具结果。
+/// 参数：workspace为授权工作根，args为原path及offset/limit输入。
+/// 返回：带行号文本、空文件或窗口越界提示。
+/// 错误：路径、大小或读取失败进入原工具错误结果。
+/// 状态：只读，不创建文件。
+/// 并发与取消：异步读取，宿主负责共享资源锁。
+/// 权限：复用原路径验证，不读取授权根外文件。
+/// 关联：需求/设计REQ-OP-014；DES-OP-006。
 pub async fn run(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
     let a: Args = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => return Ok(ToolCallOutcome::error(format!("read: bad args: {e}"))),
     };
-    let path = match crate::safety::resolve(workspace, &a.path) {
-        Ok(p) => p,
+    let content = match read_text_bounded(workspace, &a.path, 10 * 1024 * 1024).await {
+        Ok(content) => content,
         Err(e) => return Ok(ToolCallOutcome::error(e.to_string())),
-    };
-
-    const MAX_READ_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-    let metadata = match tokio::fs::metadata(&path).await {
-        Ok(m) => m,
-        Err(e) => {
-            return Ok(ToolCallOutcome::error(format!(
-                "read {}: {e}",
-                path.display()
-            )))
-        }
-    };
-    if metadata.len() > MAX_READ_SIZE {
-        return Ok(ToolCallOutcome::error(format!(
-            "file too large: {} bytes (max {MAX_READ_SIZE} bytes). Use offset/limit to read sections.",
-            metadata.len()
-        )));
-    }
-
-    let content = match tokio::fs::read_to_string(&path).await {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(ToolCallOutcome::error(format!(
-                "read {}: {e}",
-                path.display()
-            )))
-        }
     };
 
     let offset = a.offset.unwrap_or(0);
@@ -97,4 +78,50 @@ pub async fn run(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOu
         out.push_str(&format!("... ({} more lines)\n", total - end));
     }
     Ok(ToolCallOutcome::ok(out))
+}
+
+/// 功能：在授权根内读取有字节上限的普通UTF8文本。
+/// 参数：workspace为授权根，path为相对或根内绝对路径，max_bytes为硬上限。
+/// 返回：无行号的原始文本，供原read_file和Host预览共用。
+/// 错误：越界、非普通文件、过大、无效UTF8和IO错误。
+/// 状态：只读，不创建文件。
+/// 并发与取消：异步读取max_bytes加一字节；调用方负责协作资源锁。
+/// 权限：复用原safety路径检查，不能读取根外链接。
+/// 关联：需求/设计REQ-OP-014；DES-OP-006。
+pub async fn read_text_bounded(workspace: &Path, path: &str, max_bytes: usize) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let path = crate::safety::resolve(workspace, path)?;
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| openpaw_core::Error::ToolHost(format!("read: {e}")))?;
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|e| openpaw_core::Error::ToolHost(format!("read metadata: {e}")))?;
+    if !metadata.is_file() {
+        return Err(openpaw_core::Error::ToolHost(
+            "not a regular text file".into(),
+        ));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(openpaw_core::Error::ToolHost(format!(
+            "file too large (max {max_bytes} bytes)"
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|e| openpaw_core::Error::ToolHost(format!("read: {e}")))?;
+    if bytes.len() > max_bytes {
+        return Err(openpaw_core::Error::ToolHost(
+            "file too large during read".into(),
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err(openpaw_core::Error::ToolHost(
+            "not a plain text file".into(),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| openpaw_core::Error::ToolHost("file is not UTF8".into()))
 }

@@ -1,7 +1,24 @@
-//! 职责：预留Office和固定OpenCode协议兼容层所属crate；T0尚无运行实现。
-//! 输入输出：当前不提供HTTP、Run或查询API；T3建立共享宿主，T4—T7接适配器。
-//! 依赖：CLI通过默认关闭的engine-host feature可选引用；核心不依赖Office DTO。
-//! 禁止职责：不复制AgentLoop、Session、工具或存储，不将占位构建宣称为产品可用。
-//!
-//! 当前方案与里程碑见docs/engine-host/master.md。历史M5b实验检查点已由
-//! 当前T0—T8计划替代；不删除历史ADR，也不由本crate文档授权修改Office。
+//! 职责：承载Office与固定OpenCode适配器共用的运行服务。
+//! 输入输出：可信Rust作用域到Session、Run、审批、查询及就绪监听。
+//! 依赖：可选核心引擎、工具、原存储和执行环境。
+//! 禁止职责：不复制AgentLoop、会话账本或工具主体；外部协议留后续适配器。
+#[cfg(feature = "engine-host")]
+mod approval;
+#[cfg(feature = "engine-host")]
+mod config;
+#[cfg(feature = "engine-host")]
+mod query;
+#[cfg(feature = "engine-host")]
+mod resource;
+#[cfg(feature = "engine-host")]
+mod server;
+#[cfg(feature = "engine-host")]
+mod service;
+#[cfg(feature = "engine-host")]
+mod store;
+#[cfg(feature = "engine-host")]
+mod tool_host;
+#[cfg(feature = "engine-host")]
+mod types;
+#[cfg(feature = "engine-host")]
+pub use {config::HostConfig, server::HostServer, service::Host, types::*};

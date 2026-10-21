@@ -30,10 +30,17 @@ fn main() {
     // `--sidecar` short-circuits subcommands: the MCP server runs in-process.
     #[cfg(feature = "sidecar")]
     if cli.sidecar {
+        #[cfg(feature = "engine-host")]
+        if matches!(cli.command, Some(Command::EngineHost { .. })) {
+            eprintln!("engine-host不能与--sidecar同时启动");
+            std::process::exit(2);
+        }
         let code = sidecar::run_server(&cli.sidecar_transport);
         std::process::exit(code);
     }
     let code = match cli.command {
+        #[cfg(feature = "engine-host")]
+        Some(Command::EngineHost { config, port }) => openpaw_cli::host_cmd::run(&config, port),
         Some(Command::Hello) => hello::run(),
         Some(Command::Chat {
             model,

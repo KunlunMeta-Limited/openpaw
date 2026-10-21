@@ -18,3 +18,10 @@ pub mod session_cmd;
 pub mod tool_cmd;
 
 pub use cli::{Cli, Command};
+
+/// 职责：可选Host命令装配与停止。
+/// 输入输出：本机配置到退出码。
+/// 依赖：共享Host服务。
+/// 禁止职责：不处理Office协议或复写核心。
+#[cfg(feature = "engine-host")]
+pub mod host_cmd;

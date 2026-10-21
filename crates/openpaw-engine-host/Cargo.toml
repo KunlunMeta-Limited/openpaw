@@ -1,6 +1,6 @@
 [package]
 name = "openpaw-engine-host"
-description = "Shared OpenPaw host for Office and pinned OpenCode adapters; T0 placeholder, runtime planned for T3-T7."
+description = "Shared OpenPaw runtime for Office and pinned OpenCode adapters."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,46 @@ authors.workspace = true
 
 [features]
 default = []
-engine-host = []
+engine-host = ["dep:openpaw-core", "dep:openpaw-engine", "dep:openpaw-llm", "dep:openpaw-store", "dep:openpaw-tools", "dep:openpaw-memory", "dep:openpaw-goal-ledger", "dep:openpaw-sandbox", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:futures", "dep:serde", "dep:serde_json", "dep:toml", "dep:rusqlite", "dep:uuid", "dep:chrono", "dep:axum", "dep:same-file"]
+
+[dependencies]
+openpaw-core = { workspace = true, optional = true }
+openpaw-engine = { workspace = true, optional = true }
+openpaw-llm = { workspace = true, optional = true }
+openpaw-store = { workspace = true, optional = true }
+openpaw-tools = { workspace = true, optional = true }
+openpaw-memory = { workspace = true, optional = true }
+openpaw-goal-ledger = { workspace = true, optional = true }
+openpaw-sandbox = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["net", "signal"] }
+tokio-util = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+same-file = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[test]]
+name = "host_runtime"
+path = "tests/features/runtime.rs"
+required-features = ["engine-host"]
+
+[[test]]
+name = "host_recovery"
+path = "tests/regressions/recovery.rs"
+required-features = ["engine-host"]
+
+[[example]]
+name = "host_smoke"
+required-features = ["engine-host"]
 
 [lints]
 workspace = true

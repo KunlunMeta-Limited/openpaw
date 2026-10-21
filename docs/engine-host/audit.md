@@ -165,3 +165,10 @@ D35修复结果：0.103.16/1.0.10已锁定，原两包许可证实核、精确�
 ## T3开工只读复核（0004方案待审）
 
 Host仍占位。T1的llm::assemble_provider、RunObserver/SessionWriter与T2的ToolCallContext/ToolExecutionObserver、ToolRegistry/Environment可直接复用，无须改core/engine/sandbox。新增Host只负责绑定、接受/并发、持久审批、根资源和恢复。SkillManager::list_active会写telemetry，Host不能调用；FsSkillStore::list_scope与FsGoalStore::list_all旧容错列表会跳过坏记录，本次拟在原Store复用扫描/解析增加checked只读入口，不复制到Host。此为明确的能力延展，未新列D缺陷；实施发现真实缺陷另行登记。T2 PR #6已合入，但其Windows原生验证仍按原安排待补。具体逐文件原因、方法及H场景在CHG-2026-0004，尚未实施。
+
+
+### T3实施复用复核（0004已获批准，验收待完成）
+
+原AgentLoop/RunContext/RunObserver、Provider装配、SessionWriter/Reader/SessionDb、ToolRegistry与Environment、OS文件锁均直接复用；新增Host模块只管理核心没有的运行注册/绑定/审批消费/根锁/恢复及协议无关查询。Skill/Goal新增checked只读入口仍调用原解析器，不改旧容错列表；有界文本提取沿用原read_file，带行号输出保留。没有修改core/engine/sandbox/chat.rs，也未修改Office。
+
+新Host开发中已核查取消与状态竞争、真实句柄关闭、数据库故障锁存、根身份配置变更及索引损坏恢复；这些为本次新增实现的测试修正，不补造既有OpenPaw D编号。对照0004 H01—H12的准确交付与剩余限制以专用验证记录为准。
