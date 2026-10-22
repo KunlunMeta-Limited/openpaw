@@ -67,6 +67,8 @@ pub(crate) struct MainOffice {
     /// 复用连接且禁止重定向的客户端；页面代理不附业务 Bearer。
     pub(crate) client: Client,
     started: std::sync::atomic::AtomicBool,
+    // 由原版 gateway 的能力响应协商；不改变磁盘快照格式。
+    conversation_wire: std::sync::atomic::AtomicBool,
     projection_tx: mpsc::Sender<MainProjection>,
     projection_rx: Mutex<Option<mpsc::Receiver<MainProjection>>>,
     sessions: Mutex<HashMap<String, std::sync::Weak<crate::runtime::SessionHandle>>>,
@@ -161,6 +163,7 @@ impl MainOffice {
                 .build()
                 .expect("HTTP client"),
             started: std::sync::atomic::AtomicBool::new(false),
+            conversation_wire: std::sync::atomic::AtomicBool::new(false),
             projection_tx,
             projection_rx: Mutex::new(Some(projection_rx)),
             sessions: Mutex::new(HashMap::new()),
@@ -572,9 +575,72 @@ impl MainOffice {
         }
         record.conversation = Some(conversation.into());
         record.session = Some(session.into());
+        let seq = record.snapshot["seq"].as_u64().ok_or("办公室版本损坏")?;
+        record.snapshot["seq"] = Value::from(
+            seq.checked_add(1)
+                .filter(|seq| *seq <= 9_007_199_254_740_991)
+                .ok_or("办公室版本耗尽")?,
+        );
         self.save(&next)?;
         *records = next;
         Ok(())
+    }
+
+    /// 功能：按已协商的原版 main 协议生成出站快照。
+    /// 参数：snapshot 为 Host 原有内部快照。
+    /// 返回：旧协议原值或 conversations 形式的快照。
+    /// 错误：无；未绑定时输出空会话目录。
+    /// 状态：只读，不迁移持久记录。
+    /// 并发与取消：同步短锁，不等待网络。
+    /// 权限：会话身份仅来自办公室登记。
+    /// 关联：CHG-2026-0044。
+    pub(crate) fn wire_snapshot(&self, snapshot: &Value) -> Value {
+        if !self
+            .conversation_wire
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return snapshot.clone();
+        }
+        let record = snapshot["workspace"]["id"]
+            .as_str()
+            .and_then(|id| self.record(id).ok());
+        let conversations = record
+            .and_then(|record| record.conversation)
+            .map(|id| {
+                serde_json::json!([{
+            "id":id,"title":"主对话","employees":snapshot["employees"],"tasks":snapshot["tasks"],
+            "events":snapshot["events"],"whiteboard":snapshot["whiteboard"]}])
+            })
+            .unwrap_or_else(|| serde_json::json!([]));
+        serde_json::json!({"schemaVersion":"1.0","seq":snapshot["seq"],"workspace":snapshot["workspace"],
+            "system":snapshot["system"],"conversations":conversations})
+    }
+
+    fn wire_message(&self, mut message: Value) -> Value {
+        if !self
+            .conversation_wire
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return message;
+        }
+        if message["type"] == "offices.initialize" {
+            if let Some(snapshots) = message["offices"].as_array_mut() {
+                for snapshot in snapshots {
+                    *snapshot = self.wire_snapshot(snapshot);
+                }
+            }
+        } else if message["type"] == "office.snapshot" {
+            message["snapshot"] = self.wire_snapshot(&message["snapshot"]);
+        } else if message["type"] == "decision.request" || message.get("command").is_some() {
+            if let Some(conversation) = message["teamId"]
+                .as_str()
+                .and_then(|id| self.record(id).ok())
+                .and_then(|record| record.conversation)
+            {
+                message["conversationId"] = Value::from(conversation);
+            }
+        }
+        message
     }
 
     /// 功能：向固定 main gateway 发送原协议消息并保留实际状态及完整 data。
@@ -590,6 +656,7 @@ impl MainOffice {
         message: Value,
         timeout: Duration,
     ) -> Result<(u16, Value), String> {
+        let message = self.wire_message(message);
         fn valid(value: &Value, depth: usize) -> bool {
             depth <= 64
                 && match value {
@@ -637,6 +704,25 @@ impl MainOffice {
             return Err("main 响应 envelope 不合法".into());
         }
         let data = value["data"].clone();
+        if status == 200 && message["type"] == "office.capabilities" {
+            fn has_conversations(value: &Value) -> bool {
+                match value {
+                    Value::Object(fields) => {
+                        fields
+                            .get("properties")
+                            .and_then(Value::as_object)
+                            .is_some_and(|properties| properties.contains_key("conversations"))
+                            || fields.values().any(has_conversations)
+                    }
+                    Value::Array(values) => values.iter().any(has_conversations),
+                    _ => false,
+                }
+            }
+            self.conversation_wire.store(
+                has_conversations(&data["requests"]),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         if status >= 400
             && (!data["reasonCode"].is_string()
                 || !data["details"].is_object()
@@ -992,17 +1078,33 @@ impl MainOffice {
                             let Some(team) = action["teamId"].as_str() else {
                                 continue;
                             };
+                            let matching = office.record(team).ok().is_some_and(|record| {
+                                !office
+                                    .conversation_wire
+                                    .load(std::sync::atomic::Ordering::Acquire)
+                                    || action["conversationId"].as_str()
+                                        == record.conversation.as_deref()
+                            });
                             let content = match action["action"].as_str() {
                                 Some("actor.inspect" | "employee.inspect" | "dialog.action") => {
-                                    office.prepare_detail(team, action).await;
-                                    office.inspect(team, action)
+                                    if matching {
+                                        office.prepare_detail(team, action).await;
+                                        office.inspect(team, action)
+                                    } else {
+                                        serde_json::json!({"template":"detail-v1","title":"对话不匹配","description":"请返回原对话查看员工。","fields":[],"actions":[]})
+                                    }
                                 }
                                 _ => {
                                     serde_json::json!({"template":"detail-v1","title":"操作说明","description":"此操作尚未开放，未启动或修改任务。","fields":[],"actions":[]})
                                 }
                             };
+                            let presentation = if action["action"] == "conversation.delete" {
+                                serde_json::json!({"target":"result","success":false,"message":"本轮暂不支持删除主对话，历史已保留。"})
+                            } else {
+                                serde_json::json!({"target":"dialog","content":content})
+                            };
                             let response = serde_json::json!({"type":"ui.respond","interactionId":id,
-                                "presentation":{"target":"dialog","content":content}});
+                                "presentation":presentation});
                             tokio::select! { _ = shutdown.cancelled() => return,
                             _ = office.message(response,Duration::from_secs(5)) => {} }
                         }
@@ -2334,6 +2436,53 @@ mod tests {
 
     fn recording_dispatcher() -> (OfficeDispatcher, mpsc::Receiver<OfficeAction>) {
         OfficeDispatcher::recording()
+    }
+
+    #[tokio::test]
+    async fn main_conversation_wire_preserves_storage_and_scopes_decisions_and_actions() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let office = MainOffice::new(home.path(), workspace.path(), None);
+        let snapshot = office.directory().unwrap().remove(0);
+        let team = snapshot["workspace"]["id"].as_str().unwrap();
+        assert_eq!(office.wire_snapshot(&snapshot), snapshot);
+        office
+            .conversation_wire
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            office.wire_snapshot(&snapshot)["conversations"],
+            serde_json::json!([])
+        );
+        let state = crate::runtime::AppState::new(crate::protocol::HostConfig {
+            home: home.path().into(),
+            workspace: workspace.path().into(),
+            provider: "echo".into(),
+            ..Default::default()
+        });
+        let handle = state
+            .create_session(Some("echo"), None, None, Some("真实登记会话"))
+            .await
+            .unwrap();
+        office.bind(team, "real-conversation", &handle.id).unwrap();
+        let record = office.record(team).unwrap();
+        let wire = office.wire_snapshot(&record.snapshot);
+        assert_eq!(wire["conversations"][0]["id"], "real-conversation");
+        assert!(wire.get("employees").is_none());
+        assert!(record.snapshot.get("conversations").is_none());
+        for message in [
+            serde_json::json!({"teamId":team,"command":{"type":"actor.presentation.set"}}),
+            serde_json::json!({"teamId":team,"type":"decision.request","decision":{"id":"permission"}}),
+        ] {
+            assert_eq!(
+                office.wire_message(message)["conversationId"],
+                "real-conversation"
+            );
+        }
+        let reopened = MainOffice::new(home.path(), workspace.path(), None);
+        assert_eq!(
+            reopened.record(team).unwrap().conversation.as_deref(),
+            Some("real-conversation")
+        );
     }
 
     #[test]

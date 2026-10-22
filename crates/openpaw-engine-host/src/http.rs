@@ -104,6 +104,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/chat",
             post(main_chat).layer(axum::extract::DefaultBodyLimit::max(500_000)),
         )
+        .route(
+            "/api/pawoffice/workspaces",
+            post(main_create_workspace).layer(axum::extract::DefaultBodyLimit::max(4096)),
+        )
+        .route(
+            "/api/pawoffice/chat",
+            post(main_conversation_chat).layer(axum::extract::DefaultBodyLimit::max(524_288)),
+        )
         .route("/office", get(main_proxy))
         .route("/office/", get(main_proxy))
         .route("/office/{*path}", get(main_proxy))
@@ -414,6 +422,482 @@ fn main_history(handle: &SessionHandle) -> Vec<MainChatMessage> {
         history.drain(..2);
     }
     history
+}
+
+/// 功能：解析发布预览的工作空间创建请求。
+/// 关联：API-HOST-OFFICE-WORKSPACE-001、CHG-2026-0043。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainWorkspaceRequest {
+    /// 用户输入的工作空间名称，同时用作根目录下的单层目录名。
+    name: String,
+}
+
+/// 功能：在 Host 工作根目录下创建真实子目录并登记办公室。
+/// 参数：state 提供可信工作根目录；body 只接受 name。
+/// 返回：201 和原办公室快照；其他响应沿用 error JSON。
+/// 错误：名称非法400、已存在409、容量422、存储故障500。
+/// 状态：仅创建目录和办公室；不创建会话、不启动模型或工具。
+/// 并发与取消：admission 串行创建；同步登记失败只回收本次新建空目录。
+/// 权限：沿用统一 Basic 鉴权；输入不能选择根目录或复用已有目录。
+/// 关联：API-HOST-OFFICE-WORKSPACE-001、CHG-2026-0043。
+async fn main_create_workspace(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MainWorkspaceRequest>, JsonRejection>,
+) -> Response {
+    let Ok(Json(body)) = body else {
+        return bad(StatusCode::BAD_REQUEST, "工作空间请求格式错误");
+    };
+    let name = body.name.trim();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && matches!(stem.as_bytes()[3], b'1'..=b'9');
+    if name.is_empty()
+        || name.encode_utf16().count() > 40
+        || name.ends_with('.')
+        || reserved
+        || name
+            .chars()
+            .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c))
+    {
+        return bad(
+            StatusCode::BAD_REQUEST,
+            "名称需要1–40个字符，不能包含路径、非法字符或设备名",
+        );
+    }
+    let _admission = state.main_office.admission.lock().await;
+    let offices = match state.main_office.directory() {
+        Ok(offices) => offices,
+        Err(_) => return bad(StatusCode::INTERNAL_SERVER_ERROR, "办公室目录无法读取"),
+    };
+    if offices.iter().any(|office| {
+        office["workspace"]["name"]
+            .as_str()
+            .is_some_and(|existing| existing.to_lowercase() == name.to_lowercase())
+    }) {
+        return bad(StatusCode::CONFLICT, "这个工作空间名称已存在，请换一个名称");
+    }
+    if offices.len() >= 100 {
+        return bad(StatusCode::UNPROCESSABLE_ENTITY, "最多支持100个办公室");
+    }
+    let root = match std::fs::canonicalize(&state.config.workspace) {
+        Ok(root) => root,
+        Err(_) => return bad(StatusCode::INTERNAL_SERVER_ERROR, "工作空间根目录不可用"),
+    };
+    let path = root.join(name);
+    if let Err(error) = std::fs::create_dir(&path) {
+        return if error.kind() == std::io::ErrorKind::AlreadyExists {
+            bad(StatusCode::CONFLICT, "同名目录已存在，未覆盖任何文件")
+        } else {
+            bad(StatusCode::INTERNAL_SERVER_ERROR, "工作空间目录创建失败")
+        };
+    }
+    if let Err(error) = state.main_office.register(&path) {
+        let _ = std::fs::remove_dir(&path);
+        return if error == "办公室数量已达上限" {
+            bad(StatusCode::UNPROCESSABLE_ENTITY, error)
+        } else {
+            bad(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "办公室登记失败，未创建聊天",
+            )
+        };
+    }
+    match state.main_office.directory().ok().and_then(|offices| {
+        offices
+            .into_iter()
+            .find(|office| office["workspace"]["name"] == name)
+    }) {
+        Some(snapshot) => (
+            StatusCode::CREATED,
+            Json(state.main_office.wire_snapshot(&snapshot)),
+        )
+            .into_response(),
+        None => bad(StatusCode::INTERNAL_SERVER_ERROR, "办公室登记状态无法读取"),
+    }
+}
+
+/// 原版 main 的四种聊天操作；身份始终由已登记办公室解析。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct MainConversationChat {
+    version: String,
+    #[serde(rename = "type")]
+    kind: String,
+    team_id: String,
+    conversation_id: String,
+    #[serde(default)]
+    turn_id: String,
+    #[serde(default)]
+    messages: Vec<MainChatMessage>,
+    #[serde(default)]
+    cursor: String,
+    #[serde(default = "main_history_limit")]
+    limit: usize,
+}
+fn main_history_limit() -> usize {
+    20
+}
+
+fn main_chat_result(data: serde_json::Value) -> Response {
+    Json(serde_json::json!({"code":200,"msg":"OK","data":data})).into_response()
+}
+fn main_chat_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({"code":status.as_u16(),"msg":message,
+        "data":{"reasonCode":"BUSINESS_ERROR","details":{},"issues":[]}})),
+    )
+        .into_response()
+}
+
+// 只读取原运行时已经公布的消息与执行结果，包含旧版聊天的历史。
+fn main_conversation_turns(handle: &SessionHandle) -> Vec<serde_json::Value> {
+    let outcomes = handle.turn_outcomes();
+    let messages = handle.wire_messages();
+    let text = |id: &str, assistant: bool| -> String {
+        messages
+            .iter()
+            .filter(|message| {
+                message["info"]["id"].as_str().is_some_and(|value| {
+                    value == id
+                        || assistant
+                            && value
+                                .strip_prefix(&format!("{id}_"))
+                                .is_some_and(|suffix| suffix.parse::<u32>().is_ok())
+                })
+            })
+            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "text")
+            .filter_map(|part| part["text"].as_str())
+            .collect()
+    };
+    outcomes.iter().map(|outcome| {
+        let state = match outcome.state {
+            TurnState::Completed => "complete", TurnState::Failed => "error",
+            TurnState::Cancelled => "stopped", _ => "pending",
+        };
+        serde_json::json!({"id":outcome.user_message_id,"user":text(&outcome.user_message_id,false),
+            "assistant":text(&format!("msg_{}_{}_assistant",handle.id,outcome.turn_id),true),
+            "state":state,"error":if state=="error" {"本轮执行失败，请检查会话状态"} else {""}})
+    }).collect()
+}
+
+fn main_conversation_context(turns: &[serde_json::Value]) -> Vec<MainChatMessage> {
+    let mut context = turns
+        .iter()
+        .filter(|turn| turn["state"] == "complete")
+        .flat_map(|turn| {
+            [
+                MainChatMessage {
+                    role: "user".into(),
+                    content: turn["user"].as_str().unwrap_or("").into(),
+                },
+                MainChatMessage {
+                    role: "assistant".into(),
+                    content: turn["assistant"].as_str().unwrap_or("").into(),
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    while context.len() > 20
+        || context
+            .iter()
+            .map(|message| message.content.encode_utf16().count())
+            .sum::<usize>()
+            > 100_000
+    {
+        context.drain(..2);
+    }
+    context
+}
+
+// 每次订阅先发当前完整快照；断开只结束观察，不取消原执行。
+fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response {
+    let stream = futures::stream::unfold(
+        (
+            handle,
+            id,
+            None::<serde_json::Value>,
+            tokio::time::Instant::now() + Duration::from_secs(180),
+        ),
+        |(handle, id, mut previous, deadline)| async move {
+            if previous
+                .as_ref()
+                .is_some_and(|value| value["state"] != "pending")
+            {
+                return None;
+            }
+            loop {
+                let row = main_conversation_turns(&handle)
+                    .into_iter()
+                    .find(|row| row["id"] == id)?;
+                let event = if row["assistant"]
+                    .as_str()
+                    .unwrap_or("")
+                    .encode_utf16()
+                    .count()
+                    > 50_000
+                {
+                    serde_json::json!({"type":"snapshot","text":"","state":"error","message":"回复超过长度限制，请查看会话记录"})
+                } else {
+                    serde_json::json!({"type":"snapshot","text":row["assistant"],"state":row["state"],"message":row["error"]})
+                };
+                if previous.as_ref() != Some(&event) {
+                    previous = Some(event.clone());
+                    return Some((
+                        Ok::<_, Infallible>(format!("{event}\n")),
+                        (handle, id, previous, deadline),
+                    ));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    let event = serde_json::json!({"type":"snapshot","text":row["assistant"],"state":"error","message":"观察连接超时，请重新同步"});
+                    return Some((
+                        Ok(format!("{event}\n")),
+                        (handle, id, Some(event), deadline),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        },
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// 功能：适配未修改原版 main 的聊天、历史、恢复与显式停止。
+/// 参数：state 提供原运行时，body 提供办公室、对话、轮次和操作。
+/// 返回：结构化 JSON 或以 snapshot 开始的 NDJSON。
+/// 错误：非法请求400、其他主对话409、未知轮次404、存储/停止失败503。
+/// 状态：send 经原接收事务执行；其余操作不启动模型。
+/// 并发与取消：准入串行；断流不取消，cancel 只取消已验证轮次。
+/// 权限：统一 Basic 鉴权；工作目录、会话与审批来自原登记。
+/// 关联：CHG-2026-0044、原版 chatOperationSchema。
+async fn main_conversation_chat(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MainConversationChat>, JsonRejection>,
+) -> Response {
+    let Ok(Json(mut body)) = body else {
+        return main_chat_error(StatusCode::BAD_REQUEST, "聊天请求格式错误");
+    };
+    let valid_id = |id: &str| {
+        !id.is_empty()
+            && id.len() <= 100
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+    };
+    if body.version != "1.0"
+        || !valid_id(&body.team_id)
+        || !valid_id(&body.conversation_id)
+        || !matches!(body.kind.as_str(), "send" | "history" | "resume" | "cancel")
+        || body.kind != "history" && !valid_id(&body.turn_id)
+        || !(1..=50).contains(&body.limit)
+        || body.cursor.len() > 500
+    {
+        return main_chat_error(StatusCode::BAD_REQUEST, "聊天字段无效");
+    }
+    let admission = state.main_office.admission.lock().await;
+    let record = match state.main_office.record(&body.team_id) {
+        Ok(record) => record,
+        Err(_) => return main_chat_error(StatusCode::NOT_FOUND, "办公室不存在"),
+    };
+    let bound = record.conversation.as_deref() == Some(&body.conversation_id);
+    if body.kind == "history" && !bound {
+        return main_chat_result(
+            serde_json::json!({"turns":[],"nextCursor":"","hasMore":false,"activeTurnId":""}),
+        );
+    }
+    if record.conversation.is_some() && !bound {
+        return main_chat_error(StatusCode::CONFLICT, "本轮暂不支持其他主对话，请返回原对话");
+    }
+    let handle = if let Some(id) = record.session {
+        match state.get_typed(&id).await {
+            Ok(handle) => Some(handle),
+            Err(_) => return main_chat_error(StatusCode::SERVICE_UNAVAILABLE, "会话暂不可用"),
+        }
+    } else {
+        None
+    };
+    if body.kind == "send"
+        && (body.messages.is_empty()
+            || body.messages.len() > 21
+            || body.messages.len() % 2 != 1
+            || body.messages.iter().enumerate().any(|(index, message)| {
+                message.role != if index % 2 == 0 { "user" } else { "assistant" }
+            }))
+    {
+        return main_chat_error(StatusCode::BAD_REQUEST, "消息历史格式错误");
+    }
+    if body.kind == "send"
+        && body.messages.last().is_some_and(|message| {
+            message.content.trim().is_empty() || message.content.encode_utf16().count() > 4000
+        })
+    {
+        return main_chat_error(StatusCode::BAD_REQUEST, "输入需要1–4000个字符");
+    }
+    let handle = if let Some(handle) = handle {
+        handle
+    } else if body.kind == "send" {
+        if body.messages.len() != 1 {
+            return main_chat_error(StatusCode::CONFLICT, "对话历史与服务端不一致");
+        }
+        let handle = match state
+            .create_session(None, None, Some(record.workspace), Some("Office main"))
+            .await
+        {
+            Ok(handle) => handle,
+            Err(_) => return main_chat_error(StatusCode::SERVICE_UNAVAILABLE, "创建会话失败"),
+        };
+        if state
+            .main_office
+            .bind(&body.team_id, &body.conversation_id, &handle.id)
+            .is_err()
+        {
+            return main_chat_error(StatusCode::SERVICE_UNAVAILABLE, "对话绑定失败");
+        }
+        handle
+    } else {
+        return main_chat_error(StatusCode::NOT_FOUND, "轮次不存在");
+    };
+    let turns = main_conversation_turns(&handle);
+    if body.kind == "history" {
+        let end = if body.cursor.is_empty() {
+            turns.len()
+        } else {
+            match turns.iter().position(|turn| turn["id"] == body.cursor) {
+                Some(index) => index,
+                None => return main_chat_error(StatusCode::BAD_REQUEST, "历史游标无效"),
+            }
+        };
+        let start = end.saturating_sub(body.limit);
+        let rows = &turns[start..end];
+        let active = rows
+            .iter()
+            .find(|turn| turn["state"] == "pending")
+            .map(|turn| turn["id"].as_str().unwrap_or(""))
+            .unwrap_or("");
+        return main_chat_result(
+            serde_json::json!({"turns":rows,"nextCursor":if start>0 {rows[0]["id"].as_str().unwrap_or("")} else {""},"hasMore":start>0,"activeTurnId":active}),
+        );
+    }
+    let existing = turns.iter().position(|turn| turn["id"] == body.turn_id);
+    if body.kind == "cancel" {
+        let Some(outcome) = handle
+            .turn_outcomes()
+            .into_iter()
+            .find(|outcome| outcome.user_message_id == body.turn_id)
+        else {
+            return main_chat_error(StatusCode::NOT_FOUND, "轮次不存在");
+        };
+        if !outcome.state.is_terminal() {
+            handle.cancel_main_turn(&outcome.turn_id);
+        }
+        drop(admission);
+        let waited = tokio::time::timeout(Duration::from_secs(14), async {
+            loop {
+                if handle
+                    .turn_outcomes()
+                    .iter()
+                    .any(|value| value.turn_id == outcome.turn_id && value.state.is_terminal())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        return if waited.is_ok() {
+            main_chat_result(serde_json::json!({"stopped":true}))
+        } else {
+            main_chat_error(StatusCode::SERVICE_UNAVAILABLE, "停止尚未完成，请重新同步")
+        };
+    }
+    if body.kind == "resume" {
+        return if existing.is_some() {
+            main_conversation_stream(handle, body.turn_id)
+        } else {
+            main_chat_error(StatusCode::NOT_FOUND, "轮次不存在")
+        };
+    }
+    let latest = body.messages.pop().expect("validated messages");
+    if latest.content.trim().is_empty() || latest.content.encode_utf16().count() > 4000 {
+        return main_chat_error(StatusCode::BAD_REQUEST, "输入需要1–4000个字符");
+    }
+    let context_end = existing.unwrap_or(turns.len());
+    if body.messages != main_conversation_context(&turns[..context_end]) {
+        return main_chat_error(StatusCode::CONFLICT, "对话历史与服务端不一致");
+    }
+    if let Some(index) = existing {
+        if turns[index]["user"] != latest.content {
+            return main_chat_error(StatusCode::CONFLICT, "同一轮次不能更改输入");
+        }
+        return main_conversation_stream(handle, body.turn_id);
+    }
+    if let Ok(record) = state.main_office.record(&body.team_id) {
+        let _=state.main_office.message(serde_json::json!({"type":"office.snapshot","teamId":body.team_id,"snapshot":record.snapshot}),Duration::from_secs(2)).await;
+    }
+    let permissions = state.global_events.subscribe();
+    let response = schedule_turn(
+        state.clone(),
+        handle.id.clone(),
+        MessageRequest {
+            text: Some(latest.content),
+            message_id: Some(body.turn_id.clone()),
+            request_id: Some(body.turn_id.clone()),
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    if response.status() != StatusCode::NO_CONTENT {
+        return response;
+    }
+    let turn = response.headers()[OPENPAW_TURN_ID]
+        .to_str()
+        .expect("internal turn")
+        .to_string();
+    let stop = CancellationToken::new();
+    main_approval_bridge(
+        state.main_office.clone(),
+        body.team_id,
+        handle.clone(),
+        permissions,
+        stop.clone(),
+    );
+    let execution = handle.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            if execution
+                .turn_outcomes()
+                .iter()
+                .any(|outcome| outcome.turn_id == turn && outcome.state.is_terminal())
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                execution.cancel_main_turn(&turn);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stop.cancel();
+    });
+    main_conversation_stream(handle, body.turn_id)
 }
 
 async fn main_chat(
@@ -1970,6 +2454,228 @@ mod tests {
             std::fs::read(home.path().join("offices/registry.json")).unwrap(),
             b"broken registry"
         );
+    }
+
+    #[tokio::test]
+    async fn main_conversation_chat_supports_history_replay_pagination_and_resume() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("emoji", "confirm").await;
+        let call = |operation: serde_json::Value| {
+            let app = fixture.app.clone();
+            let mut body = serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":"current"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(operation.as_object().unwrap().clone());
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/pawoffice/chat")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response = call(serde_json::json!({"type":"history","cursor":"","limit":1})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let empty: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(empty["data"]["turns"], serde_json::json!([]));
+        assert!(fixture.model_seen.lock().await.is_empty());
+        let send = serde_json::json!({"type":"send","turnId":"turn-one","messages":[{"role":"user","content":"first"}]});
+        let response = call(send.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 500_000).await.unwrap();
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let answer = events.last().unwrap()["text"].as_str().unwrap().to_string();
+        assert_eq!(events.last().unwrap()["state"], "complete");
+        let calls = fixture.model_seen.lock().await.len();
+        let replay = call(send).await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let _ = to_bytes(replay.into_body(), 500_000).await.unwrap();
+        assert_eq!(fixture.model_seen.lock().await.len(), calls);
+        assert_eq!(call(serde_json::json!({"type":"send","turnId":"turn-one","messages":[{"role":"user","content":"changed"}]})).await.status(), StatusCode::CONFLICT);
+        let response = call(serde_json::json!({"type":"send","turnId":"turn-two","messages":[{"role":"user","content":"first"},{"role":"assistant","content":answer},{"role":"user","content":"second"}]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 500_000).await.unwrap();
+        let response = call(serde_json::json!({"type":"history","cursor":"","limit":1})).await;
+        let page: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 500_000).await.unwrap())
+                .unwrap();
+        assert_eq!(page["data"]["turns"][0]["id"], "turn-two");
+        assert_eq!(page["data"]["hasMore"], true);
+        let response = call(
+            serde_json::json!({"type":"history","cursor":page["data"]["nextCursor"],"limit":1}),
+        )
+        .await;
+        let earlier: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 500_000).await.unwrap())
+                .unwrap();
+        assert_eq!(earlier["data"]["turns"][0]["id"], "turn-one");
+        assert_eq!(earlier["data"]["hasMore"], false);
+        let response = call(serde_json::json!({"type":"resume","turnId":"turn-one"})).await;
+        let resumed: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 500_000).await.unwrap())
+                .unwrap();
+        assert_eq!(resumed["type"], "snapshot");
+        assert_eq!(resumed["state"], "complete");
+        let response = call(serde_json::json!({"type":"cancel","turnId":"turn-one"})).await;
+        let cancelled: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(cancelled["data"]["stopped"], true);
+        assert_eq!(call(serde_json::json!({"type":"send","turnId":"turn-three","conversationId":"other","messages":[{"role":"user","content":"other"}]})).await.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn main_conversation_disconnect_preserves_execution_and_explicit_cancel_stops_it() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("recover", "confirm").await;
+        let call = |operation: serde_json::Value| {
+            let app = fixture.app.clone();
+            let mut body = serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":"active"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(operation.as_object().unwrap().clone());
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/pawoffice/chat")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let response=call(serde_json::json!({"type":"send","turnId":"active-turn","messages":[{"role":"user","content":"hold"}]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&first).unwrap()["state"],
+            "pending"
+        );
+        drop(stream);
+        let id = fixture
+            .state
+            .main_office
+            .record(&fixture.team)
+            .unwrap()
+            .session
+            .unwrap();
+        let handle = fixture.state.get_typed(&id).await.unwrap();
+        assert!(handle.is_active());
+        let response = call(serde_json::json!({"type":"history","limit":20,"cursor":""})).await;
+        let page: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(page["data"]["activeTurnId"], "active-turn");
+        let response = call(serde_json::json!({"type":"resume","turnId":"active-turn"})).await;
+        drop(response);
+        assert!(handle.is_active());
+        let response = call(serde_json::json!({"type":"cancel","turnId":"active-turn"})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!handle.is_active());
+        assert_eq!(handle.turn_outcomes()[0].state, TurnState::Cancelled);
+        let restarted = AppState::new(fixture.state.config.clone());
+        let restored = restarted.get_typed(&id).await.unwrap();
+        assert_eq!(main_conversation_turns(&restored)[0]["state"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn main_workspace_creation_is_persistent_bounded_and_does_not_execute() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("emoji", "confirm").await;
+        let create = |name: &str| {
+            let app = fixture.app.clone();
+            let request = Request::builder()
+                .method("POST")
+                .uri("/api/pawoffice/workspaces")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({"name":name}).to_string()))
+                .unwrap();
+            async move { app.oneshot(request).await.unwrap() }
+        };
+        let response = create("  研发预览  ").await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(snapshot["workspace"]["name"], "研发预览");
+        assert!(fixture.workspace.path().join("研发预览").is_dir());
+        assert_eq!(snapshot["employees"], serde_json::json!([]));
+        for invalid in [
+            "",
+            "  ",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "a:b",
+            "CON",
+            "nul.txt",
+            "a.",
+            "a\nname",
+        ] {
+            assert_eq!(
+                create(invalid).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{invalid:?}"
+            );
+        }
+        assert_eq!(
+            create(&"字".repeat(41)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let (first, duplicate) = tokio::join!(create("Team A"), create("team a"));
+        assert_eq!(first.status(), StatusCode::CREATED);
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        std::fs::create_dir(fixture.workspace.path().join("Existing")).unwrap();
+        std::fs::write(fixture.workspace.path().join("Existing/keep.txt"), "keep").unwrap();
+        assert_eq!(create("Existing").await.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("Existing/keep.txt")).unwrap(),
+            "keep"
+        );
+        let reopened = crate::office::MainOffice::new(
+            &fixture.state.config.home,
+            &fixture.state.config.workspace,
+            None,
+        );
+        assert!(reopened
+            .directory()
+            .unwrap()
+            .iter()
+            .any(|office| office == &snapshot));
+        let registry = fixture.home.path().join("offices/registry.json");
+        let saved = std::fs::read(&registry).unwrap();
+        std::fs::remove_file(&registry).unwrap();
+        std::fs::create_dir(&registry).unwrap();
+        assert_eq!(
+            create("CannotSave").await.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(!fixture.workspace.path().join("CannotSave").exists());
+        std::fs::remove_dir(&registry).unwrap();
+        std::fs::write(&registry, saved).unwrap();
+        assert_eq!(fixture.state.main_office.directory().unwrap().len(), 3);
+        assert!(fixture.model_seen.lock().await.is_empty());
     }
 
     #[tokio::test]
