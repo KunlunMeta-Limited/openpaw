@@ -95,7 +95,7 @@ impl WebSearchAdapter for BingAdapter {
 /// 状态：只读，不发请求、不解码跳转、不写缓存。
 /// 并发与取消：纯内存有界扫描，无异步等待。
 /// 权限：不执行页面脚本，不放宽原网络URL/域名过滤。
-/// 关联：CHG-2026-0005第9.11节；D42。
+/// 关联：CHG-2026-0005第9.11节的搜索结果污染回归。
 pub fn parse_bing_html(html: &str, limit: usize) -> Vec<SearchResult> {
     let mut results = Vec::new();
     if limit == 0 {
