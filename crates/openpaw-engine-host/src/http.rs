@@ -796,6 +796,7 @@ async fn main_conversation_chat(
     };
     let turns = main_conversation_turns(&handle);
     if body.kind == "history" {
+        state.main_office.refresh_presentation(&handle.id);
         let end = if body.cursor.is_empty() {
             turns.len()
         } else {
@@ -2277,9 +2278,16 @@ mod tests {
                     },
                     Some("decision.request") => {
                         if choice == "pending" || choice == "child-pending" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") { std::future::pending::<()>().await; }
-                        let chosen = if choice == "by-conversation" { if body["conversationId"] == "a" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") {"reject"} else {"confirm"} } else if matches!(choice,"child-pending"|"child-timeout") {"confirm"}else{choice};
-                        serde_json::json!({"teamId":body["teamId"],"decisionId":body["decision"]["id"],"choiceId":chosen,
-                            "label":if chosen == "confirm" {"允许本次"} else {"拒绝"}})
+                        let chosen = if matches!(choice,"by-conversation"|"missing-conversation"|"child-pending"|"child-timeout") {"confirm"}else{choice};
+                        let mut response = serde_json::json!({"teamId":body["teamId"],"decisionId":body["decision"]["id"],"choiceId":chosen,
+                            "label":if chosen == "confirm" {"允许本次"} else {"拒绝"}});
+                        if body["conversationId"].is_string() && choice != "missing-conversation" {
+                            response["conversationId"] = if choice == "by-conversation" && body["conversationId"] == "a" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") {serde_json::json!("b")} else {body["conversationId"].clone()};
+                            if choice == "by-conversation" && body["conversationId"] == "a" && seen.lock().await.iter().filter(|m| m["type"] == "decision.request" && m["conversationId"] == "a").count() == 3 {
+                                response.as_object_mut().unwrap().remove("conversationId");
+                            }
+                        }
+                        response
                     },
                     _ => serde_json::json!({"forwarded":1}),
                 };
@@ -2351,7 +2359,8 @@ mod tests {
                     } else {serde_json::json!({"choices":[{"delta":{"content":if parent {"parent integrated"} else {"本轮任务已完成"}},"finish_reason":"stop"}]})};
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
-                if (scenario == "recover" && parent || scenario == "recover-registered" && !parent || scenario == "delegate-conversations" && !parent) && tools == 0 { gate.notified().await; }
+                let gated = if parent { scenario == "recover" } else { matches!(scenario,"recover-registered" | "delegate-conversations") };
+                if gated && tools == 0 { gate.notified().await; }
                 let call = if (scenario.starts_with("delegate") || scenario.starts_with("recover")) && parent && tools == 0 {
                     Some(("delegate_task",serde_json::json!({"name":"资料检索","task":if scenario == "delegate-repeat" {
                         format!("读取 README.md 并汇报：{}", messages[latest]["content"].as_str().unwrap_or(""))
@@ -2675,6 +2684,30 @@ mod tests {
         assert_eq!(a_members.len(), 2);
         assert_eq!(b_members.len(), 2);
         assert!(a_members.iter().all(|id| !b_members.contains(id)));
+        // B 的聚合快照应用后，也必须恢复 A 仍在执行的当前状态。
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let messages = fixture.seen.lock().await;
+                let latest = messages
+                    .iter()
+                    .rposition(|m| {
+                        m["type"] == "office.snapshot"
+                            && m["snapshot"]["conversations"]
+                                .as_array()
+                                .is_some_and(|items| items.len() == 2)
+                    })
+                    .unwrap();
+                if messages[latest + 1..].iter().any(|m| {
+                    m["conversationId"] == "a" && m["command"]["type"] == "actor.presentation.set"
+                }) {
+                    break;
+                }
+                drop(messages);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("背景更新后没有恢复前景会话状态");
         let cross = serde_json::json!({"id":"cross-conversation","teamId":fixture.team,"conversationId":"b","action":"employee.inspect","employeeId":a_members[1]});
         fixture.ui_actions.lock().await.push_back(cross);
         tokio::time::timeout(Duration::from_secs(6), async {

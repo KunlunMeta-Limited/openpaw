@@ -492,6 +492,19 @@ impl MainOffice {
         Ok(())
     }
 
+    fn directory_bytes(
+        &self,
+        records: &std::collections::BTreeMap<String, MainOfficeEntry>,
+    ) -> Result<usize, String> {
+        let wire = self
+            .conversation_wire
+            .load(std::sync::atomic::Ordering::Acquire);
+        serde_json::to_vec(&serde_json::json!({"type":"offices.initialize",
+            "offices":records.values().map(|entry|entry.snapshot(wire)).collect::<Vec<_>>()}))
+        .map(|bytes| bytes.len())
+        .map_err(|_| "办公室目录编码失败".into())
+    }
+
     /// 功能：在创建子会话前原子预留已绑定办公室的成员容量。
     /// 参数：parent 为可信父会话身份。
     /// 返回：main 绑定父返回预留 guard；原 feature/OpenWork 独立父返回 None。
@@ -509,7 +522,7 @@ impl MainOffice {
         }
         let mut guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
         let records = guard.as_mut().map_err(|error| error.clone())?;
-        let directory_bytes = serde_json::to_vec(&serde_json::json!({"type":"offices.initialize","offices":records.values().map(|entry|entry.snapshot(self.conversation_wire.load(std::sync::atomic::Ordering::Acquire))).collect::<Vec<_>>()})).map_err(|_|"办公室目录编码失败")?.len();
+        let directory_bytes = self.directory_bytes(records)?;
         let pending = records
             .values()
             .flat_map(MainOfficeEntry::all)
@@ -731,7 +744,7 @@ impl MainOffice {
                 .filter(|seq| *seq <= 9_007_199_254_740_991)
                 .ok_or("办公室版本耗尽")?,
         );
-        let bytes = serde_json::to_vec(&serde_json::json!({"type":"offices.initialize","offices":next.values().map(|entry|entry.snapshot(self.conversation_wire.load(std::sync::atomic::Ordering::Acquire))).collect::<Vec<_>>()})).map_err(|_|"办公室目录编码失败")?.len();
+        let bytes = self.directory_bytes(&next)?;
         if bytes + 4096 > 65536 {
             return Err("办公室快照发布容量不足（64 KiB），未启动新对话".into());
         }
@@ -1050,6 +1063,8 @@ impl MainOffice {
                 Some("decision.request") => {
                     status == 200
                         && data["teamId"] == message["teamId"]
+                        && (message.get("conversationId").is_none()
+                            || data["conversationId"] == message["conversationId"])
                         && data["decisionId"] == message["decision"]["id"]
                         && data["choiceId"].is_string()
                         && data["label"].is_string()
@@ -1135,6 +1150,44 @@ impl MainOffice {
         Ok(())
     }
 
+    /// 功能：续看历史时请求重新应用当前人物状态。
+    /// 参数：session 为已验证且已加载的主会话身份。
+    /// 返回：无；展示队列满时由原周期同步恢复。
+    /// 错误：无；未绑定或不在运行的会话忽略。
+    /// 状态：只排队现有快照，不写业务事实、不重放动作或执行工具。
+    /// 并发与取消：短同步锁和非阻塞队列，不阻塞聊天准入。
+    /// 权限：不接收浏览器人物或路径，按真实 Session 定位。
+    /// 关联：CHG-2026-0045、A6。
+    pub(crate) fn refresh_presentation(&self, session: &str) {
+        let handle = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .and_then(std::sync::Weak::upgrade);
+        let Some(handle) = handle.filter(|handle| handle.is_active()) else {
+            return;
+        };
+        let guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(records) = guard.as_ref() else { return };
+        let Some((team, record)) = records
+            .iter()
+            .flat_map(|(team, entry)| entry.all().map(move |record| (team, record)))
+            .find(|(_, record)| record.session.as_deref() == Some(session))
+        else {
+            return;
+        };
+        let _ = self.projection_tx.try_send(MainProjection {
+            team: team.clone(),
+            conversation: record.conversation.clone(),
+            snapshot: record.snapshot.clone(),
+            commands: Vec::new(),
+            expires: tokio::time::Instant::now() + Duration::from_secs(3),
+            cancel: handle.main_cancel_token(),
+            allow_cancelled: false,
+        });
+    }
+
     async fn publish_commands(&self, projection: &MainProjection) -> Result<(), String> {
         if projection.commands.is_empty() {
             return Ok(());
@@ -1212,8 +1265,8 @@ impl MainOffice {
             loop {
                 let projection = tokio::select! { biased;
                     _ = stop.cancelled() => break,
-                    projection = receiver.recv() => match projection {Some(projection)=>Some(projection),None=>break},
                     _ = interval.tick() => None,
+                    projection = receiver.recv() => match projection {Some(projection)=>Some(projection),None=>break},
                 };
                 let Some(office) = weak.upgrade() else {
                     break;
@@ -1245,6 +1298,13 @@ impl MainOffice {
                             && tokio::time::Instant::now() <= projection.expires
                         {
                             office.publish_commands(&projection).await?;
+                            // 聚合快照会重算当前页面的全部人物，来源会话动作不足以恢复其他活动会话。
+                            // 仅补当前状态；交接、拜访等瞬时动作仍只发送一次。
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                office.restore_presentations(),
+                            )
+                            .await;
                         }
                         return Ok(());
                     }
@@ -1338,7 +1398,7 @@ impl MainOffice {
                                         office.prepare_detail(team, action).await;
                                         office.inspect(team, action)
                                     } else {
-                                        serde_json::json!({"template":"detail-v1","title":"对话不匹配","description":"请返回原对话查看员工。","fields":[],"actions":[]})
+                                        serde_json::json!({"template":"detail-v1","title":"归属不匹配","description":"办公室不匹配或对话不存在，请返回原对话查看员工。","fields":[],"actions":[]})
                                     }
                                 }
                                 _ => {
