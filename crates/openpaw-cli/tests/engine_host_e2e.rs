@@ -124,7 +124,7 @@ fn invalid_config_and_sidecar_conflict_do_not_start() {
 }
 
 #[test]
-fn office_configuration_enables_real_v1_chat_and_cors() {
+fn office_configuration_enables_official_send_chat_and_cors() {
     let base = tempfile::tempdir().unwrap();
     let workspace = base.path().join("workspace 中文");
     std::fs::create_dir(&workspace).unwrap();
@@ -156,7 +156,7 @@ fn office_configuration_enables_real_v1_chat_and_cors() {
         .trim()
         .strip_prefix("openpaw engine host listening on http://")
         .unwrap();
-    let payload = r#"{"version":"1.0","teamId":"office-1","conversationId":"binary-test","messages":[{"role":"user","content":"真实HTTP回归"}]}"#;
+    let payload = r#"{"type":"send","version":"1.0","teamId":"office-1","conversationId":"binary-test","turnId":"binary-turn","messages":[{"role":"user","content":"真实HTTP回归"}]}"#;
     let mut socket = TcpStream::connect(address).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))

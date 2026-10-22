@@ -194,12 +194,36 @@ pub(super) fn protocol_value(value: &Value) -> bool {
 /// 字段：send/history/resume/cancel各自严格载荷。
 /// 来源去向：Node转发到Host协议入口。
 /// 约束：不默认为旧版send。
-/// 稳定性：Office 02dbac4。
+/// 稳定性：固定Office 02dbac4官方协议。
 /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
 pub(super) enum Operation {
+    /// 用途：可靠接受用户轮次并订阅真实运行。
+    /// 字段：严格校验的官方请求载荷。
+    /// 来源去向：Office Node转发至Host共享服务。
+    /// 约束：办公室与会话范围必须一致。
+    /// 稳定性：固定Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
     Send(ChatRequest),
+    /// 用途：只读分页查询原会话账本。
+    /// 字段：严格校验的官方请求载荷。
+    /// 来源去向：Office Node转发至Host共享服务。
+    /// 约束：办公室与会话范围必须一致。
+    /// 稳定性：固定Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
     History(HistoryRequest),
+    /// 用途：恢复已有轮次快照和增量订阅。
+    /// 字段：严格校验的官方请求载荷。
+    /// 来源去向：Office Node转发至Host共享服务。
+    /// 约束：办公室与会话范围必须一致。
+    /// 稳定性：固定Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
     Resume(ControlRequest),
+    /// 用途：显式取消并等待真实清理结束。
+    /// 字段：严格校验的官方请求载荷。
+    /// 来源去向：Office Node转发至Host共享服务。
+    /// 约束：办公室与会话范围必须一致。
+    /// 稳定性：固定Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
     Cancel(ControlRequest),
 }
 #[derive(Deserialize)]
@@ -208,7 +232,7 @@ pub(super) enum Operation {
 /// 字段：版本、办公室、会话、游标和页大小。
 /// 来源去向：Node到历史投影。
 /// 约束：不创建Session；limit为1到50。
-/// 稳定性：Office 02dbac4。
+/// 稳定性：固定Office 02dbac4官方协议。
 /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
 pub(super) struct HistoryRequest {
     /// 用途：官方聊天操作字段。
@@ -258,7 +282,7 @@ fn default_limit() -> usize {
 /// 字段：版本、办公室、会话及轮次。
 /// 来源去向：Node到原Run订阅或取消服务。
 /// 约束：查找必须绑定完整范围。
-/// 稳定性：Office 02dbac4。
+/// 稳定性：固定Office 02dbac4官方协议。
 /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
 pub(super) struct ControlRequest {
     /// 用途：官方聊天操作字段。

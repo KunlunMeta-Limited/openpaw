@@ -130,7 +130,7 @@ pub(super) async fn history(
 }
 /// 功能：映射官方聊天状态。
 /// 参数：run为真实Run视图。
-/// 返回：pending/complete/stopped/error。
+/// 返回：官方轮次状态pending、complete、stopped或error。
 /// 错误：无。
 /// 状态：只读，不把中断伪装恢复执行。
 /// 并发与取消：取消清理完成前保持pending。
