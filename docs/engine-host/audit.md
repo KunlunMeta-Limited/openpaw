@@ -181,3 +181,5 @@ Host仍占位。T1的llm::assemble_provider、RunObserver/SessionWriter与T2的T
 | D39 | send/resume接受拒绝原用409/503，Office按官方协议转通用502；仅六类可恢复拒绝用HTTP200单条官方error，安全白名单，无新Run/假done；前置4xx和存储503、JSON控制操作保留 | host_office修复前409不满足官方错误事件断言；修复后覆盖请求/历史冲突、忙、容量、缺失及无副作用；真实双浏览器与完整结果见0005验证记录 |
 
 复用判定：延展原live/Store、原错误分类、原Office事件和原产品runner；新增仅Host内部展示累积器与接受错误私有映射。无独立解析器/存储/Provider或Office改动。D36/D37仍开放，T4仅只读工具，不因通过本轮测试关闭shell清理风险。
+
+r6修复实现6530dec的D38/D39已获定向、完整27项和实际网页/在线DeepSeek验证；属于“修复已验证、待交付与PR审核”，不伪造已合入关闭。D36/D37仍开放，Windows原生未执行。原失败报告及复验哈希见0005验证记录。

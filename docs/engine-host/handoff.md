@@ -189,3 +189,5 @@ D37 Linux取消回归间歇失败必须在开放shell前定位修复并稳定验
 用户已批准0005 r6（准确对象见该单首页），本轮仅D38/D39和原T4.2网页验收扩充。RunText在Host内统一live/原JSONL投影消息边界，原消息事实与数据库版本不变；旧浏览器缓存须官方history同步。send/resume六类可恢复接受拒绝改HTTP200单条官方error；直连客户端必须检查事件，不能只认HTTP成功。前置4xx、存储故障及history/cancel的JSON语义不变；原Office仍可能把上游非2xx映射通用502。
 
 测试延展原host_office及office-product.mjs，后者使用固定Office原服务/独立Chromium验证Markdown复制、草稿/搜索/键盘、25轮分页失败原游标重试和双浏览器历史冲突；失败报告保留，准确结果见0005验证记录。在线DeepSeek另记，不冒充确定性Provider结果。当前未获得本轮交付验收、无T4 PR、不进入T5；Office所有申请仍暂缓，Windows原生未执行，D36/D37继续开放。
+
+r6本轮技术证据：`6530dec02b331965e5e64e1d75aa3eaae5bfa7f3`完整27/27，报告`/home/cheng/.cache/t4-r6-full-20261022-b/report.json`；线上8765已运行同源稳定二进制，home升级前完整备份在`artifacts/live-office-20261022-r6/host-home-before`。在线证据`artifacts/t4-r6-deepseek-20261022-b/`含既有缓存前后、DeepSeek消息与任务中心截图、视频/trace/账本对账。Office仍冻结02dbac4，不改其文件；当前交付验收pending，无PR/合入。最终含本段文档的版本须另完整检查，报告以专用记录指向的最终路径为准。
