@@ -201,3 +201,19 @@ Host默认五项与两层配置校验未开放Web、模型缺当前时间属于�
 真实8765/DeepSeek调用web_search的tool_result第一项包含“rguments.length”等大段脚本，模型明确反馈搜索无有效天气条目。证据：`artifacts/t4-r7-deepseek-20261022-b/本轮专用会话.jsonl`，call `call_00_B8MtJSVzQJ7t6ryl6lcb5779`；c轮独立再现。源码`web_search/adapters/bing.rs::parse_bing_html`遍历`html.split("class=\"b_algo\"")`，连结果容器前的首段也走宽泛href/标题兜底，页面脚本可进入输出并消耗模型上下文；不能由HTTP200/非空列表认定有效结果。
 
 本轮r7未修改该适配器，不写已修复/已关闭。拟在同一T4主CHG后续修订中登记准确适配器/既有测试路径与批准对象：只解析真实结果容器，剔除script/style等非结果，零结果/挑战页保留明确语义；扩充原web_search_e2e的无b_algo、头部脚本加真实结果、相邻结果及原重定向/域名过滤回归，再用真实网络验证。不能用Host临时字符串清洗或降低断言掩盖。当前天气查询通过实际web_fetch获得有效来源，不等于该搜索缺陷已解决。
+
+
+### D43：已启用能力下旧会话仍沿用“无联网/时钟”断言（现场复现，待修正）
+
+用户原session `50f53b9517a94dac9aefde208f73d58c`含多轮r7前否定能力的assistant历史；升级后短句追问仍重复否定。2026-10-22真实8765浏览器原会话重现，`artifacts/t4-r7-existing-before-20261022-a/report.json`failed，无Web任务；不是Office预览，也不是新模型配置未加载。源码确认每Run已构建当前system和工具，原r7提示未明确旧自述与本轮能力的优先关系；此前只测新会话漏此路径。
+
+拟仅增强原Host私有system的能力/历史边界，原引擎仍决策并实际调用允许工具；原历史不清空、不写伪事实。回归覆盖禁网历史→同根同Session启用→再次关闭及原网页短句/刷新连续追问。模型是否遵守以在线真实旧会话为准，捕获system字段存在不能单独判为修好；不通过重写历史、强制每个问题联网或天气硬编码修补。
+
+
+### D43复核与D44：实际请求对比（2026-10-22，仍待修复）
+
+仅增强Host开头system的候选在原对话短句“长沙天气”真实浏览器仍失败：`artifacts/t4-d43-existing-after-20261022-a/report.json`，无Web调用。原先“明确历史边界即可解决”的私有方案不成立；runtime 16项通过只证明结构，不能作为模型实际使用工具的证据。
+
+用隔离复制的同Session、原Host/AgentLoop/OpenAiProvider截获实际HTTP正文：当前时钟与七项tool均存在，末条真实用户问题不变。用户原生DeepSeek端点上同历史temperature=0对比：原开头/短中文开头各零tool_calls；相同可信system放到当前用户文本前，两次均请求web_search/web_fetch。诊断没有执行工具，不能当作天气或浏览器成功；D43保持开放。证据：`artifacts/t4-d43-wire-diagnostic-20261022-a/{actual-wire-body.json,native-compare.json,manifest.json}`；不含模型凭据，隔离数据未回写原会话。
+
+D44：CompletionRequest.system_blocks已有“优先于system”的公开约定，而openpaw-llm/src/openai.rs::build_messages完全忽略它；这不等于原Host本轮信息丢失（原Host未设置blocks），但阻碍使用既有动态上下文接口。拟在0005第9.11节r8补齐原Provider及实际wire回归、Host私有委托；D42在原Bing解析器独立修复。新增范围均待人工审核，尚未实施，不借r7批准越界。Office不改，D36/D37仍开放。
