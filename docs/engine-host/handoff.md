@@ -43,7 +43,7 @@
 | 场景步骤 | 真实执行/存储证据（Session/Run/call） | 聊天/messages/seq证据 | 页面截图/文件哈希/进程证据 | 状态/未通过原因 |
 |---|---|---|---|---|
 
-说明实际支持的按钮和动画。任务/白板必须来自真实运行，人物是功能角色；202/forwarded/delivered分别不是页面应用/动画完成/副作用成功。T4/T5产品演示必须真服务真浏览器；T0的Schema夹具只证明协议基线。R1未获批时写明180秒/刷新取消，不以SDK通过代替Office产品旅程。
+说明实际支持的按钮和动画。任务/白板必须来自真实运行，人物是功能角色；202/forwarded/delivered分别不是页面应用/动画完成/副作用成功。T4/T5产品演示必须真服务真浏览器；T0的Schema夹具只证明协议基线。新版写明180秒单连接与history/resume/cancel；旧R1四URL不实施，不以SDK通过代替Office产品旅程。
 
 ## 验证
 
@@ -122,7 +122,7 @@ Host命令保持openpaw engine-host --config /absolute/path/host.toml。TOML明�
 
 配置实现提交f70d43763c24c595d44c0b6ee6bdea52c2de2760已通过Linux原26项全量，见0005专用验证记录与仓库外准确head报告。Windows原生没有环境，未计通过；真实DeepSeek只在用户填入密钥后连接。该结果仅覆盖配置子范围，不改变T4/M4和Office页面未接入的状态。
 
-## 当前T4实施交接：官方v1聊天与真实投影（0005 r3）
+## 历史T4 r3旧版交接（仅旧b221a44；新版见本文末r4）
 
 用户明确“那继续完成T4”，本轮在同一0005内恢复原完整方案，保留r2统一模型配置；不修改Office原工程。T3历史待审文字保留当时语境，当前#7已实际合入。T4用户交付验收、PR审核和合入仍待发生。
 
@@ -152,3 +152,14 @@ OPENPAW_NPM_CLI=<npm11的npm-cli.js路径，可自动从PATH或标准布局发�
 runner的本地OpenAI协议fixture只用于确定性测试模型：回答取自原read_file真实结果（两个随机文件标记），不能直接写浏览器答案/伪造快照。真实DeepSeek验证另外保存。产物含命令与退出码、模型请求、浏览器POST和被动CDP NDJSON、官方messages/read结果、截图、录像、trace、原JSONL与host.db；密钥不采集。CDP只观察网络，不能clone/tee fetch保活，否则会破坏停止测试。
 
 v1限制保留：浏览器180秒预算，刷新/断线取消，无Run ID/续接游标；T5才交付菜单/详情/写入审批，R1长任务扩展须按Rx另行批准。Windows原生本机未执行，不能据脚本可移植或Linux结果记通过。准确结果与剩余项见0005专用验证记录。
+
+## 当前T4 r4实施交接（新版协议，尚待产品验收）
+
+Office固定02dbac4419e325efda9fa6293060037bd60da5e5；隔离源码/home/cheng/.cache/ai-office-react-latest-20261022-v2。旧r3直连/VITE配置/断开取消说明仅适用于旧版，不用于新版部署。Host运行时用实际监听地址注册chat.url；浏览器始终走Office同源/api/pawoffice/chat。四操作/状态/容量/安全按master第4节，0005第9.7节是本轮实施依据。
+
+T5须复用本轮conversationId目录、turn/Run映射和每办公室seq，实现带conversationId的单ui.next、审批/详情/删除；当前删除不支持。T6负责>180秒重连、并发订阅/慢消费者、磁盘及崩溃加固，不实施旧R1四URL。原用户Office两文档和OpenPaw旧工作区不改。Windows原生用户暂缓，不记通过。新代码/真实浏览器/完整验证结果待本轮完成后登记，不沿用旧版测试。
+
+
+新版操作方法：保持OpenPaw原生.env；Host TOML的office.base_url填Office Node根地址，office.api_key_env引用PAWOFFICE_专用系统变量，allowed_origins仍填浏览器准确源。先启动任一服务均可，Host会重试同步。Office原生npm ci、npm run build:full、Node server/dist/index.js启动，不设置旧VITE聊天地址；打开/office/后选择办公室、新会话并发送。Host实际端口自动注册；同办公室可切换A/B，刷新history→resume，停止按钮显式cancel。删除按钮对应后端T5尚未实现，不能用于本阶段验收。
+
+产品脚本仍为node tests/engine-host-contracts/office-product.mjs，沿用上面的OPENPAW_OFFICE_SOURCE/CHROMIUM/NPM_CLI和输出变量；来源必须含02dbac4。新版runner在全新浏览器操作会话、真实读取文件、切换/刷新/停止、另一个浏览器发现会话，并保存网络、场景导出、录像、官方快照和原JSONL。确定性Provider用于自动化，用户真实模型另做网页验收，互不代替。

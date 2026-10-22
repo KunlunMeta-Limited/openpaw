@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { officeRequestSchema, officeSnapshotSchema, officeErrorResultSchema, officeResultSchema, officeUiActionSchema } from './upstream-office/packages/protocol/src/office-integration.ts'
-import { chatRequestSchema, chatEventSchema } from './upstream-office/packages/protocol/src/chat.ts'
+import { chatRequestSchema, chatEventSchema, chatOperationSchema, chatHistoryPageSchema, chatCancelResultSchema } from './upstream-office/packages/protocol/src/chat.ts'
 import { assertProtocolValue, responseEnvelopeSchema } from './upstream-office/packages/protocol/src/schema.ts'
 import { relayMessageSchema } from './upstream-office/packages/protocol/src/relay.ts'
 
@@ -38,10 +38,9 @@ test('snapshot default normalization is stable and full replacement clears omiss
   const once = officeSnapshotSchema.parse(f.snapshot)
   assert.deepEqual(officeSnapshotSchema.parse(once), once)
   assert.equal(once.system.cpuPercent, -1)
-  assert.equal(once.whiteboard.title, '')
+  assert.equal(once.conversations[0].whiteboard.title, '')
   const minimal = officeSnapshotSchema.parse({ schemaVersion: '1.0', seq: 2, workspace: f.snapshot.workspace })
-  assert.deepEqual(minimal.tasks, [])
-  assert.deepEqual(minimal.employees, [])
+  assert.deepEqual(minimal.conversations, [])
   assertProtocolValue(minimal)
 })
 
@@ -50,7 +49,7 @@ test('upstream rejects invalid seq, mismatched team, dangling assignee and unkno
     assert.equal(officeSnapshotSchema.safeParse({ ...f.snapshot, seq }).success, false)
   }
   assert.equal(officeRequestSchema.safeParse({ type: 'office.snapshot', teamId: 'other', snapshot: f.snapshot }).success, false)
-  assert.equal(officeSnapshotSchema.safeParse({ ...f.snapshot, tasks: [{ ...f.snapshot.tasks[0], assigneeId: 'missing' }] }).success, false)
+  assert.equal(officeSnapshotSchema.safeParse({ ...f.snapshot, conversations: [{...f.snapshot.conversations[0], tasks:[{...f.snapshot.conversations[0].tasks[0],assigneeId:'missing'}]}] }).success, false)
   assert.equal(officeRequestSchema.safeParse({ type: 'office.read', teamId: 'office-1', invented: true }).success, false)
 })
 
@@ -64,10 +63,13 @@ test('upstream enforces no-null, reserved keys and depth independently of DTO pa
 
 test('chat requests/events and limits use real schemas; v1 cannot carry invented run IDs', () => {
   chatRequestSchema.parse(f.chatRequest)
+  for(const op of [f.chatRequest,f.historyRequest,f.resumeRequest,f.cancelRequest]) chatOperationSchema.parse(op)
+  chatHistoryPageSchema.parse(f.historyPage)
+  chatCancelResultSchema.parse({stopped:true})
   for (const event of [...f.chatEvents, f.chatError]) {
     assertProtocolValue(event)
     chatEventSchema.parse(event)
-    assert.ok(JSON.stringify(event).length <= 32000)
+    assert.ok(JSON.stringify(event).length <= 350000)
   }
   assert.equal(chatRequestSchema.safeParse({ ...f.chatRequest, runId: 'invented' }).success, false)
   assert.equal(chatEventSchema.safeParse({ type: 'delta', text: 'x'.repeat(16001) }).success, false)

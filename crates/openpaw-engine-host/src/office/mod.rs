@@ -6,6 +6,7 @@ mod chat;
 mod client;
 mod dto;
 mod projection;
+mod turns;
 
 use crate::{HostConfig, HostError, HostResult};
 use serde::{Deserialize, Serialize};

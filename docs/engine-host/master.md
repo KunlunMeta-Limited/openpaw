@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-状态：T0—T3本轮批准范围已合入（T3 #7，d11b944）；历史Windows暂缓未记通过。T4按CHG-2026-0005 r3继续实施：统一.env、官方聊天与持久快照已落地，真实网页已验证DeepSeek读取两文件、追问和停止，以及任务/人物/白板同步；Linux准确提交27/27及真实DeepSeek网页已通过，M4待人工验收、Windows未执行、无T4 PR。T5—T8未开始。修订日期：2026-10-22。
+状态：T0—T3本轮批准范围已合入（T3 #7，d11b944）；历史Windows暂缓未记通过。T4按CHG-2026-0005 r4适配新版Office：四操作聊天、稳定turn、每会话快照与同办公室并行实施中；旧版r3证据仅作历史，新版全量与真实浏览器尚待验证。M4未完成、Windows原生按用户安排暂缓、无T4 PR。T5—T8未开始。修订日期：2026-10-22。
 
 本文件同时服务人工评审和 coding agent：先明确真实协议、用户行为与系统边界，再定义实现方法、产物、测试和 PR 交接。下文均是待实施要求；不能将设计、fixture 通过或 feature 连线描述为功能已交付。用户提供的 master-plan 仅作为参考材料。
 
@@ -28,7 +28,7 @@
 |---|---|---|
 | OpenPaw 初始审核 | 60a531a51172d14fc3db1a8e7eb6762c2c8369d8 | 引擎、Provider、工具、存储可复用；Host 当时只有占位说明 |
 | OpenPaw 当前集成基线 | d11b944073ea3c3bc8cf3dac308e435647e6ee52 | T0 #4、T1 #5、T2 #6、T3 #7已合入；Windows待验和用户本轮安排保留，当前状态见14.1 |
-| Office | b221a44ce22fe08956356b5002d17df59a6a4f50 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
+| Office | 02dbac4419e325efda9fa6293060037bd60da5e5 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
 | OpenCode SDK | @opencode-ai/sdk 1.18.15 | 精确版本、integrity、lockfile 和真实 v1 类型 |
 | 集成分支 | merge/ai-ofice-react-overagent | OpenPaw Tx PR 的目标分支，保留现有 ofice 拼写 |
 
@@ -36,13 +36,13 @@
 
 | 来源编号 | 固定版本资料                                                                                                                                                                              | 本项目必须落实的内容                                 |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| S0   | [README](https://github.com/KunlunMeta-Limited/ai-office-react/blob/b221a44ce22fe08956356b5002d17df59a6a4f50/integration/README.md)                                                 | 外部业务后端身份、服务模式、完整阅读链                        |
-| S1   | [office-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/b221a44ce22fe08956356b5002d17df59a6a4f50/integration/docs/office-integration.md)                 | 七类业务操作、完整流程、快照版本、审批、UI、错误与恢复               |
-| S2   | [dashboard-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/b221a44ce22fe08956356b5002d17df59a6a4f50/integration/docs/dashboard-integration.md)           | 成员、任务、事件、人物绑定、进度、白板与展示边界                   |
-| S3   | [message-relay.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/b221a44ce22fe08956356b5002d17df59a6a4f50/integration/docs/message-relay.md)                           | 部署、认证、浏览器 SSE、容量、服务重启和访问控制                 |
-| S4   | [chat-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/b221a44ce22fe08956356b5002d17df59a6a4f50/integration/docs/chat-integration.md)                     | 聊天请求/NDJSON、长度、历史、停止、180 秒限制、IndexedDB     |
-| S5   | [office-integration.ts](https://github.com/KunlunMeta-Limited/ai-office-react/blob/b221a44ce22fe08956356b5002d17df59a6a4f50/packages/protocol/src/office-integration.ts) 及关联 Schema | 精确字段、默认值、strictObject、枚举、引用、响应类型           |
-| S6   | [plugin-runtime.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/b221a44ce22fe08956356b5002d17df59a6a4f50/docs/plugin-runtime.md)                                     | 场景 v2、能力、参与者、命令 ID、活动与队列                   |
+| S0   | [README](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/README.md)                                                 | 外部业务后端身份、服务模式、完整阅读链                        |
+| S1   | [office-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/office-integration.md)                 | 七类业务操作、完整流程、快照版本、审批、UI、错误与恢复               |
+| S2   | [dashboard-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/dashboard-integration.md)           | 成员、任务、事件、人物绑定、进度、白板与展示边界                   |
+| S3   | [message-relay.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/message-relay.md)                           | 部署、认证、浏览器 SSE、容量、服务重启和访问控制                 |
+| S4   | [chat-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/chat-integration.md)                     | 聊天请求/NDJSON、长度、历史、停止、180 秒限制、IndexedDB     |
+| S5   | [office-integration.ts](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/packages/protocol/src/office-integration.ts) 及关联 Schema | 精确字段、默认值、strictObject、枚举、引用、响应类型           |
+| S6   | [plugin-runtime.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/docs/plugin-runtime.md)                                     | 场景 v2、能力、参与者、命令 ID、活动与队列                   |
 | S7   | integration/clients/client.mjs、ui-client.mjs                                                                                                                                        | 外部客户端调用方法；示例数据不作为真实业务实现复制                  |
 | S8   | tests/README.md、tests/integration-e2e/README.md                                                                                                                                     | 真实 HTTP/浏览器验收；现有 Docker 入口不等于 Windows 原生验收 |
 
@@ -76,13 +76,13 @@ audit/r1-chat/handoff 已同步为条件提案；达到扩展体验需要修改�
 | 用户实际要做的事 | 页面可见结果及真实依据 | 协议与交付阶段 | 首期边界 |
 |---|---|---|---|
 | 选择办公室，开始工作 | 稳定办公室目录、成员、空闲/最近任务和白板 | capabilities → initialize → read；T3/T4 | 默认四间，各绑定配置的授权根；不新建租户 |
-| 提问并继续追问 | 增量文本、同一对话上下文、停止按钮；账本可查 | 官方 chat v1 JSON/NDJSON；T1/T3/T4 | 180秒总时限，刷新取消；长任务续接须 R1 |
+| 提问并继续追问 | 增量文本、同一对话上下文、停止按钮；账本可查 | 官方四操作 chat JSON/NDJSON；T1/T3/T4 | 每连接180秒，刷新history→resume；显式cancel |
 | 让助手阅读项目并给出结论 | 任务从等待到运行，文件功能人物工作，白板显示当前工作；回答引用真实文件 | AgentLoop/工具事实 → 完整 snapshot；T2/T3/T4 | T4只开放核实的只读工具，不用随机数据展示进度 |
 | 让助手写一份报告/执行获准命令 | 审批菜单说明实际操作；批准后才执行，拒绝后文件不变；可查真实产物 | decision.request + 共享 Approval + snapshot；T2/T3/T5 | 仅开放已验收工具；不执行超出授权根或不可落实的受限操作 |
 | 看人物分工和交接 | 工作/思考/空闲、任务气泡、真实功能派发产生的跨人物拜访、有限发言 | snapshot + task.assigned，由 sceneBridge 自动 visit；必要时 scene.say；T4/T5 | 人物代表功能角色，同一 Run 仍是一个 AgentLoop；不宣称多 Agent 协作 |
 | 点击人物、成员查看工作依据 | detail-v1 中查看任务、历史、工具结果、文件及 Skill/Goal/Todo；能分页/返回 | ui.next → 共享只读查询 → ui.respond；T5 | 使用已有详情入口；不增加侧栏和富文本；只读数据不能借查询初始化/修改 |
-| 在另一办公室同时提问，或停止一个任务 | 其他对话继续；被停止任务实际清理后结束，任务状态说明取消原因 | 共享 Run/锁/取消 + v1 abort；T1/T2/T3/T5 | 同办公室/同 Session 只一个活动 Run；默认总容量四个 |
-| 断网或重启后继续使用 | 保留真实记录和最新任务；未完 Run 说明中断；Office恢复最新完整快照 | JSONL/Host恢复 + initialize/snapshot/read；T3/T6 | 不自动重放工具；v1不能接回原生成，重试属于新的用户请求 |
+| 在另一办公室同时提问，或停止一个任务 | 其他对话继续；被停止任务实际清理后结束，任务状态说明取消原因 | 共享 Run/锁/取消 + 官方cancel；T1/T2/T3/T5 | 同Session一个活动Run；同办公室可多会话并行；默认总容量四个 |
+| 断网或重启后继续使用 | 保留真实记录和最新任务；未完 Run 说明中断；Office恢复最新完整快照 | JSONL/Host恢复 + initialize/snapshot/read；T3/T6 | 不自动重放工具；通过history/resume接回原Run；Host崩溃不重放执行 |
 | 点击任务的开始/暂停/完成/改派 | 返回准确的能力说明与可用操作建议 | ui.next + detail-v1；T5 | 首期不实现旧 Run 重放、可恢复暂停、手动伪完成、执行所有权迁移；按钮不是已支持命令 |
 
 里程碑状态及PR追踪统一见[第14节](#milestones)，当前T0—T3本轮批准范围已合入，Windows待补；T4 r3完整接入已按用户指令实施，交付验收待核查；[第14.2节](#protocol-checklist)给出Tx到官方文档/实施章节/验收证据的核查表。
@@ -107,7 +107,7 @@ Office 的地图编辑、家具互动、任意移动、独立会议、持续 foc
 | 6 | 在第二间办公室执行任务，停止第一间的慢命令 | 审批真实命令后执行；取消进程树并回收；Session和根锁隔离 | 第一间显示取消/清理原因，第二间继续；进程检查证明无残留，不能只看页面颜色 |
 | 7 | 重启Office，再重启有活动Run的Host | 从持久化状态重建快照；活动Run变interrupted，审批失效 | 最新状态恢复、没有重复文件写入/旧菜单生效；v1刷新后不伪装续接 |
 
-步骤1—2是T4演示；步骤3—6是T5完整演示；步骤7在T6加固；T8在Linux与Windows各执行一次完整旅程。v1演示的每次Run设计在180秒内，审批测试留足余量；超过时限、刷新和断线另作边界用例。要宣称“长时间工作且刷新续接”的产品，必须另行获得R1批准并通过扩展验收，不能删去这一条件。
+步骤1—2是T4演示；步骤3—6是T5完整演示；步骤7在T6加固；T8在Linux与Windows各执行一次完整旅程。v1演示的每次Run设计在180秒内，审批测试留足余量；超过时限、刷新和断线另作边界用例。新版官方协议已提供history/resume/cancel，T4必须适配基础恢复；T6验收超过180秒和故障加固，不需要旧R1四URL扩展。
 
 ~~~mermaid
 flowchart LR
@@ -137,8 +137,8 @@ flowchart LR
 ~~~mermaid
 flowchart TB
     U[用户] --> B[Office 浏览器]
-    B -->|配置的聊天地址：POST JSON| C[Host：Office 聊天适配器]
-    C -->|NDJSON 文本与终态| B
+    B <-->|同源 POST /api/pawoffice/chat| F[Office Fastify]
+    F <-->|注册的chat.url：JSON / NDJSON| C[Host：Office 聊天适配器]
     B -->|内部 reply 与 ui| F[Office Fastify]
     F -->|Office 原有 SSE| B
     A[Host：Office 业务适配器] -->|官方 messages API| F
@@ -151,7 +151,7 @@ flowchart TB
 ~~~
 
 - OpenPaw Host 充当 S1 的“外部业务后端”，不是另建 Office 服务。
-- 聊天：浏览器主动调用 Host；Office Fastify 默认不提供聊天生成。Host 提供 /office/chat，这是本项目地址选择，非 Office 强制路径。
+- 聊天：浏览器调用Office同源POST /api/pawoffice/chat；Fastify转发到Host通过offices.initialize.chat.url注册的/office/chat。模型仍只在Host执行，不依赖VITE_PAWOFFICE_CHAT_URL。
 - 展示和操作：Host 调用 POST /api/pawoffice/messages；Office 自己管理 GET /api/pawoffice/events、POST /api/pawoffice/reply、POST /api/pawoffice/ui。Host 不伪装浏览器回报，不直接接管内部 SSE。
 - Office 主入口由浏览器建立 workspace=1 订阅。仅 teams=… 的场景订阅不能接收业务快照恢复或菜单，不能当作在线业务页面。
 - 文本输出不会自动更新任务/白板；Host 从真实运行事实生成投影，经 messages 同步。
@@ -251,82 +251,70 @@ Office Fastify 重启丢失目录和快照；Host 使用自己保存的最新完
 
 <a id="office-chat"></a>
 
-## 4. 聊天需求：v1 可实现什么、不能承诺什么
+## 4. 新版聊天：四操作、历史与稳定轮次
 
-### 4.1 请求、会话绑定与历史
+### 4.1 单一官方转发链路
 
-浏览器以配置的 VITE_PAWOFFICE_CHAT_URL 向 Host /office/chat 发送：
+Office版本固定02dbac4，虽然version仍为1.0，协议已区别于历史b221a44。浏览器调用同源POST /api/pawoffice/chat；Host在offices.initialize顶层注册chat:{url:"http://127.0.0.1:<Host实际端口>/office/chat"}。Office Node只转Content-Type/Accept，不转Origin、Cookie或Authorization。Host默认回环监听、精确Host校验；有Origin请求仍须命中配置白名单，不能以teamId当授权。首期同机单用户；跨机需另行设计受保护代理，不能直接开放私有工作区。
+
+| type | 请求必要字段（均含version/teamId/conversationId） | 返回与用途 |
+|---|---|---|
+| send | turnId、messages | HTTP200 NDJSON；可靠接受一次输入，返回该轮快照/增量 |
+| history | cursor默认空、limit默认20（1—50） | {code:200,msg:"OK",data:{turns,nextCursor,hasMore,activeTurnId}}；进入会话/刷新/分页使用，不启动模型 |
+| resume | turnId | HTTP200 NDJSON；首条snapshot完整文本和状态，再收新增内容 |
+| cancel | turnId | {code:200,msg:"OK",data:{stopped:true}}；真实清理结束后确认，已终态重复操作幂等 |
 
 ~~~json
-{"version":"1.0","teamId":"office-1","conversationId":"conversation-id","messages":[{"role":"user","content":"处理当前任务"}]}
+{"version":"1.0","type":"send","teamId":"office-1","conversationId":"conversation-id","turnId":"turn-id","messages":[{"role":"user","content":"读取README.md和notes.txt并比较"}]}
 ~~~
 
-1. version/teamId/conversationId/messages 都必填；role 只接受 user/assistant。Host 同时执行真实 Schema 和本项目语义校验：最后一项为本次非空 user，历史为完整交替对话，拒绝未知办公室/未授权工作区。
-2. teamId 必须来自配置的办公室绑定，不能凭请求新建任意工作区。同 Session 或同办公室已有 active Run 返回 409；容量满 503，不建立隐式无限队列。
-3. 首次未知 conversationId 可导入浏览器提供的合法完整历史，标记为不可信的 imported 用户/助手上下文，只作为历史文本，不导入工具执行、审批或运行成功事实。新 Session、绑定、导入文本和本次输入在接受边界可靠保存；失败不启动工具。
-4. 已绑定会话以 Host 账本为准；浏览器历史须与 Host 中已完成且可发送的 user/assistant 展示投影后缀核对，不用浏览器短历史覆盖完整账本。合法短后缀接受，不一致返回明确 409，不能静默覆盖或自动新建会话。失败/取消回复不当成完整历史。
-5. 首次导入、后续后缀核对、压缩后的历史查询分别测试；不以消息数组长度推断新增账本。导入规则是 Host 策略，不是 Office 协议自带同步机制。
-6. 新对话创建新的 conversationId/Session，原办公室保留；旧账本不删除。切换办公室保留原运行，关闭/刷新导致的 v1 请求断开按取消处理。
-7. v1 无 turnId，不承诺提交恰好一次、刷新续接或完成后的请求重试幂等。不能用“最后一条文本相同”误判两个相同用户问题；不得自动重放有副作用的请求。
+### 4.2 接受、历史与取消不变量
 
-### 4.2 NDJSON、容量与终态
+1. (teamId,conversationId)固定绑定原Session；conversationId同时用在conversations[].id，不能换成Session/Run ID。新对话仍留在同办公室，首次成功发送后加入快照目录，空草稿/history读取不创建Run。
+2. (Session,turnId)与Run及规范请求的精确关联在Accepting同一SQLite事务保存；相同键相同内容返回原Run，相同键异内容409。关联只用于幂等，不作为第二模型账本；JSONL仍是事实。legacy:RunID是升级前Run的稳定历史身份，send拒绝占用该前缀，resume/cancel可读旧身份。
+3. 同Session最多一个活动Run；**同办公室不同会话可并行**，全局默认四个，复用原根资源锁。超限明确拒绝。每办公室最多100个绑定，超过时拒绝新会话，不删旧账本。
+4. messages最多十完整轮次加当前非空user；首次导入仅为不可信外部文本，后续核对已完成展示历史后缀，不覆盖原账本或导入工具/授权。历史按Run输入位置读取，不将tool_result(User角色)当成用户轮次。
+5. history页内旧→新，游标绑定既存Run身份；新追加不移动旧页边界。仅最新页含最后一个pending，activeTurnId与之相同；旧页无活动标识。旧Run用原ID稳定映射；完整工具结果留原查询接口/T5详情。
+6. resume先订阅再读同Run的完整文本快照，再按已发前缀发送增量；落后重取。快照是{text,state,message}，state只允许pending/complete/stopped/error。终态快照直接结束；不在流里发自定义runId或cursor。
+7. **断开/刷新/卸载/180秒单连接到期仅detach**；共享Host继续拥有Run。显式cancel才关闭授权并取消模型/等待/工具，清理结束才stopped:true；cancelling仍属pending。Host崩溃后unfinished→interrupted→聊天error，不自动执行旧工具。
 
-成功 HTTP 200，Content-Type: application/x-ndjson，每行一个 JSON 并换行；事件仅允许：
+### 4.3 容量、流与错误
 
-~~~jsonl
-{"type":"status","phase":"thinking"}
-{"type":"status","phase":"streaming"}
-{"type":"delta","text":"正在处理。"}
-{"type":"done"}
-~~~
-
-失败流发送 {type:"error",message:"非空错误说明"}，不再发 done。status 仅 thinking/streaming；不向 strict v1 添加 runId、cursor、工具、审批状态等字段。接流前参数错误使用明确 HTTP 错误；接流后用 error，不能已输出 200 后再改 HTTP 状态。
-
-| 边界 | 实现和测试要求 |
+| 边界 | 必须落实 |
 |---|---|
-| 当前输入 | 最多 4000 字符，纯空白拒绝 |
-| 历史 | 最近最多 10 轮完整历史，历史部分最多 100000 字符；另加本次输入 |
-| 回复 | 最多 50000 字符；错误说明≤1000，必须非空 |
-| delta | text≤16000；实际序列化单行≤32000，包含JSON包装/转义，不只检查正文 |
-| 长度计算 | 浏览器 .length 按 UTF-16；Rust 按兼容语义计数，UTF-8 字节单独检查；覆盖中文/emoji/引号/控制字符及跨片段字符边界 |
-| 请求大小 | Host 聊天独立配置有界 UTF-8 body 上限，至少容纳上述合法历史及JSON最坏转义；不能直接沿用 messages 的64 KiB |
-| 请求时间 | Office 默认 180000ms 总时限，心跳不会重置；Host 的空闲超时/Run预算另设，不能宣称绕过浏览器总时限 |
-| 成功 | 有实际文本，必要账本与终态保存成功后发送 done；空文本/错误/写入失败/输出超限不发虚假 done |
-| 重试 | 已输出后不自动从头重试拼接；有副作用后不通过重新运行伪恢复 |
-| 断开与停止 | v1 HTTP 断开触发取消；先关审批门，取消上游/等待/工具，回收完成才结束 |
-
-浏览器停止/刷新会保留已生成部分并标停止，不证明 Host 已清理完毕；v1 没有可靠远程运行状态查询界面。这个缺口必须向用户说明，不因后端增加接口就宣称现有页面已获得续接能力。
+| body/历史JSON | 请求UTF-8最多512KiB；历史响应最多8MiB，必要时缩页并保留稳定游标 |
+| 当前输入/历史 | 当前输入≤4000 UTF-16单元；最多21messages交替且最后user；历史部分≤100000 |
+| 回复/delta/单行 | 回复和snapshot.text≤50000，delta≤16000，JSON行≤350000 UTF-16单元；字节与字符独立检查 |
+| 流事件 | status(thinking/streaming)、delta、snapshot、done、error；无null/未知字段 |
+| 成功/失败 | 完整账本与终态保存后才done或complete snapshot；空输出、超限、持久失败不得假done；错误说明有界且不泄密 |
+| 请求期限 | 非流操作Office转发15秒，send/resume每连接180秒；Run总预算独立；T6覆盖超过连接期限再恢复，不用心跳宣称无限连接 |
+| HTTP错误 | Host用code/msg/data对象封套；Office当前可能将上游非2xx转换为502 CHAT_UPSTREAM_ERROR，不能承诺Host细分状态原样到浏览器 |
 
 ~~~mermaid
 sequenceDiagram
     participant B as Office浏览器
-    participant C as Host聊天适配器
-    participant S as 共享Session/Run服务
-    participant E as 现有AgentLoop
-    B->>C: v1请求，teamId/conversationId/messages
-    C->>S: 校验范围/历史/容量，持久化接受
-    S->>E: 新建独立运行上下文
-    E-->>C: 文本与运行结果
-    C-->>B: 合法status/delta
-    alt 正常完成且账本保存成功
-        S->>S: 持久化终态
-        C-->>B: done
-    else 错误
-        C-->>B: error，不发done
-    else 浏览器断开/停止/180秒超时
-        C->>S: 请求取消
-        S->>E: 取消并等待实际清理
-        S->>S: 持久化cancelled
-    end
+    participant F as Office Fastify
+    participant C as Host Office适配器
+    participant S as 原Session/Run/JSONL
+    C->>F: initialize(offices,chat.url)
+    B->>F: history(team,conversation)
+    F->>C: 转发history
+    C->>S: 只读轮次页
+    C-->>B: 经Fastify返回历史/activeTurnId
+    B->>F: send(turnId,messages) 或 resume(turnId)
+    F->>C: 同一POST转发
+    C->>S: 幂等接受一次 或 查找原Run
+    C-->>B: 经Fastify返回snapshot→delta→终态
+    Note over B,S: 刷新/断网只detach，不停止Run
+    B->>F: cancel(turnId)
+    F->>C: 显式取消
+    C->>S: 取消并等待真实工具/资源清理
+    C-->>B: stopped:true
 ~~~
 
-### 4.3 密钥与部署
+### 4.4 部署与配置
 
-模型密钥仅 Host 持有；Office API Key 仅 Host/Fastify 持有，不写入 VITE_*、事件、工具继承环境或浏览器。VITE_PAWOFFICE_CHAT_URL 是公开构建配置，生产须在构建前配置；不提供携带任意 secret 的浏览器 Bearer 方案。
-
-优先同源代理到 Host；跨域时 Host 显式允许受信 Office origin 和 OPTIONS，不依赖跨域 Cookie，不使用通配源开放私密工作区。Host 负责来源/访问范围验证，teamId/runId 不是授权凭据。Office SSE 不内置完整登录或租户隔离，部署方通过可信本机范围或反向代理保护页面、SSE 和聊天入口。
-
-Office 开发用 npm run dev，纯 npm run dev:vite 不接收外部业务。生产复用 npm run build:full 后 npm start；环境由 shell/PowerShell/部署工具注入，启动器不会自动加载 .env。Linux/Windows 启动说明使用同一配置含义，Windows 不要求 sh。不得为了配置连接地址修改 Office 源码或擅自提交配置文件。
+模型仍按OpenPaw原生.env读取，密钥只在Host；Office API Key只在Host/Node服务，不进VITE_*、浏览器、事件或工具环境。聊天地址运行时注册，不需修改Office构建配置。Office重启后Host重新注册地址并重发已保存完整快照。Linux/Windows使用同一配置意义，Windows不依赖WSL。使用上游隔离副本安装/构建，不改用户原Office文件。
 
 <a id="office-snapshot"></a>
 
@@ -336,10 +324,11 @@ Office 开发用 npm run dev，纯 npm run dev:vite 不接收外部业务。生�
 
 | 结构 | 必填/关键约束 |
 |---|---|
-| 快照 | schemaVersion="1.0"，seq为正安全整数，workspace.id/name；workspace.name≤80 |
-| employees | ≤200；id/name必填，name≤80；role≤80，sceneActorId默认空，online默认false；ID唯一 |
-| tasks | ≤1000；id/title/status/updatedAt必填，title≤160，summary≤1000；assigneeId空或引用当前员工 |
-| events | ≤500；id/kind/summary/occurredAt必填，summary≤300；kind仅 note/task.assigned/task.started/task.blocked/task.completed |
+| 快照 | schemaVersion="1.0"，seq为正安全整数，workspace.id/name；workspace.name≤80；顶层只有conversations和system，不带employees/tasks/events/whiteboard |
+| conversations | 最多100；id等于原conversationId且唯一，title≤160；各自employees/tasks/events/whiteboard，切换只投影选中会话 |
+| conversation.employees | ≤200；id/name必填，name≤80；role≤80，sceneActorId默认空，online默认false；ID唯一 |
+| conversation.tasks | ≤1000；id/title/status/updatedAt必填，title≤160，summary≤1000；assigneeId空或引用当前员工 |
+| conversation.events | ≤500；id/kind/summary/occurredAt必填，summary≤300；kind仅 note/task.assigned/task.started/task.blocked/task.completed |
 | system | 未测cpu/memory/network为-1；不能生成假监控值 |
 | 时间/引用 | 时间带时区；事件引用指向当前投影中有效对象或按Schema省略/空串；Host额外维护事件ID唯一和稳定性 |
 
@@ -459,11 +448,11 @@ sequenceDiagram
     participant B as Office浏览器
     E->>A: 最终输入校验/分类，绑定Run/call/摘要
     A->>A: 保存pending，未持工作区锁
-    A->>F: decision.request，新展示ID
+    A->>F: decision.request，teamId+conversationId+新展示ID
     F->>B: 展示菜单
     alt 有效用户选择
         B-->>F: 内部reply
-        F-->>A: 原POST返回teamId/decisionId/choiceId
+        F-->>A: 原POST返回teamId/conversationId/decisionId/choiceId
         A->>A: 校验关联，CAS批准或拒绝
         A-->>E: 本次授权结果
         E->>E: 可取消取锁，重验输入/路径/前置条件后执行
@@ -479,13 +468,14 @@ Office无菜单重试去重/已结束结果查询。网络未知结果不等于�
 
 ### 6.2 ui.next / ui.respond
 
-一个全局领取器按teamId路由，不为四个办公室各建竞争poller。ui.next空数组继续等待；503有界退避；关闭可取消。收到action后立即持久化处理记录，再查服务或执行已支持行为；查询处理不阻塞下一次领取，不让慢详情堵住全局poller。
+一个全局领取器按teamId+conversationId路由，不为四个办公室各建竞争poller。ui.next空数组继续等待；503有界退避；关闭可取消。收到action后立即持久化处理记录，再查服务或执行已支持行为；查询处理不阻塞下一次领取，不让慢详情堵住全局poller。
 
 用户操作最多128个、等待60秒，ui.next同时等待最多16个；Host只需要一个。领取即失去再次投递资格，无ACK/租约/requeue，响应丢失或收到前Host崩溃可能丢一次操作。记录后可减少后续重复/丢失，但不能宣称端到端恰好一次。R2若需改变该边界，必须先Rx批准。
 
 | action | 本期明确行为 |
 |---|---|
-| actor.inspect | 查该办公室人物绑定成员；多成员给真实列表/分页，不假定人物=唯一Agent |
+| conversation.delete | T5：阻止新提交→取消Run/失效审批并等待清理→删除原账本/元数据/索引和缓存→更高seq完整快照移除会话→ui.respond result成功；失败不先报成功，当前T4未支持 |
+| actor.inspect | 查该办公室当前会话人物绑定成员；多成员给真实列表/分页，不假定人物=唯一Agent |
 | employee.inspect | 查真实成员、任务与关联历史 |
 | dialog.action | 校验原interaction上下文、optionId、办公室/会话/查询范围和有效期；处理分页/返回/详情 |
 | task.start | 首期未实现“从展示任务重新启动业务”的命令，明确不支持；不自动重放旧Run |
@@ -496,7 +486,7 @@ Office无菜单重试去重/已结束结果查询。网络未知结果不等于�
 
 对受支持查询或不支持业务操作，用合法detail-v1回复说明；UI已过期410则记录未送达，不以新ID伪装原请求。ui.respond用新action.id，即使它是dialog.action也不能用其原interactionId。收到delivered=true只说明展示结果已提交，不证明副作用执行或用户已阅读。
 
-presentation.target=dialog时content必须detail-v1；target=whiteboard时snapshot必须该办公室完整新快照，并经过同一版本协调器。不能只发白板字段、跨办公室回应或绕过seq。原详情按钮产生新的action，Host为新action.id再次回应。
+presentation.target=result时返回success/message，用于删除等明确处理结果；删除成功前必须已从更高seq完整快照移除会话，否则Office返回SNAPSHOT_REQUIRED。presentation.target=dialog时content必须detail-v1；target=whiteboard时snapshot必须该办公室完整新快照，并经过同一版本协调器。不能只发白板字段、跨办公室回应或绕过seq。原详情按钮产生新的action，Host为新action.id再次回应。
 
 <a id="office-details"></a>
 
@@ -520,10 +510,10 @@ detail-v1标题≤160、description≤4000、fields≤30（label≤100/value≤2
 ### 7.1 场景仅作反馈
 
 ~~~json
-{"teamId":"office-1","command":{"protocolVersion":"2.0","sceneId":"office-1","commandId":"say-1","type":"activity.start","capability":"scene.say","participants":[{"entityId":"office-lead","role":"actor"}],"params":{"text":"开始处理任务。","durationMs":2000}}}
+{"teamId":"office-1","conversationId":"conversation-id","command":{"protocolVersion":"2.0","sceneId":"office-1","commandId":"say-1","type":"activity.start","capability":"scene.say","participants":[{"entityId":"office-lead","role":"actor"}],"params":{"text":"开始处理任务。","durationMs":2000}}}
 ~~~
 
-先通过capabilities/office.read核实能力、参与者角色和参数；teamId必须等于每条sceneId，不能硬编码未知能力。新命令唯一ID，重试同ID同规范化内容。batch为{mode:"sequence"或"parallel",commands:[…]}，≤32，非全有或全无事务。默认只用已验收的发言/必要反馈，不顺手开放map.edit或任意物品写入。
+会话相关场景命令携带conversationId，后台会话按Office规则跳过且不补播；省略代表办公室范围。先通过capabilities/office.read核实能力、参与者角色和参数；teamId必须等于每条sceneId，不能硬编码未知能力。新命令唯一ID，重试同ID同规范化内容。batch为{mode:"sequence"或"parallel",commands:[…]}，≤32，非全有或全无事务。默认只用已验收的发言/必要反馈，不顺手开放map.edit或任意物品写入。
 
 HTTP200含forwarded只是连接转发数，无开始/完成回执；场景runtime本地的同ID去重和执行结果不等于Host能通过HTTP查询。临时动画离线不积压、不补播。command.cancel/activity.stop是场景控制，不取消AgentLoop；Run取消由共享服务执行，场景停止是尽力反馈。持续工作状态优先用snapshot表达，不依赖动画成功。
 
@@ -555,7 +545,7 @@ task.assigned已触发跨人物拜访时不重复visit；同人物交接不拜�
 
 | Rx | 分类与原因 | 当前处理 |
 |---|---|---|
-| R1 | 必要功能扩展候选：超过180秒、刷新续接、Run标识、detach/cancel；v1缺这些能力，不属于现有Office缺陷 | 可提交审核，尚未批准；本期默认按v1交付，不实现提案 |
+| R1 | 原长任务四URL提案已由新版官方turnId/history/resume/cancel覆盖基础能力 | 旧提案不实施；T4适配官方协议，T6验收可靠性；未覆盖项另行Rx |
 | R2 | 协议扩展候选：UI领取ACK/租约/重投；现协议明确无此保证，不伪报缺陷 | 本期不实施，记录可靠性边界 |
 | R3 | 产品新增：侧栏/富文本/管理页 | 本期不做，复用detail-v1 |
 | R4 | 工程扩展候选：为原生验收改Office测试启动器 | 默认在OpenPaw写外部原生runner、复用公开场景；确需改Office测试才提交Rx，不默认修改 |
@@ -564,7 +554,7 @@ task.assigned已触发跨人物拜访时不重复visit；同人物交接不拜�
 
 批准后才创建/修改Office实施范围，Office PR指向Office评审基线，不指向OpenPaw分支；与Host关联PR互链。变更后先完整测试，再审核当前提交；不因提案批准跳过PR审核。用户未回复、仅同意研究、CI成功都不是批准。
 
-R1若将来获批，可复用[r1-chat.md](r1-chat.md)深化：Host新增Run创建/快照/事件续接/显式cancel；浏览器先保存turnId再提交、保存runId/cursor、刷新detach、停止cancel、cancelling等待清理、旧IndexedDB兼容。它是双方新增的opt-in契约，不是Office当前官方v1能力。接口字段和事件必须先冻结再开发，不能把runId/cursor塞入v1 strict事件。未经批准不提前修改Office，也不单方面实现一套无人使用的扩展冒充交付。
+历史[r1-chat.md](r1-chat.md)仅保留旧版讨论，不是新版实现契约。新版以第4节及02dbac4官方Schema为准；R5多会话扩展候选因上游已支持而撤回。旧单会话IndexedDB草稿自动迁移未被覆盖，如需修复须另Rx。
 
 ## 9. OpenPaw共享运行、缺陷与复用不变量
 
@@ -611,7 +601,7 @@ D12—D24具体来源、类型迁移和许可证影响继续见audit、dependenc
 
 ### 9.3 运行与资源状态
 
-同Session最多一个active Run；同Office最多一个；不同Session可以并行，全局默认4，超限明确503。默认关闭Run内工具并行，但已有并行路径仍修复。Run预算、取消、消息上下文不共享。审批/查询/取消不被长运行的全局串行锁堵住。
+同Session最多一个active Run；同Office不同Session也可并行，全局默认4，超限明确503。默认关闭Run内工具并行，但已有并行路径仍修复。Run预算、取消、消息上下文不共享。审批/查询/取消不被长运行的全局串行锁堵住。
 
 工作区按规范化真实根识别，读共享、写文件/Todo/shell独占；审批不持锁，取锁可取消，获批后重验最终输入、权限、路径和必要文件前置条件；实际提交/进程回收完成后才释放。外部编辑器不遵守锁，不能承诺防止其改动。同根复用Store；固定home显式注入，不能每请求new存储或改环境绕过全局OnceLock。
 
@@ -772,18 +762,18 @@ approved不是无条件执行通行证；取消、输入变化、权限变化或
 
 **执行导航：**[通用约束](#office-common)、[四操作及响应](#office-operations)、[启动恢复](#office-boot)、[聊天全部细则](#office-chat)、[完整快照/seq](#office-snapshot)、[真实任务投影](#office-projection)、[里程碑M4](#milestone-m4)。逐项对照S1/S2/S3/S4/S5。
 
-**具体实施审核单：**[CHG-2026-0005](../changes/CHG-2026-0005.md) r3合并r1完整协议方案与已完成r2配置，第4节列实际文件职责，第9节说明聊天/历史/任务/快照/关闭，第10节O01—O10对应验收。真实代码在Host src/office；独立运行方法与测试参数见handoff当前T4章节。业务连接、真实Provider和技术全量分别提供证据，交付验收/PR/合入不得混写。
+**具体实施审核单：**[CHG-2026-0005](../changes/CHG-2026-0005.md) r4固定新版02dbac4官方协议，第9.7节替代旧冲突规则；保留原r1/r2/r3历史，第4节列实际文件职责，第9节说明聊天/历史/任务/快照/关闭，第10节O01—O10对应验收。真实代码在Host src/office；独立运行方法与测试参数见handoff当前T4章节。业务连接、真实Provider和技术全量分别提供证据，交付验收/PR/合入不得混写。
 
 **真实场景/用途：**完成第1.4节步骤1—2：打开办公室，提问读取项目并追问，聊天有真实回答，同时任务、白板和功能人物有依据。影响对话、办公室目录、工作状态、气泡、白板与历史绑定。关联REQ-OP-010/011/012；不改Office，不开放写工具。
 
-**协议安排：**独立POST /office/chat严格使用S4 v1；Host另用官方messages的capabilities/initialize/snapshot/read。快照schemaVersion=1.0，场景协议2.0，chat version=1.0三者不混用。此时先依靠Office原有sceneBridge呈现工作/任务状态；主动发言与交接全面验收在T5。
+**协议安排：**浏览器经Office同源POST转发到Host /office/chat，严格使用S4四操作；Host另用官方messages的capabilities/initialize/snapshot/read。快照schemaVersion=1.0，场景协议2.0，chat version=1.0三者不混用。此时先依靠Office原有sceneBridge呈现工作/任务状态；主动发言与交接全面验收在T5。
 
 **实施顺序与细则：**
 
-1. 在Host Office适配职责内建立强类型DTO/错误转换、官方messages客户端；校验无null/strict/envelope/UTF-8预算，设置不同操作的超时/退避。密钥留Host，VITE_PAWOFFICE_CHAT_URL只有公开地址；部署优先同源代理或受信本机CORS。
+1. 在Host Office适配职责内建立强类型DTO/错误转换、官方messages客户端；校验无null/strict/envelope/UTF-8预算，设置不同操作的超时/退避。密钥留Host，chat.url在Host监听后动态注册；浏览器同源转发，本期只支持受信本机。
 2. 实现启动协调：恢复→capabilities核对所需Schema/人物/UI→生成空闲完整投影→initialize→read核对；202记录cached，不能宣称页面就绪。Office恢复404时重新initialize，不重置本地seq；只teams订阅不算业务在线。
 3. 聊天验证、接受和绑定遵守第4.1节：team来自授权配置，(team,conversation)→真实Session；首次导入标记不可信历史，后续只核对合法历史后缀；浏览器截断不覆盖账本。冲突/满载分别明确返回，不建重复Run。
-4. 连接T3服务，将TextDelta切为合法NDJSON delta，输出status和正常/错误终态。按UTF-16字符/序列化单行及UTF-8 body独立约束；纯文本无工具也能回答。断开取消并等待清理；不发心跳假装突破180秒、不在strict事件夹带内部runId。
+4. 连接T3服务，将TextDelta切为合法NDJSON delta，输出status和正常/错误终态。按UTF-16字符/序列化单行及UTF-8 body独立约束；纯文本无工具也能回答。断开仅detach，cancel等待实际清理；不发心跳假装突破180秒、不在strict事件夹带内部runId。
 5. 按第5.4节从真实Run/call建立主/子任务和功能成员，稳定ID关系留Host；投影白板最多3阶段，未知进度-1。模型内部思考不展示，副作用和任务成功不从文本推断。
 6. 建每办公室单写投影协调器：保存seq+规范化完整内容→发送→记录applied/cached/ignored；重试同版同内容，旧回执不覆盖新状态，SEQ_CONFLICT停投诊断。对容量进行引用闭包裁剪，保留活动任务及有界近期记录；禁止局部快照覆盖。
 7. 在OpenPaw测试目录写外部HTTP/浏览器runner，读取未修改Office隔离副本构建/启动服务，运行第1.4节步骤1—2。仅启用已核实的文件读/搜索等只读工具，未知/写/占位工具明确不支持。生成产物不得写Office工作区。
@@ -834,7 +824,7 @@ approved不是无条件执行通行证；取消、输入变化、权限变化或
 
 ### T6：把展示闭环加固为可重复使用的产品；Rx只按批准范围实施
 
-**执行导航：**[错误与重试](#office-errors)、[快照恢复](#office-snapshot)、[审批未知结果](#office-approval)、[核心恢复](#host-state)、[Rx边界](#office-rx)、[R1提案](r1-chat.md)、[里程碑M6](#milestone-m6)。逐项对照S1/S3/S4；R1不是当前官方协议。
+**执行导航：**[错误与重试](#office-errors)、[快照恢复](#office-snapshot)、[审批未知结果](#office-approval)、[核心恢复](#host-state)、[Rx边界](#office-rx)、[R1提案](r1-chat.md)、[里程碑M6](#milestone-m6)。逐项对照S1/S3/S4；旧R1自定义URL不是当前官方契约。
 
 **真实场景/用途：**演示不能只成功一次。用户网络波动、Office重启、Host崩溃时不应重复写报告，旧批准不复活，任务要有可解释结果。影响恢复、运维提示和数据一致性；REQ-OP-009/016/019。默认不改Office，T7不依赖未批准R1。
 
@@ -843,15 +833,15 @@ approved不是无条件执行通行证；取消、输入变化、权限变化或
 1. 以T5演示为故障注入脚本，在请求已接受/审批等待/获批未执行/实际写入后/终态保存后等边界断连接或终止进程，核对账本、文件哈希、call与审批状态，定位真实重复/丢失窗口。
 2. 针对Office失联、重启、202未知结果和旧HTTP确认晚到，验证seq+内容恢复；重连只发送最新完整业务状态，不补播临时动画。任何失败都不能用新版本掩盖同版内容冲突。
 3. Host恢复未完Run→interrupted、旧审批失效；已发生副作用有证据，不能自动重试。持久化失败/损坏中段明确报错，备份/索引重建可执行；故障修复回所属模块并登记D编号，不在Host复制修补代码。
-4. 真实浏览器测试刷新、切换、关闭、停止、180秒到期；验证v1断开取消和实际清理。剩余期限与审批/HTTP/代理超时分层说明，不加心跳绕过总时限；对用户明确“已停止/重启中断/请重新发起”，不能声称已续接。
+4. 真实浏览器测试刷新、切换、关闭、停止、180秒到期；验证detach不中断、显式cancel实际清理和history/resume恢复。剩余期限与审批/HTTP/代理超时分层说明，不加心跳绕过总时限；对用户明确“已停止/重启中断/请重新发起”，只能在实际history/resume证据通过后声明续接。
 5. 记录UI领取无重投、动画无远端结果查询的边界；故障后再次点击产生新查询，不能自动重放有副作用action。整理用户恢复说明和诊断关联字段，不输出密钥/全文文件。
-6. 对R1/R2/R4更新原因/方案/影响/准确文件/验证/回退及无修改替代方案，交用户审核。未批准只登记；若基础产品要求变成长期后台任务，说明R1是达到该体验的前置，而非暗中降低验收。
+6. 对R1/R2/R4更新原因/方案/影响/准确文件/验证/回退及无修改替代方案，交用户审核。未批准只登记；若基础产品要求变成长期后台任务，说明新版官方恢复是该体验的实现基础，未覆盖项需要另Rx，而非暗中降低验收。
 
-**R1获批时的条件实施步骤：**先冻结双方新增的opt-in契约：POST /office/chat/runs创建；GET /office/chat/runs/:runId查状态/文本快照/游标；GET其/events?after=续接；POST其/cancel显式取消。按(team,conversation,turnId)幂等，同键异内容冲突；查询/订阅校验范围。快照/游标一致，过期游标重新取快照。Office先保存turnId，存档runId/cursor；刷新/断网仅detach，停止cancel；显示cancelling至真实回收；旧IndexedDB可迁移且失败保留原数据。保留v1默认；具体字段/事件/文件必须在获批版本中冻结，不能把runId塞进v1 strict事件。两仓关联PR和迁移/回退/原有测试必交。
+**已被上游覆盖的R1/R5部分：**不再实现旧四URL或改Office会话列表。T4按第4节实现官方四操作和快照会话目录；T6验证>180秒后新连接resume、并发订阅/慢消费者、磁盘故障、崩溃中断及副作用不重放。仍需Office改动的缺陷或必要扩展另提精确Rx并人工批准。
 
 **必须产物：**故障注入/恢复矩阵及可重跑入口、归属明确的修复和回归、v1产品限制/备份恢复说明、Rx最新提案和真实人工决议。若批准扩展，额外交付Host接口、Office opt-in实现、双方契约/存档迁移/浏览器证据。
 
-**完成标准/可演示结果：**第1.4节步骤7双平台通过；断线/重启不重复副作用、不复活审批；v1 >180秒按当前协议停止/失败，无假续接。未批准Rx写“提案待审/未实施”，只完成T6基础范围；已批准纳入本期的扩展须>180秒、刷新同Run、文本不重复、取消回收及两仓PR全部通过。基础PR经人工批准合入才进入T7。
+**完成标准/可演示结果：**第1.4节步骤7双平台通过；断线/重启不重复副作用、不复活审批；每连接>180秒重新history/resume同Run，无重复文本或工具。未批准Rx写“提案待审/未实施”，只完成T6基础范围；已批准纳入本期的扩展须>180秒、刷新同Run、文本不重复、取消回收及两仓PR全部通过。基础PR经人工批准合入才进入T7。
 
 **交给T7：**稳定共享服务、客户端传输取消规则、实际可用接口、恢复证据与准确Rx决定；SDK不得改变Office取消语义。
 
@@ -901,14 +891,14 @@ approved不是无条件执行通行证；取消、输入变化、权限变化或
 1. 在两平台原生环境，使用相同配置格式、未修改Office服务和固定SDK，完整执行第1.4节步骤1—7。每一步保存提交/平台/命令/退出码、脱敏请求和响应、关键页面截图/录像、JSONL关联及文件/进程证据。
 2. 固定自动化场景：纯聊天、读两文件追问、拒绝/批准写报告、六类详情分页、真实交接与发言、多办公室并行、共享根写竞争/等待可取消、进程树/大输出取消、重启恢复。没有Skill/Goal的环境额外准备隔离的真实存储样例，覆盖有数据/空/错误三分支，不伪造业务执行。
 3. 至少一轮已配置真实Provider的完整读/审批写/结果链路；确定性Provider用于稳定自动化，不替代真实模型验证。真实模型未按预期调工具时记录实际行为/修正配置，不从测试代码伪造调用。
-4. 执行故障矩阵与同Run多视图一致性：Host崩溃、Office重启、浏览器刷新/断线、磁盘/损坏、旧审批、缓存和晚到确认。核对终态/副作用而非只看UI颜色；R1未批准按v1边界验收，不宣称长任务续接。
+4. 执行故障矩阵与同Run多视图一致性：Host崩溃、Office重启、浏览器刷新/断线、磁盘/损坏、旧审批、缓存和晚到确认。核对终态/副作用而非只看UI颜色；按新版四操作验证续接与Host崩溃终态，未批准Office扩展仍不实施。
 5. Linux脚本与Windows PowerShell共用配置，检查端口、依赖和授权根，输出可访问页面/发现地址，关闭时回收进程。Office按npm run build:full与npm start在隔离目录运行，不要求Docker/WSL；VITE_*公开地址在构建前配置，secret只留服务端。
 6. 交付备份/恢复/回退说明、默认本机与同源代理样例、Host feature发布候选、版本/校验值、THIRD-PARTY-NOTICES/third-party-licenses；说明D21迁移和D22许可审核。保留CLI/sidecar/default/v1回归；发现缺陷登记修复，不趁最终验收扩功能。
 7. 逐项核对需求/Tx产物/PR/D/R和当前证据，完成用户产品验收；集成分支到main最终PR人工批准后才合入。T0—T8全部约定范围验收才记录初期结束，后续转普通CHG。
 
 **必须产物：**可重复联合验收入口与双平台报告；能启动/关闭的发布候选与配置；产品演示材料和产物文件；备份/恢复/回退手册；最终能力/未支持/Rx矩阵；最终集成PR。
 
-**完成标准/可交付结果：**用户能按说明从干净环境完成演示；双平台原生运行、真实Provider、动画和实际副作用证据齐全；必要测试无skip/mock成功或交叉编译替代；关键缺陷关闭、Office任何修改均有有效Rx和两仓PR。若仅T4聊天通过、T5产物/动画未通过，不能发布为目标产品完成；若R1未批，明确交付“v1基础产品”及180秒/刷新限制。
+**完成标准/可交付结果：**用户能按说明从干净环境完成演示；双平台原生运行、真实Provider、动画和实际副作用证据齐全；必要测试无skip/mock成功或交叉编译替代；关键缺陷关闭、Office任何修改均有有效Rx和两仓PR。若仅T4聊天通过、T5产物/动画未通过，不能发布为目标产品完成；新版官方基础恢复属于必需范围，不能以旧R1未批豁免。
 
 <a id="verification"></a>
 
@@ -1022,7 +1012,7 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 - 核心执行/会话/工具最大复用；通用缺陷独立修复，不用Host复制补丁版本。
 - 默认四办公室/四Run是本项目配置，不是Office协议人物数、办公室上限或多Agent承诺。
 - 技能/目标/Todo首期真实查询及已有能力，不新增调度/技能写管理/多Agent编排。
-- Office v1保留180秒、刷新停止、无严格turn幂等/续接、UI领取无重投、动画无HTTP完成回执的边界。
+- Office新版保留180秒单连接限制，具备turn幂等/history/resume/cancel、UI领取无重投、动画无HTTP完成回执的边界。
 - R1/R2/R4只有明确人工批准后才可实施；批准前不修改Office任何文件；R3本期不做。
 - v1限制不伪报Office缺陷；真实缺陷也先Rx，不能先改后补审批。
 - 固定SDK通过不等于OpenWork桌面通过；T0/feature构建通过不等于Host运行或Windows进程验收。
@@ -1054,9 +1044,9 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 | M1 / T1 | 正确模型、可信停止和完整历史可复用 | [T1任务卡](#tx-t1)；D01—D04回归、真实Provider请求捕获、存储/取消边界、CLI兼容 | 已完成：用户2026-10-21确认T1审核通过；PR #5已合入 | [OpenPaw #5](https://github.com/KunlunMeta-Limited/openpaw/pull/5)，最终head 383d0922eba3d069794015e1f280668a690c482c；合入ac1b58285fb6c73dce6363ce88fe62100199bb73；[最终push CI](https://github.com/KunlunMeta-Limited/openpaw/actions/runs/39416514821)13/13；PR事件另轮CI因账单未启动，保留历史失败，不虚称全部事件成功 |
 | M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、D34/D35及执行矩阵 | 已完成本轮范围：用户确认审核，PR #6实际合入；Windows原生验证按原决定暂缓，未执行不算通过 | [OpenPaw #6](https://github.com/KunlunMeta-Limited/openpaw/pull/6)，head 53243079b5d969486ff72f83102b6e0fd7890f7d，merge 3a159a41c5440df6ce0cbbedb4edc7b0a87fe428；Linux完整26/26；用户会话确认审核，页面无独立Review；[0003履历](../changes/CHG-2026-0003.md#12-验证和审批记录) |
 | M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；[0004第9/10节](../changes/CHG-2026-0004.md#9-影响数据流和实现)的H01—H12 | 已完成本轮批准范围并合入；Linux准确交付与合入head均完整26/26，Windows按用户明确指示暂缓、未验证 | [OpenPaw #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)，head 825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52；2026-10-21 19:16:12合入；用户会话确认、API无独立Review；[0004履历](../changes/CHG-2026-0004.md#12-验证和审批记录)保留CI未启动与门禁例外冲突 |
-| M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；[0005 r3](../changes/CHG-2026-0005.md)第4/9/10节；handoff当前T4实施交接 | 待人工验收：5c039fb的Linux27/27和真实DeepSeek网页均通过；M4逐项证据见0005验证记录；Windows原生未执行 | 未创建；用户交付验收、平台审核/合入待发生 |
+| M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；[0005 r4](../changes/CHG-2026-0005.md)第4/9/10节；handoff当前T4实施交接 | 新版02dbac4适配实施中；旧r3绿灯仅作历史；新版技术核查和人工验收待发生，Windows暂缓未执行 | 未创建；用户交付验收、平台审核/合入待发生 |
 | M5 / T5 | 常规产品闭环：审批写产物、详情、交接与发言 | [演示步骤3—6](#product-demo)、[T5任务卡](#tx-t5)；文件哈希、call/审批、真浏览器动画/详情可交叉核对 | 待实施 | 未创建；批准/合入待发生 |
-| M6 / T6 | 故障恢复可重复；已批准扩展单独验收 | [演示步骤7](#product-demo)、[T6任务卡](#tx-t6)；故障矩阵、v1取消/180秒限制；纳入范围的Rx另验 | 待实施；R1/R2/R4未批准，扩展未实施 | 未创建；若批准跨仓扩展，全部必要PR及Rx版本一起记录 |
+| M6 / T6 | 故障恢复可重复；已批准扩展单独验收 | [演示步骤7](#product-demo)、[T6任务卡](#tx-t6)；故障矩阵、新版detach/cancel及180秒单连接限制；纳入范围的Rx另验 | 待实施；R1/R2/R4未批准，扩展未实施 | 未创建；若批准跨仓扩展，全部必要PR及Rx版本一起记录 |
 | M7 / T7 | 固定SDK可复用同一Host | [T7任务卡](#tx-t7)；真实SDK请求/事件迭代/审批/abort及Office并用 | 待实施 | 未创建；不声明OpenWork桌面已验收 |
 | M8 / T8 | Linux/Windows可启动、演示、备份和恢复的交付包 | [完整演示](#product-demo)、[T8任务卡](#tx-t8)；原生双平台、真实Provider、发布候选与用户验收 | 待实施 | 未创建；T8主PR及最终集成到main的PR分别追踪 |
 
@@ -1208,7 +1198,7 @@ PR关闭未合入、批准后又有实质变更、必需跨仓PR只合入一方�
 **实施入口：**[第10节T6任务卡](#tx-t6)；[协议对照](#protocol-checklist)；[提PR前核查表](#milestone-gate)。当前状态与PR只维护[14.1台账](#milestones)，本小节不保存第二份状态。
 
 - 产物核查：快照/审批/UI/执行故障注入、重启中断、旧回执和未知结果、v1停止/刷新/180秒、备份恢复；每项Rx状态单列。
-- 通过依据：演示步骤7与故障矩阵双平台通过；无重复副作用/旧授权复活。R1若已批准纳入，额外>180秒/同Run续接/显式cancel和两仓PR。
+- 通过依据：演示步骤7与故障矩阵双平台通过；无重复副作用/旧授权复活。新版官方>180秒重连接/同Run续接/显式cancel必须验证；额外Office修改仍需Rx及两仓PR。
 - 交付边界：基础M6与R1分别验收；未批准Rx只记未实施，不把它标完成或偷偷修改Office。
 
 提交前在主CHG逐项填产物/测试定位及本小节核查结果；全部必需项符合后提PR。获非作者审核并合入后按[14.4](#milestone-close)登记已完成与实际提交/合入证据。
@@ -1290,3 +1280,8 @@ Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2
 ### T4交付候选技术核查（2026-10-22）
 
 实现提交5c039fb8e52046965660b14caa113c63505ca361已在Linux干净副本通过完整27项，确定性真实浏览器和用户DeepSeek网页均保留原始协议/截图/录像/账本证据。当前可展示真实对话、只读文件/检索、追问、任务/人物/白板和停止；Office/Host重启恢复及202/seq另有真实服务验收。逐项O01—O10与文件落点见[0005验证记录末尾](../verification/CHG-2026-0005/验证记录.md)。未修改Office；其原两份用户文档改动保留。Windows原生未执行，不记通过；人工交付验收、PR与合入仍待发生，不能仅以本段技术绿灯进入T5。
+
+
+### T4 r4新版适配（2026-10-22，实施中）
+
+用户批准按02dbac4适配。具体实现/验收见0005第9.7节；浏览器→Fastify→Host、每会话快照、turn幂等、history/resume/cancel取代旧直连/断开取消。新证据未生成前不标M4通过。Office本体未修改，T5删除/审批/详情仍待实施。

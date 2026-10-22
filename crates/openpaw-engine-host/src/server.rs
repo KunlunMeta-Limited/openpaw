@@ -41,7 +41,7 @@ impl HostServer {
         }}));
         if let Some(config) = host.inner.config.office.clone() {
             app = app.merge(crate::office::router(host.clone(), config, addr));
-            host.start_office().await?;
+            host.start_office(addr).await?;
         }
         let task = tokio::spawn(async move {
             axum::serve(listener, app)

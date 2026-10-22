@@ -25,7 +25,7 @@ async fn v1_metadata_upgrades_atomically_and_future_schema_is_rejected() {
     assert_eq!(
         db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
             .unwrap(),
-        2
+        3
     );
     db.pragma_update(None, "user_version", 99).unwrap();
     drop(db);
@@ -81,7 +81,9 @@ async fn sync_scenario() {
             "office.read" => directory(&s),
             "offices.initialize" => {
                 s.initialized = true;
-                s.snapshot = Some(request["offices"][0].clone());
+                if let Some(first) = request["offices"].as_array().and_then(|a| a.first()) {
+                    s.snapshot = Some(first.clone());
+                }
                 code = 202;
                 directory(&s)
             }

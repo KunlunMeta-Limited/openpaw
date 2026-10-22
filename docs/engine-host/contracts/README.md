@@ -4,15 +4,15 @@
 
 Office 原仓不能匿名下载。upstream-office 是九个原始协议 Schema 与 LICENSE 的只读测试快照，非 Host 实现或手写替代 Schema。默认准备流程验证快照哈希、无网络；传 --office-source 时从固定 git commit 校验全部 21 份来源并刷新测试快照，不读取工作区未提交改动。升级先审源码/契约，再同步 commit、哈希和 fixtures，不手改快照。
 
-## Office：v1 官方服务
+## Office：02dbac4 官方服务（version仍为1.0）
 
 Host → POST /api/pawoffice/messages，Bearer 仅服务端持有。外部消息包括 capabilities、initialize、snapshot、read、decision.request、ui.next/respond；场景走 teamId+command 现有 v2。Host 不向 Office 发送旧 actions gateway 格式。
 
 | 规则 | 必须实现的语义 |
 |---|---|
 | JSON | 任意深度无 null，无 __proto__，最大嵌套 64；严格字段 |
-| 容量 | messages 请求 65536 UTF-8 字节；员工≤200、任务≤1000、事件≤500；缓存≤100办公室/8MiB |
-| 快照 | schemaVersion 1.0，seq 1..9007199254740991，每办公室持久递增；完整替换，省略字段按默认清空 |
+| 容量 | messages 请求 65536 UTF-8 字节；每会话员工≤200、任务≤1000、事件≤500；每办公室≤100会话；缓存≤100办公室/8MiB |
+| 快照 | schemaVersion 1.0，seq 1..9007199254740991，每办公室持久递增；conversations[]内独立成员/任务/事件/白板，id等于conversationId；整办公室完整替换，省略字段按默认清空 |
 | 重试 | 同 seq 同规范化内容重同步，不改时间；同 seq 异内容 409；旧 seq ignored |
 | 确认 | 200/applied 是浏览器逻辑确认；202/cached 仅缓存（离线或等待容量满）；请求失败可能已经缓存 |
 | 恢复 | Office Fastify 状态内存存储，重启必须重新初始化；read 不是宿主账本 |
@@ -24,9 +24,12 @@ Host → POST /api/pawoffice/messages，Bearer 仅服务端持有。外部消息
 | 状态 | queued/running/blocked/completed/failed；取消/中断映射 failed 并给原因；进度未知 -1，不伪测CPU/内存 |
 | 白板 | task-board-v1 最多3步骤；前端平滑进度不是业务真实进度 |
 
-NDJSON 请求：version=1.0、teamId、conversationId、messages；事件 status(thinking/streaming)、delta(text)、done、error(message)。不擅加 runId/cursor 到严格 v1 事件。
+聊天为浏览器同源POST /api/pawoffice/chat→Office Fastify→Host /office/chat。Host用offices.initialize.chat.url动态注册实际回环端口；不靠VITE变量，不要求Node无法转发的Origin/认证头；有Origin仍须白名单，Host只监听loopback并校验Host。
 
-输入≤4000、回复≤50000，历史最多10轮且≤100000，行≤32000，delta≤16000；浏览器相关逻辑按 JS UTF-16。当前固定 Zod 的 max(string) 按 Unicode code point，不能把 Schema 通过当成浏览器长度也通过：Host 使用更保守的 UTF-16 分片/总长度保证两者。请求总时限180秒，心跳不重置。v1断开取消，刷新原实现标停止。空输出/错误不发正常 done。
+四操作均有version/teamId/conversationId：send加turnId/messages，history加cursor/limit，resume/cancel加turnId。send/resume是NDJSON，history/cancel是code/msg/data。新增snapshot{text,state,message}，resume第一条必须snapshot；terminal snapshot可直接结束。重复turn相同内容同Run，异内容冲突；history从Run原输入边界投影，工具结果不是新轮次，页内旧→新，游标稳定。断开仅detach，显式cancel清理完成后stopped:true。
+
+请求≤512KiB；输入≤4000、回复≤50000，历史最多10轮且≤100000，行≤350000，delta≤16000；按JS UTF-16兼容限制，字节另计。history响应≤8MiB、每页1—50。单流连接180秒，非流15秒；Run预算独立。空输出/错误不发假done。完整契约与状态图见master第4节，T4实际能力及证据见0005，旧Office验证不能覆盖新版。
+
 
 Fixtures 验证 Schema 的规范化、引用关系、数量/字段、场景绑定、无null/深度、响应形状。seq 冲突/缓存/浏览器应用等运行语义要在 T4 真服务测试，不能靠本阶段 fixtures 声称通过。
 

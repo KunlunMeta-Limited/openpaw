@@ -33,7 +33,7 @@ fn config(base: &std::path::Path) -> HostConfig {
     serde_json::from_value(json!({"home":base.join("home"),"roots":{"project":root},"slots":{"office-1":"project","office-2":"project"},"provider":"mock","tools":["read_file","grep","glob","todo_list","think"],"office":{"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_TEST_KEY","allowed_origins":["http://127.0.0.1:8765"]}})).unwrap()
 }
 fn request(conversation: &str, input: &str) -> Value {
-    json!({"version":"1.0","teamId":"office-1","conversationId":conversation,"messages":[{"role":"user","content":input}]})
+    json!({"type":"send","turnId":uuid::Uuid::new_v4().simple().to_string(),"version":"1.0","teamId":"office-1","conversationId":conversation,"messages":[{"role":"user","content":input}]})
 }
 fn post(client: &reqwest::Client, url: &str, body: &Value) -> reqwest::RequestBuilder {
     client
@@ -50,7 +50,7 @@ async fn events(response: reqwest::Response) -> Vec<Value> {
     let body = response.text().await.unwrap();
     body.lines()
         .map(|line| {
-            assert!(line.encode_utf16().count() <= 32000);
+            assert!(line.encode_utf16().count() <= 350000);
             serde_json::from_str(line).unwrap()
         })
         .collect()
@@ -83,7 +83,7 @@ async fn suite() {
             .unwrap(),
     )
     .await;
-    assert_eq!(e.last().unwrap(), &json!({"type":"done"}));
+    assert!(completed(e.last().unwrap()));
     let text: String = e.iter().filter_map(|e| e["text"].as_str()).collect();
     assert!(text.contains("ALPHA"));
     let scope = ClientScope {
@@ -107,9 +107,60 @@ async fn suite() {
         .await
         .unwrap();
     assert!(serde_json::to_string(&history).unwrap().contains("ALPHA"));
-    let follow = json!({"version":"1.0","teamId":"office-1","conversationId":"first","messages":[{"role":"user","content":"读取README.md"},{"role":"assistant","content":text},{"role":"user","content":"记得什么？"}]});
+    let page_request = json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"first","limit":1});
+    let page: Value = post(&client, &url, &page_request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["data"]["turns"].as_array().unwrap().len(), 1);
+    assert!(page["data"]["turns"][0]["assistant"]
+        .as_str()
+        .unwrap()
+        .contains("ALPHA"));
+    assert_eq!(page["data"]["turns"][0]["user"], "读取README.md");
+    // 原turn重试先从持久关联返回终态快照，不再调用Provider/工具。
+    let turn = page["data"]["turns"][0]["id"].clone();
+    let mut duplicate = request("first", "读取README.md");
+    duplicate["turnId"] = turn;
+    let replay = events(post(&client, &url, &duplicate).send().await.unwrap()).await;
+    assert_eq!(replay[0]["type"], "snapshot");
+    assert_eq!(replay[0]["state"], "complete");
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        1
+    );
+    duplicate["messages"][0]["content"] = json!("不同输入");
+    assert_eq!(
+        post(&client, &url, &duplicate)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        409
+    );
+    let empty =
+        json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"empty"});
+    let empty_page: Value = client
+        .post(format!("{url}/office/chat"))
+        .json(&empty)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty_page["data"]["turns"], json!([]));
+    let follow = json!({"type":"send","turnId":uuid::Uuid::new_v4().simple().to_string(),"version":"1.0","teamId":"office-1","conversationId":"first","messages":[{"role":"user","content":"读取README.md"},{"role":"assistant","content":text},{"role":"user","content":"记得什么？"}]});
     let follow_events = events(post(&client, &url, &follow).send().await.unwrap()).await;
-    assert_eq!(follow_events.last().unwrap()["type"], "done");
+    assert!(completed(follow_events.last().unwrap()));
     let mut wrong = follow.clone();
     wrong["messages"][1]["content"] = json!("篡改历史");
     assert_eq!(
@@ -175,13 +226,18 @@ async fn suite() {
         .await
         .unwrap();
     assert_eq!(
-        post(&client, &url, &request("duplicate", "重复提交"))
+        post(&client, &url, &request("cancel", "重复提交"))
             .send()
             .await
             .unwrap()
             .status(),
         409
     );
+    let same_office = post(&client, &url, &request("parallel", "同办公室不同会话"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same_office.status(), 200);
     let mut other = request("independent", "另一个办公室");
     other["teamId"] = json!("office-2");
     let independent = post(&client, &url, &other).send().await.unwrap();
@@ -191,6 +247,44 @@ async fn suite() {
     let mut stream = response.bytes_stream();
     assert!(stream.next().await.is_some());
     drop(stream);
+    let control =
+        json!({"version":"1.0","type":"history","teamId":"office-1","conversationId":"cancel"});
+    let page: Value = post(&client, &url, &control)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["data"]["turns"].as_array().unwrap().len(), 1);
+    assert_eq!(page["data"]["turns"][0]["state"], "pending");
+    let turn = page["data"]["activeTurnId"].clone();
+    let resume = json!({"version":"1.0","type":"resume","teamId":"office-1","conversationId":"cancel","turnId":turn});
+    let mut resumed = post(&client, &url, &resume)
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let first = resumed.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("snapshot"));
+    drop(resumed);
+    let cancel = json!({"version":"1.0","type":"cancel","teamId":"office-1","conversationId":"cancel","turnId":turn});
+    let stopped: Value = post(&client, &url, &cancel)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stopped["data"]["stopped"], true);
+    let again: Value = post(&client, &url, &cancel)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["data"]["stopped"], true);
     let s = ClientScope {
         namespace: "office".into(),
         slot_id: "office-1".into(),
@@ -225,8 +319,10 @@ async fn suite() {
         .state
         .is_terminal());
     drop(other_stream);
+    drop(same_office);
     server.shutdown().await.unwrap();
     boundary_cases(tmp.path()).await;
+    persistent_turn_cases(tmp.path()).await;
 }
 async fn boundary_cases(base: &std::path::Path) {
     let client = reqwest::Client::new();
@@ -255,12 +351,15 @@ async fn boundary_cases(base: &std::path::Path) {
         )
         .await;
         if index < 2 {
-            assert_eq!(result.last().unwrap()["type"], "error");
+            assert!(
+                result.last().unwrap()["type"] == "error"
+                    || result.last().unwrap()["state"] == "error"
+            );
             assert!(!result.iter().any(|v| v["type"] == "done"));
         } else {
             let actual: String = result.iter().filter_map(|v| v["text"].as_str()).collect();
             assert_eq!(actual, text);
-            assert_eq!(result.last().unwrap()["type"], "done");
+            assert!(completed(result.last().unwrap()));
         }
         server.shutdown().await.unwrap();
     }
@@ -270,14 +369,27 @@ async fn boundary_cases(base: &std::path::Path) {
         .unwrap();
     let server = HostServer::bind(host.clone(), 0).await.unwrap();
     let url = format!("http://{}", server.address());
-    let imported = json!({"version":"1.0","teamId":"office-1","conversationId":"import","messages":[{"role":"user","content":"已有用户"},{"role":"assistant","content":"已有回复"},{"role":"user","content":"新输入"}]});
-    assert_eq!(
+    let imported = json!({"type":"send","turnId":uuid::Uuid::new_v4().simple().to_string(),"version":"1.0","teamId":"office-1","conversationId":"import","messages":[{"role":"user","content":"已有用户"},{"role":"assistant","content":"已有回复"},{"role":"user","content":"新输入"}]});
+    assert!(completed(
         events(post(&client, &url, &imported).send().await.unwrap())
             .await
             .last()
-            .unwrap()["type"],
-        "done"
-    );
+            .unwrap()
+    ));
+    let import_page: Value = post(
+        &client,
+        &url,
+        &json!({"version":"1.0","type":"history","teamId":"office-1","conversationId":"import"}),
+    )
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(import_page["data"]["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(import_page["data"]["turns"][0]["user"], "已有用户");
+    assert_eq!(import_page["data"]["turns"][0]["assistant"], "已有回复");
     let scope = ClientScope {
         namespace: "office".into(),
         slot_id: "office-1".into(),
@@ -299,14 +411,13 @@ async fn boundary_cases(base: &std::path::Path) {
         .unwrap();
     let server = HostServer::bind(host.clone(), 0).await.unwrap();
     let url = format!("http://{}", server.address());
-    let suffix = json!({"version":"1.0","teamId":"office-1","conversationId":"import","messages":[{"role":"user","content":"新输入"},{"role":"assistant","content":"新回答"},{"role":"user","content":"同文本也可以再次提问"}]});
-    assert_eq!(
+    let suffix = json!({"type":"send","turnId":uuid::Uuid::new_v4().simple().to_string(),"version":"1.0","teamId":"office-1","conversationId":"import","messages":[{"role":"user","content":"新输入"},{"role":"assistant","content":"新回答"},{"role":"user","content":"同文本也可以再次提问"}]});
+    assert!(completed(
         events(post(&client, &url, &suffix).send().await.unwrap())
             .await
             .last()
-            .unwrap()["type"],
-        "done"
-    );
+            .unwrap()
+    ));
     let oversized = client
         .post(format!("{url}/office/chat"))
         .header("origin", "http://127.0.0.1:8765")
@@ -354,4 +465,147 @@ impl LlmProvider for Slow {
     fn default_model(&self) -> &str {
         "slow-test"
     }
+}
+
+fn completed(event: &Value) -> bool {
+    event["type"] == "done" || event["type"] == "snapshot" && event["state"] == "complete"
+}
+
+async fn persistent_turn_cases(base: &std::path::Path) {
+    let cfg = config(&base.join("persistent-turns"));
+    let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed("稳定历史回答")))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("http://{}", server.address());
+    let first = request("pages", "第一页输入");
+    let (a, b) = tokio::join!(
+        post(&client, &url, &first).send(),
+        post(&client, &url, &first).send()
+    );
+    assert!(completed(events(a.unwrap()).await.last().unwrap()));
+    assert!(completed(events(b.unwrap()).await.last().unwrap()));
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "pages".into(),
+    };
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        1
+    );
+    for input in ["第二页输入", "第三页输入"] {
+        assert!(completed(
+            events(
+                post(&client, &url, &request("pages", input))
+                    .send()
+                    .await
+                    .unwrap()
+            )
+            .await
+            .last()
+            .unwrap()
+        ));
+    }
+    let page_request = json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"pages","limit":1});
+    let page: Value = post(&client, &url, &page_request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["data"]["turns"][0]["user"], "第三页输入");
+    assert_eq!(page["data"]["hasMore"], true);
+    let mut older = page_request.clone();
+    older["cursor"] = page["data"]["nextCursor"].clone();
+    assert!(completed(
+        events(
+            post(&client, &url, &request("pages", "第四页输入"))
+                .send()
+                .await
+                .unwrap()
+        )
+        .await
+        .last()
+        .unwrap()
+    ));
+    let prior: Value = post(&client, &url, &older)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prior["data"]["turns"][0]["user"], "第二页输入");
+    older["conversationId"] = json!("other-scope");
+    assert_eq!(
+        post(&client, &url, &older).send().await.unwrap().status(),
+        400
+    );
+    server.shutdown().await.unwrap();
+    let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed("不得重复执行")))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let replay = events(post(&client, &url, &first).send().await.unwrap()).await;
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0]["state"], "complete");
+    assert_eq!(replay[0]["text"], "稳定历史回答");
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        4
+    );
+    // 模拟升级前未保存turnId的原Run；历史与resume使用稳定legacy身份，不启动Provider。
+    let old_scope = ClientScope {
+        conversation_id: "old-session".into(),
+        ..scope.clone()
+    };
+    let binding = host.open_session(old_scope.clone()).await.unwrap();
+    let old = host
+        .submit_run(&old_scope, &binding.session_id, "旧版用户输入".into())
+        .await
+        .unwrap();
+    loop {
+        if host
+            .get_run(&old_scope, &old.run_id)
+            .await
+            .unwrap()
+            .state
+            .is_terminal()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let history = json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"old-session"});
+    let old_page: Value = post(&client, &url, &history)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        old_page["data"]["turns"][0]["id"],
+        format!("legacy:{}", old.run_id)
+    );
+    let resume = json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"old-session","turnId":format!("legacy:{}",old.run_id)});
+    assert_eq!(
+        events(post(&client, &url, &resume).send().await.unwrap()).await[0]["state"],
+        "complete"
+    );
+    server.shutdown().await.unwrap();
 }

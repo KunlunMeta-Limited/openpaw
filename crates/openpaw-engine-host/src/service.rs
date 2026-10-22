@@ -77,6 +77,7 @@ pub(crate) struct Inner {
     shutdown_result: tokio::sync::Mutex<Option<HostResult<()>>>,
     idle: Notify,
     office: tokio::sync::Mutex<Option<crate::office::Coordinator>>,
+    acceptance: tokio::sync::Mutex<()>,
     notices: broadcast::Sender<HostNotice>,
     live: Arc<Mutex<HashMap<String, (String, bool)>>>,
 }
@@ -198,6 +199,7 @@ impl Host {
                 shutdown_result: tokio::sync::Mutex::new(None),
                 idle: Notify::new(),
                 office: tokio::sync::Mutex::new(None),
+                acceptance: tokio::sync::Mutex::new(()),
                 notices,
                 live,
             }),
@@ -236,6 +238,21 @@ impl Host {
             .call(move |db| {
                 if let Some(binding) = db.bindings()?.into_iter().find(|b| b.scope == scope) {
                     return Ok(binding);
+                }
+                if scope.namespace == "office"
+                    && db
+                        .bindings()?
+                        .iter()
+                        .filter(|b| {
+                            b.scope.namespace == "office" && b.scope.slot_id == scope.slot_id
+                        })
+                        .count()
+                        >= 100
+                {
+                    return Err(HostError::new(
+                        "capacity_exceeded",
+                        "办公室已达到100个会话上限",
+                    ));
                 }
                 let mut session = Session::new(model, provider);
                 session.meta.workspace_id = Some(root.clone());
@@ -300,6 +317,64 @@ impl Host {
         input: String,
         history: Option<Vec<Message>>,
     ) -> HostResult<RunView> {
+        self.submit_with_key(scope, session_id, input, history, None)
+            .await
+    }
+    /// 功能：根据客户端稳定键可靠接受或重订阅原Run。
+    /// 参数：scope/session_id为授权范围，input/history为输入，key/canonical为幂等标识及规范请求。
+    /// 返回：新接受或原已接受的Run。
+    /// 错误：同键异内容、容量、历史或存储错误。
+    /// 状态：映射与Accepting状态同事务保存，执行仍用原AgentLoop。
+    /// 并发与取消：短接受锁仅覆盖查重/持久化，不占用推理、查询、取消或审批。
+    /// 权限：重试同样校验固定会话归属；键不是授权。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    pub(crate) async fn submit_idempotent(
+        &self,
+        scope: &ClientScope,
+        session_id: &str,
+        input: String,
+        history: Vec<Message>,
+        key: String,
+        canonical: String,
+    ) -> HostResult<RunView> {
+        let _acceptance = self.inner.acceptance.lock().await;
+        let sid = session_id.to_owned();
+        let s = scope.clone();
+        let k = key.clone();
+        if let Some((prior, id)) = self
+            .inner
+            .store
+            .call(move |db| {
+                check_scope(&db.binding(&sid)?, &s)?;
+                db.request_for_key(&sid, &k)
+            })
+            .await?
+        {
+            if prior != canonical {
+                return Err(HostError::new(
+                    "request_conflict",
+                    "相同turnId的请求内容不同",
+                ));
+            }
+            return self.get_run(scope, &id).await;
+        }
+        self.submit_with_key(
+            scope,
+            session_id,
+            input,
+            Some(history),
+            Some((key, canonical)),
+        )
+        .await
+    }
+    async fn submit_with_key(
+        &self,
+        scope: &ClientScope,
+        session_id: &str,
+        input: String,
+        history: Option<Vec<Message>>,
+        request: Option<(String, String)>,
+    ) -> HostResult<RunView> {
         if self.inner.unavailable.load(Ordering::Acquire) {
             return Err(HostError::new(
                 "storage_unavailable",
@@ -340,10 +415,10 @@ impl Host {
             if state.active.values().any(|a| a.session == session_id) {
                 return Err(HostError::new("session_busy", "会话已有活动运行"));
             }
-            if state
-                .active
-                .values()
-                .any(|a| a.scope.namespace == scope.namespace && a.scope.slot_id == scope.slot_id)
+            if scope.namespace != "office"
+                && state.active.values().any(|a| {
+                    a.scope.namespace == scope.namespace && a.scope.slot_id == scope.slot_id
+                })
             {
                 return Err(HostError::new("slot_busy", "办公室已有活动运行"));
             }
@@ -377,11 +452,13 @@ impl Host {
                     db.reconcile_history(&view.session_id, &history)?;
                 }
                 let offset = db.events(&view.session_id)?.len();
-                let mut view = db.save_run(view, offset)?;
+                let mut view = db.save_run_with_request(view, offset, request)?;
                 db.append(
                     &view.session_id,
                     SessionEvent::Message(Message::user_text(input)),
                 )?;
+                // 输入事实已落盘才标记归属；接受失败的旧offset不能挪用后续Run的用户输入。
+                db.bump("run_input_committed", &view.run_id)?;
                 view.state = RunState::Accepted;
                 let view = db.save_run(view, offset)?;
                 let session = db.session(&view.session_id)?;
@@ -833,20 +910,21 @@ impl Host {
     }
 
     /// 功能：启动可选Office同步，在原shutdown中统一回收。
-    /// 参数：self为已恢复的共享Host。
+    /// 参数：self为已恢复的共享Host，address为实际回环监听地址。
     /// 返回：启动成功或已启动时成功。
     /// 错误：Office凭据/客户端装配错误。
     /// 状态：不重复启动办公室协调器。
     /// 并发与取消：异步生命周期锁避免两个监听器重复装配。
     /// 权限：只使用已验证本机配置。
     /// 关联：需求/设计REQ-OP-011；DES-OP-007/009。
-    pub(crate) async fn start_office(&self) -> HostResult<()> {
+    pub(crate) async fn start_office(&self, address: std::net::SocketAddr) -> HostResult<()> {
         let mut owner = self.inner.office.lock().await;
         if owner.is_none() {
             if let Some(config) = &self.inner.config.office {
                 *owner = Some(crate::office::Coordinator::start(
                     self.clone(),
                     config.clone(),
+                    address,
                 )?);
             }
         }

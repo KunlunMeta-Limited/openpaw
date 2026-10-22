@@ -8,11 +8,11 @@ use serde_json::Value;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-/// 用途：冻结Office v1请求；禁止添加Run ID等扩展。
+/// 用途：新版Office send请求；运行身份使用官方turnId。
 /// 字段：版本、办公室、会话及文本轮次。
 /// 来源去向：浏览器到Host接受入口。
 /// 约束：无null、未知字段或任意工作目录。
-/// 稳定性：严格兼容Office b221a44。
+/// 稳定性：严格兼容Office 02dbac4。
 /// 关联：需求/设计REQ-OP-010；API-OFFICE-CHAT。
 pub(super) struct ChatRequest {
     /// 用途：聊天协议版本。
@@ -43,6 +43,13 @@ pub(super) struct ChatRequest {
     /// 稳定性：T4新增，保持冻结Office协议。
     /// 关联：需求/设计REQ-OP-010；DES-OP-007。
     pub messages: Vec<Turn>,
+    /// 用途：客户端持久轮次身份。
+    /// 字段：非空字符串，最多100 UTF-16单元。
+    /// 来源去向：Office到Host幂等关联。
+    /// 约束：同键异内容冲突，不作为授权。
+    /// 稳定性：Office 02dbac4官方字段。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub turn_id: String,
 }
 #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -80,9 +87,8 @@ impl ChatRequest {
     pub(super) fn validate(&self) -> HostResult<()> {
         let valid = self.version == "1.0"
             && scene_id(&self.team_id)
-            && !self.conversation_id.is_empty()
-            && units(&self.conversation_id) <= 100
-            && !self.conversation_id.chars().any(char::is_control)
+            && scene_id(&self.conversation_id)
+            && valid_turn_id(&self.turn_id)
             && !self.messages.is_empty()
             && self.messages.len() <= 21
             && self.messages.len() % 2 == 1;
@@ -180,4 +186,148 @@ pub(super) fn protocol_value(value: &Value) -> bool {
         }
     }
     walk(value, 0)
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+/// 用途：Office官方单POST四操作分派。
+/// 字段：send/history/resume/cancel各自严格载荷。
+/// 来源去向：Node转发到Host协议入口。
+/// 约束：不默认为旧版send。
+/// 稳定性：Office 02dbac4。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+pub(super) enum Operation {
+    Send(ChatRequest),
+    History(HistoryRequest),
+    Resume(ControlRequest),
+    Cancel(ControlRequest),
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+/// 用途：只读历史请求。
+/// 字段：版本、办公室、会话、游标和页大小。
+/// 来源去向：Node到历史投影。
+/// 约束：不创建Session；limit为1到50。
+/// 稳定性：Office 02dbac4。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+pub(super) struct HistoryRequest {
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub version: String,
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub team_id: String,
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub conversation_id: String,
+    #[serde(default)]
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub cursor: String,
+    #[serde(default = "default_limit")]
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub limit: usize,
+}
+fn default_limit() -> usize {
+    20
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+/// 用途：恢复或显式取消请求。
+/// 字段：版本、办公室、会话及轮次。
+/// 来源去向：Node到原Run订阅或取消服务。
+/// 约束：查找必须绑定完整范围。
+/// 稳定性：Office 02dbac4。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+pub(super) struct ControlRequest {
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub version: String,
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub team_id: String,
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub conversation_id: String,
+    /// 用途：官方聊天操作字段。
+    /// 字段：按字段类型承载版本、范围或分页/轮次身份。
+    /// 来源去向：Office Node到Host校验/查找入口。
+    /// 约束：由Operation::scope严格校验，不作为授权。
+    /// 稳定性：Office 02dbac4官方协议。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub turn_id: String,
+}
+impl Operation {
+    /// 功能：校验操作身份和各自字段边界。
+    /// 参数：self为严格反序列化后的请求。
+    /// 返回：可信形状的客户端范围（授权仍由Host校验）。
+    /// 错误：版本、标识、长度或操作字段非法。
+    /// 状态：不创建数据。
+    /// 并发与取消：纯计算。
+    /// 权限：ID不是授权凭证。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub(super) fn scope(&self) -> HostResult<crate::ClientScope> {
+        let (v, t, c) = match self {
+            Self::Send(r) => {
+                r.validate()?;
+                (&r.version, &r.team_id, &r.conversation_id)
+            }
+            Self::History(r) => {
+                if !(1..=50).contains(&r.limit) || units(&r.cursor) > 500 {
+                    return Err(HostError::new("invalid_input", "历史分页参数无效"));
+                }
+                (&r.version, &r.team_id, &r.conversation_id)
+            }
+            Self::Resume(r) | Self::Cancel(r) => {
+                if !valid_turn_id(&r.turn_id) {
+                    return Err(HostError::new("invalid_input", "turnId无效"));
+                }
+                (&r.version, &r.team_id, &r.conversation_id)
+            }
+        };
+        if v != "1.0" || !scene_id(t) || !scene_id(c) {
+            return Err(HostError::new("invalid_input", "版本或会话标识无效"));
+        }
+        Ok(crate::ClientScope {
+            namespace: "office".into(),
+            slot_id: t.clone(),
+            conversation_id: c.clone(),
+        })
+    }
+}
+fn valid_turn_id(s: &str) -> bool {
+    !s.is_empty() && units(s) <= 100 && !s.chars().any(char::is_control)
 }

@@ -1,12 +1,12 @@
-//! 职责：严格Office v1聊天、来源校验、有界NDJSON与断开取消。
+//! 职责：严格Office v1聊天、来源校验、有界NDJSON、订阅脱离与显式取消。
 //! 输入输出：HTTP请求到共享Host Run及流式事件。
 //! 依赖：原Host接受、订阅、取消；不自行驱动模型。
-//! 禁止职责：不引入Run ID扩展、写工具或第二套会话。
+//! 禁止职责：不引入自定义Run URL或写工具或第二套会话。
 use super::{
-    dto::{self, ChatRequest},
-    OfficeConfig,
+    dto::{self, Operation},
+    turns, OfficeConfig,
 };
-use crate::{ClientScope, Host, HostError, RunState};
+use crate::{ClientScope, Host, HostError};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -30,13 +30,13 @@ struct ChatState {
 /// 返回：仅含官方POST及OPTIONS的Router。
 /// 错误：请求错误在处理入口明确返回。
 /// 状态：不创建独立运行服务。
-/// 并发与取消：独立任务持有Run生命周期；断开后仍等待清理。
-/// 权限：精确Host/Origin及只读配置校验。
+/// 并发与取消：Run由共享Host持有；订阅断开只detach，显式cancel等待清理。
+/// 权限：回环监听和精确Host；浏览器Origin白名单，Node无Origin转发仍限本机。
 /// 关联：需求/设计REQ-OP-010；DES-OP-007。
 pub(crate) fn router(host: Host, config: OfficeConfig, address: SocketAddr) -> Router {
     Router::new()
         .route("/office/chat", post(handle).options(options))
-        .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
+        .layer(axum::extract::DefaultBodyLimit::max(512 * 1024))
         .with_state(ChatState {
             host,
             config,
@@ -57,7 +57,7 @@ fn origin(state: &ChatState, headers: &HeaderMap) -> Result<String, HostError> {
         format!("localhost:{}", state.address.port()),
     ]
     .contains(&host.to_owned())
-        || !state.config.allowed_origins.iter().any(|o| o == source)
+        || (!source.is_empty() && !state.config.allowed_origins.iter().any(|o| o == source))
     {
         return Err(HostError::new("scope_denied", "聊天来源未获授权"));
     }
@@ -65,8 +65,10 @@ fn origin(state: &ChatState, headers: &HeaderMap) -> Result<String, HostError> {
 }
 fn cors(mut response: Response, source: &str) -> Response {
     let h = response.headers_mut();
-    if let Ok(v) = source.parse() {
-        h.insert("access-control-allow-origin", v);
+    if !source.is_empty() {
+        if let Ok(v) = source.parse() {
+            h.insert("access-control-allow-origin", v);
+        }
     }
     h.insert("vary", "Origin".parse().unwrap());
     h.insert("cache-control", "no-store".parse().unwrap());
@@ -75,14 +77,15 @@ fn cors(mut response: Response, source: &str) -> Response {
 fn error(e: HostError) -> Response {
     let code = match e.kind.as_str() {
         "scope_denied" => 403,
-        "session_busy" | "slot_busy" | "history_conflict" => 409,
+        "session_busy" | "slot_busy" | "history_conflict" | "request_conflict" => 409,
+        "not_found" => 404,
         "capacity_exceeded" | "storage_unavailable" | "cancelled" => 503,
         "unsupported" => 422,
         _ => 400,
     };
     (
         StatusCode::from_u16(code).unwrap(),
-        axum::Json(json!({"error":e.kind,"message":e.message})),
+        axum::Json(json!({"code":code,"msg":e.message,"data":{"reasonCode":e.kind,"details":{},"issues":[]}})),
     )
         .into_response()
 }
@@ -153,41 +156,64 @@ async fn handle(
             Ok(b) => b,
             Err(e) => return e.into_response(),
         };
-        let request: ChatRequest = match serde_json::from_slice(&body) {
+        let value: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return error(HostError::new("invalid_input", "聊天JSON无效")),
+        };
+        if !dto::protocol_value(&value) {
+            return error(HostError::new("invalid_input", "聊天不允许null或保留字段"));
+        }
+        let request: Operation = match serde_json::from_value(value) {
             Ok(r) => r,
             Err(_) => return error(HostError::new("invalid_input", "聊天JSON格式或字段无效")),
         };
-        if let Err(e) = request.validate() {
-            return error(e);
+        let scope = match request.scope() {
+            Ok(s) => s,
+            Err(e) => return error(e),
+        };
+        if !state.host.inner.config.slots.contains_key(&scope.slot_id) {
+            return error(HostError::new("scope_denied", "办公室未授权"));
         }
-        let scope = ClientScope {
-            namespace: "office".into(),
-            slot_id: request.team_id,
-            conversation_id: request.conversation_id,
+        let request = match request {
+            Operation::History(r) => {
+                return match turns::history(&state.host, &scope, r).await {
+                    Ok(page) => ok(page),
+                    Err(e) => error(e),
+                }
+            }
+            Operation::Cancel(r) => {
+                // 取消任务归Host所有；HTTP连接消失不能使清理半途停止。
+                let host = state.host.clone();
+                return match tokio::spawn(async move {
+                    let run = turns::find(&host, &scope, &r.turn_id).await?;
+                    host.cancel_run(&scope, &run.run_id).await?;
+                    loop {
+                        let view = host.get_run(&scope, &run.run_id).await?;
+                        if view.state.is_terminal() {
+                            return Ok::<_, HostError>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                {
+                    Ok(Ok(())) => ok(json!({"stopped":true})),
+                    Ok(Err(e)) => error(e),
+                    Err(_) => error(HostError::new("interrupted", "取消任务异常")),
+                };
+            }
+            other => other,
         };
         let (ready_tx, ready_rx) = oneshot::channel();
         let (tx, rx) = mpsc::channel::<Bytes>(1);
         let host = state.host.clone();
         // 接受与流归同一个宿主任务所有；请求future消失不能丢下已接受的Run。
         tokio::spawn(async move {
-            let accepted = async {
-                let binding = host.open_session(scope.clone()).await?;
-                let mut messages = request.messages;
-                let input = messages.pop().unwrap().content;
-                let history = messages
-                    .into_iter()
-                    .map(|m| {
-                        if m.role == "user" {
-                            openpaw_core::Message::user_text(m.content)
-                        } else {
-                            openpaw_core::Message::assistant_text(m.content)
-                        }
-                    })
-                    .collect();
-                host.submit_with_history(&scope, &binding.session_id, input, Some(history))
-                    .await
-            }
-            .await;
+            let accepted = match request {
+                Operation::Send(r) => turns::accept(&host, &scope, r).await,
+                Operation::Resume(r) => turns::find(&host, &scope, &r.turn_id).await,
+                _ => unreachable!("控制操作已分派"),
+            };
             let run = match accepted {
                 Ok(r) => r,
                 Err(e) => {
@@ -195,22 +221,9 @@ async fn handle(
                     return;
                 }
             };
-            if ready_tx.send(Ok(())).is_err() {
-                let _ = host.cancel_run(&scope, &run.run_id).await;
-                return;
-            }
-            let result = stream_run(&host, &scope, &run.run_id, &tx).await;
-            if !result {
-                let _ = host.cancel_run(&scope, &run.run_id).await;
-                // 共享执行任务仍持有资源，清理完成才进入终态；不drop工具future。
-                loop {
-                    match host.get_run(&scope, &run.run_id).await {
-                        Ok(v) if !v.state.is_terminal() => {
-                            tokio::time::sleep(Duration::from_millis(20)).await
-                        }
-                        _ => break,
-                    }
-                }
+            if ready_tx.send(Ok(())).is_ok() {
+                // 流任务仅持有订阅；断线、刷新或慢消费者不取消原Run。
+                let _ = stream_run(&host, &scope, &run.run_id, &tx).await;
             }
         });
         match ready_rx.await {
@@ -239,7 +252,7 @@ async fn handle(
 }
 async fn send(tx: &mpsc::Sender<Bytes>, event: serde_json::Value) -> bool {
     let mut line = event.to_string();
-    if dto::units(&line) > 32000 {
+    if dto::units(&line) > 350000 {
         return false;
     }
     line.push('\n');
@@ -248,9 +261,7 @@ async fn send(tx: &mpsc::Sender<Bytes>, event: serde_json::Value) -> bool {
         .is_ok_and(|r| r.is_ok())
 }
 async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sender<Bytes>) -> bool {
-    if !send(tx, json!({"type":"status","phase":"thinking"})).await {
-        return false;
-    }
+    let mut first = true;
     let mut sent = String::new();
     let mut streaming = false;
     loop {
@@ -268,10 +279,28 @@ async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sende
                 return false;
             }
         };
+        if first {
+            let event = json!({"type":"snapshot","text":dto::bounded(&run.text,50000),"state":turns::state(&run),"message":turns::message(&run)});
+            if !send(tx, event).await {
+                return false;
+            }
+            if turns::state(&run) != "pending" {
+                if !run.state.is_terminal() {
+                    let _ = host.cancel_run(scope, id).await;
+                }
+                return true;
+            }
+            sent = run.text.clone();
+            first = false;
+            if !send(tx, json!({"type":"status","phase":"thinking"})).await {
+                return false;
+            }
+        }
         if !run.text.starts_with(&sent) || dto::units(&run.text) > 50000 || run.text_truncated {
+            let _ = host.cancel_run(scope, id).await;
             let _ = send(
                 tx,
-                json!({"type":"error","message":"回复超限或流内容不一致，运行已停止"}),
+                json!({"type":"error","message":"回复超限或流内容不一致，已请求停止"}),
             )
             .await;
             return false;
@@ -291,24 +320,24 @@ async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sende
             }
             tail = &tail[chunk.len()..];
         }
-        sent = run.text;
+        sent = run.text.clone();
         if run.state.is_terminal() {
-            if run.state == RunState::Completed && !sent.trim().is_empty() && run.error.is_none() {
-                return send(tx, json!({"type":"done"})).await;
-            }
-            let message = if sent.trim().is_empty() && run.state == RunState::Completed {
-                "模型没有返回可显示文本"
-            } else {
-                match run.state {
-                    RunState::Cancelled => "运行已取消",
-                    RunState::TimedOut => "运行超时",
-                    RunState::Interrupted => "运行已中断",
-                    _ => "运行失败，未正常完成",
+            return match turns::state(&run) {
+                "complete" => send(tx, json!({"type":"done"})).await,
+                "stopped" => {
+                    send(
+                        tx,
+                        json!({"type":"snapshot","text":sent,"state":"stopped","message":""}),
+                    )
+                    .await
                 }
+                _ => send(tx, json!({"type":"error","message":turns::message(&run)})).await,
             };
-            let _ = send(tx, json!({"type":"error","message":message})).await;
-            return true;
         }
         tokio::select! {_=tx.closed()=>return false,_=notices.recv()=>{},_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }
+}
+
+fn ok(data: serde_json::Value) -> Response {
+    axum::Json(json!({"code":200,"msg":"OK","data":data})).into_response()
 }

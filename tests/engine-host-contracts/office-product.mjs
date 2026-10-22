@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
 import { once } from 'node:events'
 import { officeRequestSchema, officeResultSchema, officeSnapshotSchema } from './upstream-office/packages/protocol/src/office-integration.ts'
-import { chatEventSchema } from './upstream-office/packages/protocol/src/chat.ts'
+import { chatEventSchema, chatOperationSchema, chatHistoryPageSchema, chatCancelResultSchema } from './upstream-office/packages/protocol/src/chat.ts'
 import { assertProtocolValue, responseEnvelopeSchema } from './upstream-office/packages/protocol/src/schema.ts'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
@@ -88,7 +88,7 @@ function provider() {
       const prompt = data.messages[lastUser]?.content ?? ''
       const results = data.messages.slice(lastUser + 1).filter(m => m.role === 'tool')
       if (prompt.includes('慢任务')) {
-        const timer = setTimeout(() => { if (!res.destroyed) finish({ content: '慢任务完成' }) }, 30000)
+        const timer = setTimeout(() => { if (!res.destroyed) finish({ content: '慢任务完成' }) }, 60000)
         res.once('close', () => clearTimeout(timer)); return
       }
       if (prompt.includes('读取') && results.length === 0) {
@@ -129,7 +129,7 @@ try {
   let host = start(resolve(binary), ['engine-host', '--config', config, '--port', '0'], root, childEnv, 'host')
   const hostBase = await waitFor(() => host.stdout().match(/openpaw engine host listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1])
   report.hostBinarySha256 = createHash('sha256').update(await readFile(resolve(binary))).digest('hex')
-  const buildEnv = { ...childEnv, VITE_PAWOFFICE_CHAT_URL: hostBase + '/office/chat' }
+  const buildEnv = { ...childEnv } // chat.url由Host运行时注册，不再注入VITE配置
   await run(process.execPath, [npm, 'run', 'build:full'], office, buildEnv, 'office-build')
   let officeProcess = start(process.execPath, ['server/dist/index.js'], office, { ...childEnv, PORT: String(officePort), HOST: '127.0.0.1', PAWOFFICE_PUBLIC_ORIGIN: officeBase }, 'office-server')
   await waitFor(async () => { try { return (await fetch(officeBase + '/office/')).ok } catch { return false } })
@@ -144,10 +144,22 @@ try {
   await cdp.send('Network.enable')
   const streams = new Map(), captureJobs = []
   page.on('pageerror', e => report.browserErrors.push(e.message))
+  page.on('response', async response => {
+    if(response.url()!==officeBase+'/api/pawoffice/chat') return
+    const request=response.request().postDataJSON()
+    if(!['history','cancel'].includes(request.type))return
+    const item=report.browserRequests.findLast(r=>JSON.stringify(r.request)===JSON.stringify(request))
+    if(!item)return
+    try {item.http=response.status();item.json=await response.json();responseEnvelopeSchema.parse(item.json);assertProtocolValue(item.json)
+      if(response.ok())(request.type==='history'?chatHistoryPageSchema:chatCancelResultSchema).parse(item.json.data)
+    }catch(e){report.browserErrors.push(String(e))}
+  })
   cdp.on('Network.requestWillBeSent', event => {
-    if (event.request.url === hostBase + '/office/chat' && event.request.method === 'POST') {
+    if (event.request.url === officeBase + '/api/pawoffice/chat' && event.request.method === 'POST') {
       const item = { at: new Date().toISOString(), url: event.request.url, method: 'POST', request: JSON.parse(event.request.postData) }
-      report.browserRequests.push(item); streams.set(event.requestId, { item, chunks: [] })
+      chatOperationSchema.parse(item.request)
+      report.browserRequests.push(item)
+      if (['send','resume'].includes(item.request.type)) streams.set(event.requestId, { item, chunks: [] })
     }
   })
   cdp.on('Network.responseReceived', event => {
@@ -164,91 +176,133 @@ try {
       item.body = Buffer.concat(chunks).toString('utf8')
       assert.ok(!item.captureError, item.captureError)
       assert.equal(item.request.teamId, 'office-1', 'browser journey must use selected office')
-      item.events = item.body.split('\n').filter(Boolean).map(line => { assert.ok(line.length <= 32000); const event = JSON.parse(line); chatEventSchema.parse(event); assertProtocolValue(event); return event })
+      item.events = item.body.split('\n').filter(Boolean).map(line => { assert.ok(line.length <= 350000); const event = JSON.parse(line); chatEventSchema.parse(event); assertProtocolValue(event); return event })
     }
   }
-  await page.goto(officeBase + '/office/', { waitUntil: 'domcontentloaded' })
-  const input = page.getByRole('textbox', { name: '给办公室发送消息' }); await input.waitFor({ timeout: 60000 })
-  await page.getByText(/正在加载办公室/).waitFor({ state: 'hidden', timeout: 60000 })
-  await waitFor(async () => { const directory = await officePost(officeBase, { type: 'office.read' }); return directory.code === 200 && ['office-1', 'office-2'].every(id => directory.data.offices.some(o => o.id === id && o.runtimeReady)) })
-  // Workers initialize independently; never assume which office the UI initially selects.
-  await page.getByRole('button', { name: /^团队空间，当前团队/ }).click()
-  await page.getByRole('button', { name: '进入真实运行验收', exact: true }).click()
-  await page.getByRole('dialog').waitFor({ state: 'hidden' })
-  await page.getByRole('button', { name: /^团队空间，当前团队：真实运行验收/ }).waitFor()
-  await page.screenshot({ path: join(output, '01-connected.png'), fullPage: true })
-  async function send(text, expected) {
-    // Switching offices restores its IndexedDB chat asynchronously; fill only after ready,
-    // and tolerate the draft being replaced once by that restoration before submitting.
-    await waitFor(async () => { if (!await input.isEnabled()) return false; await input.fill(text); return await page.getByRole('button', { name: '发送消息', exact: true }).isEnabled() })
-    await page.getByRole('button', { name: '发送消息', exact: true }).click()
-    await waitFor(async () => (await page.getByRole('log', { name: '对话内容' }).innerText()).includes(expected), 30000)
-    await page.getByRole('button', { name: '停止生成', exact: true }).waitFor({ state: 'hidden', timeout: 30000 })
+  const input = page.getByRole('textbox', { name: '给办公室发送消息' })
+  const log = page.getByRole('log', {name:'对话内容'})
+  async function chooseOffice(p=page){
+    await p.getByText(/正在加载办公室/).waitFor({state:'hidden',timeout:60000})
+    await p.getByRole('button',{name:/^团队空间，当前团队/}).click()
+    await p.getByRole('button',{name:'进入真实运行验收',exact:true}).click()
+    await p.getByRole('dialog').waitFor({state:'hidden'})
   }
-  await send('你好', '网页协议对话正常')
-  assert.equal(await page.getByText('交互预览', { exact: true }).isVisible(), false)
-  await send('读取README.md和notes.txt并总结', markerA)
-  const transcript = await page.getByRole('log', { name: '对话内容' }).innerText(); assert.ok(transcript.includes(markerB))
-  await page.screenshot({ path: join(output, '02-real-tools.png'), fullPage: true })
-  await send('追问：刚才两个文件分别包含什么？', '已保留历史')
-  const state = await waitFor(async () => { const result = await officePost(officeBase, { type: 'office.read', teamId: 'office-1' }); return result.code === 200 && result.data.snapshot.tasks.filter(t => t.id.startsWith('tool:')).length === 2 ? result : false })
-  assert.ok(state.data.snapshot.tasks.some(t => t.title.includes('read_file') && t.status === 'completed'))
-  assert.ok(state.data.snapshot.events.some(e => e.kind === 'task.assigned'))
-  assert.ok(state.data.snapshot.whiteboard.steps.length <= 3)
-  await page.getByRole('button', { name: '收起对话', exact: true }).first().click(); await delay(300)
-  await page.getByRole('button', { name: /任务中心/ }).click()
-  await page.screenshot({ path: join(output, '03-tasks-and-whiteboard.png'), fullPage: true })
-  // Validate the real server's version semantics; no fixture can replace this journey.
-  const saved = structuredClone(state.data.snapshot)
-  const same = await officePost(officeBase, { type: 'office.snapshot', teamId: 'office-1', snapshot: saved }); assert.ok([200, 202].includes(same.code))
-  const changed = structuredClone(saved); changed.workspace.name = '同版本不同内容'
-  const conflict = await officePost(officeBase, { type: 'office.snapshot', teamId: 'office-1', snapshot: changed }); assert.equal(conflict.code, 409); assert.equal(conflict.data.reasonCode, 'SEQ_CONFLICT')
-  if (saved.seq > 1) { const old = structuredClone(saved); old.seq--; const stale = await officePost(officeBase, { type: 'office.snapshot', teamId: 'office-1', snapshot: old }); assert.equal(stale.data.status, 'ignored') }
-  await input.fill('慢任务：请等待'); await page.getByRole('button', { name: '发送消息', exact: true }).click()
-  await page.getByRole('button', { name: '停止生成', exact: true }).waitFor()
-  await delay(200); await page.getByRole('button', { name: '停止生成', exact: true }).click()
-  await waitFor(async () => (await page.getByRole('log', { name: '对话内容' }).innerText()).includes('已停止生成'))
-  await waitFor(async () => { const r = await officePost(officeBase, { type: 'office.read', teamId: 'office-1' }); return r.code === 200 && r.data.snapshot.tasks.some(t => t.summary.includes('用户取消，清理已完成')) })
-  await page.screenshot({ path: join(output, '04-stop-confirmed.png'), fullPage: true })
-  // Fastify restart clears its memory directory. Host must reinitialize from its durable version.
-  officeProcess.p.kill('SIGTERM'); await officeProcess.close
-  officeProcess = start(process.execPath, ['server/dist/index.js'], office, { ...childEnv, PORT: String(officePort), HOST: '127.0.0.1', PAWOFFICE_PUBLIC_ORIGIN: officeBase }, 'office-restarted')
-  await waitFor(async () => { try { const r = await officePost(officeBase, { type: 'office.read' }); return r.code === 200 && r.data.offices.some(o => o.id === 'office-1') } catch { return false } })
-  await page.reload({ waitUntil: 'domcontentloaded' }); await input.waitFor({ timeout: 60000 })
-  await waitFor(async () => { const r = await officePost(officeBase, { type: 'office.read', teamId: 'office-1' }); return r.code === 200 && r.data.snapshot.tasks.some(t => t.title.includes('read_file')) }, 45000)
-  await page.getByRole('button', { name: /^团队空间，当前团队/ }).click()
-  await page.getByRole('button', { name: '进入真实运行验收', exact: true }).click()
-  await page.getByRole('dialog').waitFor({ state: 'hidden' })
-  await page.screenshot({ path: join(output, '05-office-restart-recovered.png'), fullPage: true })
-  // Crash an accepted, still-waiting run. Restart the same Host port/data;
-  // v1 has no resume, but interrupted metadata and original tools must survive.
-  const crashRequest = fetch(hostBase + '/office/chat', { method: 'POST', headers: { 'content-type': 'application/json', Origin: officeBase }, body: JSON.stringify({ version: '1.0', teamId: 'office-1', conversationId: 'host-crash-' + Date.now(), messages: [{ role: 'user', content: '慢任务：模拟Host崩溃' }] }) }).catch(() => null)
-  await waitFor(() => report.modelRequests.some(r => r.messages.some(m => m.role === 'user' && m.content === '慢任务：模拟Host崩溃')))
-  const requestsBeforeCrash = report.modelRequests.length
-  host.p.kill('SIGKILL'); await host.close
-  host = start(resolve(binary), ['engine-host', '--config', config, '--port', new URL(hostBase).port], root, childEnv, 'host-restarted')
-  await waitFor(() => host.stdout().includes('openpaw engine host listening on'))
-  await waitFor(async () => { const r = await officePost(officeBase, { type: 'office.read', teamId: 'office-1' }); return r.code === 200 && r.data.snapshot.tasks.some(t => t.summary.includes('Host重启中断')) }, 45000)
-  await page.screenshot({ path: join(output, '06-host-crash-interrupted.png'), fullPage: true })
-  assert.equal(report.modelRequests.length, requestsBeforeCrash, 'restart must not replay Provider/tool work')
-  await crashRequest
-  const recovered = await officePost(officeBase, { type: 'office.read', teamId: 'office-1' })
-  await page.close()
-  // Restart Office after the Host crash. During its startup the official API accepts
-  // the snapshot into its durable cache and returns 202; the coordinator applies it
-  // after capabilities/initialization, so this is observed through the real API.
-  officeProcess.p.kill('SIGTERM'); await officeProcess.close
-  officeProcess = start(process.execPath, ['server/dist/index.js'], office, { ...childEnv, PORT: String(officePort), HOST: '127.0.0.1', PAWOFFICE_PUBLIC_ORIGIN: officeBase }, 'office-offline-restarted')
-  const offline = await waitFor(async () => { try {
-    const r = await officePost(officeBase, { type: 'office.snapshot', teamId: 'office-1', snapshot: recovered.data.snapshot })
-    return r.code === 202 && r.data.status === 'cached' ? r : false
-  } catch { return false } }, 45000)
-  report.assertions.push('Host crash marks accepted run interrupted without replay', 'No browser: real Office returns 202 cached rather than applied')
-  report.transcript = transcript // Captured before closing the page for offline-cache validation
-  await Promise.all(captureJobs); capturedEvents()
-  assert.ok(report.browserRequests.some(r => r.http === 200 && r.events?.some(e => e.type === 'done')))
-  assert.equal(report.browserErrors.length, 0)
-  report.assertions.push('Real browser POST /office/chat and strict upstream events', 'Actual original read_file outputs contain two unpredictable file markers', 'Follow-up uses original session tool history', 'Run/tool tasks, task.assigned and whiteboard read from real Office', 'Same-version duplicate/conflict and stale-version behavior', 'Browser stop cancels Host run', 'Office service restart reinitialized without replaying tools')
+  async function newConversation(){
+    await page.getByRole('button',{name:'新会话',exact:true}).first().click()
+    await input.waitFor();await waitFor(()=>input.isEnabled())
+  }
+  async function send(text,expected){
+    await waitFor(async()=>{if(!await input.isEnabled())return false;await input.fill(text);return await page.getByRole('button',{name:'发送消息',exact:true}).isEnabled()})
+    await page.getByRole('button',{name:'发送消息',exact:true}).click()
+    if(expected){await waitFor(async()=>(await log.innerText()).includes(expected),45000);await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000})}
+  }
+  const readOffice=()=>officePost(officeBase,{type:'office.read',teamId:'office-1'})
+  const conv=(result,id)=>result.data.snapshot.conversations.find(c=>c.id===id)
+  const latestSend=()=>report.browserRequests.findLast(r=>r.request.type==='send')
+  const terminal=e=>e.type==='done'||e.type==='snapshot'&&e.state==='complete'
+  await page.goto(officeBase + '/office/', { waitUntil: 'domcontentloaded' })
+  await chooseOffice()
+  await newConversation()
+  await page.screenshot({path:join(output,'01-connected.png'),fullPage:true})
+  await send('A读取README.md和notes.txt并总结',markerA)
+  const aRequest=structuredClone(latestSend().request), a=aRequest.conversationId
+  const transcript=await log.innerText();assert.ok(transcript.includes(markerB))
+  const state=await waitFor(async()=>{const r=await readOffice();return r.code===200&&conv(r,a)?.tasks.filter(t=>t.id.startsWith('tool:')).length===2?r:false})
+  const current=conv(state,a)
+  assert.ok(current.tasks.filter(t=>t.title.includes('read_file')).every(t=>t.status==='completed'))
+  assert.ok(current.events.some(e=>e.kind==='task.assigned'));assert.ok(current.whiteboard.steps.length<=3)
+  report.correlations={conversationA:a,firstTurn:aRequest.turnId,toolTasks:current.tasks.filter(t=>t.id.startsWith('tool:')).map(t=>t.id),runTask:current.tasks[0].id}
+  await page.screenshot({path:join(output,'02-real-tools.png'),fullPage:true})
+  const downloadPromise=page.waitForEvent('download')
+  await page.getByRole('button',{name:'导出快照',exact:true}).click()
+  const download=await downloadPromise;await download.saveAs(join(output,'02-scene-export.json'))
+  // Same real request twice: original Run, terminal snapshot and no new model/tool request.
+  const modelCount=report.modelRequests.length
+  const replay=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(aRequest)})
+  assert.equal(replay.status,200)
+  const replayEvents=(await replay.text()).trim().split('\n').map(JSON.parse)
+  for(const e of replayEvents)chatEventSchema.parse(e)
+  assert.equal(replayEvents[0].type,'snapshot');assert.equal(replayEvents[0].state,'complete')
+  assert.equal(report.modelRequests.length,modelCount)
+  const changed=structuredClone(aRequest);changed.messages.at(-1).content='同turn不同内容'
+  const conflictTurn=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(changed)})
+  assert.equal(conflictTurn.status,409)
+  report.idempotency={request:aRequest,replayEvents,conflictHttp:conflictTurn.status,modelCountBefore:modelCount,modelCountAfter:report.modelRequests.length}
+  await send('追问：刚才两个文件分别包含什么？','已保留历史')
+  await send('慢任务A：保持后台运行')
+  const active=structuredClone(latestSend().request)
+  await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.status==='running')})
+  await newConversation()
+  await send('B会话你好','网页协议对话正常')
+  const b=latestSend().request.conversationId
+  assert.notEqual(a,b);assert.ok(!(await log.innerText()).includes(markerA))
+  const both=await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.status==='running')&&conv(r,b)?.tasks.some(t=>t.status==='completed')?r:false})
+  report.correlations.conversationB=b
+  await page.screenshot({path:join(output,'03-B-independent-A-running.png'),fullPage:true})
+  await page.getByRole('tab',{name:/A读取README/}).click()
+  await waitFor(async()=>(await log.innerText()).includes(markerA))
+  await page.screenshot({path:join(output,'04-A-working-before-refresh.png'),fullPage:true})
+  const runsBeforeRefresh=report.modelRequests.filter(r=>r.messages.some(m=>m.role==='user'&&m.content==='慢任务A：保持后台运行')).length
+  await page.reload({waitUntil:'domcontentloaded'})
+  await chooseOffice()
+  await input.waitFor({timeout:60000})
+  await waitFor(()=>report.browserRequests.some(r=>r.request.type==='resume'&&r.request.turnId===active.turnId),45000)
+  assert.equal(report.modelRequests.filter(r=>r.messages.some(m=>m.role==='user'&&m.content==='慢任务A：保持后台运行')).length,runsBeforeRefresh)
+  if(await page.getByRole('button',{name:'展开对话',exact:true}).isVisible())await page.getByRole('button',{name:'展开对话',exact:true}).click()
+  await page.getByRole('tab',{name:/A读取README/}).click()
+  await page.screenshot({path:join(output,'05-refresh-resume-same-run.png'),fullPage:true})
+  await page.getByRole('button',{name:'停止生成',exact:true}).click()
+  await waitFor(async()=>(await log.innerText()).includes('已停止生成'))
+  await waitFor(()=>report.browserRequests.some(r=>r.request.type==='cancel'&&r.request.turnId===active.turnId&&r.json?.data?.stopped===true))
+  await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.summary.includes('用户取消，清理已完成'))})
+  await page.screenshot({path:join(output,'06-explicit-cancel-confirmed.png'),fullPage:true})
+  // Fresh browser storage discovers the exact conversation IDs from the live catalogue.
+  const secondContext=await browser.newContext({viewport:{width:1440,height:1050},locale:'zh-CN'})
+  const second=await secondContext.newPage();await second.goto(officeBase+'/office/',{waitUntil:'domcontentloaded'});await chooseOffice(second)
+  await second.getByRole('button',{name:'展开对话',exact:true}).click()
+  await second.getByRole('tab',{name:/B会话你好/}).click()
+  await waitFor(async()=>(await second.getByRole('log',{name:'对话内容'}).innerText()).includes('网页协议对话正常'))
+  await second.screenshot({path:join(output,'07-new-browser-discovers-conversations.png'),fullPage:true});await secondContext.close()
+  async function control(request){
+    chatOperationSchema.parse(request)
+    const r=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)})
+    assert.equal(r.status,200);const json=await r.json();responseEnvelopeSchema.parse(json);assertProtocolValue(json);return json.data
+  }
+  const identity={version:'1.0',teamId:'office-1',conversationId:a}
+  const latestPage=await control({...identity,type:'history',limit:1});chatHistoryPageSchema.parse(latestPage);assert.equal(latestPage.turns[0].id,active.turnId);assert.equal(latestPage.turns[0].state,'stopped');assert.ok(latestPage.hasMore)
+  const olderPage=await control({...identity,type:'history',limit:1,cursor:latestPage.nextCursor});chatHistoryPageSchema.parse(olderPage);assert.notEqual(olderPage.turns[0].id,active.turnId)
+  report.historyPages=[latestPage,olderPage]
+  const saved=structuredClone((await readOffice()).data.snapshot)
+  const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
+  const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'
+  const conflict=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:differing});assert.equal(conflict.code,409)
+  if(saved.seq>1){const old=structuredClone(saved);old.seq--;assert.equal((await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:old})).data.status,'ignored')}
+  officeProcess.p.kill('SIGTERM');await officeProcess.close
+  officeProcess=start(process.execPath,['server/dist/index.js'],office,{...childEnv,PORT:String(officePort),HOST:'127.0.0.1',PAWOFFICE_PUBLIC_ORIGIN:officeBase},'office-restarted')
+  await waitFor(async()=>{try{const r=await readOffice();return r.code===200&&conv(r,a)&&conv(r,b)}catch{return false}},45000)
+  chatHistoryPageSchema.parse(await control({...identity,type:'history'}))
+  // Verify registered chat.url after real Fastify restart through its public route.
+  const forwarded=await fetch(officeBase+'/api/pawoffice/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...identity,type:'history'})})
+  assert.equal(forwarded.status,200);chatHistoryPageSchema.parse((await forwarded.json()).data)
+  const crashId='host-crash-'+Date.now(),crashTurn='crash-turn-'+Date.now()
+  const crashRequest=fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version:'1.0',type:'send',turnId:crashTurn,teamId:'office-1',conversationId:crashId,messages:[{role:'user',content:'慢任务：模拟Host崩溃'}]})}).catch(()=>null)
+  await waitFor(()=>report.modelRequests.some(r=>r.messages.some(m=>m.role==='user'&&m.content==='慢任务：模拟Host崩溃')))
+  const requestsBeforeCrash=report.modelRequests.length
+  host.p.kill('SIGKILL');await host.close
+  host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-restarted')
+  await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
+  await waitFor(async()=>{const r=await readOffice();return conv(r,crashId)?.tasks.some(t=>t.summary.includes('Host重启中断'))},45000)
+  const crashHistory=await control({version:'1.0',type:'history',teamId:'office-1',conversationId:crashId});chatHistoryPageSchema.parse(crashHistory);assert.equal(crashHistory.turns[0].state,'error');assert.equal(crashHistory.turns[0].id,crashTurn)
+  assert.equal(report.modelRequests.length,requestsBeforeCrash);await crashRequest
+  const recovered=await readOffice()
+  await page.close();officeProcess.p.kill('SIGTERM');await officeProcess.close
+  officeProcess=start(process.execPath,['server/dist/index.js'],office,{...childEnv,PORT:String(officePort),HOST:'127.0.0.1',PAWOFFICE_PUBLIC_ORIGIN:officeBase},'office-offline-restarted')
+  await waitFor(async()=>{try{const r=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:recovered.data.snapshot});return r.code===202&&r.data.status==='cached'?r:false}catch{return false}},45000)
+  report.transcript=transcript
+  await Promise.all(captureJobs);capturedEvents()
+  assert.ok(report.browserRequests.some(r=>r.http===200&&r.events?.some(terminal)))
+  assert.equal(report.browserErrors.length,0)
+  report.assertions.push('Real browser same-origin four-operation chat through unmodified latest Office','A/B conversations independent tasks and whiteboards; A running while B completes','Original read_file outputs correlated with Run/call/scene snapshot','Same turn retry reuses Run; different content conflicts','Refresh history/resume detaches without duplicate model/tool execution','Explicit cancel waits for cleanup','New browser discovers original conversation IDs and stored history','Stable paginated history and stopped state','Same seq retry/conflict/stale and offline 202 from real service','Fastify restart re-registers chat.url','Host crash interrupted without replay; stable turn survives restart')
   const sessionDir = join(output, 'host-data/sessions')
   report.sessions = await readdir(sessionDir)
   for (const file of report.sessions) {
