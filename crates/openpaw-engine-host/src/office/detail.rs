@@ -29,6 +29,7 @@ pub(super) struct Details {
 
 struct Snapshot {
     team: String,
+    conversation: Option<String>,
     employee: String,
     session: String,
     name: String,
@@ -82,7 +83,7 @@ impl MainOffice {
     /// 权限：先验证已登记员工，再将 ID 交原 get_typed；不接受任意路径。
     /// 关联：CHG-2026-0040、ADR-003。
     pub(super) async fn prepare_detail(&self, team: &str, action: &Value) {
-        let Ok(record) = self.record(team) else {
+        let Ok(record) = self.action_record(team, action) else {
             return;
         };
         let employee = if action["action"] == "dialog.action" {
@@ -91,7 +92,10 @@ impl MainOffice {
                 .unwrap_or_else(|e| e.into_inner())
                 .entries
                 .get(action["interactionId"].as_str().unwrap_or(""))
-                .filter(|cursor| cursor.snapshot.team == team)
+                .filter(|cursor| {
+                    cursor.snapshot.team == team
+                        && cursor.snapshot.conversation == record.conversation
+                })
                 .map(|cursor| cursor.snapshot.employee.clone())
         } else {
             record.snapshot["employees"]
@@ -152,7 +156,7 @@ impl MainOffice {
     }
 
     fn detail_session(&self, team: &str, employee: &str) -> Option<Arc<SessionHandle>> {
-        let record = self.record(team).ok()?;
+        let record = self.employee_record(team, employee)?;
         if !record.snapshot["employees"]
             .as_array()?
             .iter()
@@ -177,8 +181,8 @@ impl MainOffice {
 
     fn detail_snapshot(&self, team: &str, employee: &str) -> Result<Arc<Snapshot>, Value> {
         let record = self
-            .record(team)
-            .map_err(|_| unavailable("办公室不存在，未启动任何工作。"))?;
+            .employee_record(team, employee)
+            .ok_or_else(|| unavailable("办公室员工不存在，未启动任何工作。"))?;
         let Some(handle) = self.detail_session(team, employee) else {
             return self
                 .legacy_snapshot(team, employee)
@@ -262,6 +266,7 @@ impl MainOffice {
         }
         Ok(Arc::new(Snapshot {
             team: team.into(),
+            conversation: record.conversation.clone(),
             employee: employee.into(),
             session: handle.id.clone(),
             name,
@@ -271,7 +276,7 @@ impl MainOffice {
     }
 
     fn legacy_snapshot(&self, team: &str, employee: &str) -> Option<Arc<Snapshot>> {
-        let record = self.record(team).ok()?;
+        let record = self.employee_record(team, employee)?;
         if !record.snapshot["employees"]
             .as_array()?
             .iter()
@@ -310,6 +315,7 @@ impl MainOffice {
         );
         Some(Arc::new(Snapshot {
             team: team.into(),
+            conversation: record.conversation.clone(),
             employee: employee.into(),
             session: employee.into(),
             name: legacy["name"].as_str().unwrap_or("历史员工").into(),
@@ -327,6 +333,9 @@ impl MainOffice {
     /// 权限：绑定服务端办公室、员工和随机按钮，不能选择任意会话。
     /// 关联：CHG-2026-0036、subagent-design A4。
     pub(super) fn inspect(&self, team: &str, action: &Value) -> Value {
+        let Ok(record) = self.action_record(team, action) else {
+            return unavailable("办公室不匹配或对话不存在，未读取其他会话记录。");
+        };
         let Some(id) = action["id"].as_str() else {
             return unavailable("无效请求编号。");
         };
@@ -342,7 +351,7 @@ impl MainOffice {
             let Some(cursor) = details.entries.get(previous) else {
                 return unavailable("详情已关闭、过期或被替换，请重新点击员工；未执行任何工作。");
             };
-            if cursor.snapshot.team != team {
+            if cursor.snapshot.team != team || cursor.snapshot.conversation != record.conversation {
                 return unavailable("分页办公室不匹配，拒绝访问其他办公室的员工记录。");
             }
             let Some(operation) = cursor.options.get(option).copied() else {
@@ -367,9 +376,6 @@ impl MainOffice {
                 },
             }
         } else {
-            let Ok(record) = self.record(team) else {
-                return unavailable("办公室不存在，未启动任何工作。");
-            };
             let employee = record.snapshot["employees"]
                 .as_array()
                 .into_iter()
@@ -392,11 +398,9 @@ impl MainOffice {
             }
         };
         // 新关联可能来自重放 ID；只能替换同办公室的关联，不能污染其他办公室。
-        if details
-            .entries
-            .get(id)
-            .is_some_and(|entry| entry.snapshot.team != team)
-        {
+        if details.entries.get(id).is_some_and(|entry| {
+            entry.snapshot.team != team || entry.snapshot.conversation != record.conversation
+        }) {
             return unavailable("请求编号已属于其他办公室，拒绝覆盖。");
         }
         while details.entries.len() >= MAX_SNAPSHOTS {

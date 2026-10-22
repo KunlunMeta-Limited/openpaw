@@ -542,6 +542,17 @@ struct MainConversationChat {
     #[serde(default = "main_history_limit")]
     limit: usize,
 }
+fn main_conversation_title(input: &str) -> String {
+    // 与 main 的空白合并及 UTF-16 长度约束一致，保证 JSON 字符串始终有效。
+    let normalized = input
+        .split(|c: char| c.is_whitespace() && c != '\u{0085}' || c == '\u{feff}')
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let units = normalized.encode_utf16().take(36).collect::<Vec<_>>();
+    String::from_utf16_lossy(&units)
+}
+
 fn main_history_limit() -> usize {
     20
 }
@@ -715,16 +726,21 @@ async fn main_conversation_chat(
         Ok(record) => record,
         Err(_) => return main_chat_error(StatusCode::NOT_FOUND, "办公室不存在"),
     };
-    let bound = record.conversation.as_deref() == Some(&body.conversation_id);
+    let binding = match state
+        .main_office
+        .conversation_record(&body.team_id, &body.conversation_id)
+    {
+        Ok(binding) => binding,
+        Err(_) => return main_chat_error(StatusCode::SERVICE_UNAVAILABLE, "对话目录暂不可用"),
+    };
+    let bound = binding.is_some();
+    let record = binding.unwrap_or(record);
     if body.kind == "history" && !bound {
         return main_chat_result(
             serde_json::json!({"turns":[],"nextCursor":"","hasMore":false,"activeTurnId":""}),
         );
     }
-    if record.conversation.is_some() && !bound {
-        return main_chat_error(StatusCode::CONFLICT, "本轮暂不支持其他主对话，请返回原对话");
-    }
-    let handle = if let Some(id) = record.session {
+    let handle = if let Some(id) = record.session.filter(|_| bound) {
         match state.get_typed(&id).await {
             Ok(handle) => Some(handle),
             Err(_) => return main_chat_error(StatusCode::SERVICE_UNAVAILABLE, "会话暂不可用"),
@@ -764,7 +780,12 @@ async fn main_conversation_chat(
         };
         if state
             .main_office
-            .bind(&body.team_id, &body.conversation_id, &handle.id)
+            .bind_named(
+                &body.team_id,
+                &body.conversation_id,
+                &handle.id,
+                &main_conversation_title(&body.messages[0].content),
+            )
             .is_err()
         {
             return main_chat_error(StatusCode::SERVICE_UNAVAILABLE, "对话绑定失败");
@@ -1177,7 +1198,7 @@ fn main_approval_bridge(
             let owner = event.properties["metadata"]["workspaceID"]
                 .as_str()
                 .unwrap_or(&handle.id);
-            let employee = office.record(&team).ok().and_then(|record| {
+            let employee = office.session_record(&team, &handle.id).and_then(|record| {
                 record.snapshot["employees"]
                     .as_array()
                     .and_then(|employees| employees.iter().find(|employee| employee["id"] == owner))
@@ -1201,7 +1222,10 @@ fn main_approval_bridge(
             pending.insert(id.clone(), cancel.clone());
             let (office, team, handle) = (office.clone(), team.clone(), handle.clone());
             tokio::spawn(async move {
-                let request = serde_json::json!({"type":"decision.request","teamId":team,"timeoutMs":60000,"decision":decision});
+                let conversation = office
+                    .session_record(&team, &handle.id)
+                    .and_then(|record| record.conversation);
+                let request = serde_json::json!({"type":"decision.request","teamId":team,"conversationId":conversation,"timeoutMs":60000,"decision":decision});
                 let result = tokio::select! { _ = cancel.cancelled() => return,
                 result = office.message(request,Duration::from_secs(65)) => result };
                 if cancel.is_cancelled() {
@@ -2227,7 +2251,7 @@ mod tests {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
                 let data = match body["type"].as_str() {
-                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":{},"responses":{"success":{},"error":{}}}),
+                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("delegate-conversations") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
                     Some("office.read") if body["teamId"].is_string() => {
                         let messages = seen.lock().await;
                         let snapshot = messages.iter().rev().find(|message| message["type"] == "office.snapshot" && message["teamId"] == body["teamId"]).unwrap()["snapshot"].clone();
@@ -2253,7 +2277,7 @@ mod tests {
                     },
                     Some("decision.request") => {
                         if choice == "pending" || choice == "child-pending" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") { std::future::pending::<()>().await; }
-                        let chosen = if matches!(choice,"child-pending"|"child-timeout") {"confirm"}else{choice};
+                        let chosen = if choice == "by-conversation" { if body["conversationId"] == "a" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") {"reject"} else {"confirm"} } else if matches!(choice,"child-pending"|"child-timeout") {"confirm"}else{choice};
                         serde_json::json!({"teamId":body["teamId"],"decisionId":body["decision"]["id"],"choiceId":chosen,
                             "label":if chosen == "confirm" {"允许本次"} else {"拒绝"}})
                     },
@@ -2296,7 +2320,7 @@ mod tests {
                     else {serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]})};
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
-                if scenario == "delegate-single-approval" {
+                if matches!(scenario, "delegate-single-approval" | "delegate-conversations-approval") {
                     let task = messages[latest]["content"].as_str().unwrap_or("");
                     let call = if parent && tools == 0 {
                         Some(("delegate_task",serde_json::from_str::<serde_json::Value>(task).unwrap()))
@@ -2327,7 +2351,7 @@ mod tests {
                     } else {serde_json::json!({"choices":[{"delta":{"content":if parent {"parent integrated"} else {"本轮任务已完成"}},"finish_reason":"stop"}]})};
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
-                if (scenario == "recover" && parent || scenario == "recover-registered" && !parent) && tools == 0 { gate.notified().await; }
+                if (scenario == "recover" && parent || scenario == "recover-registered" && !parent || scenario == "delegate-conversations" && !parent) && tools == 0 { gate.notified().await; }
                 let call = if (scenario.starts_with("delegate") || scenario.starts_with("recover")) && parent && tools == 0 {
                     Some(("delegate_task",serde_json::json!({"name":"资料检索","task":if scenario == "delegate-repeat" {
                         format!("读取 README.md 并汇报：{}", messages[latest]["content"].as_str().unwrap_or(""))
@@ -2355,7 +2379,13 @@ mod tests {
             ("OPENPAW_MAIN_API_KEY", "fixture-gateway-key".into()),
             (
                 "OPENPAW_ENGINE_MAX_MODEL_REQUESTS",
-                if matches!(scenario, "delegate-concurrent" | "delegate-cancel") {
+                if matches!(
+                    scenario,
+                    "delegate-concurrent"
+                        | "delegate-cancel"
+                        | "delegate-conversations"
+                        | "delegate-conversations-approval"
+                ) {
                     "2"
                 } else {
                     "1"
@@ -2367,6 +2397,7 @@ mod tests {
                 if scenario == "write"
                     || scenario == "delegate-write"
                     || scenario == "delegate-single-approval"
+                    || scenario == "delegate-conversations-approval"
                 {
                     "manual"
                 } else {
@@ -2393,7 +2424,14 @@ mod tests {
         };
         let mut state = AppState::new_with_turn_limits(
             config.clone(),
-            if scenario == "delegate-cancel" { 2 } else { 1 },
+            if matches!(
+                scenario,
+                "delegate-cancel" | "delegate-conversations" | "delegate-conversations-approval"
+            ) {
+                2
+            } else {
+                1
+            },
             0,
         )
         .unwrap();
@@ -2533,7 +2571,252 @@ mod tests {
         let cancelled: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
         assert_eq!(cancelled["data"]["stopped"], true);
-        assert_eq!(call(serde_json::json!({"type":"send","turnId":"turn-three","conversationId":"other","messages":[{"role":"user","content":"other"}]})).await.status(), StatusCode::CONFLICT);
+        let response = call(serde_json::json!({"type":"send","turnId":"turn-three","conversationId":"other","messages":[{"role":"user","content":"other"}]})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 500_000).await.unwrap();
+        let response = call(serde_json::json!({"type":"history","conversationId":"other"})).await;
+        let other: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 500_000).await.unwrap())
+                .unwrap();
+        assert_eq!(other["data"]["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(other["data"]["turns"][0]["user"], "other");
+        let response = call(serde_json::json!({"type":"history"})).await;
+        let original: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 500_000).await.unwrap())
+                .unwrap();
+        assert_eq!(original["data"]["turns"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn main_parallel_conversations_keep_children_actions_cancel_and_restart_owned() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-conversations", "confirm").await;
+        let call = |conversation: &str, operation: serde_json::Value| {
+            let app = fixture.app.clone();
+            let mut body = serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":conversation});
+            body.as_object_mut()
+                .unwrap()
+                .extend(operation.as_object().unwrap().clone());
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/pawoffice/chat")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let capabilities = fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.0, 200);
+        let draft = call("a", serde_json::json!({"type":"history"})).await;
+        let draft: serde_json::Value =
+            serde_json::from_slice(&to_bytes(draft.into_body(), 65536).await.unwrap()).unwrap();
+        assert!(draft["data"]["turns"].as_array().unwrap().is_empty());
+        let a = call("a",serde_json::json!({"type":"send","turnId":"turn-a","messages":[{"role":"user","content":"  Alpha   task  "}]})).await;
+        assert_eq!(a.status(), StatusCode::OK);
+        let b = call("b",serde_json::json!({"type":"send","turnId":"turn-b","messages":[{"role":"user","content":"Beta task"}]})).await;
+        assert_eq!(b.status(), StatusCode::OK);
+        // 两个根回合各自等待真实子会话，放行模型之前必须同时在途。
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if fixture.model_seen.lock().await.len() >= 4 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let read = fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.read","teamId":fixture.team}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap()
+            .1;
+        let conversations = read["snapshot"]["conversations"].as_array().unwrap();
+        assert_eq!(conversations.len(), 2);
+        assert_eq!(
+            conversations.iter().find(|c| c["id"] == "a").unwrap()["title"],
+            "Alpha task"
+        );
+        assert_eq!(
+            conversations.iter().find(|c| c["id"] == "b").unwrap()["title"],
+            "Beta task"
+        );
+        let members = |id: &str| {
+            conversations.iter().find(|c| c["id"] == id).unwrap()["employees"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let a_members = members("a");
+        let b_members = members("b");
+        assert_eq!(a_members.len(), 2);
+        assert_eq!(b_members.len(), 2);
+        assert!(a_members.iter().all(|id| !b_members.contains(id)));
+        let cross = serde_json::json!({"id":"cross-conversation","teamId":fixture.team,"conversationId":"b","action":"employee.inspect","employeeId":a_members[1]});
+        fixture.ui_actions.lock().await.push_back(cross);
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if let Some(reply) = fixture.seen.lock().await.iter().find(|m| {
+                    m["type"] == "ui.respond" && m["interactionId"] == "cross-conversation"
+                }) {
+                    assert!(reply["presentation"]["content"]["fields"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let response = call("a", serde_json::json!({"type":"cancel","turnId":"turn-a"})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let history = call("b", serde_json::json!({"type":"history"})).await;
+        let page: serde_json::Value =
+            serde_json::from_slice(&to_bytes(history.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(page["data"]["activeTurnId"], "turn-b");
+        fixture.release_model.notify_waiters();
+        let bytes = to_bytes(b.into_body(), 500_000).await.unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("\"state\":\"complete\""));
+        drop(a);
+        let messages = fixture.seen.lock().await;
+        let commands = messages
+            .iter()
+            .filter(|message| message.get("command").is_some())
+            .collect::<Vec<_>>();
+        assert!(!commands.is_empty());
+        assert!(commands
+            .iter()
+            .all(|message| matches!(message["conversationId"].as_str(), Some("a" | "b"))));
+        drop(messages);
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        for (id, turn, text) in [
+            ("a", "turn-a", "  Alpha   task  "),
+            ("b", "turn-b", "Beta task"),
+        ] {
+            let response=restarted.clone().oneshot(Request::builder().method("POST").uri("/api/pawoffice/chat").header("content-type","application/json").body(Body::from(serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":id,"type":"history"}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let page: serde_json::Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 500_000).await.unwrap())
+                    .unwrap();
+            assert_eq!(page["data"]["turns"][0]["id"], turn);
+            assert_eq!(page["data"]["turns"][0]["user"], text);
+            assert_eq!(
+                page["data"]["turns"][0]["state"],
+                if id == "a" { "stopped" } else { "complete" }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn main_parallel_approvals_authorize_only_their_original_conversation_and_call() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-conversations-approval", "by-conversation").await;
+        fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        let send = |id: &str, name: &str| {
+            let app = fixture.app.clone();
+            let task = serde_json::json!({"name":name,"task":format!("{id}-work")}).to_string();
+            let body = serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":id,"type":"send","turnId":format!("turn-{id}"),"messages":[{"role":"user","content":task}]});
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/api/pawoffice/chat")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), 500_000).await.unwrap()
+            }
+        };
+        let (a, b) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(send("a", "甲员工"), send("b", "乙员工"))
+        })
+        .await
+        .unwrap();
+        assert!(std::str::from_utf8(&a)
+            .unwrap()
+            .contains("\"state\":\"complete\""));
+        assert!(std::str::from_utf8(&b)
+            .unwrap()
+            .contains("\"state\":\"complete\""));
+        for n in 0..2 {
+            assert!(!fixture
+                .workspace
+                .path()
+                .join(format!("a-work-{n}.txt"))
+                .exists());
+            assert_eq!(
+                std::fs::read_to_string(fixture.workspace.path().join(format!("b-work-{n}.txt")))
+                    .unwrap(),
+                "single-call-authorized"
+            );
+        }
+        let messages = fixture.seen.lock().await;
+        for id in ["a", "b"] {
+            let cards = messages
+                .iter()
+                .filter(|message| {
+                    message["type"] == "decision.request" && message["conversationId"] == id
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cards.len(),
+                3,
+                "one parent delegation and two child calls need separate decisions"
+            );
+            assert!(cards
+                .iter()
+                .filter(|card| !card["decision"]["title"]
+                    .as_str()
+                    .unwrap()
+                    .contains("delegate_task"))
+                .all(|card| card["decision"]["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains(if id == "a" { "甲员工" } else { "乙员工" })));
+        }
     }
 
     #[tokio::test]
