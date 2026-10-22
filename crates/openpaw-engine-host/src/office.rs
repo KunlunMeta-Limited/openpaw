@@ -56,6 +56,33 @@ fn default_conversation_title() -> String {
     "主对话".into()
 }
 
+// 人物外观的名字属于展示名册；子会话职责和任务名称保留在原执行事实中。
+fn roster_display_snapshot(mut snapshot: Value) -> Value {
+    if let Some(conversations) = snapshot
+        .get_mut("conversations")
+        .and_then(Value::as_array_mut)
+    {
+        for conversation in conversations {
+            *conversation = roster_display_snapshot(conversation.take());
+        }
+    }
+    if let Some(employees) = snapshot.get_mut("employees").and_then(Value::as_array_mut) {
+        for employee in employees {
+            let name = match employee["sceneActorId"].as_str() {
+                Some("office-lead") => "王明",
+                Some("code-agent") => "李研",
+                Some("file-agent") => "周理",
+                Some("app-agent") => "陈书",
+                Some("review-agent") => "刘市",
+                Some("data-agent") => "赵审",
+                _ => continue,
+            };
+            employee["name"] = Value::from(name);
+        }
+    }
+    snapshot
+}
+
 // 原单绑定字段继续可读；额外会话拥有独立快照、成员名额及活动展示。
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct MainOfficeEntry {
@@ -89,7 +116,7 @@ impl MainOfficeEntry {
 
     fn snapshot(&self, conversation_wire: bool) -> Value {
         if !conversation_wire {
-            return self.primary.snapshot.clone();
+            return roster_display_snapshot(self.primary.snapshot.clone());
         }
         let conversations = self
             .all()
@@ -106,8 +133,10 @@ impl MainOfficeEntry {
             .all()
             .map(|record| record.snapshot["seq"].as_u64().unwrap_or(1))
             .sum::<u64>();
-        serde_json::json!({"schemaVersion":"1.0","seq":revision,"workspace":self.primary.snapshot["workspace"],
-            "system":self.primary.snapshot["system"],"conversations":conversations})
+        roster_display_snapshot(
+            serde_json::json!({"schemaVersion":"1.0","seq":revision,"workspace":self.primary.snapshot["workspace"],
+            "system":self.primary.snapshot["system"],"conversations":conversations}),
+        )
     }
 }
 
@@ -847,28 +876,37 @@ impl MainOffice {
 
     /// 功能：按已协商的原版 main 协议生成出站快照。
     /// 参数：snapshot 为 Host 原有内部快照。
-    /// 返回：旧协议原值或 conversations 形式的快照。
+    /// 返回：保留原人物名的旧协议或 conversations 形式快照。
     /// 错误：无；未绑定时输出空会话目录。
     /// 状态：只读，不迁移持久记录。
     /// 并发与取消：同步短锁，不等待网络。
     /// 权限：会话身份仅来自办公室登记。
-    /// 关联：CHG-2026-0044。
+    /// 关联：CHG-2026-0044、CHG-2026-0046。
     pub(crate) fn wire_snapshot(&self, snapshot: &Value) -> Value {
         if !self
             .conversation_wire
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return snapshot.clone();
+            return roster_display_snapshot(snapshot.clone());
         }
         let guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
         snapshot["workspace"]["id"]
             .as_str()
             .and_then(|team| guard.as_ref().ok()?.get(team))
             .map(|entry| entry.snapshot(true))
-            .unwrap_or_else(|| snapshot.clone())
+            .unwrap_or_else(|| roster_display_snapshot(snapshot.clone()))
     }
 
     fn wire_message(&self, mut message: Value) -> Value {
+        if message["type"] == "offices.initialize" {
+            if let Some(snapshots) = message["offices"].as_array_mut() {
+                for snapshot in snapshots {
+                    *snapshot = self.wire_snapshot(snapshot);
+                }
+            }
+        } else if message["type"] == "office.snapshot" {
+            message["snapshot"] = self.wire_snapshot(&message["snapshot"]);
+        }
         if !self
             .conversation_wire
             .load(std::sync::atomic::Ordering::Acquire)
@@ -878,15 +916,7 @@ impl MainOffice {
             }
             return message;
         }
-        if message["type"] == "offices.initialize" {
-            if let Some(snapshots) = message["offices"].as_array_mut() {
-                for snapshot in snapshots {
-                    *snapshot = self.wire_snapshot(snapshot);
-                }
-            }
-        } else if message["type"] == "office.snapshot" {
-            message["snapshot"] = self.wire_snapshot(&message["snapshot"]);
-        } else if (message["type"] == "decision.request" || message.get("command").is_some())
+        if (message["type"] == "decision.request" || message.get("command").is_some())
             && message["conversationId"].is_null()
         {
             let guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
@@ -2742,6 +2772,91 @@ fn compact_topic(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use openpaw_engine::AgentEvent;
+
+    #[tokio::test]
+    async fn main_employee_display_keeps_roster_names_and_original_work_facts() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let office = MainOffice::new(home.path(), workspace.path(), None);
+        let initial = office.directory().unwrap().remove(0);
+        let team = initial["workspace"]["id"].as_str().unwrap();
+        let actors = [
+            "office-lead",
+            "code-agent",
+            "file-agent",
+            "app-agent",
+            "review-agent",
+            "data-agent",
+            "",
+            "unknown-actor",
+        ];
+        {
+            let mut guard = office.records.lock().unwrap();
+            let entry = guard.as_mut().unwrap().get_mut(team).unwrap();
+            entry.conversation = Some("original-conversation".into());
+            entry.snapshot["employees"] = actors.iter().enumerate().map(|(index, actor)| {
+                serde_json::json!({"id":format!("employee-{index}"),"sceneActorId":actor,"name":"天气检索","role":"子 Agent","online":false})
+            }).collect::<Vec<_>>().into();
+            entry.snapshot["tasks"] = serde_json::json!([{"id":"original-task","title":"查询天气","assigneeId":"employee-1"}]);
+            let mut other = entry.primary.clone();
+            other.conversation = Some("other-conversation".into());
+            entry
+                .conversations
+                .insert("other-conversation".into(), other);
+        }
+        let original = office.record(team).unwrap().snapshot;
+        let expected = serde_json::json!([
+            "王明",
+            "李研",
+            "周理",
+            "陈书",
+            "刘市",
+            "赵审",
+            "天气检索",
+            "天气检索"
+        ]);
+        for wire in [false, true] {
+            office
+                .conversation_wire
+                .store(wire, std::sync::atomic::Ordering::Release);
+            let directory = office.directory().unwrap().remove(0);
+            let message = office.wire_message(
+                serde_json::json!({"type":"office.snapshot","teamId":team,"snapshot":original}),
+            );
+            let initialized = office.wire_message(
+                serde_json::json!({"type":"offices.initialize","offices":[original]}),
+            );
+            for snapshot in [&directory, &message["snapshot"], &initialized["offices"][0]] {
+                let records = if wire {
+                    snapshot["conversations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![snapshot]
+                };
+                for record in records {
+                    let employees = record["employees"].as_array().unwrap();
+                    assert_eq!(
+                        Value::from(
+                            employees
+                                .iter()
+                                .map(|employee| employee["name"].clone())
+                                .collect::<Vec<_>>()
+                        ),
+                        expected
+                    );
+                    assert_eq!(record["tasks"], original["tasks"]);
+                    for (index, employee) in employees.iter().enumerate() {
+                        assert_eq!(employee["id"], format!("employee-{index}"));
+                        assert_eq!(employee["sceneActorId"], actors[index]);
+                    }
+                }
+            }
+            assert_eq!(office.record(team).unwrap().snapshot, original);
+        }
+    }
 
     fn recording_dispatcher() -> (OfficeDispatcher, mpsc::Receiver<OfficeAction>) {
         OfficeDispatcher::recording()
