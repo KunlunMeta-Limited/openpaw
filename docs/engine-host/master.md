@@ -1310,6 +1310,12 @@ Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2
 0005第12节与专用验证记录给出a67ad97准确head的完整27/27、真实新版Node/Chromium旅程、原生.env的DeepSeek实测、截图/录像/原始NDJSON及JSONL关联。现有8765已切新版，旧home停写后完整备份，再原地迁移v3，旧11个会话绑定保留。新版不设置VITE聊天地址；Host运行时注册实际端口，聊天同源转发。任务/人物/白板来自真实Run；快速工具不声称捕获工作动画，完整主动场景仍T5。D37原Linux取消回归间歇失败如实保留，不宣称已修复，开放shell前须另审核。M4只读证据供用户验收，不填人工批准，不建PR、不进入T5；Windows按用户安排未执行。
 
 
+### T4 r5功能覆盖与Office申请归档（2026-10-22）
+
+用户批准同步本轮具体规划，并要求Office申请暂不允许通过、集中保存待统一审核。同一0005 r5方案对象见主CHG；第15节49项明确工作包/产物/验收，T5仍未实现，新增T4.2细项待补浏览器证据。唯一现行Office申请台账为office-change-requests.md，R1—R10状态分开保留，未产生Office修改。
+
+准确提交`449c9d09a7e07e69a45832b2ffd0e1ee15807d59`完整27/27及原真实Office浏览器产品runner通过，报告和hash见0005专用验证记录；本次文档登记后最终复验固定`/home/cheng/.cache/t4-r5-docs-final-full-20261022-a/report.json`。本轮不将全功能规划标完成，不创建PR、不开始T5；Windows暂缓与D37未修状态保留。
+
 <a id="office-function-coverage"></a>
 
 ## 15. 新版 Office 全功能覆盖与具体工作包
