@@ -121,3 +121,34 @@ CHG-2026-0005 r2仅批准配置子范围，完整Office方案仍待审核。CLI/
 Host命令保持openpaw engine-host --config /absolute/path/host.toml。TOML明确的provider/model/base_url/api_key_env优先；沿用.env请省略这些字段。根、工具和办公室绑定仍只来自TOML，不能用.env覆盖权限。旧load/start嵌入式API保持原行为。本轮不修改Office、不开T4 PR，不把模型配置或独立健康检查算成M4完成。Linux/Windows实测结果见0005验证记录，未运行不能当通过。
 
 配置实现提交f70d43763c24c595d44c0b6ee6bdea52c2de2760已通过Linux原26项全量，见0005专用验证记录与仓库外准确head报告。Windows原生没有环境，未计通过；真实DeepSeek只在用户填入密钥后连接。该结果仅覆盖配置子范围，不改变T4/M4和Office页面未接入的状态。
+
+## 当前T4实施交接：官方v1聊天与真实投影（0005 r3）
+
+用户明确“那继续完成T4”，本轮在同一0005内恢复原完整方案，保留r2统一模型配置；不修改Office原工程。T3历史待审文字保留当时语境，当前#7已实际合入。T4用户交付验收、PR审核和合入仍待发生。
+
+1. 安装/构建：`cargo build --locked -p openpaw-cli --features engine-host,sidecar`。模型只需填写原生`OPENPAW_HOME/.env`或`~/.openpaw/.env`，模板见仓库`.env.example`；`openpaw config show`只显示有效配置和密钥有无。不要把密钥发聊天或放入VITE_*。
+2. 复制`host-config.example.toml`到本机自选路径，修改home、roots、slots并启用示例office段。要沿用.env须删去示例的显式provider="echo"；其余模型字段也可省略。T4只开放read_file/glob/grep/todo_list/think，配置写工具明确拒绝；旧无office配置仍只有健康服务。
+3. Office密钥是独立的官方`PAWOFFICE_API_KEY`系统环境，Host和Fastify使用同一值；模型密钥仍只在原生.env中。默认本机演示可使用公开的`pawoffice-demo-key`，正式部署使用受保护的服务环境配置；不把Office密钥当模型密钥，也不把二者输出到诊断。
+4. 启动Host：`openpaw engine-host --config /absolute/path/host.toml --port 41949`。随机端口模式`--port 0`可从发现行读实际地址；生产可使用同源代理固定公开路径。独立部署只监听loopback，来源须与office.allowed_origins精确匹配；代理须正确转发来源与上游Host。
+5. Office保持冻结源码只读，在隔离副本构建。**构建之前**设置公开`VITE_PAWOFFICE_CHAT_URL=http://127.0.0.1:41949/office/chat`，再执行原`npm ci`与`npm run build:full`。Fastify按官方PORT/HOST/PAWOFFICE_API_KEY启动`node server/dist/index.js`。只在构建后设置VITE变量不会改变静态页面；浏览器需刷新载入新构建。
+6. 页面发送消息后，真实请求经过Host→原引擎→Provider；工具请求执行原工具。业务同步独立通过官方messages，不能从health200推断页面已应用快照。`applied`与`cached`在宿主日志和host_office_projection.sync_state分开登记，完整seq/内容在外发前持久化；halted代表冲突/认证/协议问题，先人工核对所有者/数据，不盲目删库或抬序号。
+
+源码导航：`src/office/chat.rs`严格v1与断开取消，`dto.rs`类型/Unicode边界，`client.rs`官方messages，`projection.rs`任务/事件/白板及worker，`service.rs::submit_with_history`复用原接受流程，`store.rs`原JSONL/元数据迁移与恢复，`tool_host.rs`仅补资源等待事实。没有Node聊天bridge，没有新引擎或会话存储。
+
+### 可执行Linux/Windows产品验收
+
+先准备Node24、Rust及原生Chromium。PowerShell使用`$env:变量='值'`，Linux使用`export 变量='值'`，其余同一Node入口，不要求Docker或WSL。设置：
+
+~~~text
+OPENPAW_OFFICE_SOURCE=<只读Office原仓库绝对路径>
+OPENPAW_CHROMIUM=<已安装且与Playwright版本匹配的Chromium可执行文件>
+OPENPAW_NPM_CLI=<npm11的npm-cli.js路径，可自动从PATH或标准布局发现>
+~~~
+
+执行`node tests/engine-host-contracts/office-product.mjs`。默认在系统临时目录创建全新证据目录；可选`OPENPAW_OFFICE_PRODUCT_OUTPUT`指定仓库外不存在目录。runner只在隔离clone按锁文件执行npm ci --prefer-offline --ignore-scripts并完整构建Office，安装/构建各有300秒等待上限；默认自行构建Host组合feature，以免前面offline smoke的默认构建覆盖二进制。可选`OPENPAW_HOST_BINARY`仅用于明确验证已有准确构建。全量入口新增TEST-OFFICE-PRODUCT，保留原26项，统一执行27项；缺Office源/浏览器明确失败而非skip。
+
+自动化全量验收还须设置仓库外空`OPENPAW_HOME`，避免使用开发者个人.env影响默认模型断言；真实模型演示独立运行，不能因此删除个人配置。
+
+runner的本地OpenAI协议fixture只用于确定性测试模型：回答取自原read_file真实结果（两个随机文件标记），不能直接写浏览器答案/伪造快照。真实DeepSeek验证另外保存。产物含命令与退出码、模型请求、浏览器POST和被动CDP NDJSON、官方messages/read结果、截图、录像、trace、原JSONL与host.db；密钥不采集。CDP只观察网络，不能clone/tee fetch保活，否则会破坏停止测试。
+
+v1限制保留：浏览器180秒预算，刷新/断线取消，无Run ID/续接游标；T5才交付菜单/详情/写入审批，R1长任务扩展须按Rx另行批准。Windows原生本机未执行，不能据脚本可移植或Linux结果记通过。准确结果与剩余项见0005专用验证记录。

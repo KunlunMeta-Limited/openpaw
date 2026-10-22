@@ -122,3 +122,70 @@ fn invalid_config_and_sidecar_conflict_do_not_start() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("不能与--sidecar"));
     }
 }
+
+#[test]
+fn office_configuration_enables_real_v1_chat_and_cors() {
+    let base = tempfile::tempdir().unwrap();
+    let workspace = base.path().join("workspace 中文");
+    std::fs::create_dir(&workspace).unwrap();
+    let home = base.path().join("home");
+    let config = base.path().join("office.toml");
+    let body=format!("home = {}\nprovider = \"echo\"\n[roots]\nproject = {}\n[slots]\noffice-1 = \"project\"\n[office]\nbase_url = \"http://127.0.0.1:9\"\napi_key_env = \"PAWOFFICE_TEST_KEY\"\nallowed_origins = [\"http://127.0.0.1:8765\"]\n",serde_json::to_string(&home.to_string_lossy()).unwrap(),serde_json::to_string(&workspace.to_string_lossy()).unwrap());
+    std::fs::write(&config, body).unwrap();
+    let mut child = Child(
+        Command::new(env!("CARGO_BIN_EXE_openpaw"))
+            .args(["engine-host", "--config"])
+            .arg(&config)
+            .args(["--port", "0"])
+            .env("OPENPAW_HOME", base.path().join("model-env-home"))
+            .env("PAWOFFICE_TEST_KEY", "fixture-not-real")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        BufReader::new(stdout).read_line(&mut line).unwrap();
+        let _ = tx.send(line);
+    });
+    let line = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let address = line
+        .trim()
+        .strip_prefix("openpaw engine host listening on http://")
+        .unwrap();
+    let payload = r#"{"version":"1.0","teamId":"office-1","conversationId":"binary-test","messages":[{"role":"user","content":"真实HTTP回归"}]}"#;
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    write!(socket,"POST /office/chat HTTP/1.1\r\nHost: {address}\r\nOrigin: http://127.0.0.1:8765\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",payload.len()).unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    assert!(response.contains("200 OK"));
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("access-control-allow-origin: http://127.0.0.1:8765"));
+    assert!(response.contains("application/x-ndjson"));
+    assert!(response.contains("真实HTTP回归"));
+    assert!(response.contains("\"type\":\"done\""));
+    #[cfg(unix)]
+    {
+        assert!(Command::new("kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        let until = std::time::Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

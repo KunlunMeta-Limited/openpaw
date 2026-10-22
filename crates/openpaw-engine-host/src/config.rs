@@ -18,6 +18,14 @@ use std::{
 /// 稳定性：T3新增，协议无关Rust接口。
 /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
 pub struct HostConfig {
+    /// 用途：可选Office适配配置，缺省保持原健康服务。
+    /// 字段：OfficeConfig或无。
+    /// 来源去向：可信TOML到Host适配器。
+    /// 约束：不得由浏览器改变；密钥只引用变量名。
+    /// 稳定性：T4新增可选字段；Rust字面量需补None。
+    /// 关联：需求/设计REQ-OP-010/011/012；DES-OP-007。
+    #[serde(default)]
+    pub office: Option<crate::OfficeConfig>,
     /// 用途：显式Host数据根，必须与所有工作根互不包含。
     /// 字段：PathBuf，宿主类型字段。
     /// 来源去向：共享Host内部与可信Rust适配器。
@@ -287,6 +295,9 @@ impl HostConfig {
                     "凭据变量名不合法或与工具系统环境冲突",
                 ));
             }
+        }
+        if let Some(office) = &self.office {
+            office.validate(self)?;
         }
         let allowed = [
             "read_file",

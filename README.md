@@ -356,3 +356,5 @@ secrets/internal-terms scrub.
 
 Apache-2.0. Contributions are subject to the Developer Certificate of
 Origin (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+Office 接入使用可选 `engine-host` feature。完成模型 `.env` 后，还需在 Host TOML 中启用 `[office]`，并在 Office **构建前**配置公开聊天地址；只改模型配置不会改变已有的预览构建。完整配置、启动与原生 Linux/Windows 验证命令见 [Office 交接说明](docs/engine-host/handoff.md#当前t4实施交接官方v1聊天与真实投影0005-r3) 和 [配置示例](docs/engine-host/host-config.example.toml)。Office 与模型密钥分别保留在服务端，均不得进入 `VITE_*`。

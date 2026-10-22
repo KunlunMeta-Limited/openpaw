@@ -1165,6 +1165,7 @@ dependencies = [
  "openpaw-sandbox",
  "openpaw-store",
  "openpaw-tools",
+ "reqwest 0.12.28",
  "rusqlite",
  "same-file",
  "serde",

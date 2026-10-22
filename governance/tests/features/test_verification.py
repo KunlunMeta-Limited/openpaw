@@ -42,7 +42,8 @@ class RunnerTests(unittest.TestCase):
     def test_all_registered_scope_commands_share_source_and_stage(self):
         import json
         commands=json.loads((ROOT/'governance/commands.json').read_text(encoding='utf-8'))['commands']
-        self.assertEqual(len(commands),26)
+        self.assertEqual(len(commands),27)
+        self.assertIn("TEST-OFFICE-PRODUCT", {command["id"] for command in commands})
         for command in commands:
             actual=verify.command_argv(command,{'{python}':sys.executable,'{head}':'fixed-sha','{base}':'base'},'worktree','delivery')
             if command['id'] in {'TEST-COMMENTS','TEST-GOV-DIFF'}:

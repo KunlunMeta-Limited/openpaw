@@ -76,6 +76,7 @@ pub(crate) struct Inner {
     unavailable: AtomicBool,
     shutdown_result: tokio::sync::Mutex<Option<HostResult<()>>>,
     idle: Notify,
+    office: tokio::sync::Mutex<Option<crate::office::Coordinator>>,
     notices: broadcast::Sender<HostNotice>,
     live: Arc<Mutex<HashMap<String, (String, bool)>>>,
 }
@@ -196,6 +197,7 @@ impl Host {
                 unavailable: AtomicBool::new(false),
                 shutdown_result: tokio::sync::Mutex::new(None),
                 idle: Notify::new(),
+                office: tokio::sync::Mutex::new(None),
                 notices,
                 live,
             }),
@@ -280,6 +282,24 @@ impl Host {
         session_id: &str,
         input: String,
     ) -> HostResult<RunView> {
+        self.submit_with_history(scope, session_id, input, None)
+            .await
+    }
+    /// 功能：在同一运行预留内核对或导入客户端完整文本历史。
+    /// 参数：scope/session_id为固定范围，input为新输入，history为可选外部历史。
+    /// 返回：输入与历史可靠保存后的accepted Run。
+    /// 错误：冲突、容量、历史不一致或持久化错误。
+    /// 状态：复用原接受流程与JSONL；外部文本不产生工具事实。
+    /// 并发与取消：先预留会话和槽，再核对，禁止首请求交错导入。
+    /// 权限：只允许配置范围，不从历史恢复任何授权。
+    /// 关联：需求/设计REQ-OP-010；DES-OP-003/007。
+    pub(crate) async fn submit_with_history(
+        &self,
+        scope: &ClientScope,
+        session_id: &str,
+        input: String,
+        history: Option<Vec<Message>>,
+    ) -> HostResult<RunView> {
         if self.inner.unavailable.load(Ordering::Acquire) {
             return Err(HostError::new(
                 "storage_unavailable",
@@ -353,6 +373,9 @@ impl Host {
             .inner
             .store
             .call(move |db| {
+                if let Some(history) = history {
+                    db.reconcile_history(&view.session_id, &history)?;
+                }
                 let offset = db.events(&view.session_id)?.len();
                 let mut view = db.save_run(view, offset)?;
                 db.append(
@@ -799,9 +822,35 @@ impl Host {
             }
         }
         self.wait_idle().await;
-        let result = self.inner.store.close().await;
+        let projection = if let Some(office) = self.inner.office.lock().await.take() {
+            office.finish(self).await
+        } else {
+            Ok(())
+        };
+        let result = projection.and(self.inner.store.close().await);
         *completed = Some(result.clone());
         result
+    }
+
+    /// 功能：启动可选Office同步，在原shutdown中统一回收。
+    /// 参数：self为已恢复的共享Host。
+    /// 返回：启动成功或已启动时成功。
+    /// 错误：Office凭据/客户端装配错误。
+    /// 状态：不重复启动办公室协调器。
+    /// 并发与取消：异步生命周期锁避免两个监听器重复装配。
+    /// 权限：只使用已验证本机配置。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-007/009。
+    pub(crate) async fn start_office(&self) -> HostResult<()> {
+        let mut owner = self.inner.office.lock().await;
+        if owner.is_none() {
+            if let Some(config) = &self.inner.config.office {
+                *owner = Some(crate::office::Coordinator::start(
+                    self.clone(),
+                    config.clone(),
+                )?);
+            }
+        }
+        Ok(())
     }
 
     /// 功能：读取已恢复且可继续接受运行的就绪状态。

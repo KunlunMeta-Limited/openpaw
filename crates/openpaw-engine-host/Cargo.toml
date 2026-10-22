@@ -9,7 +9,7 @@ authors.workspace = true
 
 [features]
 default = []
-engine-host = ["dep:openpaw-core", "dep:openpaw-engine", "dep:openpaw-llm", "dep:openpaw-store", "dep:openpaw-tools", "dep:openpaw-memory", "dep:openpaw-goal-ledger", "dep:openpaw-sandbox", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:futures", "dep:serde", "dep:serde_json", "dep:toml", "dep:rusqlite", "dep:uuid", "dep:chrono", "dep:axum", "dep:same-file"]
+engine-host = ["dep:openpaw-core", "dep:openpaw-engine", "dep:openpaw-llm", "dep:openpaw-store", "dep:openpaw-tools", "dep:openpaw-memory", "dep:openpaw-goal-ledger", "dep:openpaw-sandbox", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:futures", "dep:serde", "dep:serde_json", "dep:toml", "dep:rusqlite", "dep:uuid", "dep:chrono", "dep:axum", "dep:same-file", "dep:reqwest"]
 
 [dependencies]
 openpaw-core = { workspace = true, optional = true }
@@ -33,6 +33,8 @@ chrono = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 same-file = { workspace = true, optional = true }
 
+reqwest = { workspace = true, optional = true }
+
 [dev-dependencies]
 tempfile.workspace = true
 
@@ -44,6 +46,16 @@ required-features = ["engine-host"]
 [[test]]
 name = "host_recovery"
 path = "tests/regressions/recovery.rs"
+required-features = ["engine-host"]
+
+[[test]]
+name = "host_office"
+path = "tests/features/office.rs"
+required-features = ["engine-host"]
+
+[[test]]
+name = "host_office_sync"
+path = "tests/regressions/office_sync.rs"
 required-features = ["engine-host"]
 
 [[example]]

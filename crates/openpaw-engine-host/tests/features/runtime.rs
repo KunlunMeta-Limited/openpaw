@@ -13,6 +13,7 @@ fn config(base: &std::path::Path) -> HostConfig {
     let root = base.join("项目 workspace");
     std::fs::create_dir_all(&root).unwrap();
     HostConfig {
+        office: None,
         home: base.join("home"),
         roots: [("project".into(), root)].into(),
         slots: (1..=5)
@@ -779,4 +780,52 @@ async fn h08_acceptance_failure_does_not_start_tools_or_replay_input() {
         1
     );
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_waiting_resource_is_distinct_from_execution_and_can_be_cancelled() {
+    let base = tempfile::tempdir().unwrap();
+    let cfg = config(base.path());
+    std::fs::write(cfg.roots["project"].join("read.txt"), "not-yet-read").unwrap();
+    let provider = MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "read_file".into(),
+            input: json!({"path":"read.txt"}),
+            text: "读取".into(),
+        },
+        MockMode::Fixed("done".into()),
+    ]);
+    let host = Host::with_provider(cfg.clone(), Arc::new(provider))
+        .await
+        .unwrap();
+    let guard = openpaw_sandbox::file_lock::try_lock_exclusive(
+        &cfg.roots["project"].join(".openpaw/engine-host-resource.lock"),
+    )
+    .unwrap();
+    let s = scope(1);
+    let binding = host.open_session(s.clone()).await.unwrap();
+    let run = host
+        .submit_run(&s, &binding.session_id, "读取read.txt".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let view = host.get_run(&s, &run.run_id).await.unwrap();
+            if view.tools.iter().any(|t| t.state == "awaiting_resource") {
+                assert!(!view.tools.iter().any(|t| t.state == "running"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    host.cancel_run(&s, &run.run_id).await.unwrap();
+    host.wait_idle().await;
+    assert_eq!(
+        host.get_run(&s, &run.run_id).await.unwrap().state,
+        RunState::Cancelled
+    );
+    drop(guard);
+    host.shutdown().await.unwrap();
 }

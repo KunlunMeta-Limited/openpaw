@@ -99,3 +99,30 @@ test('upstream bounds decision wait, UI wait, detail actions and scene team bind
   assert.equal(officeRequestSchema.safeParse(tooMany).success, false)
   assert.equal(relayMessageSchema.safeParse({ ...f.sceneCommand, teamId: 'other' }).success, false)
 })
+
+test('product evidence validates actual Host/Office protocol values through pinned schemas', async () => {
+  // A caller can also revalidate an archived real product report. The product
+  // runner always applies these same schemas directly to its live traffic.
+  const path = process.env.OPENPAW_OFFICE_PRODUCT_REPORT
+  if (path) {
+    const report = JSON.parse(await readFile(path, 'utf8'))
+    assert.equal(report.result, 'passed')
+    assert.ok(report.browserRequests.some(request => request.events?.some(event => event.type === 'done')))
+    for (const request of report.browserRequests) for (const event of request.events ?? []) {
+      assertProtocolValue(event); chatEventSchema.parse(event)
+    }
+    for (const item of report.messages) {
+      assertProtocolValue(item.request); officeRequestSchema.parse(item.request)
+      responseEnvelopeSchema.parse(item.response)
+      assert.equal(item.http, item.response.code)
+      if (item.http >= 200 && item.http < 300) officeResultSchema(item.request.type, Boolean(item.request.teamId)).parse(item.response.data)
+    }
+  }
+  // These transport constraints are stronger than simply JSON.parse: even
+  // the strongest escaping case must retain a legal Unicode delta/line.
+  for (const text of ['😀'.repeat(2000), '\u0001'.repeat(4000), '中"\\\n'.repeat(1000)]) {
+    const event = { type: 'delta', text }
+    chatEventSchema.parse(event); assertProtocolValue(event)
+    assert.ok(JSON.stringify(event).length < 32000)
+  }
+})

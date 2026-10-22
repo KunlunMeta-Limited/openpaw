@@ -15,7 +15,7 @@ tool_timeout_secs = 300
 approval_timeout_secs = 300
 # 写入和bash需显式加入；每次调用仍必须通过Host持久审批。
 tools = ["read_file", "glob", "grep", "todo_list", "think"]
-# T7预留：必须成对配置，当前T3只开放健康接口。
+# T7预留：必须成对配置，T4启用office段后增加官方聊天接口；OpenCode认证路由尚未交付。
 # basic_username_env = "OPENPAW_HOST_USER"
 # basic_password_env = "OPENPAW_HOST_PASSWORD"
 [roots]
@@ -25,3 +25,16 @@ office-1 = "project"
 office-2 = "project"
 office-3 = "project"
 office-4 = "project"
+
+# Office接入（T4）：取消以下注释才启用；保持上方tools只读。
+# 不填模型字段即可沿用原生 ~/.openpaw/.env 的DeepSeek配置。
+# Office服务密钥是独立的系统环境 PAWOFFICE_API_KEY，不能用模型密钥替代。
+# [office]
+# base_url = "http://127.0.0.1:8765"
+# api_key_env = "PAWOFFICE_API_KEY"
+# allowed_origins = ["http://127.0.0.1:8765"]
+# [office.names]
+# office-1 = "研发办公室"
+# office-2 = "产品办公室"
+# office-3 = "资料办公室"
+# office-4 = "测试办公室"

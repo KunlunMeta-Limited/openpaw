@@ -1,7 +1,7 @@
 //! 职责：loopback健康监听、端口发现与可靠停止。
 //! 输入输出：已恢复的Host到本机HTTP健康接口。
 //! 依赖：可选axum和Host关闭服务。
-//! 禁止职责：本阶段不开放执行、审批或客户端协议路由。
+//! 禁止职责：协议处理委托Office模块，不在监听器实现引擎或审批。
 use crate::{Host, HostError, HostResult};
 use axum::{routing::get, Json, Router};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -23,7 +23,7 @@ impl HostServer {
     /// 参数：host为共享服务，port零表示随机端口。
     /// 返回：实际监听地址及停止所有者。
     /// 错误：非法范围、状态冲突或存储故障明确上报；无失败分支的读取不产生错误。
-    /// 状态：仅GET /health；不开放调试执行和审批。
+    /// 状态：默认仅健康；显式office段才装配官方聊天及快照同步。
     /// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
@@ -35,10 +35,14 @@ impl HostServer {
         let stop = CancellationToken::new();
         let signal = stop.clone();
         let health = host.clone();
-        let app = Router::new().route("/health",get(move||{let health=health.clone();async move{
+        let mut app = Router::new().route("/health",get(move||{let health=health.clone();async move{
             let ready=health.ready();
             (if ready{axum::http::StatusCode::OK}else{axum::http::StatusCode::SERVICE_UNAVAILABLE},Json(serde_json::json!({"status":if ready{"ready"}else{"unavailable"},"schemaVersion":1})))
         }}));
+        if let Some(config) = host.inner.config.office.clone() {
+            app = app.merge(crate::office::router(host.clone(), config, addr));
+            host.start_office().await?;
+        }
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(signal.cancelled_owned())

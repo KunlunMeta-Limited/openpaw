@@ -137,6 +137,22 @@ impl ToolExecutor for HostTools {
                 .await
                 .map_err(|e| Error::ToolHost(e.to_string()))?;
         }
+        let waiting_binding = context.binding().clone();
+        if let Err(error) = self
+            .store
+            .call(move |db| {
+                let revision = db.bump(
+                    "tool_waiting_resource",
+                    &serde_json::to_string(&waiting_binding).map_err(HostError::storage)?,
+                )?;
+                let _ = db.notices.send(crate::HostNotice::Changed { revision });
+                Ok(())
+            })
+            .await
+        {
+            self.control.fail(error);
+            return Err(Error::Store("无法保存工具资源等待事实".into()));
+        }
         let _guard = self
             .root
             .acquire(write, &context.cancel())
