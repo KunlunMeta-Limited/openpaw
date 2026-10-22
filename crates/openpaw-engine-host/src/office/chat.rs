@@ -89,6 +89,27 @@ fn error(e: HostError) -> Response {
     )
         .into_response()
 }
+// 仅传输已知、可由用户恢复的接受拒绝；未知/存储故障保留HTTP失败。
+// Office官方代理将非2xx映射成通用502，因此这里不能回传原始诊断。
+fn acceptance_error(e: HostError) -> Response {
+    let message = match e.kind.as_str() {
+        "history_conflict" => "会话历史已更新，请点击重新同步后重试",
+        "request_conflict" => "本轮标识已用于其他内容，请重新同步会话后重试",
+        "session_busy" => "当前会话仍有任务运行，请等待完成或先停止",
+        "slot_busy" => "当前办公室仍有任务运行，请等待完成或先停止",
+        "capacity_exceeded" => "当前运行容量已满，请稍后重试",
+        "not_found" => "未找到这轮对话，请重新同步会话",
+        _ => return error(e),
+    };
+    (
+        [
+            ("content-type", "application/x-ndjson; charset=utf-8"),
+            ("x-accel-buffering", "no"),
+        ],
+        format!("{}\n", json!({"type":"error","message":message})),
+    )
+        .into_response()
+}
 async fn options(State(state): State<ChatState>, headers: HeaderMap) -> Response {
     let source = match origin(&state, &headers) {
         Ok(s) => s,
@@ -243,7 +264,7 @@ async fn handle(
                     .insert("x-accel-buffering", "no".parse().unwrap());
                 response
             }
-            Ok(Err(e)) => error(e),
+            Ok(Err(e)) => acceptance_error(e),
             Err(_) => error(HostError::new("interrupted", "聊天接受任务异常")),
         }
     }

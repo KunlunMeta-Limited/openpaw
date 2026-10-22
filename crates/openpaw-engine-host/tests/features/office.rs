@@ -69,7 +69,7 @@ async fn suite() {
             input: json!({"path":"README.md"}),
             text: "读取文件。".into(),
         },
-        MockMode::Fixed("已读取 ALPHA。".into()),
+        MockMode::Fixed("# 读取结果\n\n已读取 ALPHA。".into()),
         MockMode::Fixed("记得 ALPHA。".into()),
     ]));
     let host = Host::with_provider(cfg.clone(), provider).await.unwrap();
@@ -85,7 +85,7 @@ async fn suite() {
     .await;
     assert!(completed(e.last().unwrap()));
     let text: String = e.iter().filter_map(|e| e["text"].as_str()).collect();
-    assert!(text.contains("ALPHA"));
+    assert_eq!(text, "读取文件。\n\n# 读取结果\n\n已读取 ALPHA。");
     let scope = ClientScope {
         namespace: "office".into(),
         slot_id: "office-1".into(),
@@ -116,10 +116,26 @@ async fn suite() {
         .await
         .unwrap();
     assert_eq!(page["data"]["turns"].as_array().unwrap().len(), 1);
-    assert!(page["data"]["turns"][0]["assistant"]
-        .as_str()
+    assert_eq!(page["data"]["turns"][0]["assistant"], text);
+    let resume_first = json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"first","turnId":page["data"]["turns"][0]["id"]});
+    assert_eq!(
+        events(post(&client, &url, &resume_first).send().await.unwrap()).await[0]["text"],
+        text
+    );
+    let original_messages = host
+        .get_session(&scope, &snapshot.runs[0].session_id)
+        .await
         .unwrap()
-        .contains("ALPHA"));
+        .messages;
+    let original_text: Vec<_> = original_messages
+        .iter()
+        .filter(|m| m.role == openpaw_core::Role::Assistant)
+        .map(|m| m.text())
+        .collect();
+    assert_eq!(
+        original_text,
+        vec!["读取文件。", "# 读取结果\n\n已读取 ALPHA。"]
+    );
     assert_eq!(page["data"]["turns"][0]["user"], "读取README.md");
     // 原turn重试先从持久关联返回终态快照，不再调用Provider/工具。
     let turn = page["data"]["turns"][0]["id"].clone();
@@ -138,13 +154,19 @@ async fn suite() {
         1
     );
     duplicate["messages"][0]["content"] = json!("不同输入");
+    let rejection = events(post(&client, &url, &duplicate).send().await.unwrap()).await;
     assert_eq!(
-        post(&client, &url, &duplicate)
-            .send()
+        rejection,
+        vec![json!({"type":"error","message":"本轮标识已用于其他内容，请重新同步会话后重试"})]
+    );
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
             .await
             .unwrap()
-            .status(),
-        409
+            .0
+            .runs
+            .len(),
+        1
     );
     let empty =
         json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"empty"});
@@ -163,9 +185,25 @@ async fn suite() {
     assert!(completed(follow_events.last().unwrap()));
     let mut wrong = follow.clone();
     wrong["messages"][1]["content"] = json!("篡改历史");
+    wrong["turnId"] = json!(uuid::Uuid::new_v4().simple().to_string());
+    let rejection = events(post(&client, &url, &wrong).send().await.unwrap()).await;
     assert_eq!(
-        post(&client, &url, &wrong).send().await.unwrap().status(),
-        409
+        rejection,
+        vec![json!({"type":"error","message":"会话历史已更新，请点击重新同步后重试"})]
+    );
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        2
+    );
+    let missing = json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"first","turnId":"missing-turn"});
+    assert_eq!(
+        events(post(&client, &url, &missing).send().await.unwrap()).await,
+        vec![json!({"type":"error","message":"未找到这轮对话，请重新同步会话"})]
     );
     let mut invalid = request("bad", "hello");
     invalid["runId"] = json!("not-v1");
@@ -217,7 +255,42 @@ async fn suite() {
     let mut writes = cfg.clone();
     writes.tools.push("write_file".into());
     assert!(writes.validate().is_err());
-    let cfg = config(&tmp.path().join("slow"));
+    let restarted = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed("不应执行")))
+        .await
+        .unwrap();
+    let server = HostServer::bind(restarted, 0).await.unwrap();
+    let restarted_url = format!("http://{}", server.address());
+    let restored: Value = post(&client, &restarted_url, &page_request)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // 第一页limit=1为追问；resume仍能按原稳定turn读取工具前后同一展示文本。
+    assert_eq!(restored["data"]["turns"][0]["assistant"], "记得 ALPHA。");
+    assert_eq!(
+        events(
+            post(&client, &restarted_url, &resume_first)
+                .send()
+                .await
+                .unwrap()
+        )
+        .await[0]["text"],
+        text
+    );
+    let missing_control = json!({"type":"cancel","version":"1.0","teamId":"office-1","conversationId":"first","turnId":"missing-turn"});
+    assert_eq!(
+        post(&client, &restarted_url, &missing_control)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    server.shutdown().await.unwrap();
+    let mut cfg = config(&tmp.path().join("slow"));
+    cfg.max_active_runs = 3;
     let slow = Host::with_provider(cfg, Arc::new(Slow)).await.unwrap();
     let server = HostServer::bind(slow.clone(), 0).await.unwrap();
     let url = format!("http://{}", server.address());
@@ -226,12 +299,14 @@ async fn suite() {
         .await
         .unwrap();
     assert_eq!(
-        post(&client, &url, &request("cancel", "重复提交"))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        409
+        events(
+            post(&client, &url, &request("cancel", "重复提交"))
+                .send()
+                .await
+                .unwrap()
+        )
+        .await,
+        vec![json!({"type":"error","message":"当前会话仍有任务运行，请等待完成或先停止"})]
     );
     let same_office = post(&client, &url, &request("parallel", "同办公室不同会话"))
         .send()
@@ -242,6 +317,28 @@ async fn suite() {
     other["teamId"] = json!("office-2");
     let independent = post(&client, &url, &other).send().await.unwrap();
     assert_eq!(independent.status(), 200);
+    assert_eq!(
+        events(
+            post(&client, &url, &request("capacity", "容量已满"))
+                .send()
+                .await
+                .unwrap()
+        )
+        .await,
+        vec![json!({"type":"error","message":"当前运行容量已满，请稍后重试"})]
+    );
+    let capacity_scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "capacity".into(),
+    };
+    assert!(slow
+        .snapshot_and_subscribe(&capacity_scope)
+        .await
+        .unwrap()
+        .0
+        .runs
+        .is_empty());
     let mut other_stream = independent.bytes_stream();
     assert!(other_stream.next().await.is_some());
     let mut stream = response.bytes_stream();

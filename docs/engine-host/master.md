@@ -272,7 +272,7 @@ Office版本固定02dbac4，虽然version仍为1.0，协议已区别于历史b22
 ### 4.2 接受、历史与取消不变量
 
 1. (teamId,conversationId)固定绑定原Session；conversationId同时用在conversations[].id，不能换成Session/Run ID。新对话仍留在同办公室，首次成功发送后加入快照目录，空草稿/history读取不创建Run。
-2. (Session,turnId)与Run及规范请求的精确关联在Accepting同一SQLite事务保存；相同键相同内容返回原Run，相同键异内容409。关联只用于幂等，不作为第二模型账本；JSONL仍是事实。legacy:RunID是升级前Run的稳定历史身份，send拒绝占用该前缀，resume/cancel可读旧身份。
+2. (Session,turnId)与Run及规范请求的精确关联在Accepting同一SQLite事务保存；相同键相同内容返回原Run，相同键异内容拒绝，并以官方NDJSON error说明（见4.3）；HTTP200不代表接受成功。关联只用于幂等，不作为第二模型账本；JSONL仍是事实。legacy:RunID是升级前Run的稳定历史身份，send拒绝占用该前缀，resume/cancel可读旧身份。
 3. 同Session最多一个活动Run；**同办公室不同会话可并行**，全局默认四个，复用原根资源锁。超限明确拒绝。每办公室最多100个绑定，超过时拒绝新会话，不删旧账本。
 4. messages最多十完整轮次加当前非空user；首次导入仅为不可信外部文本，后续核对已完成展示历史后缀，不覆盖原账本或导入工具/授权。历史按Run输入位置读取，不将tool_result(User角色)当成用户轮次。
 5. history页内旧→新，游标绑定既存Run身份；新追加不移动旧页边界。仅最新页含最后一个pending，activeTurnId与之相同；旧页无活动标识。旧Run用原ID稳定映射；完整工具结果留原查询接口/T5详情。
@@ -289,7 +289,9 @@ Office版本固定02dbac4，虽然version仍为1.0，协议已区别于历史b22
 | 流事件 | status(thinking/streaming)、delta、snapshot、done、error；无null/未知字段 |
 | 成功/失败 | 完整账本与终态保存后才done或complete snapshot；空输出、超限、持久失败不得假done；错误说明有界且不泄密 |
 | 请求期限 | 非流操作Office转发15秒，send/resume每连接180秒；Run总预算独立；T6覆盖超过连接期限再恢复，不用心跳宣称无限连接 |
-| HTTP错误 | Host用code/msg/data对象封套；Office当前可能将上游非2xx转换为502 CHAT_UPSTREAM_ERROR，不能承诺Host细分状态原样到浏览器 |
+| 可恢复接受拒绝 | 仅send/resume的history_conflict/request_conflict/session_busy/slot_busy/capacity_exceeded/not_found：HTTP200/application/x-ndjson一条官方error{message}；安全白名单文案，无done/成功snapshot/新Run；不按Accept分叉 |
+| HTTP错误 | 非法JSON/字段/来源/办公室仍真实4xx；存储/未知故障保留HTTP失败。history/cancel仍code/msg/data；Office将上游非2xx转通用502，不承诺原细分状态透传 |
+| 消息段落 | 每条assistant消息内部原文不变，两条有文字消息间补足两换行；live/JSONL恢复同一累积器，4MiB预算含分隔；空/Thinking/纯工具不制造回复，原JSONL不回写 |
 
 ~~~mermaid
 sequenceDiagram
@@ -421,7 +423,7 @@ sequenceDiagram
 
 | 顺序 | 调用/内部接口安排 | 事实保存与失败行为 | 用户看见什么 |
 |---|---|---|---|
-| 1 | 浏览器同源POST Office /api/pawoffice/chat → Fastify按initialize.chat.url转发Host /office/chat（S4）；聊天适配器调用共享服务接受Run | 校验办公室/历史/容量；保存输入和绑定成功后才启动；不合法用HTTP错误，流已开始则合法error事件 | 开始思考或明确错误 |
+| 1 | 浏览器同源POST Office /api/pawoffice/chat → Fastify按initialize.chat.url转发Host /office/chat（S4）；聊天适配器调用共享服务接受Run | 校验办公室/历史/容量；保存输入和绑定成功后才启动；前置非法/存储故障用HTTP错误，send/resume可恢复业务拒绝用官方error事件 | 开始思考或明确错误 |
 | 2 | AgentLoop的TextDelta → 聊天适配器delta；生命周期 → Office投影器 | 文本可合并，消息/工具/终态可靠保存；两通道只共享事实，不互相冒充确认 | 聊天文字与任务/白板可以先后到达，最后一致 |
 | 3 | 投影器 → messages.office.snapshot（S1/S2） | 保存seq+原内容；202只缓存；失败有界恢复；不阻塞模型输出或资源清理 | 工作状态、气泡、新分配拜访；失联时不伪成功 |
 | 4 | 工具授权 → messages.decision.request（S1） | pending可靠保存；等待无锁；校验原POST返回的选择并CAS；断线/过期不授权 | 审批菜单；确认后才出现写入/执行 |
@@ -783,7 +785,7 @@ approved不是无条件执行通行证；取消、输入变化、权限变化或
 **完成标准/可演示结果：**
 
 - 页面真实读取两文件、回答和追问正确，任务与白板来自同一Run；切换办公室不串线，新对话保留旧账本，纯聊天无伪工具任务。
-- 4000/50000/100000/32000/16000及中文emoji/转义边界、空输出/提前断流/存储失败有测试，不发假done；历史导入/后缀不一致409明确。
+- 4000/50000/100000/32000/16000及中文emoji/转义边界、空输出/提前断流/存储失败有测试，不发假done；历史导入/后缀不一致拒绝，以官方NDJSON error说明，不启动Run。
 - 真服务覆盖新/旧/相同seq同内容/异内容、离线202、容量cached、重启404恢复；截图对应实际seq。停止证明引擎实际结束，非只浏览器中止。
 - Linux/Windows原生Node和真实浏览器通过，记录未启用写入/审批/详情的阶段边界；完整测试、独立PR批准合入。只跑Schema或curl不算T4产品完成。
 
@@ -1340,7 +1342,7 @@ Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2
 | F08 | 多轮上下文和较早消息 | S4 history分页；ChatSession/原JSONL | 已有接入：完整账本、稳定分页、空历史不运行模型；加载更早/错误重试补网页验收 | T4.2、T6.3 |
 | F09 | Markdown、表格、代码、复制回复 | ChatMarkdown/ChatTranscript | 原生复用：禁原始HTML；显示/复制原始模型文本，未获承诺附件不静默忽略 | T4.2、T8.1 |
 | F10 | 配置错误、网络错误可恢复 | S3/S4；重新同步与存储错误提示 | 已有接入+复用：未配置显示真实错误；history/resume恢复，不用假done | T4.2、T6.1 |
-| F11 | 同一提交重试不执行两遍 | S4稳定turnId；Host v3 host_requests | 已有接入：同ID异内容409，丢失响应再查同Run，非只断言HTTP200 | T4.1、T6.2 |
+| F11 | 同一提交重试不执行两遍 | S4稳定turnId；Host v3 host_requests | 已有接入：同ID异内容返回官方error，丢失响应再查同Run，非只断言HTTP200 | T4.1、T6.2 |
 | F12 | 刷新/关闭/断网后继续看原Run | S4 history/resume；ChatSession | 已有基础：detach不取消；刷新重连；超过180秒现需重新同步，不宣称无感自动续接 | T6.1 |
 | F13 | 点停止后任务确实停止 | S4 cancel；共享Run/进程清理 | 已有只读链路；cancelling直到完成清理；写入/命令取消在T5验 | T4.1、T5.6、T6.2 |
 | F14 | 删除对话及其已保存聊天历史 | S1 conversation.delete/result；新seq移除 | 待适配：共享删除服务、墓碑、防复活、关闭writer、清索引/元数据并恢复 | T5.3、T6.2 |
@@ -1394,6 +1396,8 @@ Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2
 4. 同一会话积累超过一页历史，加载更早记录无重复/跳项；加载失败可重试，完整JSONL未被浏览器裁剪覆盖。
 5. 真实模型回答包含Markdown标题/代码/表格，检查页面渲染和复制原文；不执行原始HTML。不以任意远端图片下载作为模型可用证据。
 6. 配置缺失/非法模型/连接失败/历史冲突显示真实错误；重新同步后状态与Host一致。刷新选择行为按当前Office源码验证，不预设它跨所有浏览器持久保持同一选择。
+7. 模型先给工具前说明、执行真实read_file，再给以Markdown标题开头的最终消息；检查标题/表格/代码、复制原文和delta/history/resume/重启一致；消息间段落边界不得改变原JSONL或模型上下文。旧浏览器缓存不清库，升级后用官方history同步再追问。
+8. 双浏览器更新同会话，旧历史提交显示“会话历史已更新，请点击重新同步后重试”；仅一条官方error，无done/新Run/额外模型调用。明确区分接受拒绝HTTP200与实际成功，非法字段/真实离线/存储错误仍HTTP失败。
 
 **产物：**F01—F10逐项网页证据、请求/响应与绑定对账表、没有执行/没有覆盖的明确列表。**完成标准：**每条声明由实际点击/输入得到，有team/conversation/Run关联；不通过改Office文案或测试替身模拟产品成功。若必须改Office，先单列Rx。
 
@@ -1512,3 +1516,7 @@ Office对应依据：固定S1 `decision.request`的confirm/reject/408，以及S2
 | M8 | 全产品脚本/用户操作手册、原生共存、部署保护、真实模型、备份回退及平台证据 | Windows按用户安排暂缓不记通过；未补原生验收不称双平台发布完成 |
 
 每个Tx仍一个主CHG与独立主PR；工作包不另开Tx/审核总单。进入实现前在该Tx主CHG列准确文件、复用理由、方法、影响、产物和证据；当前新增细化仅用于规划，不能越过前一PR批准合入或Office Rx审批。T0—T8完成后恢复普通CHG开发流程。
+
+### T4 r6当前实施登记（2026-10-22）
+
+用户已批准0005 r6完整提案（准确Git对象见主CHG）。本轮仅修D38消息段落和D39接受错误传输，并延展原真实浏览器入口；原27/27不作新版本结果。M4仍待精确提交完整验证、在线DeepSeek复验及用户交付验收，无T4 PR；D36/D37、Windows暂缓与Office全部申请未批准保持不变。

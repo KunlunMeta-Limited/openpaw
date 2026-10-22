@@ -79,7 +79,7 @@ pub(crate) struct Inner {
     office: tokio::sync::Mutex<Option<crate::office::Coordinator>>,
     acceptance: tokio::sync::Mutex<()>,
     notices: broadcast::Sender<HostNotice>,
-    live: Arc<Mutex<HashMap<String, (String, bool)>>>,
+    live: Arc<Mutex<HashMap<String, RunText>>>,
 }
 struct Active {
     session: String,
@@ -94,6 +94,8 @@ struct Registry {
 struct Observer {
     store: Store,
     session_id: String,
+    run_id: String,
+    live: Arc<Mutex<HashMap<String, RunText>>>,
     control: RunControl,
 }
 #[async_trait]
@@ -116,10 +118,23 @@ impl RunObserver for Observer {
                 *error = Some("宿主关键事实保存失败".into());
             }
         }
+        let assistant_message =
+            matches!(&event, SessionEvent::Message(m) if m.role == openpaw_core::Role::Assistant);
         let id = self.session_id.clone();
         if let Err(e) = self.store.call(move |db| db.append(&id, event)).await {
             self.control.fail(e);
             return Err(openpaw_core::Error::Store("运行事实保存失败".into()));
+        }
+        // 可靠消息先落账本，下一次delta才可跨边界；不能依赖Provider的MessageStart。
+        if assistant_message {
+            if let Some(buffer) = self
+                .live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&self.run_id)
+            {
+                buffer.end_message();
+            }
         }
         Ok(())
     }
@@ -493,7 +508,7 @@ impl Host {
             .live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), (String::new(), false));
+            .insert(id.clone(), RunText::bounded(4 * 1024 * 1024));
         let host = self.clone();
         let run = view.clone();
         tokio::spawn(async move {
@@ -569,6 +584,8 @@ impl Host {
             let mut observer = Observer {
                 store: self.inner.store.clone(),
                 session_id: view.session_id.clone(),
+                run_id: view.run_id.clone(),
+                live: self.inner.live.clone(),
                 control: control.clone(),
             };
             let id = view.run_id.clone();
@@ -587,11 +604,7 @@ impl Host {
                         if let AgentEvent::TextDelta { text } = event {
                             let mut live = inner.live.lock().unwrap_or_else(|e| e.into_inner());
                             if let Some(buffer) = live.get_mut(&id) {
-                                if !buffer.1 && buffer.0.len() + text.len() <= 4 * 1024 * 1024 {
-                                    buffer.0.push_str(&text);
-                                } else {
-                                    buffer.1 = true;
-                                }
+                                buffer.append(&text);
                             }
                             let _ = inner.notices.send(HostNotice::Text);
                         }

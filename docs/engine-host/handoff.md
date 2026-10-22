@@ -183,3 +183,9 @@ D37 Linux取消回归间歇失败必须在开放shell前定位修复并稳定验
 本次r5文档规划已获用户授权同步，不授权T5实现或Office修改。每Tx仍受前序PR批准合入、对应主CHG和Office独立Rx约束。普通后续工作不另建治理CHG。
 
 用户要求Office申请暂不允许通过，统一保存于[集中台账](office-change-requests.md)，合适时统一审核。后续新发现Office问题只补台账，不改Office/不创建Office实施PR；现有官方能力继续由Host适配。
+
+## T4 r6实施交接边界（2026-10-22）
+
+用户已批准0005 r6（准确对象见该单首页），本轮仅D38/D39和原T4.2网页验收扩充。RunText在Host内统一live/原JSONL投影消息边界，原消息事实与数据库版本不变；旧浏览器缓存须官方history同步。send/resume六类可恢复接受拒绝改HTTP200单条官方error；直连客户端必须检查事件，不能只认HTTP成功。前置4xx、存储故障及history/cancel的JSON语义不变；原Office仍可能把上游非2xx映射通用502。
+
+测试延展原host_office及office-product.mjs，后者使用固定Office原服务/独立Chromium验证Markdown复制、草稿/搜索/键盘、25轮分页失败原游标重试和双浏览器历史冲突；失败报告保留，准确结果见0005验证记录。在线DeepSeek另记，不冒充确定性Provider结果。当前未获得本轮交付验收、无T4 PR、不进入T5；Office所有申请仍暂缓，Windows原生未执行，D36/D37继续开放。

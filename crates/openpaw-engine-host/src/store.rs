@@ -48,12 +48,12 @@ pub(crate) struct Db {
     /// 关联：需求/设计DES-OP-006。
     pub(crate) notices: broadcast::Sender<HostNotice>,
     /// 用途：活动Run的有界文本展示缓存，不作为第二份账本。
-    /// 字段：Arc<Mutex<HashMap<String, (String,bool)>>>，宿主类型字段。
+    /// 字段：Arc<Mutex<HashMap<String, RunText>>>，宿主类型字段。
     /// 来源去向：共享Host内部与可信Rust适配器。
     /// 约束：只在已授权会话及配置根内使用。
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
-    pub(crate) live: Arc<Mutex<HashMap<String, (String, bool)>>>,
+    pub(crate) live: Arc<Mutex<HashMap<String, RunText>>>,
 }
 impl Store {
     /// 功能：恢复原JSONL及宿主元数据并启动单写协调器。
@@ -68,7 +68,7 @@ impl Store {
         home: PathBuf,
         roots: BTreeMap<String, PathBuf>,
         notices: broadcast::Sender<HostNotice>,
-        live: Arc<Mutex<HashMap<String, (String, bool)>>>,
+        live: Arc<Mutex<HashMap<String, RunText>>>,
     ) -> HostResult<Self> {
         let db = tokio::task::spawn_blocking(move || Db::open(home, roots, notices, live))
             .await
@@ -143,7 +143,7 @@ impl Db {
         home: PathBuf,
         roots: BTreeMap<String, PathBuf>,
         notices: broadcast::Sender<HostNotice>,
-        live: Arc<Mutex<HashMap<String, (String, bool)>>>,
+        live: Arc<Mutex<HashMap<String, RunText>>>,
     ) -> HostResult<Self> {
         let meta = home.join("engine-host");
         std::fs::create_dir_all(&meta).map_err(HostError::storage)?;
@@ -363,7 +363,7 @@ impl Db {
             .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
         let events = self.events(&run.session_id)?;
         let mut active = false;
-        let mut text = String::new();
+        let mut text = RunText::default();
         let mut tools = std::collections::BTreeMap::new();
         for e in events {
             match e {
@@ -371,9 +371,10 @@ impl Db {
                 SessionEvent::Message(m) if active && m.role == openpaw_core::Role::Assistant => {
                     for block in m.content {
                         if let openpaw_core::ContentBlock::Text { text: t } = block {
-                            text.push_str(&t);
+                            text.append(&t);
                         }
                     }
+                    text.end_message();
                 }
                 SessionEvent::ToolCallStart { call_id, tool_name } if active => {
                     tools.insert(
@@ -428,17 +429,17 @@ impl Db {
         run.tools = tools.into_values().collect();
         if !run.state.is_terminal() {
             if let Some(live) = self.live.lock().unwrap_or_else(|e| e.into_inner()).get(id) {
-                if live.0.len() >= text.len() {
-                    run.text = live.0.clone();
-                    run.text_truncated = live.1;
+                if live.text().len() >= text.text().len() {
+                    run.text = live.text().to_owned();
+                    run.text_truncated = live.truncated();
                 } else {
-                    run.text = text;
+                    run.text = text.text().to_owned();
                 }
             } else {
-                run.text = text;
+                run.text = text.text().to_owned();
             }
         } else {
-            run.text = text;
+            run.text = text.text().to_owned();
         }
         Ok(run)
     }

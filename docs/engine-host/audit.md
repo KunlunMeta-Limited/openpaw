@@ -172,3 +172,12 @@ Host仍占位。T1的llm::assemble_provider、RunObserver/SessionWriter与T2的T
 原AgentLoop/RunContext/RunObserver、Provider装配、SessionWriter/Reader/SessionDb、ToolRegistry与Environment、OS文件锁均直接复用；新增Host模块只管理核心没有的运行注册/绑定/审批消费/根锁/恢复及协议无关查询。Skill/Goal新增checked只读入口仍调用原解析器，不改旧容错列表；有界文本提取沿用原read_file，带行号输出保留。没有修改core/engine/sandbox/chat.rs，也未修改Office。
 
 新Host开发中已核查取消与状态竞争、真实句柄关闭、数据库故障锁存、根身份配置变更及索引损坏恢复；这些为本次新增实现的测试修正，不补造既有OpenPaw D编号。对照0004 H01—H12的准确交付与剩余限制以专用验证记录为准。
+
+## T4 r6：真实网页发现的D38/D39
+
+| ID | 根因、修复与边界 | 回归/当前状态 |
+|---|---|---|
+| D38 | service.live与store::get_run分别直接拼接跨assistant文字，工具前说明紧贴下一条标题；在原types.rs引入Host内部共用RunText，可靠消息保存后延迟分隔，消息内原文不变，4MiB计入分隔；核心/JSONL不修改 | 原host_office精确文本断言修复前失败，修复后通过；inline验证分块换行、空消息、中文预算；真实网页/精确HEAD完整结果登记于0005验证记录，不提前关闭 |
+| D39 | send/resume接受拒绝原用409/503，Office按官方协议转通用502；仅六类可恢复拒绝用HTTP200单条官方error，安全白名单，无新Run/假done；前置4xx和存储503、JSON控制操作保留 | host_office修复前409不满足官方错误事件断言；修复后覆盖请求/历史冲突、忙、容量、缺失及无副作用；真实双浏览器与完整结果见0005验证记录 |
+
+复用判定：延展原live/Store、原错误分类、原Office事件和原产品runner；新增仅Host内部展示累积器与接受错误私有映射。无独立解析器/存储/Provider或Office改动。D36/D37仍开放，T4仅只读工具，不因通过本轮测试关闭shell清理风险。

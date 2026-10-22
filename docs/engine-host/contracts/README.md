@@ -26,9 +26,14 @@ Host → POST /api/pawoffice/messages，Bearer 仅服务端持有。外部消息
 
 聊天为浏览器同源POST /api/pawoffice/chat→Office Fastify→Host /office/chat。Host用offices.initialize.chat.url动态注册实际回环端口；不靠VITE变量，不要求Node无法转发的Origin/认证头；有Origin仍须白名单，Host只监听loopback并校验Host。
 
-四操作均有version/teamId/conversationId：send加turnId/messages，history加cursor/limit，resume/cancel加turnId。send/resume是NDJSON，history/cancel是code/msg/data。新增snapshot{text,state,message}，resume第一条必须snapshot；terminal snapshot可直接结束。重复turn相同内容同Run，异内容冲突；history从Run原输入边界投影，工具结果不是新轮次，页内旧→新，游标稳定。断开仅detach，显式cancel清理完成后stopped:true。
+四操作均有version/teamId/conversationId：send加turnId/messages，history加cursor/limit，resume/cancel加turnId。send/resume是NDJSON，history/cancel是code/msg/data。新增snapshot{text,state,message}，resume第一条必须snapshot或error；terminal snapshot可直接结束。重复turn相同内容同Run，异内容冲突；history从Run原输入边界投影，工具结果不是新轮次，页内旧→新，游标稳定。断开仅detach，显式cancel清理完成后stopped:true。
 
 请求≤512KiB；输入≤4000、回复≤50000，历史最多10轮且≤100000，行≤350000，delta≤16000；按JS UTF-16兼容限制，字节另计。history响应≤8MiB、每页1—50。单流连接180秒，非流15秒；Run预算独立。空输出/错误不发假done。完整契约与状态图见master第4节，T4实际能力及证据见0005，旧Office验证不能覆盖新版。
+
+
+r6错误传输：仅send/resume接受阶段的history_conflict、request_conflict、session_busy、slot_busy、capacity_exceeded、not_found，以HTTP200/application/x-ndjson返回一条官方error{message}，没有done/成功snapshot/新Run；200只表示流可传输，客户端必须读事件判断业务结果。安全文案由适配器白名单决定，不回显原诊断，也不按Accept头切换语义。非法JSON/字段/来源/未授权办公室保留真实4xx，存储/未知故障保留HTTP失败。history/cancel仍是JSON；Office转发上游非2xx时按官方行为显示通用502，不保证其原细分状态透传。
+
+r6展示文本：Host内部RunText同时处理live与JSONL投影，每条assistant消息内部原样连接；两个有文字的消息之间补足两换行，已有换行不重复补。可靠消息保存后才标记下一边界，空/Thinking/纯工具消息不造文字。实时4MiB预算计入分隔符；原JSONL、模型上下文和数据库版本不变。流、history、resume、重启和复制应一致，旧浏览器缓存按官方history重新同步，不清用户存档。
 
 
 Fixtures 验证 Schema 的规范化、引用关系、数量/字段、场景绑定、无null/深度、响应形状。seq 冲突/缓存/浏览器应用等运行语义要在 T4 真服务测试，不能靠本阶段 fixtures 声称通过。
