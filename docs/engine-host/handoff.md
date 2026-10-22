@@ -153,13 +153,20 @@ runner的本地OpenAI协议fixture只用于确定性测试模型：回答取自�
 
 v1限制保留：浏览器180秒预算，刷新/断线取消，无Run ID/续接游标；T5才交付菜单/详情/写入审批，R1长任务扩展须按Rx另行批准。Windows原生本机未执行，不能据脚本可移植或Linux结果记通过。准确结果与剩余项见0005专用验证记录。
 
-## 当前T4 r4实施交接（新版协议，尚待产品验收）
+## 当前T4 r4交付交接（新版协议，待人工验收）
 
 Office固定02dbac4419e325efda9fa6293060037bd60da5e5；隔离源码/home/cheng/.cache/ai-office-react-latest-20261022-v2。旧r3直连/VITE配置/断开取消说明仅适用于旧版，不用于新版部署。Host运行时用实际监听地址注册chat.url；浏览器始终走Office同源/api/pawoffice/chat。四操作/状态/容量/安全按master第4节，0005第9.7节是本轮实施依据。
 
-T5须复用本轮conversationId目录、turn/Run映射和每办公室seq，实现带conversationId的单ui.next、审批/详情/删除；当前删除不支持。T6负责>180秒重连、并发订阅/慢消费者、磁盘及崩溃加固，不实施旧R1四URL。原用户Office两文档和OpenPaw旧工作区不改。Windows原生用户暂缓，不记通过。新代码/真实浏览器/完整验证结果待本轮完成后登记，不沿用旧版测试。
+T5须复用本轮conversationId目录、turn/Run映射和每办公室seq，实现带conversationId的单ui.next、审批/详情/删除；当前删除不支持。T6负责>180秒重连、并发订阅/慢消费者、磁盘及崩溃加固，不实施旧R1四URL。原用户Office两文档和OpenPaw旧工作区不改。Windows原生用户暂缓，不记通过。新版a67ad97完整27/27及真实8765 DeepSeek网页已完成，准确证据见0005验证记录；不沿用旧版测试，不代替人工验收。
 
 
 新版操作方法：保持OpenPaw原生.env；Host TOML的office.base_url填Office Node根地址，office.api_key_env引用PAWOFFICE_专用系统变量，allowed_origins仍填浏览器准确源。先启动任一服务均可，Host会重试同步。Office原生npm ci、npm run build:full、Node server/dist/index.js启动，不设置旧VITE聊天地址；打开/office/后选择办公室、新会话并发送。Host实际端口自动注册；同办公室可切换A/B，刷新history→resume，停止按钮显式cancel。删除按钮对应后端T5尚未实现，不能用于本阶段验收。
 
 产品脚本仍为node tests/engine-host-contracts/office-product.mjs，沿用上面的OPENPAW_OFFICE_SOURCE/CHROMIUM/NPM_CLI和输出变量；来源必须含02dbac4。新版runner在全新浏览器操作会话、真实读取文件、切换/刷新/停止、另一个浏览器发现会话，并保存网络、场景导出、录像、官方快照和原JSONL。确定性Provider用于自动化，用户真实模型另做网页验收，互不代替。
+
+
+新版现场入口：`http://127.0.0.1:8765/office/`，Host41949；源码使用固定02dbac4的隔离构建，原Office工作区不动。升级记录与停写备份：`artifacts/live-office-20261022-r4/upgrade-backup.json`、`upgrade-result.json`；原11绑定全部保留，模型仍用户原生.env。真实网页报告`artifacts/t4-new-office-live-final-20261022/report.json`，白板真实点击/阅读截图`artifacts/t4-new-office-live-whiteboard-20261022/`；不是只用HTTP200判断可用。
+
+供用户重复演示：刷新页面，点击“新会话”，输入“请实际调用read_file读取README.md和notes.txt，比较两份内容并给出完整标记，不要修改文件”。应返回PAW-REAL-README-20261021与PAW-REAL-NOTES-20261021；聊天可展开/折叠，折叠后等待场景文字绘制再点协作白板查看当前请求。再新建B并输入“只回复B会话已连接”，通过顶部标签切换，刷新后从目录恢复；停止按钮只有运行时显示。删除按钮、审批、详情和主动交接未实现，留T5，不把闲聊动画当执行证据。
+
+D37原生Linux取消回归有间歇失败，未修复，失败与20次复检见0005记录；本T4没有开放shell。T5方案在开放写入/shell前必须审核该清理边界，不能把本轮27/27当作D37已关闭。当前T4仍待用户验收，未创建PR；Windows暂缓未运行。
