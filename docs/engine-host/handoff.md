@@ -210,3 +210,12 @@ Office冻结02dbac4只读，现有用户编辑保留；T5未开始，无T4 PR/�
 r7在线演示已升级为8ad8f1c，部署/备份`artifacts/live-office-20261022-r7/`，完整27项`/home/cheng/.cache/t4-r7-full-20261022-a/report.json`、产品回归`/home/cheng/.cache/t4-r7-full-product-20261022-a/report.json`均通过。线上用户入口仍http://127.0.0.1:8765/office/；刷新后新建会话输入0005的O13提示词即可，不必修改Office或模型.env。既有“不能联网”回复是历史事实，不会被覆盖。
 
 真实DeepSeek证据`artifacts/t4-r7-deepseek-20261022-b/`：实际2次搜索、4次fresh抓取，气象来源长沙站当日19:30实况与回复一致；c轮另验证官网当日预报及任务/白板completed终态。b轮页面done后第一次快照仍running，按异步同步机制补取官方read与SQLite/JSONL确认completed，补证保留在对账文件；c轮等待终态再截图。搜索现存D42脚本污染未修，下一次精确修订审批前不扩大文件范围，不把所有联网能力或T4整体标完成。
+
+
+## r8原会话联网失败修复交接（0005第9.11节）
+
+用户已批准ceffe709:r8-context。原8765“今天是几号”tab对应conversation 074aead8-85fc-4cc4-a24f-40cb48343f0f / Session 50f53b9517a94dac9aefde208f73d58c；旧r7及仅加强开头system候选真实失败。诊断已证明原请求工具/时间存在，但DeepSeek沿用旧历史；新增私有RunProvider复用原blocks，把可信本轮信息邻近当前真实用户，原OpenAI适配器落实该布局。Bing污染修原工具，各自有先失败后通过测试。Office工程和模型.env均未动。
+
+候选真实原会话短句/刷新追问/日期已实际产生工具、可信日期和对应任务；外部浏览器a报告误断言原始metadata.tools而失败，原记录与补充对账保留；其首轮AM/PM解释不可靠，已加强通用来源时间约束，不据此确认实况。b/c/d原会话、普通短句实际请求和账本对账记录见0005验证记录。没有新建对话/特殊提示来替代验收；公开天气API给出的current/forecast不冒充本站独立观测。
+
+上述为候选证据，最终准确HEAD的27项和部署后原会话复验由外部交付清单逐项记录；未实际通过前不写通过。Windows原生暂缓，所有Office Rx仍待审，T4未获用户交付验收/PR，不开始T5。诊断拷贝/临时截获程序不进入工程或部署，最终直接使用用户原生.env与原Provider，无常驻代理/新桥接。

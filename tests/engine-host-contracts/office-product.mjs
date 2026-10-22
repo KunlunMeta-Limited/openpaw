@@ -88,9 +88,28 @@ function provider() {
       const lastUser = data.messages.findLastIndex(m => m.role === 'user')
       const prompt = data.messages[lastUser]?.content ?? ''
       const results = data.messages.slice(lastUser + 1).filter(m => m.role === 'tool')
-      if (prompt.includes('WEB-')) {
+      if (prompt==='今天是几号') {
+        assert.equal(data.messages[lastUser-1]?.role,'system')
+        const current=data.messages[lastUser-1].content.match(/Host local time: ([^\n]+)/)?.[1]
+        assert.ok(current&&!Number.isNaN(Date.parse(current)))
+        finish({content:'HOST-DATE: '+current});return
+      }
+      if (prompt==='旧能力会话'||(prompt==='长沙天气'&&!data.tools.some(t=>t.function.name==='web_fetch'))) {
+        assert.ok(!data.tools.some(t=>['web_search','web_fetch'].includes(t.function.name)))
+        assert.equal(data.messages[lastUser-1]?.role,'system')
+        assert.ok(data.messages[lastUser-1].content.includes('本轮未启用联网工具'))
+        finish({content:'这一轮我没有联网工具，也没有系统时钟。'});return
+      }
+      const legacyFollowUp=prompt==='长沙天气'&&data.messages.some(m=>m.role==='assistant'&&m.content?.includes('这一轮我没有联网工具'))
+      if (prompt.includes('WEB-')||legacyFollowUp) {
         assert.ok(data.tools.some(t=>t.function.name==='web_search'));assert.ok(data.tools.some(t=>t.function.name==='web_fetch'))
         assert.ok(data.messages.some(m=>m.role==='system'&&m.content.includes('Current UTC time:')&&m.content.includes('fresh=true')))
+        if(legacyFollowUp){
+          // Check actual original Provider wire, not just the leading system or echoed answer.
+          assert.equal(data.messages[lastUser-1]?.role,'system')
+          assert.ok(data.messages[lastUser-1].content.includes('历史回复不代表本轮能力')&&data.messages[lastUser-1].content.includes('本轮已启用联网工具'))
+          assert.equal(data.messages.filter(m=>m.role==='system').length,2)
+        }
         if (!results.length) {
           finish({content:'正在读取真实HTTP页面。',tool_calls:[{index:0,id:'actual-web-fetch',type:'function',function:{name:'web_fetch',arguments:JSON.stringify({url:webBase+(prompt.includes('WEB-SLOW')?'/slow':'/fresh'),fresh:true})}}]},'tool_calls');return
         }
@@ -438,6 +457,40 @@ try {
   assert.equal(webFixture.requests.length,2)
   await page.screenshot({path:join(output,'18-web-cancelled-clean.png'),fullPage:true})
   report.assertions.push('Original web_fetch/fresh HTTP result correlated with browser, Run/call/tasks/whiteboard','Current time and explicitly enabled Web tools reach actual Provider request','Refresh detaches without repeating Web request; another conversation completes during Web wait','Explicit stop closes actual HTTP body wait before confirming cancelled')
+  // D43: update capabilities while keeping the same real browser conversation and ledger.
+  const enabledConfig=await readFile(config,'utf8')
+  assert.ok(enabledConfig.includes(', "web_search", "web_fetch"'))
+  await stopHost();await writeFile(config,enabledConfig.replace(', "web_search", "web_fetch"',''));await startHost()
+  await fresh(page)
+  for(let i=0;i<3;i++)await send('旧能力会话','这一轮我没有联网工具')
+  const oldCapabilityRequest=structuredClone(latestSend().request)
+  await page.screenshot({path:join(output,'19-existing-no-web-history.png'),fullPage:true})
+  await stopHost();await writeFile(config,enabledConfig);await startHost()
+  const beforeCapabilityFollow=webFixture.requests.length
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await expand(page)
+  await page.getByRole('tab',{name:'旧能力会话',exact:true}).click()
+  await send('长沙天气','WEB-HTTP-MARKER')
+  const currentCapabilityRequest=structuredClone(latestSend().request)
+  assert.equal(currentCapabilityRequest.conversationId,oldCapabilityRequest.conversationId)
+  assert.equal(currentCapabilityRequest.messages.filter(m=>m.role==='assistant'&&m.content.includes('这一轮我没有联网工具')).length,3)
+  assert.equal(webFixture.requests.length,beforeCapabilityFollow+1)
+  const capabilityState=await waitFor(async()=>{const r=await readOffice();return conv(r,currentCapabilityRequest.conversationId)?.tasks.every(t=>t.status==='completed')?r:false})
+  report.capabilityUpgrade={old:oldCapabilityRequest,current:currentCapabilityRequest,snapshot:conv(capabilityState,currentCapabilityRequest.conversationId)}
+  await page.screenshot({path:join(output,'20-existing-session-web-enabled.png'),fullPage:true})
+  report.assertions.push('D43: three old denials remain in the same conversation after enabling Web and restarting; ordinary short follow-up performs real HTTP without rewriting history')
+  await send('今天是几号','HOST-DATE:')
+  assert.equal(latestSend().request.conversationId,oldCapabilityRequest.conversationId)
+  assert.equal(webFixture.requests.length,beforeCapabilityFollow+1)
+  await stopHost();await writeFile(config,enabledConfig.replace(', "web_search", "web_fetch"',''));await startHost()
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await expand(page)
+  await page.getByRole('tab',{name:'旧能力会话',exact:true}).click()
+  await send('长沙天气','这一轮我没有联网工具')
+  assert.equal(latestSend().request.conversationId,oldCapabilityRequest.conversationId)
+  assert.equal(webFixture.requests.length,beforeCapabilityFollow+1)
+  report.capabilityUpgrade.disabledAgain=structuredClone(latestSend().request)
+  await page.screenshot({path:join(output,'21-existing-session-web-disabled-again.png'),fullPage:true})
+  report.assertions.push('D43: same-session date uses actual current server context without unnecessary Web; disabling Web again grants no stale capability and performs zero HTTP')
+  await stopHost();await writeFile(config,enabledConfig);await startHost()
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'

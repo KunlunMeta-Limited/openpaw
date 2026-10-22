@@ -217,3 +217,12 @@ Host默认五项与两层配置校验未开放Web、模型缺当前时间属于�
 用隔离复制的同Session、原Host/AgentLoop/OpenAiProvider截获实际HTTP正文：当前时钟与七项tool均存在，末条真实用户问题不变。用户原生DeepSeek端点上同历史temperature=0对比：原开头/短中文开头各零tool_calls；相同可信system放到当前用户文本前，两次均请求web_search/web_fetch。诊断没有执行工具，不能当作天气或浏览器成功；D43保持开放。证据：`artifacts/t4-d43-wire-diagnostic-20261022-a/{actual-wire-body.json,native-compare.json,manifest.json}`；不含模型凭据，隔离数据未回写原会话。
 
 D44：CompletionRequest.system_blocks已有“优先于system”的公开约定，而openpaw-llm/src/openai.rs::build_messages完全忽略它；这不等于原Host本轮信息丢失（原Host未设置blocks），但阻碍使用既有动态上下文接口。拟在0005第9.11节r8补齐原Provider及实际wire回归、Host私有委托；D42在原Bing解析器独立修复。新增范围均待人工审核，尚未实施，不借r7批准越界。Office不改，D36/D37仍开放。
+
+
+### D42/D43/D44修复候选专项结果（r8，未代替交付验收）
+
+D44原HTTP请求回归修复前两项失败，真实wire只发IGNORED_FALLBACK而丢弃blocks；修复后原mock_server_contract全部11项通过，含complete/stream、优先级/空块、历史原序、混合结果文本及多工具响应连续。D42两项污染用例修复前均失败（首项导航而非真实条目、5个伪结果），修复后原web_search_e2e全部34项通过；容器解析不承诺远端检索相关性。
+
+D43原Host运行/恢复套件及旧历史开关回归通过；真实原会话首次未用特殊提示，“长沙天气”实际2次搜索+3次抓取。a取证误读原始metadata.tools导致报告失败，原账本与官方投影补对账5个call均匹配；首轮AM/PM本地时间解释不可靠，不据其认定实况有效。候选b加强通用时区/数据日期约束后，同conversation刷新追问2次fresh抓取，原API current时间2026-10-22T20:15、Asia/Shanghai和18.7等字段与页面相符；随后日期和再次普通短句均实际验证。来源current估计不等于本站独立观测，模型自然语言其他推断不作已核实事实。
+
+此处均为专项/候选事实，最终准确干净HEAD完整27项与同二进制部署复验另在交付清单核对；三缺陷仍待最终技术核查/用户验收/PR，不因候选成功写已关闭。旧失败与r7批准对象完整保留，D36/D37开放，Office零修改，Windows原生暂缓。

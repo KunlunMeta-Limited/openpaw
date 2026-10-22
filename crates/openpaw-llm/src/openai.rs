@@ -38,15 +38,32 @@ impl OpenAiProvider {
     }
 
     /// Map core messages onto the OpenAI chat shape:
-    /// - system prompt → leading `system` message
+    /// - 旧system保持开头；显式blocks优先，dynamic在本轮真实用户文本前
+    /// - tool_result不被视为新用户提问，系统上下文不拆断工具响应链
     /// - assistant tool_use → `tool_calls`
     /// - user tool_result → `role: tool` messages
     fn build_messages(&self, req: &CompletionRequest) -> Vec<serde_json::Value> {
         let mut messages: Vec<serde_json::Value> = Vec::new();
-        if let Some(system) = &req.system {
+        let blocks = req.system_blocks.as_ref();
+        let stable = blocks.map(|b| b.stable.as_str()).or(req.system.as_deref());
+        if let Some(system) = stable.filter(|s| blocks.is_none() || !s.is_empty()) {
             messages.push(json!({"role": "system", "content": system}));
         }
-        for m in &req.messages {
+        // 当前能力必须靠近本轮问题；旧assistant自述不是当前权限来源。
+        // 只对显式blocks采用此布局，原system-only调用保持消息顺序不变。
+        let dynamic = blocks.map(|b| b.dynamic.as_str()).filter(|s| !s.is_empty());
+        let current_user = req.messages.iter().rposition(|m| {
+            m.role == Role::User
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { .. }))
+        });
+        if current_user.is_none() {
+            if let Some(context) = dynamic {
+                messages.push(json!({"role": "system", "content": context}));
+            }
+        }
+        for (index, m) in req.messages.iter().enumerate() {
             match m.role {
                 Role::User => {
                     // Split tool_result blocks into `tool` messages; text
@@ -70,6 +87,12 @@ impl OpenAiProvider {
                         }
                     }
                     if !text_parts.is_empty() {
+                        // 混合工具结果和文本时，先输出全部tool结果，不能用system拆断调用链。
+                        if current_user == Some(index) {
+                            if let Some(context) = dynamic {
+                                messages.push(json!({"role": "system", "content": context}));
+                            }
+                        }
                         messages.push(json!({"role": "user", "content": text_parts.join("\n")}));
                     }
                 }
