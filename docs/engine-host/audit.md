@@ -183,3 +183,14 @@ Host仍占位。T1的llm::assemble_provider、RunObserver/SessionWriter与T2的T
 复用判定：延展原live/Store、原错误分类、原Office事件和原产品runner；新增仅Host内部展示累积器与接受错误私有映射。无独立解析器/存储/Provider或Office改动。D36/D37仍开放，T4仅只读工具，不因通过本轮测试关闭shell清理风险。
 
 r6修复实现6530dec的D38/D39已获定向、完整27项和实际网页/在线DeepSeek验证；属于“修复已验证、待交付与PR审核”，不伪造已合入关闭。D36/D37仍开放，Windows原生未执行。原失败报告及复验哈希见0005验证记录。
+
+## T4 r7：原Web工具复用与缺陷
+
+Host默认五项与两层配置校验未开放Web、模型缺当前时间属于接入能力缺口；原搜索/抓取主体可复用，不另写天气服务。按0005 r7仅开放web_search/web_fetch，web_extract职责重叠暂不开放；Office无改动。
+
+| ID | 源码原因与修复 | 复现/回归/状态 |
+|---|---|---|
+| D40 | 注册表Web分支未传调用级取消，搜索自动正文使用分离JoinHandle；原tools内增加取消入口、搜索托管任务取消并等待，Host原观察器/锁不复制 | tool_runtime的d40_inflight修复前等待超时退出101，修复后实际HTTP等待取消；私有d40_auto_fetch_tasks_close_before_cancel_returns检查两个真实连接关闭；预取消旧实现已正确，作为保留回归，不虚称修复前失败；最终验证见0005记录 |
+| D41 | 未知长度响应先bytes读完才判断5MiB；改为chunk追加前检查，超限即错误且不缓存 | web_fetch_e2e::d41_unknown_length_body_is_rejected_before_end_of_stream修复前等待终止块超时退出101，修复后提前拒绝；最终验证见0005记录 |
+
+抓取fresh只绕本地缓存，不保证站点/CDN日期；DNS预查不是连接时地址固定，当前不声称完全防DNS重绑定。D36/D37保持开放，不因本轮Web修复开放shell/写工具。Windows原生仍按用户安排暂缓；不以Linux验证替代。

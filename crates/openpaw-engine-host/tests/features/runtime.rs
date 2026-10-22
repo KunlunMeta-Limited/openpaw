@@ -829,3 +829,81 @@ async fn tool_waiting_resource_is_distinct_from_execution_and_can_be_cancelled()
     drop(guard);
     host.shutdown().await.unwrap();
 }
+
+struct ContextProvider(std::sync::Mutex<Vec<(String, Vec<String>)>>);
+#[async_trait]
+impl LlmProvider for ContextProvider {
+    async fn complete(&self, req: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
+        MockProvider::fixed("context checked").complete(req).await
+    }
+    async fn stream(
+        &self,
+        req: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        self.0.lock().unwrap().push((
+            req.system.clone().unwrap_or_default(),
+            req.tools.iter().map(|t| t.name.clone()).collect(),
+        ));
+        MockProvider::fixed("context checked").stream(req).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn default_model(&self) -> &str {
+        "context-fixture"
+    }
+    fn name(&self) -> &str {
+        "context-fixture"
+    }
+}
+#[tokio::test]
+async fn r7_actual_model_request_has_trusted_time_and_only_configured_web_tools() {
+    for enabled in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = config(tmp.path());
+        let mut cfg: HostConfig = serde_json::from_value(
+            json!({"home":original.home,"roots":original.roots,"slots":original.slots}),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tools,
+            vec!["read_file", "glob", "grep", "todo_list", "think"]
+        );
+        if enabled {
+            cfg.tools.extend(["web_search".into(), "web_fetch".into()]);
+        }
+        let provider = Arc::new(ContextProvider(std::sync::Mutex::new(Vec::new())));
+        let before = chrono::Utc::now();
+        let host = Host::with_provider(cfg, provider.clone()).await.unwrap();
+        let s = scope(1);
+        let binding = host.open_session(s.clone()).await.unwrap();
+        host.submit_run(&s, &binding.session_id, "what is today?".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        let after = chrono::Utc::now();
+        let records = provider.0.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        let (system, tools) = &records[0];
+        let timestamp = |prefix: &str| {
+            chrono::DateTime::parse_from_rfc3339(
+                system.lines().find_map(|l| l.strip_prefix(prefix)).unwrap(),
+            )
+            .unwrap()
+        };
+        let utc = timestamp("Current UTC time: ");
+        let local = timestamp("Host local time: ");
+        assert_eq!(utc.timestamp_millis(), local.timestamp_millis());
+        assert!(utc >= before && utc <= after);
+        assert_eq!(tools.iter().any(|x| x == "web_search"), enabled);
+        assert_eq!(tools.iter().any(|x| x == "web_fetch"), enabled);
+        assert!(system.contains(if enabled {
+            "fresh=true"
+        } else {
+            "Network tools are not enabled"
+        }));
+        drop(records);
+        host.shutdown().await.unwrap();
+    }
+}

@@ -111,7 +111,7 @@ impl OfficeConfig {
         if host.tools.iter().any(|name| {
             !matches!(
                 name.as_str(),
-                "read_file" | "glob" | "grep" | "todo_list" | "think"
+                "read_file" | "glob" | "grep" | "todo_list" | "think" | "web_search" | "web_fetch"
             )
         }) {
             return Err(HostError::new(

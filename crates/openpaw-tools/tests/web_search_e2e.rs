@@ -472,3 +472,28 @@ async fn ddg_mock_server_error_maps_to_http_error() {
         .unwrap_err();
     assert!(matches!(err, SearchError::Http(_)));
 }
+
+#[test]
+fn r7_web_specs_declare_bounded_network_inputs() {
+    let spec = openpaw_tools::web::web_search::spec();
+    assert_eq!(spec.input_schema["properties"]["limit"]["minimum"], 1);
+    assert_eq!(spec.input_schema["properties"]["limit"]["maximum"], 10);
+    assert_eq!(
+        spec.input_schema["properties"]["fetch_max_chars"]["maximum"],
+        20000
+    );
+}
+
+#[tokio::test]
+async fn r7_invalid_search_counts_fail_without_network() {
+    for args in [
+        serde_json::json!({"query":"weather","limit":0}),
+        serde_json::json!({"query":"weather","limit":11}),
+        serde_json::json!({"query":"weather","fetch_max_chars":20001}),
+    ] {
+        let r = openpaw_tools::web::web_search::run(std::path::Path::new("."), args)
+            .await
+            .unwrap();
+        assert!(r.is_error && r.content.contains("must be"));
+    }
+}

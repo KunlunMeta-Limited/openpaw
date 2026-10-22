@@ -15,6 +15,10 @@ tool_timeout_secs = 300
 approval_timeout_secs = 300
 # 写入和bash需显式加入；每次调用仍必须通过Host持久审批。
 tools = ["read_file", "glob", "grep", "todo_list", "think"]
+# 需要查询天气、公开资料等时，用下面一行替换上行；不改Office或模型.env。
+# tools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch"]
+# 联网工具使用原HTTP客户端/系统代理；fresh绕本地缓存不保证站点数据为当天。
+# 公开站点超时/反爬/动态页面可能无法获取有效数据，不以旧数据伪装实时结果。
 # T7预留：必须成对配置，T4启用office段后增加官方聊天接口；OpenCode认证路由尚未交付。
 # basic_username_env = "OPENPAW_HOST_USER"
 # basic_password_env = "OPENPAW_HOST_PASSWORD"

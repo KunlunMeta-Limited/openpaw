@@ -312,6 +312,8 @@ impl HostConfig {
             "todo_add",
             "todo_update",
             "bash",
+            "web_search",
+            "web_fetch",
         ];
         if self.tools.iter().any(|t| !allowed.contains(&t.as_str())) {
             return Err(HostError::new("unsupported", "工具白名单包含未支持项"));

@@ -15,6 +15,7 @@ fn office_http_product_contract() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "office_child_suite", "--nocapture"])
         .env("OPENPAW_OFFICE_TEST_CHILD", "1")
+        .env("OPENPAW_WEB_TEST_ALLOW_LOOPBACK", "1")
         .env("PAWOFFICE_TEST_KEY", "isolated-office-test-key")
         .status()
         .unwrap();
@@ -420,6 +421,7 @@ async fn suite() {
     server.shutdown().await.unwrap();
     boundary_cases(tmp.path()).await;
     persistent_turn_cases(tmp.path()).await;
+    web_cases(tmp.path()).await;
 }
 async fn boundary_cases(base: &std::path::Path) {
     let client = reqwest::Client::new();
@@ -704,5 +706,126 @@ async fn persistent_turn_cases(base: &std::path::Path) {
         events(post(&client, &url, &resume).send().await.unwrap()).await[0]["state"],
         "complete"
     );
+    server.shutdown().await.unwrap();
+}
+
+async fn web_cases(base: &std::path::Path) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let web = format!("http://{}", listener.local_addr().unwrap());
+    let (ready, started) = tokio::sync::oneshot::channel();
+    let fixture = tokio::spawn(async move {
+        for slow in [false, true] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 8192];
+            let _ = stream.read(&mut buf).await.unwrap();
+            if !slow {
+                let body = "<h1>WEB-ACTUAL-MARKER</h1>";
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            } else {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = ready.send(());
+                let closed = stream.read(&mut buf).await;
+                assert!(
+                    matches!(closed, Ok(0))
+                        || closed.as_ref().err().is_some_and(|e| matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        )),
+                    "{closed:?}"
+                );
+                break;
+            }
+        }
+    });
+    let tmp = base.join("web-cases");
+    let mut cfg = config(&tmp);
+    cfg.tools.extend(["web_search".into(), "web_fetch".into()]);
+    cfg.validate().unwrap();
+    let mut invalid = cfg.clone();
+    invalid.tools.push("bash".into());
+    assert!(invalid.validate().is_err());
+    let provider = Arc::new(MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "web_fetch".into(),
+            input: json!({"url":format!("{web}/fresh"),"fresh":true}),
+            text: "读取真实网页。".into(),
+        },
+        MockMode::Fixed("已取得 WEB-ACTUAL-MARKER。".into()),
+        MockMode::ToolUse {
+            tool_name: "web_fetch".into(),
+            input: json!({"url":format!("{web}/slow"),"fresh":true}),
+            text: "等待网页正文。".into(),
+        },
+        MockMode::Fixed("另一会话仍可工作。".into()),
+    ]));
+    let host = Host::with_provider(cfg, provider).await.unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let client = reqwest::Client::new();
+    let req = request("web-result", "读取公开网页");
+    let e = events(post(&client, &url, &req).send().await.unwrap()).await;
+    assert!(completed(e.last().unwrap()));
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "web-result".into(),
+    };
+    let snapshot = host.snapshot_and_subscribe(&scope).await.unwrap().0;
+    let run = &snapshot.runs[0];
+    assert_eq!(run.tools[0].tool_name, "web_fetch");
+    assert_eq!(run.tools[0].state, "completed");
+    let query = host
+        .query(
+            &scope,
+            QueryRequest {
+                session_id: run.session_id.clone(),
+                kind: QueryKind::ToolResults,
+                offset: 0,
+                limit: 5,
+            },
+        )
+        .await
+        .unwrap();
+    let text = serde_json::to_string(&query).unwrap();
+    assert!(text.contains("WEB-ACTUAL-MARKER") && text.contains("retrieved_at_unix_ms:"));
+    let slow = request("web-slow", "取消网页等待");
+    let response = post(&client, &url, &slow).send().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started)
+        .await
+        .unwrap()
+        .unwrap();
+    let cancel = json!({"type":"cancel","version":"1.0","teamId":"office-1","conversationId":"web-slow","turnId":slow["turnId"]});
+    let cancelled =
+        tokio::time::timeout(Duration::from_secs(3), post(&client, &url, &cancel).send())
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(cancelled.status().is_success());
+    let _ = events(response).await;
+    let scope = ClientScope {
+        conversation_id: "web-slow".into(),
+        ..scope
+    };
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope).await.unwrap().0.runs[0].state,
+        RunState::Cancelled
+    );
+    let next = events(
+        post(&client, &url, &request("web-after", "继续工作"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(completed(next.last().unwrap()));
+    tokio::time::timeout(Duration::from_secs(3), fixture)
+        .await
+        .unwrap()
+        .unwrap();
     server.shutdown().await.unwrap();
 }

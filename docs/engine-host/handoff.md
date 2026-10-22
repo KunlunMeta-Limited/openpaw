@@ -191,3 +191,17 @@ D37 Linux取消回归间歇失败必须在开放shell前定位修复并稳定验
 测试延展原host_office及office-product.mjs，后者使用固定Office原服务/独立Chromium验证Markdown复制、草稿/搜索/键盘、25轮分页失败原游标重试和双浏览器历史冲突；失败报告保留，准确结果见0005验证记录。在线DeepSeek另记，不冒充确定性Provider结果。当前未获得本轮交付验收、无T4 PR、不进入T5；Office所有申请仍暂缓，Windows原生未执行，D36/D37继续开放。
 
 r6本轮技术证据：`6530dec02b331965e5e64e1d75aa3eaae5bfa7f3`完整27/27，报告`/home/cheng/.cache/t4-r6-full-20261022-b/report.json`；线上8765已运行同源稳定二进制，home升级前完整备份在`artifacts/live-office-20261022-r6/host-home-before`。在线证据`artifacts/t4-r6-deepseek-20261022-b/`含既有缓存前后、DeepSeek消息与任务中心截图、视频/trace/账本对账。Office仍冻结02dbac4，不改其文件；当前交付验收pending，无PR/合入。最终含本段文档的版本须另完整检查，报告以专用记录指向的最终路径为准。
+
+## T4 r7实施交接：公开网页（Office不改）
+
+用户已批准0005 r7-web并明确Office不能改动。当前Host复用原工具，只需在Host TOML显式配置：
+
+```toml
+tools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch"]
+```
+
+省略tools仍是五个本地默认，配置DeepSeek不自动允许外部HTTP。模型沿用官方.env，无需重填；Host使用原reqwest/系统代理，不传模型凭据。每Run system提供可信UTC/系统本地偏移，实时查询建议搜索fetch_content=false后web_fetch(fresh=true)验证来源；fresh不是站点数据日期保障。API/NDJSON/四操作与Office快照不变，Web调用仍是原AgentLoop与JSONL事实，原任务/白板承担显示。
+
+D40在tools内解决网络等待取消和搜索子任务回收；D41在读取时限制5MiB。当前public工具默认入口保留；取消不能通过drop代替shell/写入清理。测试环回门控只用于隔离测试进程，真实演示不得启用。原浏览器runner增加真实HTTP工具/刷新不重复抓取/并行/停止证据；确定性页面不是实时天气，在线DeepSeek单独核验来源日期与截图/账本关联。准确提交、完整27项及在线结果见0005专用验证记录，不沿用r6通过结论。
+
+Office冻结02dbac4只读，现有用户编辑保留；T5未开始，无T4 PR/用户交付批准。Windows原生继续暂缓，不计通过。运行配置/二进制升级先备份，回退不清账本、不重放工具；用原官方history重新同步旧页面。
