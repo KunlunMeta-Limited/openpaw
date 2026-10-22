@@ -597,7 +597,11 @@ fn main_conversation_turns(handle: &SessionHandle) -> Vec<serde_json::Value> {
         };
         serde_json::json!({"id":outcome.user_message_id,"user":text(&outcome.user_message_id,false),
             "assistant":text(&format!("msg_{}_{}_assistant",handle.id,outcome.turn_id),true),
-            "state":state,"error":if state=="error" {"本轮执行失败，请检查会话状态"} else {""}})
+            "state":state,"error":if state=="error" {
+                if outcome.error.as_ref().is_some_and(|error| error.code == "host_restarted") {
+                    "服务重启中断了上一回合，请明确续聊；未自动重新执行工具。"
+                } else { "本轮执行失败，请检查会话状态" }
+            } else {""}})
     }).collect()
 }
 
