@@ -194,3 +194,10 @@ Host默认五项与两层配置校验未开放Web、模型缺当前时间属于�
 | D41 | 未知长度响应先bytes读完才判断5MiB；改为chunk追加前检查，超限即错误且不缓存 | web_fetch_e2e::d41_unknown_length_body_is_rejected_before_end_of_stream修复前等待终止块超时退出101，修复后提前拒绝；最终验证见0005记录 |
 
 抓取fresh只绕本地缓存，不保证站点/CDN日期；DNS预查不是连接时地址固定，当前不声称完全防DNS重绑定。D36/D37保持开放，不因本轮Web修复开放shell/写工具。Windows原生仍按用户安排暂缓；不以Linux验证替代。
+
+
+### D42：在线DeepSeek发现的Bing结果误解析（开放，未修复）
+
+真实8765/DeepSeek调用web_search的tool_result第一项包含“rguments.length”等大段脚本，模型明确反馈搜索无有效天气条目。证据：`artifacts/t4-r7-deepseek-20261022-b/本轮专用会话.jsonl`，call `call_00_B8MtJSVzQJ7t6ryl6lcb5779`；c轮独立再现。源码`web_search/adapters/bing.rs::parse_bing_html`遍历`html.split("class=\"b_algo\"")`，连结果容器前的首段也走宽泛href/标题兜底，页面脚本可进入输出并消耗模型上下文；不能由HTTP200/非空列表认定有效结果。
+
+本轮r7未修改该适配器，不写已修复/已关闭。拟在同一T4主CHG后续修订中登记准确适配器/既有测试路径与批准对象：只解析真实结果容器，剔除script/style等非结果，零结果/挑战页保留明确语义；扩充原web_search_e2e的无b_algo、头部脚本加真实结果、相邻结果及原重定向/域名过滤回归，再用真实网络验证。不能用Host临时字符串清洗或降低断言掩盖。当前天气查询通过实际web_fetch获得有效来源，不等于该搜索缺陷已解决。

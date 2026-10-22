@@ -205,3 +205,8 @@ tools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_f
 D40在tools内解决网络等待取消和搜索子任务回收；D41在读取时限制5MiB。当前public工具默认入口保留；取消不能通过drop代替shell/写入清理。测试环回门控只用于隔离测试进程，真实演示不得启用。原浏览器runner增加真实HTTP工具/刷新不重复抓取/并行/停止证据；确定性页面不是实时天气，在线DeepSeek单独核验来源日期与截图/账本关联。准确提交、完整27项及在线结果见0005专用验证记录，不沿用r6通过结论。
 
 Office冻结02dbac4只读，现有用户编辑保留；T5未开始，无T4 PR/用户交付批准。Windows原生继续暂缓，不计通过。运行配置/二进制升级先备份，回退不清账本、不重放工具；用原官方history重新同步旧页面。
+
+
+r7在线演示已升级为8ad8f1c，部署/备份`artifacts/live-office-20261022-r7/`，完整27项`/home/cheng/.cache/t4-r7-full-20261022-a/report.json`、产品回归`/home/cheng/.cache/t4-r7-full-product-20261022-a/report.json`均通过。线上用户入口仍http://127.0.0.1:8765/office/；刷新后新建会话输入0005的O13提示词即可，不必修改Office或模型.env。既有“不能联网”回复是历史事实，不会被覆盖。
+
+真实DeepSeek证据`artifacts/t4-r7-deepseek-20261022-b/`：实际2次搜索、4次fresh抓取，气象来源长沙站当日19:30实况与回复一致；c轮另验证官网当日预报及任务/白板completed终态。b轮页面done后第一次快照仍running，按异步同步机制补取官方read与SQLite/JSONL确认completed，补证保留在对账文件；c轮等待终态再截图。搜索现存D42脚本污染未修，下一次精确修订审批前不扩大文件范围，不把所有联网能力或T4整体标完成。
