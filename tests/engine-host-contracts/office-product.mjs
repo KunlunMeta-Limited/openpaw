@@ -119,6 +119,10 @@ function provider() {
       }
       if (prompt==='帮我查询资料并记录到reports/天气.md') {
         assert.ok(data.tools.some(t=>t.function.name==='report_progress'));
+        const recovery=results.find(r=>r.tool_call_id==='progress-6')?.content;
+        const candidates=recovery?JSON.parse(recovery.match(/可用证据：(\[.*?\])。evidenceCallIds/s)?.[1]??'[]'):[];
+        const recoveredWrite=candidates.find(c=>c.tool==='write_file')?.callId;
+        if(recovery)assert.equal(recoveredWrite,'progress-5','恢复提示必须来自本轮实际成功写入');
         const calls=[
           ['report_progress',{type:'create',steps:[{id:'lookup',title:'查询当天资料'},{id:'save',title:'保存 reports/天气.md'},{id:'answer',title:'整理答复'}]}],
           ['report_progress',{type:'update',stepId:'lookup',state:'in_progress'}],
@@ -126,11 +130,13 @@ function provider() {
           ['report_progress',{type:'update',stepId:'lookup',state:'completed',evidenceCallIds:['progress-2']}],
           ['report_progress',{type:'update',stepId:'save',state:'in_progress'}],
           ['write_file',{path:'reports/天气.md',content:'# 确定性资料验收\n\n'+(results.find(r=>r.tool_call_id==='progress-2')?.content??'')}],
-          ['report_progress',{type:'update',stepId:'save',state:'completed',evidenceCallIds:['progress-5']}],
+          ['report_progress',{type:'update',stepId:'save',state:'completed',evidenceCallIds:['write_file:reports/天气.md']}],
+          ['report_progress',{type:'update',stepId:'save',state:'completed',evidenceCallIds:[recoveredWrite??'unavailable']}],
           ['report_progress',{type:'update',stepId:'answer',state:'in_progress'}],
         ];
         if(results.length<calls.length){
-          if(results.length>0&&calls[results.length-1][0]==='report_progress') assert.ok(results.at(-1).content.includes('业务步骤已记录'));
+          if(results.length>0&&calls[results.length-1][0]==='report_progress'&&results.length!==7) assert.ok(results.at(-1).content.includes('业务步骤已记录'));
+          if(results.length===7)assert.ok(results.at(-1).content.includes('invalid_progress')&&recoveredWrite);
           const [name,input]=calls[results.length];
           finish({content:'',tool_calls:[{index:0,id:'progress-'+results.length,type:'function',function:{name,arguments:JSON.stringify(input)}}]},'tool_calls');return;
         }
@@ -670,6 +676,7 @@ try {
   const recorded=await readFile(join(workspace,'reports/天气.md'),'utf8');assert.ok(recorded.includes('WEB-HTTP-MARKER'));
   await page.screenshot({path:join(output,'31-business-plan-completed.png'),fullPage:true});
   report.t5.progress={request:progressRequest,pending:progressPending,completed:progressComplete,file:{path:'reports/天气.md',sha256:createHash('sha256').update(recorded).digest('hex')}};
+  report.assertions.push('D48: original HTTP Provider receives strict rejection of a fabricated evidence alias, reads exact current-run evidence from the diagnostic, then completes the plan using the real approved write call');
   await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,'帮我查询资料并记录到reports/天气.md');
   const restored=conv(await readOffice(),progressRequest.conversationId);assert.deepEqual(restored.tasks,progressComplete.tasks);
   assert.deepEqual(restored.events,progressComplete.events,'刷新不改变实际开始时的步骤关联');

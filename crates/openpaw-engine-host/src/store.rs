@@ -190,7 +190,17 @@ impl Db {
                     .map_err(HostError::storage)?,
             );
         }
-        let next = crate::task_progress::update(previous.clone(), value, &run, &started)?;
+        let next = crate::task_progress::update(previous.clone(), value, &run, &started).map_err(
+            |mut error| {
+                if error.kind == "invalid_progress" {
+                    // 拒绝仍是拒绝；仅提供可恢复的本轮证据标识，不替模型选择或确认完成。
+                    error
+                        .message
+                        .push_str(&crate::task_progress::recovery_hint(&run, &started));
+                }
+                error
+            },
+        )?;
         if previous.as_ref() == Some(&next) {
             return Ok(());
         }

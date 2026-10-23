@@ -592,6 +592,7 @@ impl Host {
             let mut system = run_system_prompt(&root.path, &self.inner.config.tools, chrono::Utc::now());
             if progress_enabled {
                 system.push_str("\n多步骤任务先调用report_progress声明清晰的业务步骤（例如查询当天资料、保存weather_changsha.md、整理行程答复），再逐步报告。步骤标题使用用户能理解的中文，不含工具名/call ID/内部Run术语。文件步骤标题包含保存和目标路径。真实文件成功写入前不得报告已保存；网络成功仅代表取回正文，还须核对日期、地点和来源，不能把反爬/错误页当实时天气。普通问答无需强行拆步骤。report_progress仅报告元数据，不代替实际联网/写文件。completed需引用本轮成功工具调用ID；无工具的整理答复先报告in_progress，由Host在最终可靠完成后确认。暂时失败可重试，不新建重复步骤，未取得有效资料要如实说明。\n");
+                system.push_str("每个步骤开始前用{\"type\":\"update\",\"stepId\":\"该步骤ID\",\"state\":\"in_progress\"}报告；真实操作成功且内容核验后立即报告completed并填evidenceCallIds，再进入下一步。每次update必须带type。证据只用本轮工具响应对应的真实调用ID，不能猜工具名:路径、序号或时间戳；如Host返回恢复提示，逐字复制与该步骤匹配的callId修正输入，原权限/审批不变。最终回复前检查全部步骤，不能只创建计划而忘记更新。\n");
             }
             let provider = Arc::new(RunProvider {
                 inner: self.inner.provider.clone(),

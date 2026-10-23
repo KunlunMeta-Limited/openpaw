@@ -52,7 +52,7 @@ fn parse(value: &Value) -> HostResult<Report> {
     if serde_json::to_vec(value).map_err(HostError::storage)?.len() > 8192 {
         return Err(invalid("步骤报告超过8KiB"));
     }
-    serde_json::from_value(value.clone()).map_err(|_| invalid("步骤报告字段不符合约定"))
+    serde_json::from_value(value.clone()).map_err(|_| invalid("步骤报告字段不符合约定。更新必须包含type=update、stepId、state；例如{\"type\":\"update\",\"stepId\":\"原步骤ID\",\"state\":\"in_progress\"}。completed还须提供evidenceCallIds，不能用工具名、路径或时间戳代替真实调用ID。"))
 }
 fn needs_write(title: &str) -> bool {
     ["保存", "写入", "落盘", "记录", "生成文件", "导出"]
@@ -83,6 +83,35 @@ pub(crate) fn spec() -> ToolSpec {
 /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
 pub(crate) fn validate(value: &Value) -> HostResult<()> {
     parse(value).map(|_| ())
+}
+
+/// 功能：为无效进度报告提供本轮真实成功调用的有界恢复提示。
+/// 参数：run为当前运行视图，started为原Store读取的实际执行绑定。
+/// 返回：最多16项精确调用ID及工具名；不含工具输入、正文或凭据。
+/// 错误：无；无合格调用时返回空列表，不制造完成依据。
+/// 状态：只读，不批准、执行或修改任何步骤。
+/// 并发与取消：在报告原单写序列内计算，取消与终态校验仍由update负责。
+/// 权限：只提示同Run已成功且有实际started记录的调用，失败/待审/其他Run不入选。
+/// 关联：需求REQ-OP-012；设计DES-OP-006/007。
+pub(crate) fn recovery_hint(run: &RunView, started: &[ToolCallBinding]) -> String {
+    let calls = run
+        .tools
+        .iter()
+        .rev()
+        .filter(|tool| {
+            tool.state == "completed"
+                && tool.tool_name != NAME
+                && tool.call_id.len() <= 256
+                && started.iter().any(|b| {
+                    b.run_id == run.run_id
+                        && b.call_id == tool.call_id
+                        && b.tool_name == tool.tool_name
+                })
+        })
+        .take(16)
+        .map(|tool| json!({"callId":tool.call_id,"tool":tool.tool_name}))
+        .collect::<Vec<_>>();
+    format!("。仅本轮已成功且实际执行的可用证据：{}。evidenceCallIds须逐字复制匹配操作的callId；先核实任务要求和来源，再用{{\"type\":\"update\",\"stepId\":\"原步骤ID\",\"state\":\"completed\",\"evidenceCallIds\":[\"真实callId\"]}}重试。文件步骤仍须匹配真实写入路径；无工具的整理步骤用in_progress，不伪造证据。",json!(calls))
 }
 
 /// 功能：将模型报告与本Run真实执行事实绑定后生成下一份计划。
@@ -351,6 +380,56 @@ mod tests {
         assert!(rows.iter().all(|v| v["id"].as_str().unwrap().len() <= 100));
     }
     #[test]
+    fn recovery_lists_only_this_runs_successful_started_calls_without_inputs() {
+        let mut r = run();
+        let mut started = Vec::new();
+        for i in 0..25 {
+            let call = format!("actual_{i}");
+            r.tools.push(ToolView {
+                call_id: call.clone(),
+                tool_name: "read_file".into(),
+                state: "completed".into(),
+            });
+            started.push(ToolCallBinding {
+                run_id: r.run_id.clone(),
+                call_id: call,
+                tool_name: "read_file".into(),
+                input: json!({"path":"private-input-must-not-leak"}),
+            });
+        }
+        for (id, state, binding_run) in [
+            ("unstarted", "completed", "other"),
+            ("failed-call", "failed", "r"),
+            ("pending-call", "awaiting_approval", "r"),
+        ] {
+            r.tools.push(ToolView {
+                call_id: id.into(),
+                tool_name: "write_file".into(),
+                state: state.into(),
+            });
+            started.push(ToolCallBinding {
+                run_id: binding_run.into(),
+                call_id: id.into(),
+                tool_name: "write_file".into(),
+                input: json!({"content":"secret"}),
+            });
+        }
+        let hint = recovery_hint(&r, &started);
+        assert_eq!(hint.matches("\"callId\":").count(), 16);
+        assert!(hint.contains("actual_24"));
+        for forbidden in [
+            "unstarted",
+            "failed-call",
+            "pending-call",
+            "private-input-must-not-leak",
+            "secret",
+        ] {
+            assert!(!hint.contains(forbidden));
+        }
+        let e = validate(&json!({"stepId":"read","state":"completed"})).unwrap_err();
+        assert!(e.message.contains("type=update") && e.message.contains("evidenceCallIds"));
+    }
+    #[test]
     fn no_tool_answer_is_confirmed_only_by_reliable_normal_finish() {
         let mut r = run();
         let p = update(
@@ -398,6 +477,9 @@ mod lifecycle_tests {
                 text: String::new(),
             },
             step(
+                json!({"type":"update","stepId":"read","state":"completed","evidenceCallIds":["read_file:资料.txt"]}),
+            ),
+            step(
                 json!({"type":"update","stepId":"read","state":"completed","evidenceCallIds":["call_2"]}),
             ),
             step(json!({"type":"update","stepId":"answer","state":"in_progress"})),
@@ -426,6 +508,22 @@ mod lifecycle_tests {
         .await
         .unwrap();
         assert_eq!(view.state, RunState::Completed);
+        assert!(
+            view.tools
+                .iter()
+                .any(|t| t.tool_name == NAME && t.state == "failed"),
+            "无效证据仍须拒绝，不能为恢复直接批准"
+        );
+        let events = host
+            .inner
+            .store
+            .call({
+                let id = binding.session_id.clone();
+                move |db| db.events(&id)
+            })
+            .await
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(e, openpaw_core::SessionEvent::Message(m) if m.content.iter().any(|block| matches!(block,openpaw_core::ContentBlock::ToolResult { content, is_error: true, .. } if content.contains("\"callId\":\"call_2\"") && content.contains("evidenceCallIds"))))), "失败结果须向模型提供本轮真实证据，随后正确重试才能完成");
         let id = run.run_id.clone();
         let plan = host
             .inner
