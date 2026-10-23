@@ -127,3 +127,174 @@ pub(super) async fn run(host: Host, client: Arc<Client>, stop: CancellationToken
         tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(200))=>{}}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClientScope, HostConfig};
+    #[test]
+    fn scene_delivery_is_bounded_and_never_replays_offline_history() {
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "office::scene::tests::scene_fixture_child",
+                "--nocapture"
+            ])
+            .env("OPENPAW_SCENE_CHILD", "1")
+            .env("PAWOFFICE_SCENE_TEST_KEY", "scene-fixture")
+            .status()
+            .unwrap()
+            .success());
+    }
+    #[test]
+    fn scene_fixture_child() {
+        if std::env::var("OPENPAW_SCENE_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(scenario());
+    }
+    async fn scenario() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        use serde_json::Value;
+        #[derive(Default)]
+        struct Fixture {
+            offline: bool,
+            commands: Vec<Value>,
+        }
+        let state = Arc::new(tokio::sync::Mutex::new(Fixture::default()));
+        async fn handle(
+            State(s): State<Arc<tokio::sync::Mutex<Fixture>>>,
+            Json(r): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            if r["type"] == "office.capabilities" {
+                return (
+                    StatusCode::OK,
+                    Json(
+                        json!({"code":200,"msg":"fixture","data":{"scene":{"protocolVersion":"2.0","actors":[{"id":"office-lead"}],"capabilities":[{"id":"scene.say"}]},"ui":{"whiteboardSchema":{}},"requests":{},"responses":{"success":{},"error":{}}}}),
+                    ),
+                );
+            }
+            assert_eq!(r["command"]["capability"], "scene.say");
+            assert_eq!(r["teamId"], r["command"]["sceneId"]);
+            assert_eq!(r["conversationId"], "scene");
+            assert_eq!(r["command"]["busyPolicy"], "reject");
+            assert_eq!(r["command"]["timeoutMs"], 3000);
+            let expiry =
+                chrono::DateTime::parse_from_rfc3339(r["command"]["expiresAt"].as_str().unwrap())
+                    .unwrap()
+                    .timestamp_millis();
+            assert!((1..=10000).contains(&(expiry - chrono::Utc::now().timestamp_millis())));
+            let mut s = s.lock().await;
+            s.commands.push(r);
+            if s.offline {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({"code":409,"msg":"offline","data":{"reasonCode":"NO_RECEIVER"}})),
+                )
+            } else {
+                (
+                    StatusCode::OK,
+                    Json(json!({"code":200,"msg":"forwarded","data":{"forwarded":true}})),
+                )
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server_stop = CancellationToken::new();
+        let token = server_stop.clone();
+        let s = state.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api/pawoffice/messages", post(handle))
+                    .with_state(s),
+            )
+            .with_graceful_shutdown(token.cancelled_owned())
+            .await
+            .unwrap();
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let cfg:HostConfig=serde_json::from_value(json!({"home":tmp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let office:super::super::OfficeConfig=serde_json::from_value(json!({"base_url":base,"api_key_env":"PAWOFFICE_SCENE_TEST_KEY","allowed_origins":["http://127.0.0.1:8765"]})).unwrap();
+        let host = Host::start(cfg.clone()).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "scene".into(),
+        };
+        let b = host.open_session(scope.clone()).await.unwrap();
+        host.submit_run(&scope, &b.session_id, "historical run".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        let stop = CancellationToken::new();
+        let worker = tokio::spawn(run(
+            host.clone(),
+            Arc::new(Client::new(&office).unwrap()),
+            stop.clone(),
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(state.lock().await.commands.is_empty(), "启动不能补播旧终态");
+        let first = host
+            .submit_run(&scope, &b.session_id, "new run".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.lock().await.commands.len() == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.lock().await.offline = true;
+        let second = host
+            .submit_run(&scope, &b.session_id, "offline run".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.lock().await.commands.len() == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        state.lock().await.offline = false;
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        assert_eq!(
+            state.lock().await.commands.len(),
+            2,
+            "联网恢复不能补播失败指令"
+        );
+        assert_eq!(
+            host.get_run(&scope, &second.run_id).await.unwrap().state,
+            crate::RunState::Completed
+        );
+        stop.cancel();
+        worker.await.unwrap();
+        host.shutdown().await.unwrap();
+        let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+        for (r, want) in [(first.run_id, "forwarded"), (second.run_id, "failed")] {
+            let actual: String = db
+                .query_row(
+                    "SELECT status FROM host_office_scene WHERE event_id=?1",
+                    [format!("{r}:terminal")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(actual, want);
+        }
+        server_stop.cancel();
+        server.await.unwrap();
+    }
+}

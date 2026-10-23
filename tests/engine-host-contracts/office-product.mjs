@@ -560,6 +560,8 @@ try {
   await page.screenshot({path:join(output,'25-t5-real-shell-running.png'),fullPage:true});
   await delay(800);await expand(page);await page.getByRole('button',{name:'停止生成',exact:true}).click();
   await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:15000});
+  // Office先清除本地生成标记；以真实cancel业务回执作为Host完成清理的界限。
+  report.t5.cancelAcknowledged=await waitFor(()=>report.browserRequests.findLast(r=>r.request.type==='cancel'&&r.request.turnId===report.t5.shellRequest.turnId)?.json?.data?.stopped===true);
   for(const item of report.t5.processes){
     if(process.platform==='linux'){
       try{item.after=await readFile('/proc/'+item.pid+'/stat','utf8');assert.ok(['Z','X','x'].includes(item.after.slice(item.after.lastIndexOf(') ')+2).split(' ')[0]),'清理返回后仍有可运行后代')}
