@@ -205,6 +205,11 @@ async fn dispatch(
         .as_array()
         .and_then(|v| v.iter().find(|v| v["id"] == scope.conversation_id))
         .ok_or_else(|| HostError::new("not_found", "会话尚未产生可展示事实"))?;
+    if action["action"] == "employee.create" {
+        return Ok(
+            json!({"target":"result","success":false,"message":"当前接入固定六个可信角色，暂不支持动态添加成员；未创建Agent、会话或新增工具权限。请使用现有团队成员。"}),
+        );
+    }
     let context = match action["action"].as_str().unwrap_or("") {
         "actor.inspect" => {
             if conv["employees"]

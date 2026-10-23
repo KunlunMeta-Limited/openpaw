@@ -281,6 +281,30 @@ async fn interaction_scenario() {
         .await
         .unwrap()
     }
+    let sessions_before = host.snapshot_and_subscribe(&scope).await.unwrap().0;
+    let files_before = std::fs::read_dir(&cfg.roots["r"]).unwrap().count();
+    let member_create = action(
+        &shared,
+        "create-member-unsupported",
+        "employee.create",
+        json!({"name":"新成员","role":"","sceneActorId":"file-agent"}),
+    )
+    .await;
+    assert_eq!(member_create["presentation"]["target"], "result");
+    assert_eq!(member_create["presentation"]["success"], false);
+    assert!(member_create["presentation"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("固定六个可信角色"));
+    let sessions_after = host.snapshot_and_subscribe(&scope).await.unwrap().0;
+    assert_eq!(
+        serde_json::to_value(&sessions_before).unwrap(),
+        serde_json::to_value(&sessions_after).unwrap()
+    );
+    assert_eq!(
+        std::fs::read_dir(&cfg.roots["r"]).unwrap().count(),
+        files_before
+    );
     let mut inspected = std::collections::BTreeMap::new();
     for (employee, actor, name) in [
         ("assistant", "office-lead", "王明"),

@@ -325,3 +325,9 @@ D51为actions::dispatch丢失目标：actor/employee校验后统一kind=menu；d
 Office fa6ae1f新动作含name/role/sceneActorId，dto::ui_action未知动作返回false，Client::post(ui.next)将本次已消费结果判protocol_error，poller不能发送明确业务拒绝，页面最终超时。当前固定六角色满员会在浏览器禁加，故本轮没有声称从默认页面已复现添加；这是逐协议源码核对确定的新上游兼容缺口，不把它登记成Office缺陷。
 
 最小方案见0007第12.3节：严格识别合法新增动作，复用原唯一领取/持久动作/范围/期限，明确返回不支持动态角色且无副作用；不静默创建有权限Agent。新冻结/DTO/action修改尚未批准，未实施。动态添加的真实业务和权限方案另审，不拿“明确拒绝”说成完整创建成功。
+
+## 2026-10-24 D54/D55已批准实现后的专项结果
+
+本会话用户已分别批准0007第12.1安全补丁、第12.2展示检查点、第12.3上游兼容。D54已复用原Run元数据和单写Store实现，不新增消息库/Schema；真实SQL提交屏障后kill恢复原部分文本，官方history/resume一致为error/interrupted，独立Provider计数为零，原9种接受/终态/父子审批写入边界保留。原HTTP注入真实UPDATE ABORT，Run失败并清理、无done；原私有Store测试覆盖不变不写、错误会话无操作、前缀冲突/4MiB拒绝、账本追上清冗余及删除后无INSERT。证据t6-approved-host-20261024-f.log，非最终准确候选交付。
+
+D55已严格识别合法employee.create，经原唯一领取和作用域检查立即返回固定六角色限制，原HTTPfixture验证无新增Run/Session/审批/文件。源码按真实Zod Unicode码点/ECMAScript trim校验，不按旧假设UTF-16误拒非BMP姓名；原Schema契约13/13。Office仍未改；成员布局真实浏览器及原完整27项待新准确候选重验。Tokio锁只改1.53.3和checksum，cargo update产生的无关Windows依赖边选择变化未纳入，locked构建已验证此最小锁可用。旧失败均保留，暂不登记最终关闭。

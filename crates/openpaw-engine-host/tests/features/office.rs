@@ -423,6 +423,8 @@ async fn suite() {
     persistent_turn_cases(tmp.path()).await;
     web_cases(tmp.path()).await;
     unread_http_cases(tmp.path()).await;
+    checkpoint_write_failure_cancels_real_stream_without_success_and_deletion_cannot_revive_it()
+        .await;
 }
 async fn unread_http_cases(base: &std::path::Path) {
     // 保持真实HTTP响应存活且不消费正文，另外的控制请求仍须能完成和恢复终态。
@@ -925,4 +927,91 @@ async fn web_cases(base: &std::path::Path) {
         .unwrap()
         .unwrap();
     server.shutdown().await.unwrap();
+}
+
+struct PartialCheckpoint;
+#[async_trait]
+impl LlmProvider for PartialCheckpoint {
+    async fn complete(&self, req: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
+        MockProvider::fixed("不应走非流入口").complete(req).await
+    }
+    async fn stream(
+        &self,
+        _: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        Ok(futures::stream::iter([
+            Ok(StreamEvent::MessageStart),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "未完成的真实流文本".into(),
+            }),
+        ])
+        .chain(futures::stream::pending())
+        .boxed())
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn name(&self) -> &str {
+        "partial-checkpoint"
+    }
+    fn default_model(&self) -> &str {
+        "partial-checkpoint"
+    }
+}
+async fn checkpoint_write_failure_cancels_real_stream_without_success_and_deletion_cannot_revive_it(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let host = Host::with_provider(cfg.clone(), Arc::new(PartialCheckpoint))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let client = reqwest::Client::new();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_display_checkpoint BEFORE UPDATE ON host_runs WHEN json_extract(NEW.data,'$.text') != '' BEGIN SELECT RAISE(ABORT,'injected-checkpoint-write-failure'); END;").unwrap();
+    let response = post(
+        &client,
+        &url,
+        &request("checkpoint-failure", "测试真实流检查点故障"),
+    )
+    .send()
+    .await
+    .unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(6), response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!body
+        .lines()
+        .any(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "done"));
+    assert!(body.contains("error"));
+    host.wait_idle().await;
+    let data: String = db
+        .query_row("SELECT data FROM host_runs", [], |r| r.get(0))
+        .unwrap();
+    let raw: RunView = serde_json::from_str(&data).unwrap();
+    assert_eq!(raw.state, RunState::Failed);
+    assert_eq!(raw.error.unwrap().kind, "storage_unavailable");
+    db.execute_batch("DROP TRIGGER fail_display_checkpoint;")
+        .unwrap();
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "checkpoint-failure".into(),
+    };
+    host.delete_session(&scope).await.unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM host_runs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    server.shutdown().await.unwrap();
+    let host = Host::start(cfg).await.unwrap();
+    assert_eq!(
+        host.open_session(scope).await.unwrap_err().kind,
+        "session_deleted"
+    );
+    host.shutdown().await.unwrap();
 }

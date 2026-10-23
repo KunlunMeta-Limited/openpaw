@@ -112,6 +112,11 @@ fn child_fixture() {
     rt.block_on(async {
         let mut cfg = config(&base);
         let mut scope = scope();
+        if mode == "text" {
+            cfg.tools.clear();
+            scope.namespace="office".into();
+            cfg.office=Some(serde_json::from_value(json!({"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_CHECKPOINT_KEY","allowed_origins":["http://127.0.0.1:8765"]})).unwrap());
+        }
         if ["accepted", "text", "completed"].contains(&mode.as_str()) {
             let provider: Arc<dyn openpaw_core::LlmProvider> = if mode == "completed" {
                 Arc::new(MockProvider::fixed("已可靠提交的终态文本"))
@@ -123,7 +128,14 @@ fn child_fixture() {
             let run = host.submit_run(&scope, &binding.session_id, "边界输入已保存".into()).await.unwrap();
             loop {
                 let current = host.get_run(&scope, &run.run_id).await.unwrap();
-                if mode == "accepted" || mode == "text" && current.text == "硬停前已落盘的部分文本" || mode == "completed" && current.state == RunState::Completed {
+                let text_committed = if mode == "text" {
+                    // 独立SQLite读取屏障：live可见不能证明展示尾部已经提交。
+                    let db = rusqlite::Connection::open(config(&base).home.join("engine-host/host.db")).unwrap();
+                    let data: String = db.query_row("SELECT data FROM host_runs WHERE id=?1",[&run.run_id],|r|r.get(0)).unwrap();
+                    let persisted: RunView = serde_json::from_str(&data).unwrap();
+                    persisted.text == "硬停前已落盘的部分文本"
+                } else { false };
+                if mode == "accepted" || mode == "text" && current.text == "硬停前已落盘的部分文本" && text_committed || mode == "completed" && current.state == RunState::Completed {
                     let session = host.get_session(&scope, &binding.session_id).await.unwrap();
                     assert!(session.messages.iter().any(|message| message.text() == "边界输入已保存"));
                     println!("READY {} {}", run.run_id, binding.session_id);
@@ -491,6 +503,24 @@ fn host_test_process_running(pid: u32) -> bool {
 }
 #[tokio::test]
 async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval() {
+    if std::env::var("OPENPAW_CHECKPOINT_HTTP_CHILD").as_deref() != Ok("1") {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval",
+                "--nocapture",
+            ])
+            .env("OPENPAW_CHECKPOINT_HTTP_CHILD", "1")
+            .env(
+                "PAWOFFICE_CHECKPOINT_KEY",
+                "isolated-checkpoint-fixture-key",
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+
     for mode in [
         "accepted",
         "completed",
@@ -519,7 +549,11 @@ async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_app
         };
         let (mut process, line) = child(base.path(), mode);
         let ids: Vec<_> = line.split_whitespace().collect();
-        let cfg = config(base.path());
+        let mut cfg = config(base.path());
+        if mode == "text" {
+            cfg.tools.clear();
+            cfg.office=Some(serde_json::from_value(json!({"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_CHECKPOINT_KEY","allowed_origins":["http://127.0.0.1:8765"]})).unwrap());
+        }
         let approvals: Vec<ApprovalView> = {
             let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
             let mut q = db.prepare("SELECT data FROM host_approvals").unwrap();
@@ -544,7 +578,7 @@ async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_app
             .await
             .unwrap();
         let mut scope = scope();
-        if mode.starts_with("team-") {
+        if mode.starts_with("team-") || mode == "text" {
             scope.namespace = "office".into();
         }
         let run = host.get_run(&scope, ids[1]).await.unwrap();
@@ -580,6 +614,24 @@ async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_app
             host.open_session(scope.clone()).await.unwrap().session_id,
             ids[2]
         );
+        if mode == "text" {
+            let server = HostServer::bind(host.clone(), 0).await.unwrap();
+            let url = format!("http://{}/office/chat", server.address());
+            let client = reqwest::Client::new();
+            let history:serde_json::Value=client.post(&url).header("origin","http://127.0.0.1:8765").json(&json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"conversation"})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
+            assert_eq!(
+                history["data"]["turns"][0]["assistant"],
+                "硬停前已落盘的部分文本"
+            );
+            assert_eq!(history["data"]["turns"][0]["state"], "error");
+            let body=client.post(&url).header("origin","http://127.0.0.1:8765").json(&json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"conversation","turnId":history["data"]["turns"][0]["id"]})).send().await.unwrap().error_for_status().unwrap().text().await.unwrap();
+            let snapshot: serde_json::Value =
+                serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            assert_eq!(snapshot["type"], "snapshot");
+            assert_eq!(snapshot["text"], history["data"]["turns"][0]["assistant"]);
+            assert_eq!(snapshot["state"], "error");
+            server.shutdown().await.unwrap();
+        }
         host.shutdown().await.unwrap();
         assert_eq!(
             recovered_provider

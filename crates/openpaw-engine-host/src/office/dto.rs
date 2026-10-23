@@ -383,6 +383,29 @@ pub(super) fn ui_action(value: &Value) -> bool {
     {
         return false;
     }
+    if value["action"] == "employee.create" {
+        return (o.len() == 6 || o.len() == 7 && o.contains_key("role"))
+            && value["name"].as_str().is_some_and(|s| {
+                !member_trim(s).is_empty() && member_trim(s).chars().count() <= 80
+            })
+            && o.get("role").is_none_or(|v| {
+                v.as_str()
+                    .is_some_and(|s| member_trim(s).chars().count() <= 80)
+            })
+            && value["sceneActorId"].as_str().is_some_and(scene_id)
+            && o.keys().all(|k| {
+                [
+                    "id",
+                    "teamId",
+                    "conversationId",
+                    "action",
+                    "name",
+                    "role",
+                    "sceneActorId",
+                ]
+                .contains(&k.as_str())
+            });
+    }
     let extra: &[&str] = match value["action"].as_str() {
         Some("conversation.delete") => &[],
         Some("actor.inspect") => &["actorId"],
@@ -398,4 +421,40 @@ pub(super) fn ui_action(value: &Value) -> bool {
                 !s.is_empty() && units(s) <= 100 && !s.chars().any(char::is_control)
             })
         })
+}
+
+#[cfg(test)]
+mod action_regressions {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn member_create_is_strict_and_uses_upstream_unicode_trim_defaults() {
+        let action = json!({"id":"create-1","teamId":"office-1","conversationId":"conversation-1","action":"employee.create","name":" 新成员 ","sceneActorId":"file-agent"});
+        assert!(ui_action(&action));
+        for (key, bad) in [
+            ("name", json!("  ")),
+            ("name", json!("😀".repeat(81))),
+            ("role", json!("😀".repeat(81))),
+            ("role", Value::Null),
+            ("sceneActorId", json!("../actor")),
+            ("unexpected", json!(true)),
+        ] {
+            let mut invalid = action.clone();
+            invalid[key] = bad;
+            assert!(!ui_action(&invalid), "{key}");
+        }
+        let mut boundary = action.clone();
+        boundary["name"] = json!(" 😀".repeat(26).trim());
+        boundary["role"] = json!("");
+        assert!(ui_action(&boundary));
+        boundary["name"] = json!("😀".repeat(80));
+        assert!(ui_action(&boundary));
+        boundary["role"] = json!(" role ");
+        assert!(ui_action(&boundary));
+    }
+}
+
+// Zod trim沿用ECMAScript WhiteSpace/LineTerminator；Rust trim对U+0085/U+FEFF的取舍不同。
+fn member_trim(value: &str) -> &str {
+    value.trim_matches(|c| matches!(c,'\u{0009}'..='\u{000d}'|'\u{0020}'|'\u{00a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}'))
 }

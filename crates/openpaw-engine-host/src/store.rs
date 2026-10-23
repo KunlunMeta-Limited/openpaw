@@ -453,19 +453,11 @@ impl Db {
             .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
         let events = self.events(&run.session_id)?;
         let mut active = false;
-        let mut text = RunText::default();
+        let text = committed_run_text(&events, id);
         let mut tools = std::collections::BTreeMap::new();
         for e in events {
             match e {
                 SessionEvent::RunStarted { run_id } => active = run_id == id,
-                SessionEvent::Message(m) if active && m.role == openpaw_core::Role::Assistant => {
-                    for block in m.content {
-                        if let openpaw_core::ContentBlock::Text { text: t } = block {
-                            text.append(&t);
-                        }
-                    }
-                    text.end_message();
-                }
                 SessionEvent::ToolCallStart { call_id, tool_name } if active => {
                     tools.insert(
                         call_id.clone(),
@@ -525,21 +517,91 @@ impl Db {
             }
         }
         run.tools = tools.into_values().collect();
+        // 检查点只补足与可靠账本相符的展示尾部；不将它恢复为模型消息。
+        if run.text.len() > 4 * 1024 * 1024 {
+            return Err(HostError::new(
+                "storage_unavailable",
+                "展示检查点超过原有上限",
+            ));
+        }
+        let checkpoint = std::mem::take(&mut run.text);
+        let checkpoint_truncated = run.text_truncated;
+        run.text = text.text().to_owned();
+        run.text_truncated = false;
+        merge_run_display(&mut run, &checkpoint, checkpoint_truncated)?;
         if !run.state.is_terminal() {
             if let Some(live) = self.live.lock().unwrap_or_else(|e| e.into_inner()).get(id) {
-                if live.text().len() >= text.text().len() {
-                    run.text = live.text().to_owned();
-                    run.text_truncated = live.truncated();
-                } else {
-                    run.text = text.text().to_owned();
-                }
-            } else {
-                run.text = text.text().to_owned();
+                merge_run_display(&mut run, live.text(), live.truncated())?;
             }
-        } else {
-            run.text = text.text().to_owned();
         }
         Ok(run)
+    }
+    /// 功能：将本Run的有界实时展示尾部合并保存到既有元数据。
+    /// 参数：id和session为已接受运行的精确身份。
+    /// 返回：检查点写入或无变化、已结束、已删除时成功。
+    /// 错误：SQL失败或展示前缀与可靠账本冲突时明确报错。
+    /// 状态：只UPDATE既存Run，不新增消息；完整消息已提交时清除冗余尾部。
+    /// 并发与取消：原单写线程串行执行；删除墓碑后无操作，不复活会话。
+    /// 权限：同时核对Run、Session和存活作用域，不接收客户端正文。
+    /// 关联：需求/设计REQ-OP-009、REQ-OP-016；DES-OP-006。
+    pub(crate) fn checkpoint_run(&mut self, id: &str, session: &str) -> HostResult<()> {
+        let data: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM host_runs WHERE id=?1 AND session=?2",
+                params![id, session],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        let Some(data) = data else {
+            return Ok(());
+        };
+        let mut run: RunView = serde_json::from_str(&data).map_err(HostError::storage)?;
+        match self.binding(session) {
+            Ok(_) => {}
+            Err(e) if matches!(e.kind.as_str(), "session_deleted" | "not_found") => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        if run.state.is_terminal() {
+            return Ok(());
+        }
+        let (live, truncated) = {
+            let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(live) = live.get(id) else {
+                return Ok(());
+            };
+            (live.text().to_owned(), live.truncated())
+        };
+        let ledger = committed_run_text(&self.events(session)?, id);
+        let mut display = run.clone();
+        display.text = ledger.text().to_owned();
+        display.text_truncated = false;
+        merge_run_display(&mut display, &run.text, run.text_truncated)?;
+        merge_run_display(&mut display, &live, truncated)?;
+        // 仅保留未提交的尾部展示快照；账本追上后不用重复存完整回复。
+        let next = if display.text.len() > ledger.text().len() {
+            display.text
+        } else {
+            String::new()
+        };
+        let next_truncated = truncated && !next.is_empty();
+        if next.len() > 4 * 1024 * 1024 {
+            return Err(HostError::new(
+                "storage_unavailable",
+                "展示检查点超过原有上限",
+            ));
+        }
+        if run.text == next && run.text_truncated == next_truncated {
+            return Ok(());
+        }
+        run.text = next;
+        run.text_truncated = next_truncated;
+        self.conn.execute(
+            "UPDATE host_runs SET data=?3 WHERE id=?1 AND session=?2 AND EXISTS(SELECT 1 FROM host_bindings WHERE id=?2) AND NOT EXISTS(SELECT 1 FROM host_session_deletions WHERE session=?2)",
+            params![id, session, serde_json::to_string(&run).map_err(HostError::storage)?],
+        ).map_err(HostError::storage)?;
+        Ok(())
     }
     /// 功能：原子保存Run状态与生命周期revision。
     /// 参数：run为新视图，offset为原输入事件位置。
@@ -579,6 +641,18 @@ impl Db {
         {
             run.state = RunState::Cancelling;
         }
+        let checkpoint: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM host_runs WHERE id=?1 AND session=?2",
+                params![run.run_id, run.session_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        let checkpoint: Option<RunView> = checkpoint
+            .map(|v| serde_json::from_str(&v).map_err(HostError::storage))
+            .transpose()?;
         // 状态与revision同一SQLite事务，发布永远在提交之后。
         let tx = self.conn.transaction().map_err(HostError::storage)?;
         tx.execute(
@@ -588,7 +662,11 @@ impl Db {
         .map_err(HostError::storage)?;
         run.revision = tx.last_insert_rowid() as u64;
         let mut persisted = run.clone();
-        persisted.text.clear();
+        persisted.text = checkpoint
+            .as_ref()
+            .map(|v| v.text.clone())
+            .unwrap_or_default();
+        persisted.text_truncated = checkpoint.is_some_and(|v| v.text_truncated);
         persisted.tools.clear();
         tx.execute("INSERT INTO host_runs(id,session,data,input_event_offset) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data",params![run.run_id,run.session_id,serde_json::to_string(&persisted).map_err(HostError::storage)?,offset]).map_err(HostError::storage)?;
         if let Some((key, canonical)) = request {
@@ -1990,6 +2068,67 @@ mod office_regressions {
     use openpaw_core::{Message, Role};
     use serde_json::json;
     #[tokio::test]
+    async fn stream_checkpoint_is_bounded_scoped_prefix_only_and_never_revives_deleted_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "checkpoint".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let session = binding.session_id.clone();
+        host.inner.store.call(move |db| {
+            let offset=db.events(&session)?.len();
+            db.append(&session,SessionEvent::Message(Message::user_text("输入")))?;
+            db.append(&session,SessionEvent::RunStarted{run_id:"checkpoint-run".into()})?;
+            let run=RunView{run_id:"checkpoint-run".into(),session_id:session.clone(),state:RunState::Running,revision:0,text:String::new(),tools:vec![],error:None,text_truncated:false};
+            db.save_run(run,offset)?;
+            let mut buffer=RunText::bounded(4*1024*1024);buffer.append("可靠前缀");
+            db.live.lock().unwrap().insert("checkpoint-run".into(),buffer);
+            db.checkpoint_run("checkpoint-run","wrong-session")?;
+            assert!(db.runs()?.iter().find(|r|r.run_id=="checkpoint-run").unwrap().text.is_empty());
+            db.checkpoint_run("checkpoint-run",&session)?;
+            let raw=db.runs()?.into_iter().find(|r|r.run_id=="checkpoint-run").unwrap();
+            assert_eq!(raw.text,"可靠前缀");
+            // 相同内容不执行UPDATE：触发器证明不会每秒重写不变检查点。
+            db.conn.execute_batch("CREATE TRIGGER checkpoint_failure BEFORE UPDATE ON host_runs BEGIN SELECT RAISE(ABORT,'checkpoint-write-failure'); END;").map_err(HostError::storage)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            db.live.lock().unwrap().get_mut("checkpoint-run").unwrap().append("，尚未完成");
+            assert_eq!(db.checkpoint_run("checkpoint-run",&session).unwrap_err().kind,"storage_unavailable");
+            db.conn.execute_batch("DROP TRIGGER checkpoint_failure;").map_err(HostError::storage)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            // 已提交的assistant消息追上后清冗余，不用检查点替代JSONL。
+            db.append(&session,SessionEvent::Message(Message::assistant_text("可靠前缀，尚未完成")))?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            assert!(db.runs()?.iter().find(|r|r.run_id=="checkpoint-run").unwrap().text.is_empty());
+            assert_eq!(db.get_run("checkpoint-run")?.text,"可靠前缀，尚未完成");
+            let mut bad=RunText::bounded(4*1024*1024);bad.append("与原账本不符");
+            db.live.lock().unwrap().insert("checkpoint-run".into(),bad);
+            assert!(db.checkpoint_run("checkpoint-run",&session).is_err());
+            db.live.lock().unwrap().remove("checkpoint-run");
+            // 持久损坏也拒绝；不能因为live缺席就把任意文字当可信历史。
+            let mut corrupt=db.runs()?.into_iter().find(|r|r.run_id=="checkpoint-run").unwrap();corrupt.text="损坏".into();
+            db.conn.execute("UPDATE host_runs SET data=?1 WHERE id='checkpoint-run'",[serde_json::to_string(&corrupt).unwrap()]).map_err(HostError::storage)?;
+            assert!(db.get_run("checkpoint-run").is_err());
+            corrupt.text="x".repeat(4*1024*1024+1);
+            db.conn.execute("UPDATE host_runs SET data=?1 WHERE id='checkpoint-run'",[serde_json::to_string(&corrupt).unwrap()]).map_err(HostError::storage)?;
+            assert!(db.get_run("checkpoint-run").is_err());
+            corrupt.text.clear();corrupt.state=RunState::Interrupted;
+            db.conn.execute("UPDATE host_runs SET data=?1 WHERE id='checkpoint-run'",[serde_json::to_string(&corrupt).unwrap()]).map_err(HostError::storage)?;
+            db.begin_delete(&binding.scope)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            db.purge_session(&serde_json::to_string(&binding.scope).unwrap(),&session)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            assert!(db.runs()?.is_empty()); assert!(db.binding(&session).is_err());
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
     async fn failed_acceptance_offset_does_not_claim_later_user_input() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -2156,4 +2295,43 @@ mod office_regressions {
         assert!(host.open_session(scope).await.is_err());
         host.shutdown().await.unwrap();
     }
+}
+
+// 与实时RunText使用相同消息分隔规则；这里只投影原事实，不解析第二种消息格式。
+fn committed_run_text(events: &[SessionEvent], id: &str) -> RunText {
+    let mut active = false;
+    let mut text = RunText::default();
+    for event in events {
+        match event {
+            SessionEvent::RunStarted { run_id } => active = run_id == id,
+            SessionEvent::Message(message)
+                if active && message.role == openpaw_core::Role::Assistant =>
+            {
+                for block in &message.content {
+                    if let openpaw_core::ContentBlock::Text { text: chunk } = block {
+                        text.append(chunk);
+                    }
+                }
+                text.end_message();
+            }
+            _ => {}
+        }
+    }
+    text
+}
+fn merge_run_display(run: &mut RunView, candidate: &str, truncated: bool) -> HostResult<()> {
+    if run.text.starts_with(candidate) {
+        if run.text.len() == candidate.len() {
+            run.text_truncated |= truncated;
+        }
+    } else if candidate.starts_with(&run.text) {
+        run.text = candidate.to_owned();
+        run.text_truncated = truncated;
+    } else {
+        return Err(HostError::new(
+            "storage_unavailable",
+            "展示检查点与可靠账本前缀不一致",
+        ));
+    }
+    Ok(())
 }

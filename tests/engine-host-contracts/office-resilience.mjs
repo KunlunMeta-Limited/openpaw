@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release}) {
+export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release,post}) {
   const roles=[['research','command','code-agent','李研'],['organize','files','file-agent','周理'],['draft','draft','app-agent','陈书'],['review','review','review-agent','刘市'],['audit','search','data-agent','赵审']]
   let exportIndex=0
   async function scene(label) {
@@ -38,6 +38,7 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     await page.screenshot({path:join(output,`t6-member-working-${role}.png`),fullPage:true})
     await page.getByRole('button',{name:'关闭详情',exact:true}).click()
     handoffs.push({role,employee,actor,task,event,command:visit.command,record:finished.records.find(r=>r.command.commandId===visit.command.commandId)})
+    if(role==='research') await memberLayoutProduct({page,report,output,readOffice,conv,request,post,chooseOffice,waitFor})
     release(role)
   }
   await expand(page)
@@ -173,4 +174,54 @@ export async function storageProduct({page,report,output,fresh,waitFor}) {
     report.storageFailure={trigger:'actual browser IndexedDB transaction.abort, isolated browser context only; not a quota/disk-full test',aborts,warning:await alert.innerText(),before,after}
     report.assertions.push('T6 actual browser IndexedDB write abort shows save warning and preserves exact original archive; no model request')
   } finally {await page.evaluate(()=>globalThis.t6RestoreStorage?.())}
+}
+
+
+// 新布局仍消费同一Host快照；本函数只操作原Office按钮和公开布局路由。
+async function memberLayoutProduct({page,report,output,readOffice,conv,request,post,chooseOffice,waitFor}) {
+  const db=new DatabaseSync(join(output,'host-data/engine-host/host.db'),{readOnly:true})
+  const runs=()=>db.prepare('SELECT id,session FROM host_runs ORDER BY id').all()
+  const before=runs(), modelsBefore=report.modelRequests.length
+  const parent=db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run
+  const initial=(await post({type:'office.layout.read'})).data
+  assert.equal(initial.currentLayoutId,'classic')
+  await page.getByRole('button',{name:'切换页面布局',exact:true}).click()
+  await page.getByRole('button',{name:'成员布局',exact:true}).click()
+  const roster=page.getByRole('complementary',{name:'办公室成员',exact:true});await roster.waitFor()
+  const profiles=[]
+  for(const name of ['王明','李研','周理','陈书','刘市','赵审']) {
+    await page.getByRole('button',{name:'查看'+name+'的资料',exact:true}).click()
+    await page.locator('.member-profile-heading').getByRole('heading',{name:new RegExp('^'+name)}).waitFor()
+    const text=await page.getByRole('region',{name:'当前任务与最近动态'}).innerText()
+    await page.getByRole('button',{name:'查看完整档案',exact:true}).click()
+    const dialog=page.getByRole('dialog',{name:name+' · 成员详情',exact:true});await dialog.waitFor()
+    assert.ok((await dialog.innerText()).includes(name))
+    await page.screenshot({path:join(output,'t6-members-layout-'+profiles.length+'.png'),fullPage:true})
+    await page.getByRole('button',{name:'关闭详情',exact:true}).click()
+    profiles.push({name,text})
+  }
+  const add=page.getByRole('button',{name:'添加成员',exact:true})
+  assert.equal(await add.isEnabled(),false);assert.ok((await add.getAttribute('title')).includes('6'))
+  const selected=(await post({type:'office.layout.read'})).data
+  assert.equal(selected.currentLayoutId,'members');assert.ok(selected.revision>initial.revision)
+  assert.equal((await post({type:'office.layout.set',layoutId:'members'})).data.revision,selected.revision)
+  const invalid=await page.request.post(new URL('/api/pawoffice/layout',page.url()).href,{headers:{origin:new URL(page.url()).origin},data:{type:'office.layout.set',layoutId:'invented'}})
+  assert.equal(invalid.status(),400)
+  const other=await page.context().newPage()
+  try {
+    await other.goto(new URL('/office/',page.url()).href)
+    await other.getByRole('complementary',{name:'办公室成员',exact:true}).waitFor({timeout:60000})
+    await other.screenshot({path:join(output,'t6-members-second-page.png'),fullPage:true})
+    await page.reload();await chooseOffice(page);await roster.waitFor()
+    assert.equal((await post({type:'office.layout.read'})).data.revision,selected.revision)
+    await page.getByRole('button',{name:'切换页面布局',exact:true}).click()
+    await page.getByRole('button',{name:'经典布局',exact:true}).click()
+    await roster.waitFor({state:'hidden'});await other.getByRole('complementary',{name:'办公室成员',exact:true}).waitFor({state:'hidden'})
+  } finally {await other.close()}
+  assert.deepEqual(runs(),before);assert.equal(report.modelRequests.length,modelsBefore)
+  assert.equal(JSON.parse(db.prepare('SELECT data FROM host_runs WHERE id=?').get(parent).data).state,'running')
+  assert.ok(conv(await readOffice(),request.conversationId).tasks.some(t=>t.assigneeId==='command'&&t.status==='running'))
+  db.close()
+  report.memberLayout={parent,request,profiles,selected,initial,runsBefore:before,runsAfter:before,modelsBefore,modelsAfter:report.modelRequests.length,invalidStatus:invalid.status()}
+  report.assertions.push('T6 running parent and child survive classic/members switching, refresh and cross-page layout synchronization without duplicate Run/model request','T6 six members layout profile buttons reach six real Host details; full roster disables add; layout revision stays separate from snapshot seq')
 }
