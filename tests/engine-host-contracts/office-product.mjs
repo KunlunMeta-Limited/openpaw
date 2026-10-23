@@ -354,7 +354,7 @@ try {
   const box=p=>p.getByRole('textbox',{name:'给办公室发送消息'})
   const transcriptOf=p=>p.getByRole('log',{name:'对话内容'})
   async function expand(p){const b=p.getByRole('button',{name:'展开对话',exact:true});if(await b.isVisible())await b.click()}
-  async function select(p,title){await expand(p);await p.getByRole('tab',{name:title,exact:true}).click();await waitFor(()=>box(p).isEnabled())}
+  async function select(p,title){await expand(p);await p.getByRole('tab').filter({has:p.getByText(title,{exact:true})}).click();await waitFor(()=>box(p).isEnabled())}
   async function fresh(p){await expand(p);await p.getByRole('button',{name:'新会话',exact:true}).first().click();await expand(p);await waitFor(()=>box(p).isEnabled())}
   async function uiSend(p,text){await waitFor(async()=>{if(!await box(p).isEnabled())return false;await box(p).fill(text);return p.getByRole('button',{name:'发送消息',exact:true}).isEnabled()});await p.getByRole('button',{name:'发送消息',exact:true}).click();await waitFor(async()=>(await transcriptOf(p).innerText()).includes('已处理：'+text),45000);await p.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});return structuredClone(latestSend().request)}
   async function archived(p){return p.evaluate(async()=>{const db=await new Promise((resolve,reject)=>{const r=indexedDB.open('pawoffice-chat',2);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)});return new Promise((resolve,reject)=>{const tx=db.transaction(['conversations','chat-pages'],'readonly'),a=tx.objectStore('conversations').getAll(),b=tx.objectStore('chat-pages').getAll();tx.oncomplete=()=>{db.close();resolve({directories:a.result,pages:b.result})};tx.onerror=()=>reject(tx.error)})})}

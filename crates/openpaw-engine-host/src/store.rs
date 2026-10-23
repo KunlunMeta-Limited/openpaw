@@ -1205,6 +1205,7 @@ impl Db {
             .collect();
         let tx = self.conn.transaction().map_err(HostError::storage)?;
         for id in &run_ids {
+            tx.execute("DELETE FROM host_events WHERE kind='approval' AND reference IN (SELECT id FROM host_approvals WHERE run=?1)",[id]).map_err(HostError::storage)?;
             tx.execute("DELETE FROM host_office_decisions WHERE approval_id IN (SELECT id FROM host_approvals WHERE run=?1)",[id]).map_err(HostError::storage)?;
             tx.execute("DELETE FROM host_approvals WHERE run=?1", [id])
                 .map_err(HostError::storage)?;
@@ -1361,6 +1362,8 @@ impl Db {
         expiry: i64,
         state: &str,
     ) -> HostResult<()> {
+        // 显示任务可能刚从HTTP返回，此时删除已经提交；不能重建已清除的展示记录。
+        self.check_live_scope(scope)?;
         self.conn.execute("INSERT INTO host_office_decisions VALUES(?1,?2,?3,?4,?5) ON CONFLICT(approval_id) DO UPDATE SET display_id=excluded.display_id,state=excluded.state",params![approval,display,serde_json::to_string(scope).map_err(HostError::storage)?,expiry,state]).map_err(HostError::storage)?;
         Ok(())
     }
@@ -1604,6 +1607,7 @@ mod office_regressions {
             let (kind,status,body):(String,String,String)=db.conn.query_row("SELECT kind,status,context FROM host_office_actions WHERE action_id='delete-action'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(HostError::storage)?;
             assert_eq!((kind.as_str(),status.as_str(),body.as_str()),("receipt","deleted_ui_unconfirmed","{}"));
             assert!(db.office_navigation("delete-action",&s).is_err());
+            assert!(db.office_decision("late-approval","late-display",&s,chrono::Utc::now().timestamp_millis()+10000,"unknown").is_err());
             let now=chrono::Utc::now().timestamp_millis();
             db.office_scene("run:terminal","original",now+10000,"queued")?;
             db.office_scene("run:terminal","original",now+10000,"forwarded")?;
