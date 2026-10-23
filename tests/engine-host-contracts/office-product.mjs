@@ -156,6 +156,20 @@ function provider() {
         assert.ok(results.find(r=>r.tool_call_id==='progress-2').content.includes('WEB-HTTP-MARKER'));
         finish({content:'资料已通过真实HTTP取回，并经确认保存到 reports/天气.md。此为确定性协议验收数据，非实时天气。'});return;
       }
+      if (prompt==='核对已保存的记录文件位置') {
+        const calls=[
+          ['report_progress',{type:'create',steps:[{id:'check',title:'核对本地日期与已保存的资料记录文件位置'}]}],
+          ['glob',{pattern:'reports/天气.md'}],
+          ['report_progress',{type:'update',stepId:'check',state:'completed',evidenceCallIds:['location-1']}],
+        ];
+        if(results.length<calls.length){
+          if(results.length===2)assert.ok(results.at(-1).content.includes('reports/天气.md')&&results.at(-1).content.includes('[Host执行回执]'));
+          const [name,input]=calls[results.length];
+          finish({content:'',tool_calls:[{index:0,id:'location-'+results.length,type:'function',function:{name,arguments:JSON.stringify(input)}}]},'tool_calls');return;
+        }
+        assert.ok(results.at(-1).content.includes('业务步骤已记录'));
+        finish({content:'已通过真实文件查询核对位置：reports/天气.md，无需再次写入。'});return;
+      }
       if (prompt.startsWith('T5-')) {
         if (!results.length && !prompt.includes('命令')) {
           finish({content:'读取两文件后申请写入。',tool_calls:['README.md','notes.txt'].map((path,i)=>({index:i,id:'t5-read-'+i,type:'function',function:{name:'read_file',arguments:JSON.stringify({path})}}))},'tool_calls');return
@@ -694,6 +708,14 @@ try {
   await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,'帮我查询资料并记录到reports/天气.md');
   const restored=conv(await readOffice(),progressRequest.conversationId);assert.deepEqual(restored.tasks,progressComplete.tasks);
   assert.deepEqual(restored.events,progressComplete.events,'刷新不改变实际开始时的步骤关联');
+  await send('核对已保存的记录文件位置');
+  const locationRequest=structuredClone(latestSend().request);
+  const locationComplete=await waitFor(async()=>{const c=conv(await readOffice(),locationRequest.conversationId);return c?.tasks[0]?.id!==progressComplete.tasks[0].id&&c?.tasks[0]?.progress===100?c:false});
+  assert.ok(locationComplete.tasks.every(t=>t.status==='completed'));
+  assert.equal(await readFile(join(workspace,'reports/天气.md'),'utf8'),recorded,'确认文件位置不能再次写入');
+  report.t5.savedLocation={request:locationRequest,completed:locationComplete};
+  await page.screenshot({path:join(output,'31b-saved-location-query-completed.png'),fullPage:true});
+  report.assertions.push('D49: original browser follows up about an already saved record location; real glob evidence completes the query plan without another write or approval');
   // r3官方新建入口：真实空作用域action经过唯一poller和原Store。
   await page.getByRole('button',{name:'收起聊天',exact:true}).click();
   await page.getByRole('button',{name:/^团队空间，当前团队/}).click();

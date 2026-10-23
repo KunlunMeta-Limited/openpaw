@@ -55,9 +55,28 @@ fn parse(value: &Value) -> HostResult<Report> {
     serde_json::from_value(value.clone()).map_err(|_| invalid("步骤报告字段不符合约定。更新必须包含type=update、stepId、state；例如{\"type\":\"update\",\"stepId\":\"原步骤ID\",\"state\":\"in_progress\"}。completed还须提供evidenceCallIds，不能用工具名、路径或时间戳代替真实调用ID。"))
 }
 fn needs_write(title: &str) -> bool {
-    ["保存", "写入", "落盘", "记录", "生成文件", "导出"]
+    // “查看已保存的记录文件位置”是读取事实；不能把过去动作或名词当成新写入。
+    // 显式“核对后保存/并记录到…”仍命中，新产物仍须相符的真实写入证据。
+    let action = ["保存", "写入", "落盘", "记录", "生成文件", "导出"]
         .iter()
-        .any(|s| title.contains(s))
+        .fold(title.to_owned(), |text, verb| {
+            text.replace(&format!("已{verb}"), "")
+        });
+    ["保存", "写入", "落盘", "生成文件", "导出"]
+        .iter()
+        .any(|s| action.contains(s))
+        || action.trim_start().starts_with("记录")
+        || [
+            "请记录",
+            "并记录",
+            "再记录",
+            "后记录",
+            "及记录",
+            "记录到",
+            "记录至",
+        ]
+        .iter()
+        .any(|s| action.contains(s))
 }
 
 /// 功能：声明仅Office运行内使用的元数据工具。
@@ -505,6 +524,64 @@ mod tests {
         assert!(accepted_plan_hint(Some(json!({"steps":[]}))).is_err());
     }
     #[test]
+    fn checking_saved_artifact_location_requires_query_evidence_not_another_write() {
+        let mut r = run();
+        r.tools.push(ToolView {
+            call_id: "lookup".into(),
+            tool_name: "glob".into(),
+            state: "completed".into(),
+        });
+        let binding = ToolCallBinding {
+            run_id: r.run_id.clone(),
+            call_id: "lookup".into(),
+            tool_name: "glob".into(),
+            input: json!({"pattern":"reports/*.md"}),
+        };
+        let title = "核对本地日期与已保存的长沙天气记录文件位置";
+        let p = update(
+            None,
+            &json!({"type":"create","steps":[{"id":"check","title":title}]}),
+            &r,
+            &[],
+        )
+        .unwrap();
+        let report = json!({"type":"update","stepId":"check","state":"completed","evidenceCallIds":["lookup"]});
+        assert!(
+            update(Some(p.clone()), &report, &r, &[]).is_err(),
+            "查询也必须有真实started"
+        );
+        let confirmed = update(Some(p), &report, &r, std::slice::from_ref(&binding)).unwrap();
+        r.state = RunState::Completed;
+        assert_eq!(project(Some(confirmed), &r).unwrap().1, 100);
+        r.state = RunState::Running;
+        for title in [
+            "保存 reports/new.md",
+            "记录天气到 reports/new.md",
+            "核对已保存的文件后写入 reports/new.md",
+            "查询记录并保存 reports/new.md",
+            "核对日期并记录到 reports/new.md",
+        ] {
+            let p = update(
+                None,
+                &json!({"type":"create","steps":[{"id":"check","title":title}]}),
+                &r,
+                &[],
+            )
+            .unwrap();
+            assert!(
+                update(Some(p), &report, &r, std::slice::from_ref(&binding)).is_err(),
+                "读证据不能证明新的写操作：{title}"
+            );
+        }
+        for title in [
+            "读取历史记录",
+            "查询已保存的文件路径",
+            "核对已写入的文件位置",
+        ] {
+            assert!(!needs_write(title), "只读语境：{title}");
+        }
+    }
+    #[test]
     fn no_tool_answer_is_confirmed_only_by_reliable_normal_finish() {
         let mut r = run();
         let p = update(
@@ -535,7 +612,7 @@ mod lifecycle_tests {
         let root = tmp.path().join("root");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("资料.txt"), "真实读取标记").unwrap();
-        let cfg:HostConfig=serde_json::from_value(json!({"home":tmp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"mock","tools":["read_file"]})).unwrap();
+        let cfg:HostConfig=serde_json::from_value(json!({"home":tmp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"mock","tools":["read_file","glob"]})).unwrap();
         let step = |input| MockMode::ToolUse {
             tool_name: NAME.into(),
             input,
@@ -543,7 +620,7 @@ mod lifecycle_tests {
         };
         let provider = Arc::new(MockProvider::scripted(vec![
             step(
-                json!({"type":"create","steps":[{"id":"read","title":"查询资料"},{"id":"answer","title":"整理答复"}]}),
+                json!({"type":"create","steps":[{"id":"read","title":"查询资料"},{"id":"check","title":"核对已保存的资料记录文件位置"},{"id":"answer","title":"整理答复"}]}),
             ),
             step(json!({"type":"update","stepId":"read","state":"in_progress"})),
             MockMode::ToolUse {
@@ -556,6 +633,14 @@ mod lifecycle_tests {
             ),
             step(
                 json!({"type":"update","stepId":"read","state":"completed","evidenceCallIds":["call_2"]}),
+            ),
+            MockMode::ToolUse {
+                tool_name: "glob".into(),
+                input: json!({"pattern":"资料.txt"}),
+                text: String::new(),
+            },
+            step(
+                json!({"type":"update","stepId":"check","state":"completed","evidenceCallIds":["call_5"]}),
             ),
             step(json!({"type":"update","stepId":"answer","state":"in_progress"})),
             MockMode::Fixed("读取标记并整理完毕".into()),
