@@ -614,6 +614,30 @@ async fn creation_http_scenario() {
         .snapshots
         .keys()
         .any(|s| s.starts_with("reserved")));
+    let url = format!("http://{}/office/chat", server.address());
+    let client = reqwest::Client::new();
+    for kind in ["send", "history", "resume", "cancel"] {
+        let mut request =
+            json!({"version":"1.0","type":kind,"teamId":"reserved-a","conversationId":"guessed"});
+        if kind == "send" {
+            request["turnId"] = json!("before-create");
+            request["messages"] = json!([{"role":"user","content":"不能预先建会话"}]);
+        } else if kind != "history" {
+            request["turnId"] = json!("before-create");
+        }
+        let response = client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN, "{kind}");
+    }
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let guesses: i64 = db
+        .query_row(
+            "SELECT count(*) FROM host_bindings WHERE conversation='guessed'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(guesses, 0, "拒绝请求不能产生Session绑定");
+    drop(db);
     for (id, name) in [("new-a", "未确认办公室"), ("new-b", "正常办公室")] {
         shared.lock().await.actions.push_back(
             json!({"id":id,"teamId":"","conversationId":"","action":"office.create","name":name}),

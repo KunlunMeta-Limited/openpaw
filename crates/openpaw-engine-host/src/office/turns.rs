@@ -6,6 +6,20 @@ use super::dto::{self, ChatRequest, HistoryRequest};
 use crate::{ClientScope, Host, HostError, HostResult, RunState, RunView};
 use serde_json::{json, Value};
 
+// 在轮次服务统一核对创建事实；不能让猜到预留槽ID的请求先于office.create建会话。
+async fn check_active(host: &Host, scope: &ClientScope) -> HostResult<()> {
+    let config = host
+        .inner
+        .config
+        .office
+        .as_ref()
+        .ok_or_else(|| HostError::new("scope_denied", "Office未启用"))?;
+    if !super::workspaces::active(host, config, &scope.slot_id).await? {
+        return Err(HostError::new("scope_denied", "办公室尚未创建"));
+    }
+    Ok(())
+}
+
 /// 功能：可靠接受官方send或返回同一轮次的原Run。
 /// 参数：host为共享服务，scope为已校验范围，request为send载荷。
 /// 返回：新接受或已存在的Run。
@@ -19,6 +33,7 @@ pub(super) async fn accept(
     scope: &ClientScope,
     request: ChatRequest,
 ) -> HostResult<RunView> {
+    check_active(host, scope).await?;
     if request.turn_id.starts_with("legacy:") {
         return Err(HostError::new("invalid_input", "legacy:为升级历史保留前缀"));
     }
@@ -58,6 +73,7 @@ pub(super) async fn accept(
 /// 权限：逐项匹配namespace/team/conversation。
 /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
 pub(super) async fn find(host: &Host, scope: &ClientScope, turn: &str) -> HostResult<RunView> {
+    check_active(host, scope).await?;
     let scope = scope.clone();
     let turn = turn.to_owned();
     host.inner
@@ -94,6 +110,7 @@ pub(super) async fn history(
     scope: &ClientScope,
     request: HistoryRequest,
 ) -> HostResult<Value> {
+    check_active(host, scope).await?;
     let scope = scope.clone();
     host.inner.store.call(move|db|{
         db.check_live_scope(&scope)?;

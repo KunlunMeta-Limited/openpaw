@@ -42,10 +42,10 @@ office-4 = "project"
 # base_url = "http://127.0.0.1:8765"
 # api_key_env = "PAWOFFICE_API_KEY"
 # allowed_origins = ["http://127.0.0.1:8765"]
-# # 先在[roots]/[slots]声明真实根及稳定槽，再把等待页面创建的槽填入此项。
+# 先在[roots]/[slots]声明真实根及稳定槽，再把等待页面创建的槽填入此项。
 # 默认空，全部原办公室仍自动初始化；每槽只分配一次，名称不变成路径。
-creation_slots = [] # 例如 ["office-reserved"]；该槽须已在[slots]存在
-[office.names]
+# creation_slots = [] # 例如 ["office-reserved"]；该槽须已在[slots]存在
+# [office.names]
 # office-1 = "研发办公室"
 # office-2 = "产品办公室"
 # office-3 = "资料办公室"

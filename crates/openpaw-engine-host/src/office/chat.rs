@@ -195,11 +195,6 @@ async fn handle(
         if !state.host.inner.config.slots.contains_key(&scope.slot_id) {
             return error(HostError::new("scope_denied", "办公室未授权"));
         }
-        match super::workspaces::active(&state.host, &state.config, &scope.slot_id).await {
-            Ok(true) => {}
-            Ok(false) => return error(HostError::new("scope_denied", "办公室尚未创建")),
-            Err(e) => return error(e),
-        }
         let request = match request {
             Operation::History(r) => {
                 return match turns::history(&state.host, &scope, r).await {
