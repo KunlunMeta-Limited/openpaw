@@ -238,3 +238,10 @@ r7在线演示已升级为8ad8f1c，部署/备份`artifacts/live-office-20261022
 ## 当前T4平台交接：PR #10已创建（2026-10-23）
 
 https://github.com/KunlunMeta-Limited/openpaw/pull/10 ，base=merge/ai-ofice-react-overagent，创建head4a8847324aaf904be9ea8af5a7caca6af68bb8e5；准确完整27/27与真实产品b通过。用户交付验收绑定9831f59；创建前后元数据登记不改变生产源码。平台OPEN待非作者审核/合入，用户创建前批准不是平台Approve。下一合法步骤仅处理本PR审核/修复；实际审核和合入后补最终head/merge再启动T5提案。Windows暂缓及云端账单/额度未执行不计通过；原delivery门禁冲突、首轮环境失败和天气输出质量观察都在0005及外部清单保留。
+
+
+## 当前交接：T4已合入，T5编码前待审（2026-10-23）
+
+[PR #10](https://github.com/KunlunMeta-Limited/openpaw/pull/10)已MERGED，最终head e7ce707，集成merge 37f0a35729fb64639f0e1a8b8a8a4799e1dca9d3，合入北京时间09:43:00。用户会话确认，API reviews为空；准确完整27/27/产品证据和云端未启动/Windows暂缓详0005第12节，旧候选状态保留历史。此处不将Windows写通过、不声称天气每句解释正确。
+
+T5分支feat/engine-host-t5从此merge创建；唯一主CHG [0006 r1](../changes/CHG-2026-0006.md)，第2/4/9/10节分别说明用户目标、文件理由、实施和演示。当前只准备提案，未改生产/测试或Office，原8765演示无需重填.env。新方案批准后才按六包开发；重点先处理菜单操作级超时、唯一UI领取器、复用六类query、真正删除与墓碑，以及D37命令开放门禁。下一Tx T6还未开始。
