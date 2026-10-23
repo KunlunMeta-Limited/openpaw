@@ -332,6 +332,9 @@ Office fa6ae1f新动作含name/role/sceneActorId，dto::ui_action未知动作返
 
 D55已严格识别合法employee.create，经原唯一领取和作用域检查立即返回固定六角色限制，原HTTPfixture验证无新增Run/Session/审批/文件。源码按真实Zod Unicode码点/ECMAScript trim校验，不按旧假设UTF-16误拒非BMP姓名；原Schema契约13/13。Office仍未改；成员布局真实浏览器及原完整27项待新准确候选重验。Tokio锁只改1.53.3和checksum，cargo update产生的无关Windows依赖边选择变化未纳入，locked构建已验证此最小锁可用。旧失败均保留，暂不登记最终关闭。
 
-## D56：原引擎预算消费前强制扩容导致提前结束（真实复现，待r5批准）
+## D56：原引擎预算消费前强制扩容导致提前结束（r5已批准，专项修复通过）
 
 真实模型`/home/cheng/.cache/t6-real-model-20261024-approved-a/report.json`五子均完成、主Run failed，原JSONL记录18次usage后iteration budget exhausted。AgentLoop默认弹性8/25/1，run_inner将消费绑定expand成功，current_max达到25后拒绝仍未消费的额度，实际17+1次；固定new(2)亦只剩1次grace。旧engine_e1只检查消息数<12而遗漏次数。具体最小原模块修复、文件、费用/取消/回退与准确验证见0007第12.5节r5；当前未批准、核心生产/测试未改，不在Host绕过。此问题阻塞最新真实产品交付，不能标T6完成。
+
+
+2026-10-24 r5准确批准后的修复：仅原agent_loop预算条件改为先try_consume、不足才expand并consume、最后try_grace。原engine_e1保留原小于12条断言并补精确调用/消息/成功工具结果：固定2+1=3、弹性8→25+1=26、从零增长3+1=4、零且无宽限=0、零加宽限=1、固定2无宽限=2；固定2和弹性21次内最终回答成功。修前3项失败日志t6-core-budget-red-20261024-b.log，修后原13项及Host共享24/10限额回归均通过（t6-core-budget-green-20261024.log、t6-host-budget-green-20261024.log）。没有改IterationBudget类型、Host限额/权限或Office；准确提交完整与真实DeepSeek复验未完成，不标最终关闭。
