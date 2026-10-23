@@ -87,6 +87,29 @@ struct ProcessGroup {
 }
 #[cfg(unix)]
 impl ProcessGroup {
+    #[cfg(target_os = "linux")]
+    async fn wait_stopped(&mut self) -> std::io::Result<()> {
+        let group = self.pid;
+        // 本组已收到SIGKILL，此后的守卫只负责验证，绝不再次向可复用数字发信号。
+        self.armed = false;
+        let mut reported = false;
+        loop {
+            match tokio::task::spawn_blocking(move || group_has_running_members(group)).await {
+                Ok(Ok(false)) => return Ok(()),
+                Ok(Ok(true)) => {}
+                _ if !reported => {
+                    // 无法检查时保留调用和工作区锁，不用超时错误提前宣告清理已结束。
+                    eprintln!(
+                        "managed process cleanup: cannot verify group exit; retaining ownership"
+                    );
+                    reported = true;
+                }
+                _ => {}
+            }
+            // 条件轮询是等待内核退出确认，不是靠固定延迟猜测清理已经完成。
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
     fn terminate(&self) -> std::io::Result<()> {
         // SAFETY：正pid来自本函数spawn的独立进程组；负pid仅指向该组。
         if unsafe { libc::kill(-self.pid, libc::SIGKILL) } == 0 {
@@ -160,19 +183,35 @@ pub(crate) async fn run_command(
         .take()
         .ok_or_else(|| SandboxError::ExecutionFailed("missing stderr".into()))?;
     let wait = async {
-        let (status, cancelled) = tokio::select! {
-            biased;
-            _=cancel.cancelled()=> { group.terminate()?; (child.wait().await?,true) },
-            status=child.wait()=>(status?,false),
-        };
-        // leader正常退出也结束其后台后代，防止继承的管道永远不EOF。
-        group.terminate()?;
-        Ok::<_, std::io::Error>((status, cancelled))
+        #[cfg(target_os = "linux")]
+        {
+            // WNOWAIT保留leader身份直到最后一次杀组和退出确认，防止wait先回收后PGID复用。
+            let observed = tokio::select! {biased;_=cancel.cancelled()=>Ok(true),r=wait_exited_unreaped(group.pid)=>r.map(|()|false)};
+            let terminated = group.terminate();
+            // 发信号失败也须等待真正退出，不能借错误路径提前释放调用资源。
+            let verified = group.wait_stopped().await;
+            // 无论验证成功与否都回收本实例拥有的leader；错误不伪装成清理成功。
+            let status = child.wait().await?;
+            verified?;
+            terminated?;
+            let cancelled = observed?;
+            Ok::<_, std::io::Error>((status, cancelled))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let (status, cancelled) = tokio::select! {
+                biased;
+                _=cancel.cancelled()=> { group.terminate()?; (child.wait().await?,true) },
+                status=child.wait()=>(status?,false),
+            };
+            group.terminate()?;
+            Ok::<_, std::io::Error>((status, cancelled))
+        }
     };
     // join而非try_join：一条管道失败也不能drop另一条和正在回收的进程。
     let (status, stdout, stderr) = tokio::join!(wait, drain(stdout), drain(stderr));
     let (status, cancelled) = status?;
-    // 已显式杀组、回收leader并排空两管道；Drop不再向可能复用的组号发信号。
+    // Linux在回收leader前已确认本组后代停止；Drop不再向可能复用的组号发信号。
     group.armed = false;
     let stdout = stdout?;
     let stderr = stderr?;
@@ -194,4 +233,72 @@ pub(crate) async fn run_command(
         exit_code,
         audit,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn group_has_running_members(group: i32) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(s) => s,
+            // proc节点在打开后也可能随进程退出消失；ESRCH和ENOENT均是内核的退出证据。
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        let (_, tail) = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| std::io::Error::other("invalid proc stat"))?;
+        let fields: Vec<_> = tail.split_whitespace().collect();
+        let pgid = fields
+            .get(2)
+            .ok_or_else(|| std::io::Error::other("missing proc pgrp"))?
+            .parse::<i32>()
+            .map_err(std::io::Error::other)?;
+        if pgid == group && !matches!(fields.first(), Some(&"Z" | &"X" | &"x")) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_exited_unreaped(pid: i32) -> std::io::Result<()> {
+    loop {
+        // SAFETY：siginfo完整清零，pid来自本实例未回收的直接子进程；WNOWAIT不抢走tokio的wait所有权。
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY：缓冲区有效；只观察本实例子进程退出，不安装全局信号处理器。
+        let code = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+            )
+        };
+        if code < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        // SAFETY：waitid成功初始化了对应siginfo退出字段，零pid表示尚未退出。
+        if unsafe { info.si_pid() } == pid {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
 }
