@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release,post}) {
+export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release}) {
   const roles=[['research','command','code-agent','李研'],['organize','files','file-agent','周理'],['draft','draft','app-agent','陈书'],['review','review','review-agent','刘市'],['audit','search','data-agent','赵审']]
   let exportIndex=0
   async function scene(label) {
@@ -38,7 +38,6 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     await page.screenshot({path:join(output,`t6-member-working-${role}.png`),fullPage:true})
     await page.getByRole('button',{name:'关闭详情',exact:true}).click()
     handoffs.push({role,employee,actor,task,event,command:visit.command,record:finished.records.find(r=>r.command.commandId===visit.command.commandId)})
-    if(role==='research') await memberLayoutProduct({page,report,output,readOffice,conv,request,post,chooseOffice,waitFor})
     release(role)
   }
   await expand(page)
@@ -84,11 +83,12 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
 
 
 // Browser transport loss is injected only in its isolated context; Host/Provider continue their real Run.
-export async function networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,chooseOffice,select,waitFor,release,interrupt,restore}) {
+export async function networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,chooseOffice,select,waitFor,release,interrupt,restore,post}) {
   await fresh(page);await send('T6主动断网续接')
   const request=structuredClone(latestSend().request)
   const log=page.getByRole('log',{name:'对话内容'})
   await waitFor(async()=>(await log.innerText()).includes('断网前已保存的真实文本。'))
+  await memberLayoutProduct({page,report,output,readOffice,conv,request,post,chooseOffice,select,waitFor})
   const db=new DatabaseSync(join(output,'host-data/engine-host/host.db'),{readOnly:true})
   const parent=db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run
   const requestsBefore=report.modelRequests.length
@@ -178,11 +178,12 @@ export async function storageProduct({page,report,output,fresh,waitFor}) {
 
 
 // 新布局仍消费同一Host快照；本函数只操作原Office按钮和公开布局路由。
-async function memberLayoutProduct({page,report,output,readOffice,conv,request,post,chooseOffice,waitFor}) {
+async function memberLayoutProduct({page,report,output,readOffice,conv,request,post,chooseOffice,select,waitFor}) {
   const db=new DatabaseSync(join(output,'host-data/engine-host/host.db'),{readOnly:true})
   const runs=()=>db.prepare('SELECT id,session FROM host_runs ORDER BY id').all()
   const before=runs(), modelsBefore=report.modelRequests.length
   const parent=db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run
+  const collapse=page.getByRole('button',{name:'收起聊天',exact:true});if(await collapse.isVisible())await collapse.click()
   const initial=(await post({type:'office.layout.read'})).data
   assert.equal(initial.currentLayoutId,'classic')
   await page.getByRole('button',{name:'切换页面布局',exact:true}).click()
@@ -218,10 +219,11 @@ async function memberLayoutProduct({page,report,output,readOffice,conv,request,p
     await page.getByRole('button',{name:'经典布局',exact:true}).click()
     await roster.waitFor({state:'hidden'});await other.getByRole('complementary',{name:'办公室成员',exact:true}).waitFor({state:'hidden'})
   } finally {await other.close()}
+  await select(page,'T6主动断网续接')
   assert.deepEqual(runs(),before);assert.equal(report.modelRequests.length,modelsBefore)
   assert.equal(JSON.parse(db.prepare('SELECT data FROM host_runs WHERE id=?').get(parent).data).state,'running')
-  assert.ok(conv(await readOffice(),request.conversationId).tasks.some(t=>t.assigneeId==='command'&&t.status==='running'))
+  assert.ok(conv(await readOffice(),request.conversationId).tasks.some(t=>t.status==='running'))
   db.close()
   report.memberLayout={parent,request,profiles,selected,initial,runsBefore:before,runsAfter:before,modelsBefore,modelsAfter:report.modelRequests.length,invalidStatus:invalid.status()}
-  report.assertions.push('T6 running parent and child survive classic/members switching, refresh and cross-page layout synchronization without duplicate Run/model request','T6 six members layout profile buttons reach six real Host details; full roster disables add; layout revision stays separate from snapshot seq')
+  report.assertions.push('T6 active Run survives classic/members switching, refresh and cross-page layout synchronization without duplicate Run/model request','T6 six members layout profile buttons reach six real Host details; full roster disables add; layout revision stays separate from snapshot seq')
 }

@@ -769,8 +769,8 @@ try {
   await writeFile(config,(await readFile(config,'utf8'))+'\n[agents]\nenabled = true\n')
   host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-team')
   await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
-  await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,post:request=>officePost(officeBase,request),release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
-  await networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,chooseOffice,select,waitFor,
+  await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
+  await networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,chooseOffice,select,waitFor,post:request=>officePost(officeBase,request),
     release:()=>{assert.ok(networkGate);networkGate()},
     interrupt:async()=>{officeProcess.p.kill('SIGKILL');await officeProcess.close},
     restore:async()=>{
