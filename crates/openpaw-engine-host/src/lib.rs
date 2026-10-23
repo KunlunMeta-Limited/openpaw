@@ -30,3 +30,6 @@ pub use office::OfficeConfig;
 
 #[cfg(feature = "engine-host")]
 mod session_delete;
+
+#[cfg(feature = "engine-host")]
+mod task_progress;

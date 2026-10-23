@@ -11,6 +11,7 @@ mod dto;
 mod projection;
 mod scene;
 mod turns;
+mod workspaces;
 
 use crate::{HostConfig, HostError, HostResult};
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,14 @@ pub struct OfficeConfig {
     /// 稳定性：T4新增，保持冻结Office协议。
     /// 关联：需求/设计REQ-OP-010；DES-OP-007。
     pub names: BTreeMap<String, String>,
+    /// 用途：等待页面创建后才发布的预授权槽。
+    /// 字段：不重复的槽ID列表，缺省为空。
+    /// 来源去向：可信本机TOML到创建分配器。
+    /// 约束：只能引用Host现有槽；名称不是磁盘路径。
+    /// 稳定性：可选字段，旧配置仍立即初始化全部槽。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.10节。
+    #[serde(default)]
+    pub creation_slots: Vec<String>,
 }
 impl OfficeConfig {
     /// 功能：校验Office连接和显式工具授权，不进行网络调用。
@@ -105,6 +114,15 @@ impl OfficeConfig {
         for (id, name) in &self.names {
             if !host.slots.contains_key(id) || name.is_empty() || dto::units(name) > 80 {
                 return Err(HostError::new("invalid_input", "Office名称或槽无效"));
+            }
+        }
+        let mut reserved = std::collections::BTreeSet::new();
+        for slot in &self.creation_slots {
+            if !host.slots.contains_key(slot) || !reserved.insert(slot) {
+                return Err(HostError::new(
+                    "invalid_input",
+                    "创建预留槽必须唯一且已授权",
+                ));
             }
         }
         for id in host.slots.keys() {

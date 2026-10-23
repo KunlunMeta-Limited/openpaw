@@ -574,7 +574,10 @@ impl Host {
                 control.clone(),
                 Duration::from_secs(self.inner.config.approval_timeout_secs),
             ));
+            let session_id=view.session_id.clone();
+            let progress_enabled=self.inner.store.call(move |db| Ok(db.binding(&session_id)?.scope.namespace=="office")).await?;
             let tools = Arc::new(HostTools {
+                progress_enabled,
                 registry: openpaw_tools::ToolRegistry::new(&root.path),
                 allowed: self.inner.config.tools.clone(),
                 root: root.clone(),
@@ -586,8 +589,10 @@ impl Host {
                 .list_tools()
                 .await
                 .map_err(|_| HostError::new("invalid_input", "工具装配失败"))?;
-            let system =
-                run_system_prompt(&root.path, &self.inner.config.tools, chrono::Utc::now());
+            let mut system = run_system_prompt(&root.path, &self.inner.config.tools, chrono::Utc::now());
+            if progress_enabled {
+                system.push_str("\n多步骤任务先调用report_progress声明清晰的业务步骤（例如查询当天资料、保存weather_changsha.md、整理行程答复），再逐步报告。步骤标题使用用户能理解的中文，不含工具名/call ID/内部Run术语。文件步骤标题包含保存和目标路径。真实文件成功写入前不得报告已保存；网络成功仅代表取回正文，还须核对日期、地点和来源，不能把反爬/错误页当实时天气。普通问答无需强行拆步骤。report_progress仅报告元数据，不代替实际联网/写文件。completed需引用本轮成功工具调用ID；无工具的整理答复先报告in_progress，由Host在最终可靠完成后确认。暂时失败可重试，不新建重复步骤，未取得有效资料要如实说明。\n");
+            }
             let provider = Arc::new(RunProvider {
                 inner: self.inner.provider.clone(),
                 context: system.clone(),
@@ -637,15 +642,8 @@ impl Host {
                 RunStatus::Cancelled => RunState::Cancelled,
                 RunStatus::TimedOut => RunState::TimedOut,
             };
-            if outcome.error.is_some() {
-                view.error = Some(HostError::new(
-                    match outcome.status {
-                        RunStatus::Cancelled => "cancelled",
-                        RunStatus::TimedOut => "timeout",
-                        _ => "interrupted",
-                    },
-                    "运行未正常完成；详情见会话事实",
-                ));
+            if let Some(error)=outcome.error.as_ref() {
+                view.error=Some(safe_run_error(&error.to_string(),view.state));
             }
             Ok::<(), HostError>(())
         }
@@ -1150,4 +1148,42 @@ mod runtime_context_tests {
         let after = provider.with_context(request);
         assert_eq!(serde_json::to_value(after).unwrap(), before);
     }
+}
+
+/// 功能：把运行失败分类为可安全公开的固定中文说明。
+/// 参数：raw仅在内存中用于分类，state为真实运行终态。
+/// 返回：稳定错误种类及不含上游正文的说明。
+/// 错误：未知错误收敛到通用失败，不推断为超时。
+/// 状态：不重试、不改运行结果，不丢弃原JSONL诊断。
+/// 并发与取消：纯计算，无等待。
+/// 权限：不向浏览器回显原始错误、路径或密钥。
+/// 关联：需求/设计REQ-OP-012；CHG-2026-0006 D46。
+pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
+    let (kind, message) = if state == RunState::Cancelled {
+        ("cancelled", "已停止，实际操作已清理")
+    } else if raw.contains("invalid OpenAI streamed tool arguments") {
+        (
+            "provider_arguments",
+            "模型返回的工具参数格式无效，本轮未完成；已完成操作不会自动重做",
+        )
+    } else if raw.contains("finish_reason") || raw.contains("stream ended") {
+        ("provider_stream", "模型连接未完整返回，本轮未完成")
+    } else if raw.contains("provider stream idle")
+        || raw.contains("provider connection idle")
+        || raw.contains("compaction summary idle")
+    {
+        ("stream_idle", "模型服务长时间未响应，本轮已结束并完成清理")
+    } else if raw.contains("tool execution budget exceeded") {
+        ("tool_timeout", "操作执行时间超过预算，已等待实际清理")
+    } else if state == RunState::TimedOut {
+        ("run_timeout", "本次任务超过运行预算，已等待实际清理")
+    } else if raw.starts_with("store error:") {
+        ("storage_unavailable", "保存运行记录失败，本轮未确认完成")
+    } else {
+        (
+            "run_failed",
+            "本次任务未完成，请查看对话中的已完成事项后再决定是否重试",
+        )
+    };
+    HostError::new(kind, message)
 }

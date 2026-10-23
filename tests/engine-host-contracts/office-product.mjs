@@ -116,6 +116,26 @@ function provider() {
         assert.ok(results[0].content.includes('WEB-HTTP-MARKER'))
         finish({content:'# 网页读取结果\n\n'+results[0].content});return
       }
+      if (prompt==='帮我查询资料并记录到reports/天气.md') {
+        assert.ok(data.tools.some(t=>t.function.name==='report_progress'));
+        const calls=[
+          ['report_progress',{type:'create',steps:[{id:'lookup',title:'查询当天资料'},{id:'save',title:'保存 reports/天气.md'},{id:'answer',title:'整理答复'}]}],
+          ['report_progress',{type:'update',stepId:'lookup',state:'in_progress'}],
+          ['web_fetch',{url:webBase+'/fresh',fresh:true}],
+          ['report_progress',{type:'update',stepId:'lookup',state:'completed',evidenceCallIds:['progress-2']}],
+          ['report_progress',{type:'update',stepId:'save',state:'in_progress'}],
+          ['write_file',{path:'reports/天气.md',content:'# 确定性资料验收\n\n'+(results.find(r=>r.tool_call_id==='progress-2')?.content??'')}],
+          ['report_progress',{type:'update',stepId:'save',state:'completed',evidenceCallIds:['progress-5']}],
+          ['report_progress',{type:'update',stepId:'answer',state:'in_progress'}],
+        ];
+        if(results.length<calls.length){
+          if(results.length>0&&calls[results.length-1][0]==='report_progress') assert.ok(results.at(-1).content.includes('业务步骤已记录'));
+          const [name,input]=calls[results.length];
+          finish({content:'',tool_calls:[{index:0,id:'progress-'+results.length,type:'function',function:{name,arguments:JSON.stringify(input)}}]},'tool_calls');return;
+        }
+        assert.ok(results.find(r=>r.tool_call_id==='progress-2').content.includes('WEB-HTTP-MARKER'));
+        finish({content:'资料已通过真实HTTP取回，并经确认保存到 reports/天气.md。此为确定性协议验收数据，非实时天气。'});return;
+      }
       if (prompt.startsWith('T5-')) {
         if (!results.length && !prompt.includes('命令')) {
           finish({content:'读取两文件后申请写入。',tool_calls:['README.md','notes.txt'].map((path,i)=>({index:i,id:'t5-read-'+i,type:'function',function:{name:'read_file',arguments:JSON.stringify({path})}}))},'tool_calls');return
@@ -178,7 +198,7 @@ try {
   await writeFile(join(workspace,'managed-parent.cjs'),"require('fs').writeFileSync('managed-parent.pid',String(process.pid));require('child_process').spawn(process.execPath,['managed-child.cjs'],{stdio:'inherit'});setInterval(()=>console.log('parent-tick'),50)")
   await writeFile(join(workspace,'managed-child.cjs'),"const fs=require('fs');fs.writeFileSync('managed-child.pid',String(process.pid));setInterval(()=>console.error('child-tick'),50);setTimeout(()=>fs.writeFileSync('late-side-effect','bad'),8000)")
   const config = join(output, 'host.toml')
-  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash"]\n[roots]\nproject = ${JSON.stringify(workspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
+  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash"]\n[roots]\nproject = ${JSON.stringify(workspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project"\noffice-reserved = "project"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\ncreation_slots = ["office-reserved"]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
   if (!process.env.OPENPAW_HOST_BINARY) await run('cargo', ['build', '--locked', '-p', 'openpaw-cli', '--features', 'engine-host,sidecar'], root, childEnv, 'host-build')
   const binary = process.env.OPENPAW_HOST_BINARY ?? join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', process.platform === 'win32' ? 'openpaw.exe' : 'openpaw')
   let host = start(resolve(binary), ['engine-host', '--config', config, '--port', '0'], root, childEnv, 'host')
@@ -239,7 +259,7 @@ try {
     for (const { item, chunks } of allStreams) {
       item.body = Buffer.concat(chunks).toString('utf8')
       assert.ok(!item.captureError, item.captureError)
-      assert.ok(['office-1','office-2'].includes(item.request.teamId), 'browser journey must use an allowed office')
+      assert.ok(['office-1','office-2','office-reserved'].includes(item.request.teamId), 'browser journey must use an allowed office')
       if(item.http!==200){item.errorEnvelope=JSON.parse(item.body);responseEnvelopeSchema.parse(item.errorEnvelope);assertProtocolValue(item.errorEnvelope);continue}
       item.events = item.body.split('\n').filter(Boolean).map(line => { assert.ok(line.length <= 350000); const event = JSON.parse(line); chatEventSchema.parse(event); assertProtocolValue(event); return event })
     }
@@ -279,11 +299,11 @@ try {
   await log.getByRole('button',{name:'已复制',exact:true}).waitFor()
   report.clipboard=await page.evaluate(()=>navigator.clipboard.readText())
   assert.ok(report.clipboard.startsWith('我先读取这两个文件。\n\n# 文件读取结果'))
-  const state=await waitFor(async()=>{const r=await readOffice();return r.code===200&&conv(r,a)?.tasks.filter(t=>t.id.startsWith('tool:')).length===2?r:false})
+  const state=await waitFor(async()=>{const r=await readOffice();return r.code===200&&conv(r,a)?.tasks[0]?.status==='completed'?r:false})
   const current=conv(state,a)
-  assert.ok(current.tasks.filter(t=>t.title.includes('read_file')).every(t=>t.status==='completed'))
+  assert.equal(current.tasks.length,1,'无业务计划时仅显示真实用户目标'); assert.ok(!current.tasks.some(t=>t.id.startsWith('tool:')||/call_|read_file/.test(t.title)))
   assert.ok(current.events.some(e=>e.kind==='task.assigned'));assert.ok(current.whiteboard.steps.length<=3)
-  report.correlations={conversationA:a,firstTurn:aRequest.turnId,toolTasks:current.tasks.filter(t=>t.id.startsWith('tool:')).map(t=>t.id),runTask:current.tasks[0].id}
+  report.correlations={conversationA:a,firstTurn:aRequest.turnId,businessTasks:current.tasks.map(t=>t.id),runTask:current.tasks[0].id}
   await page.screenshot({path:join(output,'02-real-tools.png'),fullPage:true})
   const downloadPromise=page.waitForEvent('download')
   await page.getByRole('button',{name:'导出快照',exact:true}).click()
@@ -330,7 +350,7 @@ try {
   await page.getByRole('button',{name:'停止生成',exact:true}).click()
   await waitFor(async()=>(await log.innerText()).includes('已停止生成'))
   await waitFor(()=>report.browserRequests.some(r=>r.request.type==='cancel'&&r.request.turnId===active.turnId&&r.json?.data?.stopped===true))
-  await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.summary.includes('用户取消，清理已完成'))})
+  await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.summary.includes('已停止，实际操作已清理'))})
   await page.screenshot({path:join(output,'06-explicit-cancel-confirmed.png'),fullPage:true})
   // Fresh browser storage discovers the exact conversation IDs from the live catalogue.
   const secondContext=await browser.newContext({viewport:{width:1440,height:1050},locale:'zh-CN'})
@@ -442,12 +462,12 @@ try {
   // O11—O15: original Web tool, real browser, actual HTTP and reliable stop.
   await fresh(page);await send('WEB-READ','WEB-HTTP-MARKER')
   const webRequest=structuredClone(latestSend().request)
-  const webState=await waitFor(async()=>{const r=await readOffice();return conv(r,webRequest.conversationId)?.tasks.some(t=>t.title.includes('web_fetch')&&t.status==='completed')?r:false})
+  const webState=await waitFor(async()=>{const r=await readOffice();return conv(r,webRequest.conversationId)?.tasks[0]?.status==='completed'?r:false})
   const webConversation=conv(webState,webRequest.conversationId)
   assert.ok(webConversation.whiteboard.steps.length>0)
   // T5 maps real Web calls to the existing search role; actor handoff stays in Office.
-  const webTask=webConversation.tasks.find(t=>t.title.includes('web_fetch')&&t.status==='completed')
-  assert.equal(webTask.assigneeId,'search')
+  assert.ok(webConversation.events.some(e=>e.kind==='task.assigned'&&e.employeeId==='search'))
+  assert.ok(!webConversation.tasks.some(t=>t.title.includes('web_fetch')))
   assert.ok(webConversation.employees.some(e=>e.id==='search'&&e.sceneActorId==='data-agent'))
   assert.ok((await log.innerText()).includes('source_url:'));assert.ok((await log.innerText()).includes('retrieved_at_unix_ms:'))
   await page.screenshot({path:join(output,'16-real-web-fetch.png'),fullPage:true})
@@ -467,7 +487,7 @@ try {
   await waitFor(()=>webFixture.active===0&&webFixture.cancelled===1)
   await waitFor(()=>report.browserRequests.some(r=>r.request.type==='cancel'&&r.request.turnId===webSlow.turnId&&r.json?.data?.stopped===true))
   await waitFor(async()=>(await log.innerText()).includes('已停止生成'))
-  const afterWebStop=await waitFor(async()=>{const r=await readOffice();return conv(r,webSlow.conversationId)?.tasks.some(t=>t.summary.includes('用户取消，清理已完成'))?r:false})
+  const afterWebStop=await waitFor(async()=>{const r=await readOffice();return conv(r,webSlow.conversationId)?.tasks.some(t=>t.summary.includes('已停止，实际操作已清理'))?r:false})
   report.web={request:webRequest,snapshot:webConversation,slow:webSlow,stopped:conv(afterWebStop,webSlow.conversationId),fixture:webFixture}
   assert.equal(webFixture.requests.length,2)
   await page.screenshot({path:join(output,'18-web-cancelled-clean.png'),fullPage:true})
@@ -600,6 +620,43 @@ try {
   assert.equal(report.modelRequests.length,modelCountAfterDelete,'旧请求不能复活会话或调用模型');
   await page.screenshot({path:join(output,'27-t5-deleted-conversation-artifact-preserved.png'),fullPage:true});
   report.assertions.push('T5: real browser reject leaves no artifact; confirm executes exact original write_file once','T5: blocked approval snapshot and six original read-only detail categories; generated file matches actual disk hash','T5: actual bash working/assignment, explicit stop prevents delayed descendant side effect','T5: official conversation.delete removes snapshot/history and keeps workspace artifact');
+  // r2业务目标：同一原引擎计划、HTTP、人工审批和真实磁盘推动进度。
+  await fresh(page);await send('帮我查询资料并记录到reports/天气.md');
+  const progressRequest=structuredClone(latestSend().request);
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();
+  const progressPending=await waitFor(async()=>{const r=await readOffice();const c=conv(r,progressRequest.conversationId);return c?.tasks.length===4&&c.tasks[0].status==='blocked'?c:false});
+  assert.equal(progressPending.tasks[0].progress,25);
+  assert.equal(progressPending.tasks[1].status,'completed');
+  assert.ok(!progressPending.tasks.some(t=>/call_|web_fetch|write_file|report_progress/.test(t.title)));
+  assert.equal(await access(join(workspace,'reports/天气.md')).then(()=>true,()=>false),false);
+  await page.screenshot({path:join(output,'30-business-plan-awaiting-save.png'),fullPage:true});
+  await page.getByRole('button',{name:'允许本次',exact:true}).click();await expand(page);
+  await waitFor(async()=>(await log.innerText()).includes('资料已通过真实HTTP取回'),45000);
+  const progressComplete=await waitFor(async()=>{const c=conv(await readOffice(),progressRequest.conversationId);return c?.tasks[0]?.progress===100?c:false});
+  assert.ok(progressComplete.tasks.every(t=>t.status==='completed'));
+  assert.ok(progressComplete.whiteboard.description.includes('3/3'));
+  assert.equal(progressComplete.whiteboard.note,'');assert.equal(progressComplete.whiteboard.tagline,'');
+  const recorded=await readFile(join(workspace,'reports/天气.md'),'utf8');assert.ok(recorded.includes('WEB-HTTP-MARKER'));
+  await page.screenshot({path:join(output,'31-business-plan-completed.png'),fullPage:true});
+  report.t5.progress={request:progressRequest,pending:progressPending,completed:progressComplete,file:{path:'reports/天气.md',sha256:createHash('sha256').update(recorded).digest('hex')}};
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,'帮我查询资料并记录到reports/天气.md');
+  const restored=conv(await readOffice(),progressRequest.conversationId);assert.deepEqual(restored.tasks,progressComplete.tasks);
+  assert.deepEqual(restored.events,progressComplete.events,'刷新不改变实际开始时的步骤关联');
+  // r3官方新建入口：真实空作用域action经过唯一poller和原Store。
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  await page.getByRole('button',{name:/^团队空间，当前团队/}).click();
+  await page.getByRole('button',{name:'新建办公室',exact:true}).first().click();
+  await page.getByRole('textbox',{name:'办公室名称',exact:true}).fill('新建验收办公室');
+  await page.getByRole('button',{name:'创建办公室',exact:true}).click();
+  await page.getByRole('dialog').waitFor({state:'hidden',timeout:30000});
+  await waitFor(async()=>{const r=await officePost(officeBase,{type:'office.read'});return r.data.offices.some(o=>o.id==='office-reserved'&&o.name==='新建验收办公室')});
+  await fresh(page);await send('新办公室协议问答','网页协议对话正常');
+  const createdRequest=structuredClone(latestSend().request);assert.equal(createdRequest.teamId,'office-reserved');
+  report.t5.creation={request:createdRequest,snapshot:(await officePost(officeBase,{type:'office.read',teamId:'office-reserved'})).data.snapshot};
+  await page.screenshot({path:join(output,'32-real-browser-created-office-chat.png'),fullPage:true});
+  await switchOffice(page,'真实运行验收');
+  report.assertions.push('r2: browser goal + three business steps; 25% before approval, 100% only after exact real file write and reliable answer; stable refresh/events','r3: official office.create creates configured real workspace slot and conversation through untouched latest Office UI');
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'
@@ -619,7 +676,7 @@ try {
   host.p.kill('SIGKILL');await host.close
   host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-restarted')
   await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
-  await waitFor(async()=>{const r=await readOffice();return conv(r,crashId)?.tasks.some(t=>t.summary.includes('Host重启中断'))},45000)
+  await waitFor(async()=>{const r=await readOffice();return conv(r,crashId)?.tasks.some(t=>t.summary.includes('处理被中断'))},45000)
   const crashHistory=await control({version:'1.0',type:'history',teamId:'office-1',conversationId:crashId});chatHistoryPageSchema.parse(crashHistory);assert.equal(crashHistory.turns[0].state,'error');assert.equal(crashHistory.turns[0].id,crashTurn)
   assert.equal(report.modelRequests.length,requestsBeforeCrash);await crashRequest
   const recovered=await readOffice()
@@ -640,7 +697,7 @@ try {
   report.sessions = await readdir(sessionDir)
   for (const file of report.sessions) {
     const ledger = (await readFile(join(sessionDir, file), 'utf8')).trim().split('\n').map(JSON.parse)
-    if (!ledger.some(e=>JSON.stringify(e).includes('T5-'))) assert.ok(ledger.filter(e => e.type === 'tool_call_complete').length <= 2, 'no tool replay after restart')
+    if (!ledger.some(e=>JSON.stringify(e).includes('T5-'))) assert.ok(ledger.filter(e => e.type === 'tool_call_complete' && e.tool_name !== 'report_progress').length <= 2, 'no tool replay after restart')
     let activeRun='';const calls=new Set();for(const e of ledger){if(e.type==='run_started')activeRun=e.run_id;if(e.type==='tool_call_complete'){const key=activeRun+':'+e.call_id;assert.ok(!calls.has(key),'same Run/call executed twice');calls.add(key)}}
     report.assertions.push('Session ' + file + ': ' + ledger.filter(e => e.type === 'run_finished').map(e => e.status).join(','))
   }

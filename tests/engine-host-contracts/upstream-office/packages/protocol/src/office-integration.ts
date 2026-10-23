@@ -7,6 +7,7 @@ import { officeChatConfigSchema } from './chat.ts'
 export const officeIntegrationPaths = { reply: '/api/pawoffice/reply', ui: '/api/pawoffice/ui' } as const
 // Internal SSE subscription topic for the complete office workspace.
 export const officeWorkspaceTopic = '@pawoffice/workspace'
+export const maxDecisionCustomText = 1000
 const text = z.string().min(1).max(160)
 const employeeSchema = dashboardSnapshotSchema.shape.employees.element
 const taskSchema = dashboardSnapshotSchema.shape.tasks.element
@@ -62,13 +63,15 @@ export const officeWorkspaceResultSchema = z.strictObject({
 })
 export const officeReadResultSchema = z.strictObject({ snapshot: officeSnapshotSchema, scene: officeSceneSchema, pendingDecisions: z.array(idSchema) })
 export const officeSnapshotResultSchema = z.strictObject({ teamId: idSchema, seq: seqSchema, status: z.enum(['applied', 'cached', 'ignored']), reasonCode: z.enum(['STALE_SEQ', 'DUPLICATE_SEQ']).optional() })
-export const officeDecisionResultSchema = z.strictObject({ teamId: idSchema, conversationId: idSchema, decisionId: idSchema, choiceId: idSchema, label: text })
+export const officeDecisionResultSchema = z.strictObject({ teamId: idSchema, conversationId: idSchema, decisionId: idSchema, choiceId: idSchema, label: text,
+  customText: z.string().trim().min(1).max(maxDecisionCustomText).optional() })
 export const officeCapabilitiesResultSchema = z.strictObject({ scene: officeSceneSchema, ui: uiManifestSchema, requests: jsonSchema, responses: z.strictObject({ success: jsonSchema, error: jsonSchema }) })
 export const officeSupportedMessages = ['offices.initialize', 'office.snapshot', 'office.read', 'office.capabilities', 'decision.request', 'ui.next', 'ui.respond'] as const
 export { officeUiManifest }
 
 const uiBase = { id: idSchema, teamId: idSchema, conversationId: idSchema }
 export const officeUiActionSchema = z.discriminatedUnion('action', [
+  z.strictObject({ id: idSchema, teamId: z.literal(''), conversationId: z.literal(''), action: z.literal('office.create'), name: z.string().trim().min(1).max(40) }),
   z.strictObject({ ...uiBase, action: z.literal('conversation.delete') }),
   z.strictObject({ ...uiBase, action: z.literal('actor.inspect'), actorId: idSchema }),
   z.strictObject({ ...uiBase, action: z.literal('employee.inspect'), employeeId: z.string().min(1).max(100) }),
@@ -82,6 +85,7 @@ export const officeDialogSchema = z.strictObject({ template: z.literal('detail-v
   actions: z.array(z.strictObject({ id: idSchema, label: text })).max(8).default([]),
 })
 export const officeUiPresentationSchema = z.discriminatedUnion('target', [
+  z.strictObject({ target: z.literal('office'), snapshot: officeSnapshotSchema }),
   z.strictObject({ target: z.literal('result'), success: z.boolean(), message: z.string().max(4000).default('') }),
   z.strictObject({ target: z.literal('dialog'), content: officeDialogSchema }),
   z.strictObject({ target: z.literal('whiteboard'), snapshot: officeSnapshotSchema }),
@@ -94,13 +98,15 @@ export function describeOfficeUi() {
     presentationSchema: z.toJSONSchema(officeUiPresentationSchema, { io: 'input' }), whiteboardSchema: z.toJSONSchema(whiteboardTaskBoardSchema, { io: 'input' }) }
 }
 const decisionBase = { id: idSchema, actorId: optionalId, title: text, description: z.string().max(2000).default('') }
+// "custom" is reserved for free-text replies, never a caller-defined option.
 export const officeDecisionSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...decisionBase, kind: z.literal('confirmation'), confirmLabel: text.default('确认'), rejectLabel: text.default('拒绝') }),
-  z.strictObject({ ...decisionBase, kind: z.literal('choice'), options: z.array(z.strictObject({
-    id: idSchema, label: text, description: z.string().max(500).default(''),
+  z.strictObject({ ...decisionBase, kind: z.literal('choice'), allowCustom: z.boolean().default(true), options: z.array(z.strictObject({
+    id: idSchema.regex(/^(?!custom$)/, 'custom 为自定义回答保留，不能用作普通选项 ID'), label: text, description: z.string().max(500).default(''),
   })).min(2).max(8) }),
 ]).superRefine((decision, context) => {
-  if (decision.kind === 'choice' && new Set(decision.options.map(option => option.id)).size !== decision.options.length) {
+  if (decision.kind !== 'choice') return
+  if (new Set(decision.options.map(option => option.id)).size !== decision.options.length) {
     context.addIssue({ code: 'custom', path: ['options'], message: '选项 ID 不得重复' })
   }
 })

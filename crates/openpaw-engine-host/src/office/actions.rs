@@ -2,7 +2,7 @@
 //! 输入输出：原Office动作到共享删除或只读详情。
 //! 依赖：唯一Client、共享Host、原完整快照协调器。
 //! 禁止职责：不模拟任务暂停/改派，不竞争领取，不以丢失响应回滚删除。
-use super::{client::Client, details, projection, OfficeConfig};
+use super::{client::Client, details, projection, workspaces, OfficeConfig};
 use crate::{ClientScope, Host, HostError, HostResult};
 use serde_json::{json, Value};
 use std::{sync::Arc, time::Duration};
@@ -110,7 +110,22 @@ async fn handle(
         t.cancel();
     });
     let _guard = token.clone().drop_guard();
-    let presentation=dispatch(host,client,config,address,action,&token).await.unwrap_or_else(|e|json!({"target":"result","success":false,"message":format!("{}：{}",e.kind,e.message)}));
+    // 新建动作的team/conversation按官方协议为空，不进入普通会话作用域分派。
+    // 槽发布门必须跨ui.respond持有，否则同步线程会提前注册办公室导致官方409。
+    let mut creation_guard = None;
+    let dispatched = if action["action"] == "office.create" {
+        workspaces::create(host, client, config, action, &token)
+            .await
+            .map(|(presentation, guard)| {
+                creation_guard = Some(guard);
+                presentation
+            })
+    } else {
+        dispatch(host, client, config, address, action, &token).await
+    };
+    let presentation = dispatched.unwrap_or_else(
+        |e| json!({"target":"result","success":false,"message":format!("{}：{}",e.kind,e.message)}),
+    );
     let reply = if token.is_cancelled() {
         Err(HostError::new(
             "ui_expired",
@@ -119,6 +134,7 @@ async fn handle(
     } else {
         tokio::select! {_=token.cancelled()=>Err(HostError::new("ui_expired","操作未确认送达")),r=client.post(json!({"type":"ui.respond","interactionId":action["id"],"presentation":presentation}))=>r.map(|_|())}
     };
+    drop(creation_guard);
     timer.abort();
     let _ = timer.await;
     let (id, s) = (

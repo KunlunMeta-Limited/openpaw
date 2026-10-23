@@ -174,6 +174,7 @@ async fn sync_scenario() {
         api_key_env: "PAWOFFICE_TEST_KEY".into(),
         allowed_origins: vec!["http://127.0.0.1:8765".into()],
         names: Default::default(),
+        creation_slots: vec![],
     });
     let host = Host::start(cfg.clone()).await.unwrap();
     let server = HostServer::bind(host, 0).await.unwrap();

@@ -368,6 +368,15 @@ pub(super) fn ui_action(value: &Value) -> bool {
     let Some(o) = value.as_object() else {
         return false;
     };
+    if value["action"] == "office.create" {
+        return o.len() == 5
+            && value["id"].as_str().is_some_and(scene_id)
+            && value["teamId"] == ""
+            && value["conversationId"] == ""
+            && value["name"]
+                .as_str()
+                .is_some_and(|s| s == s.trim() && !s.is_empty() && units(s) <= 40);
+    }
     if !["id", "teamId", "conversationId"]
         .iter()
         .all(|k| o.get(*k).and_then(Value::as_str).is_some_and(scene_id))

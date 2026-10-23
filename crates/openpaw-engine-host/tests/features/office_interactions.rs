@@ -100,6 +100,7 @@ struct Fixture {
     decisions: Vec<serde_json::Value>,
     confirm: bool,
     wrong_scope: bool,
+    custom_text: bool,
     expire_delete_reply: bool,
 }
 async fn interaction_scenario() {
@@ -160,10 +161,15 @@ async fn interaction_scenario() {
             "decision.request" => {
                 let confirm = s.confirm;
                 let wrong_scope = s.wrong_scope;
+                let custom_text = s.custom_text;
                 s.decisions.push(r.clone());
                 drop(s);
                 tokio::time::sleep(Duration::from_millis(400)).await;
-                json!({"teamId":if wrong_scope {json!("other-office")}else{r["teamId"].clone()},"conversationId":r["conversationId"],"decisionId":r["decision"]["id"],"choiceId":if confirm{"confirm"}else{"reject"},"label":r["decision"][if confirm{"confirmLabel"}else{"rejectLabel"}]})
+                let mut result = json!({"teamId":if wrong_scope {json!("other-office")}else{r["teamId"].clone()},"conversationId":r["conversationId"],"decisionId":r["decision"]["id"],"choiceId":if confirm{"confirm"}else{"reject"},"label":r["decision"][if confirm{"confirmLabel"}else{"rejectLabel"}]});
+                if custom_text {
+                    result["customText"] = json!("允许永久执行");
+                }
+                result
             }
             _ => panic!("unexpected request {r}"),
         };
@@ -206,6 +212,12 @@ async fn interaction_scenario() {
             text: "request invalid".into(),
         },
         MockMode::Fixed("expired".into()),
+        MockMode::ToolUse {
+            tool_name: "write_file".into(),
+            input: json!({"path":"custom-bypass.txt","content":"must not write"}),
+            text: "request custom injection".into(),
+        },
+        MockMode::Fixed("custom rejected".into()),
     ]));
     let host = Host::with_provider(cfg.clone(), provider).await.unwrap();
     let server = HostServer::bind(host.clone(), 0).await.unwrap();
@@ -347,6 +359,24 @@ async fn interaction_scenario() {
         .await
         .unwrap();
     assert!(!cfg.roots["r"].join("wrong-scope.txt").exists());
+    {
+        let mut s = shared.lock().await;
+        s.wrong_scope = false;
+        s.custom_text = true;
+    }
+    host.submit_run(
+        &scope,
+        &b.session_id,
+        "customText must not authorize confirmation".into(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(8), host.wait_idle())
+        .await
+        .unwrap();
+    assert!(!cfg.roots["r"].join("custom-bypass.txt").exists());
+    shared.lock().await.custom_text = false;
+
     // 一次排队32个真实HTTP点击，超过处理并发16；每个ID只回应一次，不能无界派生任务。
     {
         let mut s = shared.lock().await;
@@ -449,4 +479,222 @@ async fn non_text_and_oversize_file_queries_reject_without_creating_data() {
         );
     }
     host.shutdown().await.unwrap();
+}
+
+#[test]
+fn reserved_creation_slots_must_be_unique_and_pre_authorized() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = config(tmp.path());
+    assert!(cfg.office.as_ref().unwrap().creation_slots.is_empty());
+    for slots in [
+        vec!["other".into()],
+        vec!["office-1".into(), "office-1".into()],
+    ] {
+        cfg.office.as_mut().unwrap().creation_slots = slots;
+        assert!(cfg.validate().is_err());
+    }
+    cfg.office.as_mut().unwrap().creation_slots = vec!["office-1".into()];
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn creation_http_recovers_410_serializes_allocations_and_restores_names() {
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "creation_http_fixture_child", "--nocapture"])
+        .env("OPENPAW_CREATION_HTTP_CHILD", "1")
+        .env("PAWOFFICE_TEST_KEY", "isolated-key")
+        .status()
+        .unwrap();
+    assert!(result.success());
+}
+#[test]
+fn creation_http_fixture_child() {
+    if std::env::var("OPENPAW_CREATION_HTTP_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(creation_http_scenario());
+}
+async fn creation_http_scenario() {
+    use axum::response::IntoResponse;
+    use axum::{extract::State, routing::post, Json, Router};
+    use serde_json::Value;
+    use std::{
+        collections::{BTreeMap, VecDeque},
+        sync::Arc,
+        time::Duration,
+    };
+    use tokio::sync::Mutex;
+    #[derive(Default)]
+    struct Created {
+        snapshots: BTreeMap<String, Value>,
+        actions: VecDeque<Value>,
+        responses: Vec<Value>,
+        premature: bool,
+    }
+    async fn handler(
+        State(shared): State<Arc<Mutex<Created>>>,
+        Json(r): Json<Value>,
+    ) -> axum::response::Response {
+        let mut s = shared.lock().await;
+        let data = match r["type"].as_str().unwrap() {
+            "office.capabilities" => {
+                json!({"scene":{"protocolVersion":"2.0","actors":[{"id":"office-lead"},{"id":"file-agent"},{"id":"data-agent"}],"capabilities":[]},"ui":{"whiteboardSchema":{}},"requests":{},"responses":{"success":{},"error":{}}})
+            }
+            "office.read" | "offices.initialize" => {
+                if let Some(items) = r["offices"].as_array() {
+                    for item in items {
+                        s.snapshots.insert(
+                            item["workspace"]["id"].as_str().unwrap().into(),
+                            item.clone(),
+                        );
+                    }
+                }
+                json!({"offices":s.snapshots.keys().map(|id|json!({"id":id})).collect::<Vec<_>>(),"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}})
+            }
+            "office.snapshot" => {
+                s.snapshots
+                    .insert(r["teamId"].as_str().unwrap().into(), r["snapshot"].clone());
+                json!({"teamId":r["teamId"],"seq":r["snapshot"]["seq"],"status":"applied"})
+            }
+            "ui.next" => {
+                let a = s.actions.pop_front();
+                drop(s);
+                if a.is_none() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                json!({"actions":a.into_iter().collect::<Vec<_>>()})
+            }
+            "ui.respond" => {
+                s.responses.push(r.clone());
+                if r["presentation"]["target"] == "office" {
+                    let snapshot = &r["presentation"]["snapshot"];
+                    let id = snapshot["workspace"]["id"].as_str().unwrap();
+                    if s.snapshots.contains_key(id) {
+                        s.premature = true;
+                    }
+                    if r["interactionId"] == "new-a" {
+                        return (axum::http::StatusCode::GONE,Json(json!({"code":410,"msg":"expired","data":{"reasonCode":"UI_REQUEST_EXPIRED"}}))).into_response();
+                    }
+                    s.snapshots.insert(id.to_owned(), snapshot.clone());
+                }
+                json!({"interactionId":r["interactionId"],"delivered":true})
+            }
+            _ => panic!("unexpected request {r}"),
+        };
+        Json(json!({"code":200,"msg":"fixture","data":data})).into_response()
+    }
+    let shared = Arc::new(Mutex::new(Created::default()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let signal = stop.clone();
+    let app = Router::new()
+        .route("/api/pawoffice/messages", post(handler))
+        .with_state(shared.clone());
+    let serving = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(signal.cancelled_owned())
+            .await
+            .unwrap()
+    });
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = config(tmp.path());
+    cfg.slots.insert("reserved-a".into(), "r".into());
+    cfg.slots.insert("reserved-b".into(), "r".into());
+    cfg.office.as_mut().unwrap().base_url = base;
+    cfg.office.as_mut().unwrap().creation_slots = vec!["reserved-a".into(), "reserved-b".into()];
+    let host = Host::start(cfg.clone()).await.unwrap();
+    let server = HostServer::bind(host, 0).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!shared
+        .lock()
+        .await
+        .snapshots
+        .keys()
+        .any(|s| s.starts_with("reserved")));
+    for (id, name) in [("new-a", "未确认办公室"), ("new-b", "正常办公室")] {
+        shared.lock().await.actions.push_back(
+            json!({"id":id,"teamId":"","conversationId":"","action":"office.create","name":name}),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let s = shared.lock().await;
+            if s.responses.len() >= 2 && s.snapshots.len() == 3 {
+                break;
+            }
+            drop(s);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let s = shared.lock().await;
+        assert!(!s.premature, "后台不能先于官方创建呈现初始化该槽");
+        assert_eq!(s.responses[0]["presentation"]["target"], "office");
+        assert_eq!(s.responses[1]["presentation"]["target"], "office");
+        assert_ne!(
+            s.responses[0]["presentation"]["snapshot"]["workspace"]["id"],
+            s.responses[1]["presentation"]["snapshot"]["workspace"]["id"]
+        );
+    }
+    shared.lock().await.actions.push_back(json!({"id":"new-overflow","teamId":"","conversationId":"","action":"office.create","name":"容量满"}));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if shared.lock().await.responses.iter().any(|r| {
+                r["interactionId"] == "new-overflow" && r["presentation"]["success"] == false
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    server.shutdown().await.unwrap();
+    let read_facts = || {
+        let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+        let mut stmt = db
+            .prepare("SELECT reference FROM host_events WHERE kind='office_created'")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| serde_json::from_str::<Value>(&r.unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let facts = read_facts();
+    assert_eq!(facts.len(), 2);
+    for fact in &facts {
+        assert!(cfg
+            .home
+            .join("sessions")
+            .join(format!("{}.jsonl", fact["session_id"].as_str().unwrap()))
+            .exists());
+    }
+    shared.lock().await.snapshots.clear();
+    let host = Host::start(cfg.clone()).await.unwrap();
+    let server = HostServer::bind(host, 0).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if shared.lock().await.snapshots.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for fact in &facts {
+        assert_eq!(
+            shared.lock().await.snapshots[fact["slot_id"].as_str().unwrap()]["workspace"]["name"],
+            fact["name"]
+        );
+    }
+    assert_eq!(read_facts(), facts, "重启不能重复分配或重放创建");
+    server.shutdown().await.unwrap();
+    stop.cancel();
+    serving.await.unwrap();
 }

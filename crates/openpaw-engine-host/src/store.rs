@@ -139,6 +139,73 @@ impl Store {
     }
 }
 impl Db {
+    /// 功能：读取当前Run最后一份业务步骤派生事实。
+    /// 参数：run为可信运行标识。
+    /// 返回：已有计划或无计划。
+    /// 错误：SQL或已存JSON损坏明确上报。
+    /// 状态：只读，不为旧Run补造计划。
+    /// 并发与取消：由原单写Store串行调用，无资源锁。
+    /// 权限：校验Run和Session删除门禁。
+    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    pub(crate) fn progress(&self, run: &str) -> HostResult<Option<serde_json::Value>> {
+        let view = self.get_run(run)?;
+        self.binding(&view.session_id)?;
+        let raw:Option<String>=self.conn.query_row("SELECT reference FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[run],|r|r.get(0)).optional().map_err(HostError::storage)?;
+        raw.map(|v| serde_json::from_str(&v).map_err(HostError::storage))
+            .transpose()
+    }
+
+    /// 功能：将步骤报告与原Run及真实调用绑定，持久化后通知投影。
+    /// 参数：binding为引擎可信最终调用绑定，value为报告输入。
+    /// 返回：已提交或重复内容无需追加时为空。
+    /// 错误：范围、取消、假完成、容量或存储失败明确拒绝。
+    /// 状态：每Run最多256次有效报告，原host_events保留固定分母和证据。
+    /// 并发与取消：状态检查和追加处于原Store单写命令，不等待审批或工作区锁。
+    /// 权限：仅Office绑定的同Run report_progress，不批准其他工具。
+    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    pub(crate) fn report_progress(
+        &mut self,
+        binding: &openpaw_core::ToolCallBinding,
+        value: &serde_json::Value,
+    ) -> HostResult<()> {
+        let run = self.get_run(&binding.run_id)?;
+        if self.binding(&run.session_id)?.scope.namespace != "office"
+            || binding.tool_name != "report_progress"
+            || binding.input != *value
+        {
+            return Err(HostError::new(
+                "scope_denied",
+                "步骤报告不属于当前Office运行",
+            ));
+        }
+        let previous = self.progress(&run.run_id)?;
+        let mut stmt=self.conn.prepare("SELECT reference FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([&run.run_id], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let mut started = Vec::new();
+        for row in rows {
+            started.push(
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?,
+            );
+        }
+        let next = crate::task_progress::update(previous.clone(), value, &run, &started)?;
+        if previous.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        let count:u64=self.conn.query_row("SELECT COUNT(*) FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1",[&run.run_id],|r|r.get(0)).map_err(HostError::storage)?;
+        if count >= 256 {
+            return Err(HostError::new(
+                "capacity_exceeded",
+                "本轮步骤报告已达256次上限",
+            ));
+        }
+        let revision = self.bump("run_progress", &next.to_string())?;
+        let _ = self.notices.send(HostNotice::Changed { revision });
+        Ok(())
+    }
+
     fn open(
         home: PathBuf,
         roots: BTreeMap<String, PathBuf>,
@@ -398,6 +465,21 @@ impl Db {
                 } if active => {
                     if let Some(t) = tools.get_mut(&call_id) {
                         t.state = if success { "completed" } else { "failed" }.into();
+                    }
+                }
+                SessionEvent::RunFinished {
+                    run_id,
+                    error: Some(error),
+                    ..
+                } if run_id == id => {
+                    // 历史通用错误可从账本细分；原宿主已锁存的存储等确定分类不能被通用错误覆盖。
+                    if run.error.as_ref().is_none_or(|e| {
+                        matches!(
+                            e.kind.as_str(),
+                            "interrupted" | "run_failed" | "timeout" | "cancelled"
+                        )
+                    }) {
+                        run.error = Some(crate::service::safe_run_error(&error, run.state));
                     }
                 }
                 _ => {}
@@ -1278,6 +1360,105 @@ impl Db {
         }
         drop(live);
         let revision = self.bump("deleted", session)?;
+        self.publish(revision);
+        Ok(())
+    }
+    /// 功能：按实际开始时最近的业务计划关联调用与步骤，避免历史动画随进度移动。
+    /// 参数：run为当前运行ID。
+    /// 返回：调用ID到原计划步骤下标的映射；没有计划的调用由投影归主目标。
+    /// 错误：SQL或已存计划/执行绑定损坏。
+    /// 状态：只读重建，不新增另一套调用或动画账本。
+    /// 并发与取消：在原Store序列内按revision读取，无网络或资源锁。
+    /// 权限：只使用同Run的已存计划和实际tool_started事实。
+    /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
+    pub(crate) fn office_task_assignments(
+        &self,
+        run: &str,
+    ) -> HostResult<std::collections::BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('run_progress','tool_started') AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([run], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(HostError::storage)?;
+        let mut current = None;
+        let mut assignments = std::collections::BTreeMap::new();
+        for row in rows {
+            let (kind, raw) = row.map_err(HostError::storage)?;
+            let v: serde_json::Value = serde_json::from_str(&raw).map_err(HostError::storage)?;
+            if kind == "run_progress" {
+                current = v["steps"]
+                    .as_array()
+                    .and_then(|steps| steps.iter().position(|s| s["state"] == "in_progress"));
+            } else if let (Some(index), Some(call)) = (current, v["call_id"].as_str()) {
+                assignments.insert(call.to_owned(), index);
+            }
+        }
+        Ok(assignments)
+    }
+    /// 功能：读取永久办公室分配事实，不使用有期限的UI导航记录。
+    /// 参数：无。
+    /// 返回：原host_events中按提交顺序保存的创建归属。
+    /// 错误：SQL或JSON损坏，不能当成尚无办公室。
+    /// 状态：只读；删除会话不删除办公室归属。
+    /// 并发与取消：复用唯一Store线程，不持文件锁。
+    /// 权限：仅返回控制标识与显示名称，无密钥或消息正文。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.10节。
+    pub(crate) fn office_creations(&self) -> HostResult<Vec<serde_json::Value>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT reference FROM host_events WHERE kind='office_created' ORDER BY revision",
+            )
+            .map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        rows.map(|r| {
+            serde_json::from_str(&r.map_err(HostError::storage)?).map_err(HostError::storage)
+        })
+        .collect()
+    }
+    /// 功能：在真实Session创建后可靠登记一次办公室分配。
+    /// 参数：action/slot/name/session为已审核创建动作及固定绑定。
+    /// 返回：首次提交成功；同动作同内容重试保持不变。
+    /// 错误：动作或槽冲突、绑定不匹配、SQL失败。
+    /// 状态：沿用host_events和数据版本，不创建第二套业务数据库。
+    /// 并发与取消：Store串行；外层创建门及投影门覆盖分配到UI响应。
+    /// 权限：再次验证Office命名空间和main会话绑定，根仍由Host配置决定。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.10节。
+    pub(crate) fn save_office_creation(
+        &self,
+        action: &str,
+        slot: &str,
+        name: &str,
+        session: &str,
+    ) -> HostResult<()> {
+        let record =
+            serde_json::json!({"action_id":action,"slot_id":slot,"name":name,"session_id":session});
+        for old in self.office_creations()? {
+            if old["action_id"] == action {
+                return if old == record {
+                    Ok(())
+                } else {
+                    Err(HostError::new(
+                        "scope_conflict",
+                        "相同创建动作的内容发生冲突",
+                    ))
+                };
+            }
+            if old["slot_id"] == slot {
+                return Err(HostError::new("scope_conflict", "办公室槽已经分配"));
+            }
+        }
+        let binding = self.binding(session)?;
+        if binding.scope.namespace != "office"
+            || binding.scope.slot_id != slot
+            || binding.scope.conversation_id != "main"
+        {
+            return Err(HostError::new("scope_denied", "办公室创建缺少真实固定会话"));
+        }
+        let revision = self.bump("office_created", &record.to_string())?;
         self.publish(revision);
         Ok(())
     }

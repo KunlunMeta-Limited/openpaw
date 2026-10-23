@@ -21,6 +21,13 @@ use std::sync::Arc;
 /// 稳定性：T3新增，协议无关Rust接口。
 /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
 pub(crate) struct HostTools {
+    /// 用途：仅当前Office绑定运行暴露进度元数据工具。
+    /// 字段：bool，非权限凭据。
+    /// 来源去向：可信Session绑定到原工具装配。
+    /// 约束：无Office运行和CLI不注入，不放开真实写工具。
+    /// 稳定性：T5内部字段。
+    /// 关联：需求/设计REQ-OP-012；DES-OP-009。
+    pub(crate) progress_enabled: bool,
     /// 用途：复用原ToolRegistry，执行前后仅包裹宿主责任。
     /// 字段：openpaw_tools::ToolRegistry，宿主类型字段。
     /// 来源去向：共享Host内部与可信Rust适配器。
@@ -103,13 +110,17 @@ fn writing(name: &str) -> bool {
 #[async_trait]
 impl ToolExecutor for HostTools {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
-        Ok(self
+        let mut specs: Vec<_> = self
             .registry
             .list_tools()
             .await?
             .into_iter()
             .filter(|s| self.allowed.contains(&s.name))
-            .collect())
+            .collect();
+        if self.progress_enabled {
+            specs.push(crate::task_progress::spec());
+        }
+        Ok(specs)
     }
     async fn call(&self, _: &str, _: serde_json::Value) -> Result<ToolCallOutcome> {
         Err(Error::ToolHost("Host工具必须携带Run上下文".into()))
@@ -128,6 +139,33 @@ impl ToolExecutor for HostTools {
             || context.binding().input != args
         {
             return Err(Error::ToolHost("工具绑定不匹配".into()));
+        }
+        if self.progress_enabled && name == "report_progress" {
+            if context.cancel().is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let binding = context.binding().clone();
+            let cancel = context.cancel();
+            return self
+                .store
+                .call(move |db| {
+                    if cancel.is_cancelled() {
+                        return Err(HostError::new("cancelled", "本轮正在停止"));
+                    }
+                    db.report_progress(&binding, &args)
+                })
+                .await
+                .map(|_| {
+                    ToolCallOutcome::ok("业务步骤已记录；真实操作和文件仍须通过原工具及审批执行")
+                })
+                .map_err(|e| {
+                    if e.kind == "storage_unavailable" {
+                        self.control.fail(e.clone());
+                        Error::Store("业务进度无法可靠保存".into())
+                    } else {
+                        Error::ToolHost(e.to_string())
+                    }
+                });
         }
         let write = writing(name);
         if write {
@@ -194,6 +232,9 @@ impl ToolHostValidator for HostTools {
         name: &str,
         input: &serde_json::Value,
     ) -> std::result::Result<(), String> {
+        if self.progress_enabled && name == "report_progress" {
+            return crate::task_progress::validate(input).map_err(|e| e.message);
+        }
         if !self.allowed.iter().any(|s| s == name) {
             return Err("工具未在Host授权清单".into());
         }

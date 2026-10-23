@@ -1,21 +1,52 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-状态：T0—T4本轮批准范围已合入；T4 PR #10于2026-10-23 09:43:00合入37f0a35，准确e7ce707 Linux完整27/27及真实Office产品通过，用户已验收。T5的CHG-2026-0006 r1已实施至ff7f161，用户产品复检后r2-product待审，尚未交付；T6—T8未开始。Windows原生按用户决定暂缓，不计通过；D36、天气解释质量与全部Office Rx待审边界保留；D37已修并经Linux回归验证，仍待本Tx交付/PR审核。修订日期：2026-10-23。
+状态：T0—T4本轮批准范围已合入；T4 PR #10于2026-10-23 09:43:00合入37f0a35，准确e7ce707 Linux完整27/27及真实Office产品通过，用户已验收。T5的CHG-2026-0006 r1已实施至ff7f161，用户产品复检后r2/r3已批准实施，尚未交付；T6—T8未开始。Windows原生按用户决定暂缓，不计通过；D36、天气解释质量与全部Office Rx待审边界保留；D37已修并经Linux回归验证，仍待本Tx交付/PR审核。修订日期：2026-10-23。
 
 本文件同时服务人工评审和 coding agent：先明确真实协议、用户行为与系统边界，再定义实现方法、产物、测试和 PR 交接。下文方案要求的实际完成状态以第14.1节及各主CHG最新履历为准；不能将设计、fixture 通过或 feature 连线描述为功能已交付。用户提供的 master-plan 仅作为参考材料。
 
 ### 当前产品复检与实际开发入口（2026-10-23）
 
-T5原r1准确ff7f161已完成Linux原27项及真实产品验证，但用户发现逐call任务/失败卡片、缺少业务进度及白板技术说明；**M5仍未完成、T5 PR未创建**。修订仍使用[CHG-2026-0006 r2第9.9节](../changes/CHG-2026-0006.md#t5-r2-product)，逐文件方案和验收P01—P08在该单，不新建Tx。r2新增运行内进度入口/事实和产品投影须先审；未实施不能沿用r1绿灯写通过。默认白板锚点单独[R11](office-change-requests.md#r11-empty-link)，仍未批准，不改Office。
+T5原r1准确ff7f161的Linux完整27项与产品报告保留，不能替代新版。用户已批准[0006 r2第9.9节及r3第9.10节](../changes/CHG-2026-0006.md#t5-r2-product)，目前实施目标/真实进度和d150b96创建协议适配。**M5仍未完成，T5 PR未创建，尚未交付验收。**小写r3是OpenPaw方案修订，大写Rx是[Office修改申请](office-change-requests.md)；R6由上游覆盖撤回，R11默认白板链接仍暂缓，不改Office。
 
 | 入口 | 实际版本/用途 | 当前限制 |
 |---|---|---|
-| `openpaw/` | 原主目录，仍在fix/engine-host-t2、a220c61，三份原有未提交文档保留 | 不能用此目录判断T3—T5当前文档；不同worktree不自动同步 |
-| `artifacts/openpaw-t5-worktree/` | 当前feat/engine-host-t5，主CHG0006及验证记录 | 当前准确r1为ff7f161；r2提案待审，未交付/PR |
-| http://127.0.0.1:8765/office/ | 原用户入口，仍是T4 r8只读/网络Host | 无写文件/UI消费，不能用它验收T5；升级方案见0006第9.9.5节 |
-| http://127.0.0.1:8766/office/ | T5隔离入口，选择“T5 产品演示” | 不能当作已经升级8765；不改原天气会话 |
+| `openpaw/` | 唯一开发目录，feat/engine-host-t5；最新CHG/代码均在此 | 原0003/m2/m5三份用户排版改动保留、独立未提交 |
+| 原artifacts内T3/T4/T5工作树 | 已核清洁并移除；分支与Git提交仍保留 | 不再作为开发入口；恢复方式见清理清单 |
+| http://127.0.0.1:8765/office/ | 用户正式演示入口，待新版准确候选备份升级 | 升级前仍是原T4，不得冒充已修体验；升级结果写本Tx验证记录 |
+| http://127.0.0.1:8766/office/ | 历史T5隔离演示 | 历史证据保留，不能替代8765现场验收 |
 
-CHG编号与Tx不同：0004=T3，0005=T4，0006=T5。PR合入不会自动切换原主目录分支；更新前须先处理用户原有修改，不复制最新docs覆盖T2。修复验收继续要求真实浏览器、原模型/工具/文件/进程证据；用户对产品提出的新要求不能只用技术测试通过替代。
+CHG编号0004=T3、0005=T4、0006=T5。旧工作区已在备份及保留用户改动后同步；备份在`.git/agent-local-backups/20261023-primary-sync`。功能、清理及实际服务验证证据统一见[0006验证记录](../verification/CHG-2026-0006/验证记录.md)，未运行不得记通过。
+
+### d150b96现行协议增量及人可读流程
+
+本节覆盖下文历史02dbac4的差异；历史测试报告不改基线。新版仍使用七操作messages与同源四操作chat，新增的是`ui.next`中的`office.create`动作及`ui.respond presentation.target=office`，不是增加自定义HTTP网关。
+
+~~~mermaid
+sequenceDiagram
+    participant U as 用户与Office页面
+    participant F as Office官方服务
+    participant H as OpenPaw Host
+    participant S as 原Session与Store
+    U->>F: 新建办公室（显示名称）
+    F-->>H: 唯一ui.next：office.create，team/conversation为空
+    H->>H: 分配门→预授权槽→该槽投影门
+    H->>S: 原open_session/main + office_created持久幂等
+    S-->>H: 固定根、真实Session与唯一归属
+    H->>F: ui.respond：target=office +完整官方快照
+    F-->>U: 新办公室目录与页面
+    H->>H: 释放投影门；后续原完整同步
+    U->>F: 对话与多步骤目标
+    F->>H: 原chat send/history/resume/cancel
+    H->>S: 原引擎/工具/审批 + 有界计划与执行证据
+    H->>F: snapshot：业务目标、步骤、事实计数、真实分配事件
+    F-->>U: 聊天、任务流、白板与人物工作状态
+~~~
+
+`creation_slots`默认空，旧配置所有槽仍立即初始化；显式预留槽在创建前不发布、不能凭猜ID发送聊天。空闲名额只能引用配置已授权真实根，名称不做路径；耗尽明确失败。同动作同内容返回同归属，异内容冲突；业务接受但UI410不回滚，普通同步和重启恢复唯一结果。实施/验收定位0006第9.10/10.5节和`office/workspaces.rs`，不把这些设计描述当作已通过。
+
+任务流使用主目标及最多12个业务步骤，原call仅在账本/工具详情可查。元数据工具不执行项目工作，确认完成需本轮实际成功证据；写文件需精确获批且产物路径一致。白板显示目标、实际完成N/M与≤3个当前步骤；前端running条会视觉增长，Host快照与文字计数才是事实，不伪造blocked抑制动画。R11未批准前默认链接保留。
+
+新版send/resume没有180秒总接收时限；history/cancel控制请求仍15秒。Host流空闲、工具、Run总预算独立生效，刷新/网络断开detach，显式停止才cancel。T6继续验证真实>180秒与故障恢复，无感自动续接仍不是本期已交付承诺。choice新增allowCustom/customText按原Schema冻结，危险工具仍用confirmation且拒绝customText，不接入新澄清或永久授权。
 
 ## 0. 授权、平台与阶段规则
 
@@ -41,7 +72,7 @@ CHG编号与Tx不同：0004=T3，0005=T4，0006=T5。PR合入不会自动切换�
 |---|---|---|
 | OpenPaw 初始审核 | 60a531a51172d14fc3db1a8e7eb6762c2c8369d8 | 引擎、Provider、工具、存储可复用；Host 当时只有占位说明 |
 | OpenPaw 当前集成基线 | 37f0a35729fb64639f0e1a8b8a8a4799e1dca9d3 | T0—T4已合入（T4 #10）；T5独立分支复用此基线，Windows暂缓；当前状态见14.1 |
-| Office | 02dbac4419e325efda9fa6293060037bd60da5e5 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
+| Office | d150b96ff0fff59ece869da7e3dc6067c1b066e3 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
 | OpenCode SDK | @opencode-ai/sdk 1.18.15 | 精确版本、integrity、lockfile 和真实 v1 类型 |
 | 集成分支 | merge/ai-ofice-react-overagent | OpenPaw Tx PR 的目标分支，保留现有 ofice 拼写 |
 
@@ -49,17 +80,17 @@ CHG编号与Tx不同：0004=T3，0005=T4，0006=T5。PR合入不会自动切换�
 
 | 来源编号 | 固定版本资料                                                                                                                                                                              | 本项目必须落实的内容                                 |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| S0   | [README](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/README.md)                                                 | 外部业务后端身份、服务模式、完整阅读链                        |
-| S1   | [office-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/office-integration.md)                 | 七类业务操作、完整流程、快照版本、审批、UI、错误与恢复               |
-| S2   | [dashboard-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/dashboard-integration.md)           | 成员、任务、事件、人物绑定、进度、白板与展示边界                   |
-| S3   | [message-relay.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/message-relay.md)                           | 部署、认证、浏览器 SSE、容量、服务重启和访问控制                 |
-| S4   | [chat-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/integration/docs/chat-integration.md)                     | 聊天请求/NDJSON、长度、历史、停止、180 秒限制、IndexedDB     |
-| S5   | [office-integration.ts](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/packages/protocol/src/office-integration.ts) 及关联 Schema | 精确字段、默认值、strictObject、枚举、引用、响应类型           |
-| S6   | [plugin-runtime.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/02dbac4419e325efda9fa6293060037bd60da5e5/docs/plugin-runtime.md)                                     | 场景 v2、能力、参与者、命令 ID、活动与队列                   |
+| S0   | [README](https://github.com/KunlunMeta-Limited/ai-office-react/blob/d150b96ff0fff59ece869da7e3dc6067c1b066e3/integration/README.md)                                                 | 外部业务后端身份、服务模式、完整阅读链                        |
+| S1   | [office-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/d150b96ff0fff59ece869da7e3dc6067c1b066e3/integration/docs/office-integration.md)                 | 七类业务操作、完整流程、快照版本、审批、UI、错误与恢复               |
+| S2   | [dashboard-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/d150b96ff0fff59ece869da7e3dc6067c1b066e3/integration/docs/dashboard-integration.md)           | 成员、任务、事件、人物绑定、进度、白板与展示边界                   |
+| S3   | [message-relay.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/d150b96ff0fff59ece869da7e3dc6067c1b066e3/integration/docs/message-relay.md)                           | 部署、认证、浏览器 SSE、容量、服务重启和访问控制                 |
+| S4   | [chat-integration.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/d150b96ff0fff59ece869da7e3dc6067c1b066e3/integration/docs/chat-integration.md)                     | 聊天请求/NDJSON、长度、历史、停止、无总接收时限、IndexedDB     |
+| S5   | [office-integration.ts](https://github.com/KunlunMeta-Limited/ai-office-react/blob/d150b96ff0fff59ece869da7e3dc6067c1b066e3/packages/protocol/src/office-integration.ts) 及关联 Schema | 精确字段、默认值、strictObject、枚举、引用、响应类型           |
+| S6   | [plugin-runtime.md](https://github.com/KunlunMeta-Limited/ai-office-react/blob/d150b96ff0fff59ece869da7e3dc6067c1b066e3/docs/plugin-runtime.md)                                     | 场景 v2、能力、参与者、命令 ID、活动与队列                   |
 | S7   | integration/clients/client.mjs、ui-client.mjs                                                                                                                                        | 外部客户端调用方法；示例数据不作为真实业务实现复制                  |
 | S8   | tests/README.md、tests/integration-e2e/README.md                                                                                                                                     | 真实 HTTP/浏览器验收；现有 Docker 入口不等于 Windows 原生验收 |
 
-[contracts/sources.json](contracts/sources.json) 已固定 21 份来源的哈希和 SDK integrity；不再手工维护第二张哈希表。S5 关联文件包括 schema.ts、dashboard.ts、office-ui.ts、chat.ts、relay.ts、index.ts、map.ts、spatial.ts。服务端核对点是 server/src/app.ts、officeState.ts、officeRequests.ts、officeUi.ts；聊天核对点是 apps/web/src/chat/ChatSession.ts、sources.ts、persistence.ts；场景投影核对 apps/web/src/dashboard/sceneBridge.ts。
+[contracts/sources.json](contracts/sources.json) 已固定 26 份来源的哈希和 SDK integrity；不再手工维护第二张哈希表。S5 关联文件包括 schema.ts、dashboard.ts、office-ui.ts、chat.ts、relay.ts、index.ts、map.ts、spatial.ts。服务端核对点是 server/src/app.ts、officeState.ts、officeRequests.ts、officeUi.ts；聊天核对点是 apps/web/src/chat/ChatSession.ts、sources.ts、persistence.ts；场景投影核对 apps/web/src/dashboard/sceneBridge.ts。
 
 协议字段按冻结 Schema，运行语义同时核对文档、实现和真实测试。若三者不一致，登记证据、最小复现和影响，停止依赖歧义的实现，不凭猜测改 Office。不得把 S7 的固定演示文案当成功能完成。
 
@@ -90,7 +121,7 @@ audit/r1-chat/handoff 已同步为条件提案；达到扩展体验需要修改�
 | 用户实际要做的事 | 页面可见结果及真实依据 | 协议与交付阶段 | 首期边界 |
 |---|---|---|---|
 | 选择办公室，开始工作 | 稳定办公室目录、成员、空闲/最近任务和白板 | capabilities → initialize → read；T3/T4 | 默认四间，各绑定配置的授权根；不新建租户 |
-| 提问并继续追问 | 增量文本、同一对话上下文、停止按钮；账本可查 | 官方四操作 chat JSON/NDJSON；T1/T3/T4 | 每连接180秒，刷新history→resume；显式cancel |
+| 提问并继续追问 | 增量文本、同一对话上下文、停止按钮；账本可查 | 官方四操作 chat JSON/NDJSON；T1/T3/T4 | 无180秒总接收时限，刷新history→resume；显式cancel |
 | 让助手阅读项目并给出结论 | 任务从等待到运行，文件功能人物工作，白板显示当前工作；回答引用真实文件 | AgentLoop/工具事实 → 完整 snapshot；T2/T3/T4 | T4只开放核实的只读工具，不用随机数据展示进度 |
 | 让助手写一份报告/执行获准命令 | 审批菜单说明实际操作；批准后才执行，拒绝后文件不变；可查真实产物 | decision.request + 共享 Approval + snapshot；T2/T3/T5 | 仅开放已验收工具；不执行超出授权根或不可落实的受限操作 |
 | 看人物分工和交接 | 工作/思考/空闲、任务气泡、真实功能派发产生的跨人物拜访、有限发言 | snapshot + task.assigned，由 sceneBridge 自动 visit；必要时 scene.say；T4/T5 | 人物代表功能角色，同一 Run 仍是一个 AgentLoop；不宣称多 Agent 协作 |
@@ -269,7 +300,7 @@ Office Fastify 重启丢失目录和快照；Host 使用自己保存的最新完
 
 ### 4.1 单一官方转发链路
 
-Office版本固定02dbac4，虽然version仍为1.0，协议已区别于历史b221a44。浏览器调用同源POST /api/pawoffice/chat；Host在offices.initialize顶层注册chat:{url:"http://127.0.0.1:<Host实际端口>/office/chat"}。Office Node只转Content-Type/Accept，不转Origin、Cookie或Authorization。Host默认回环监听、精确Host校验；有Origin请求仍须命中配置白名单，不能以teamId当授权。首期同机单用户；跨机需另行设计受保护代理，不能直接开放私有工作区。
+Office版本固定d150b96，虽然version仍为1.0，协议已区别于历史b221a44。浏览器调用同源POST /api/pawoffice/chat；Host在offices.initialize顶层注册chat:{url:"http://127.0.0.1:<Host实际端口>/office/chat"}。Office Node只转Content-Type/Accept，不转Origin、Cookie或Authorization。Host默认回环监听、精确Host校验；有Origin请求仍须命中配置白名单，不能以teamId当授权。首期同机单用户；跨机需另行设计受保护代理，不能直接开放私有工作区。
 
 | type | 请求必要字段（均含version/teamId/conversationId） | 返回与用途 |
 |---|---|---|
@@ -290,7 +321,7 @@ Office版本固定02dbac4，虽然version仍为1.0，协议已区别于历史b22
 4. messages最多十完整轮次加当前非空user；首次导入仅为不可信外部文本，后续核对已完成展示历史后缀，不覆盖原账本或导入工具/授权。历史按Run输入位置读取，不将tool_result(User角色)当成用户轮次。
 5. history页内旧→新，游标绑定既存Run身份；新追加不移动旧页边界。仅最新页含最后一个pending，activeTurnId与之相同；旧页无活动标识。旧Run用原ID稳定映射；完整工具结果留原查询接口/T5详情。
 6. resume先订阅再读同Run的完整文本快照，再按已发前缀发送增量；落后重取。快照是{text,state,message}，state只允许pending/complete/stopped/error。终态快照直接结束；不在流里发自定义runId或cursor。
-7. **断开/刷新/卸载/180秒单连接到期仅detach**；共享Host继续拥有Run。显式cancel才关闭授权并取消模型/等待/工具，清理结束才stopped:true；cancelling仍属pending。Host崩溃后unfinished→interrupted→聊天error，不自动执行旧工具。
+7. **断开/刷新/卸载仅detach**；共享Host继续拥有Run。显式cancel才关闭授权并取消模型/等待/工具，清理结束才stopped:true；cancelling仍属pending。Host崩溃后unfinished→interrupted→聊天error，不自动执行旧工具。
 
 ### 4.3 容量、流与错误
 
@@ -301,7 +332,7 @@ Office版本固定02dbac4，虽然version仍为1.0，协议已区别于历史b22
 | 回复/delta/单行 | 回复和snapshot.text≤50000，delta≤16000，JSON行≤350000 UTF-16单元；字节与字符独立检查 |
 | 流事件 | status(thinking/streaming)、delta、snapshot、done、error；无null/未知字段 |
 | 成功/失败 | 完整账本与终态保存后才done或complete snapshot；空输出、超限、持久失败不得假done；错误说明有界且不泄密 |
-| 请求期限 | 非流操作Office转发15秒，send/resume每连接180秒；Run总预算独立；T6覆盖超过连接期限再恢复，不用心跳宣称无限连接 |
+| 请求期限 | 非流操作Office转发15秒，send/resume无自动总时限；Run总预算独立；T6覆盖超过连接期限再恢复，不用心跳宣称无限连接 |
 | 可恢复接受拒绝 | 仅send/resume的history_conflict/request_conflict/session_busy/slot_busy/capacity_exceeded/not_found：HTTP200/application/x-ndjson一条官方error{message}；安全白名单文案，无done/成功snapshot/新Run；不按Accept分叉 |
 | HTTP错误 | 非法JSON/字段/来源/办公室仍真实4xx；存储/未知故障保留HTTP失败。history/cancel仍code/msg/data；Office将上游非2xx转通用502，不承诺原细分状态透传 |
 | 消息段落 | 每条assistant消息内部原文不变，两条有文字消息间补足两换行；live/JSONL恢复同一累积器，4MiB预算含分隔；空/Thinking/纯工具不制造回复，原JSONL不回写 |

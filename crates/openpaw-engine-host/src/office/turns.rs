@@ -160,6 +160,9 @@ pub(super) fn message(run: &RunView) -> String {
     if state(run) != "error" {
         return String::new();
     }
+    if let Some(error) = &run.error {
+        return error.message.clone();
+    }
     match run.state {
         RunState::Interrupted => "Host重启中断，未自动重放工具",
         RunState::TimedOut => "运行预算到期，清理已完成",

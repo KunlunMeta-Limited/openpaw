@@ -3,7 +3,7 @@
 //! 依赖：原Store、官方client、单办公室协调任务。
 //! 禁止职责：不伪造进度、工具开始或多Agent，不复制会话账本。
 use super::{client::Client, dto, OfficeConfig};
-use crate::{Host, HostError, HostResult, RunState, RunView};
+use crate::{Host, HostError, HostResult, RunState};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
 use tokio_util::sync::CancellationToken;
@@ -94,7 +94,9 @@ impl Coordinator {
             task.await.map_err(HostError::storage)?;
         }
         for team in host.inner.config.slots.keys() {
-            prepare(host, &self.config, team).await?;
+            if super::workspaces::active(host, &self.config, team).await? {
+                prepare(host, &self.config, team).await?;
+            }
         }
         let client = Client::new(&self.config)?;
         let flush = async {
@@ -128,21 +130,6 @@ fn actor(tool: &str) -> (&'static str, &'static str) {
         _ => ("assistant", "office-lead"),
     }
 }
-fn tool_status(run: &RunView, stage: &str) -> &'static str {
-    match stage {
-        "completed" => "completed",
-        "failed" => "failed",
-        "running" if !run.state.is_terminal() => "running",
-        "proposed" if !run.state.is_terminal() => "queued",
-        _ => {
-            if run.state.is_terminal() {
-                "failed"
-            } else {
-                "blocked"
-            }
-        }
-    }
-}
 fn task(
     id: String,
     title: String,
@@ -151,8 +138,9 @@ fn task(
     summary: String,
     old: &BTreeMap<String, Value>,
     now: &str,
+    progress: u64,
 ) -> Value {
-    let mut task = json!({"id":id,"title":dto::bounded(&title,160),"assigneeId":who,"status":state,"progress":if state=="completed"{100}else{-1},"summary":dto::bounded(&summary,1000),"updatedAt":now});
+    let mut task = json!({"id":id,"title":dto::bounded(&title,160),"assigneeId":who,"status":state,"progress":progress,"summary":dto::bounded(&summary,1000),"updatedAt":now});
     if let Some(prior) = old.get(&id) {
         let mut comparable = prior.clone();
         comparable["updatedAt"] = Value::String(now.into());
@@ -179,6 +167,8 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         .unwrap_or_else(|| team.clone());
     let command_enabled = host.inner.config.tools.iter().any(|name| name == "bash");
     host.inner.store.call(move|db|{
+        let name = db.office_creations()?.iter().find(|v|v["slot_id"]==team)
+            .and_then(|v|v["name"].as_str()).map(str::to_owned).unwrap_or(name);
         let previous=db.office_projection(&team)?;
         let prior=previous.as_ref().map(|(v,_)|v);
         let bindings:Vec<_>=db.bindings()?.into_iter().filter(|b|b.scope.namespace=="office"&&b.scope.slot_id==team).collect();
@@ -202,26 +192,64 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             // 每会话只投影最新Run，避免旧失败抢占最新成功的员工状态；完整历史走history。
             let (_,input)=db.run_input(&r)?;
             let main_id=format!("run:{}",r.run_id);
-            let summary=match r.state {RunState::Cancelled=>"用户取消，清理已完成",RunState::Interrupted=>"Host重启中断，不自动重放",RunState::TimedOut=>"预算到期，清理已完成",RunState::Cancelling=>"正在取消，等待实际资源清理",RunState::Failed=>"运行失败；原因见会话账本",_=>"真实运行；完整历史见会话账本"};
-            let main_state=if !r.state.is_terminal() && (r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
-            let mut tasks=vec![task(main_id,dto::bounded(&input,80),"assistant",main_state,summary.into(),&old,&now)];
-            let mut events=Vec::new();
-            for t in r.tools.iter().take(12) {
-                let id=db.office_call_id(&r.run_id,&t.call_id)?;let (who,_)=actor(&t.tool_name);
-                let item=task(id.clone(),format!("{} · {}",t.tool_name,dto::bounded(&t.call_id,40)),who,tool_status(&r,&t.state),format!("真实调用阶段：{}；Run {}",t.state,r.run_id),&old,&now);
-                if who!="assistant" && db.office_call_started(&r.run_id,&t.call_id)? {
-                    let time=item["updatedAt"].clone();
-                    let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|a|a.iter().find(|e|e["id"]==format!("assign:{id}")));
-                    events.push(existing.cloned().unwrap_or_else(||json!({"id":format!("assign:{id}"),"kind":"task.assigned","summary":format!("交由{}处理{}",who,t.tool_name),"occurredAt":time,"taskId":id,"employeeId":who,"fromEmployeeId":"assistant"})));
-                }
-                tasks.push(item);
+            let (steps,percent)=crate::task_progress::project(db.progress(&r.run_id)?,&r)?;
+            let summary=match r.state {
+                RunState::Cancelled=>"已停止，实际操作已清理".to_owned(),
+                RunState::Interrupted=>"处理被中断，已完成事项保留".to_owned(),
+                RunState::TimedOut|RunState::Failed=>super::turns::message(&r),
+                RunState::Cancelling=>"正在停止，等待实际操作清理".to_owned(),
+                RunState::Completed if percent<100=>"回复已结束，仍有步骤未完成".to_owned(),
+                RunState::Completed=>"本次目标已完成".to_owned(),
+                _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
+                _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
+                _=>"正在处理你的请求".to_owned(),
+            };
+            let main_state=if r.state==RunState::Completed && percent<100 {"failed"} else if !r.state.is_terminal() && (r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let mut tasks=vec![task(main_id,dto::bounded(&input,80),"assistant",main_state,summary.clone(),&old,&now,percent)];
+            for step in steps {
+                tasks.push(task(step["id"].as_str().unwrap().into(),step["title"].as_str().unwrap().into(),"assistant",step["status"].as_str().unwrap(),step["summary"].as_str().unwrap().into(),&old,&now,step["progress"].as_u64().unwrap()));
             }
-            events.sort_by(|a,b| b["occurredAt"].as_str().cmp(&a["occurredAt"].as_str()).then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
+            let mut events=Vec::new();
+            let assignments=db.office_task_assignments(&r.run_id)?;
+            // 工具仍是执行事实，公开任务只引用稳定的业务步骤；重试不增加卡片或重播交接。
+            for t in r.tools.iter().filter(|t|t.tool_name!="report_progress") {
+                // 保留原内部调用关联号供历史详情追踪，公开任务不再使用逐call卡片。
+                let _call_reference=db.office_call_id(&r.run_id,&t.call_id)?;
+                let (who,_)=actor(&t.tool_name);
+                if who=="assistant" || !db.office_call_started(&r.run_id,&t.call_id)? {continue;}
+                let current=assignments.get(&t.call_id).map(|i|i+1).filter(|i|*i<tasks.len()).unwrap_or(0);
+                let id=tasks[current]["id"].as_str().unwrap().to_owned();
+                let event_id=format!("assign:{id}:{who}");
+                if events.iter().any(|e:&Value|e["id"]==event_id) {continue;}
+                if !r.state.is_terminal() && matches!(t.state.as_str(),"running"|"awaiting_resource") {
+                    tasks[current]["assigneeId"]=json!(who);
+                }
+                let label=match who {"files"=>"文件操作","search"=>"资料查询",_=>"执行操作"};
+                let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|a|a.iter().find(|e|e["id"]==event_id));
+                events.push(existing.cloned().unwrap_or_else(||json!({"id":event_id,"kind":"task.assigned","summary":format!("开始{label}"),"occurredAt":tasks[current]["updatedAt"],"taskId":id,"employeeId":who,"fromEmployeeId":"assistant"})));
+            }
+            // assignee也是任务内容；完成全部映射后再比较，避免同内容每秒改变updatedAt/seq。
+            for task in &mut tasks {
+                if let Some(prior)=old.get(task["id"].as_str().unwrap()) {
+                    let mut comparable=prior.clone();comparable["updatedAt"]=task["updatedAt"].clone();
+                    if &comparable==task {task["updatedAt"]=prior["updatedAt"].clone();}
+                }
+            }
+            events.sort_by(|a,b|b["occurredAt"].as_str().cmp(&a["occurredAt"].as_str()).then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
             let selected=&tasks[0];
-            let whiteboard=json!({"template":"task-board-v1","title":selected["title"],"status":selected["status"],"tagline":"OpenPaw真实运行","description":"任务及人物状态来自真实Run和工具事实。","note":"仅显示当前Run及有界工具；完整历史由聊天历史查询。","link":{"label":"","url":""},"steps":[{"id":"accepted","title":"请求已接受","progress":100},{"id":"tools","title":"真实工具操作","progress":if !r.tools.is_empty() && r.tools.iter().all(|t|t.state=="completed"){100}else{-1}},{"id":"run","title":"运行结果","progress":selected["progress"]}]});
+            let board_steps:Vec<_>=if tasks.len()>1 {
+                let first=tasks[1..].iter().position(|t|t["status"]!="completed").unwrap_or(tasks.len().saturating_sub(4));
+                tasks[1..].iter().skip(first).take(3).map(|t| {
+                    let label=match t["status"].as_str(){Some("completed")=>"已完成",Some("running")=>"处理中",Some("blocked")=>"等待确认",Some("failed")=>"未完成",_=>"待处理"};
+                    json!({"id":t["id"],"title":dto::bounded(&format!("{} · {label}",t["title"].as_str().unwrap()),80),"progress":t["progress"]})
+                }).collect()
+            } else {vec![json!({"id":"goal","title":dto::bounded(&summary,80),"progress":percent})]};
+            let completed=tasks.iter().skip(1).filter(|t|t["status"]=="completed").count();
+            let description=if tasks.len()>1 {format!("已确认完成 {completed}/{} 步；{summary}",tasks.len()-1)}else{summary};
+            let whiteboard=json!({"template":"task-board-v1","title":selected["title"],"status":selected["status"],"tagline":"","description":dto::bounded(&description,500),"note":"","link":{"label":"","url":""},"steps":board_steps});
             priorities.insert(binding.scope.conversation_id.clone(),r.revision);
-            let mut employees=json!([{"id":"assistant","name":"OpenPaw助手","sceneActorId":"office-lead","role":"真实模型对话与协调","online":true},{"id":"files","name":"文件操作","sceneActorId":"file-agent","role":"同一引擎的文件工具，写入逐次审批","online":true},{"id":"search","name":"项目检索","sceneActorId":"data-agent","role":"同一引擎的检索工具","online":true}]);
-            if command_enabled {employees.as_array_mut().unwrap().push(json!({"id":"command","name":"命令执行","sceneActorId":"code-agent","role":"同一引擎的普通本机命令，逐次审批","online":true}));}
+            let mut employees=json!([{"id":"assistant","name":"OpenPaw助手","sceneActorId":"office-lead","role":"任务处理与协调","online":true},{"id":"files","name":"文件操作","sceneActorId":"file-agent","role":"文件查看与记录，修改前确认","online":true},{"id":"search","name":"项目检索","sceneActorId":"data-agent","role":"项目检索与资料查询","online":true}]);
+            if command_enabled {employees.as_array_mut().unwrap().push(json!({"id":"command","name":"命令执行","sceneActorId":"code-agent","role":"执行操作，开始前确认","online":true}));}
             conversations.push(json!({"id":binding.scope.conversation_id,"title":title,
                 "employees":employees,
                 "tasks":tasks,"events":events,"whiteboard":whiteboard}));
@@ -239,7 +267,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&matches!(c["tasks"][0]["status"].as_str(),Some("completed"|"failed"))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
             let Some((i,_))=candidate else {return Err(HostError::new("protocol_error","Office完整会话目录超限"));};
             let c=&mut convs[i];c["tasks"]=json!([]);c["events"]=json!([]);c["employees"]=json!([]);
-            c["whiteboard"]=json!({"template":"task-board-v1","title":"","status":"queued","tagline":"","description":"","note":"详情已收起，完整历史见聊天记录。","link":{"label":"","url":""},"steps":[]});
+            c["whiteboard"]=json!({"template":"task-board-v1","title":"","status":"queued","tagline":"","description":"","note":"","link":{"label":"","url":""},"steps":[]});
         }
         if prior==Some(&snapshot) {return Ok(snapshot);}
         if let Some(prior)=prior {
@@ -269,6 +297,9 @@ pub(super) async fn sync_once(
 ) -> HostResult<String> {
     let gate = client.projection_gate(team).await;
     let _guard = gate.lock().await;
+    if !super::workspaces::active(host, config, team).await? {
+        return Ok("reserved".into());
+    }
     let snapshot = prepare(host, config, team).await?;
     let key = team.to_owned();
     let saved_halt = host
@@ -355,6 +386,7 @@ mod tests {
             api_key_env: "PAWOFFICE_TEST_KEY".into(),
             allowed_origins: vec!["http://127.0.0.1:8765".into()],
             names: Default::default(),
+            creation_slots: vec![],
         };
         host.inner.store.call(|db|db.save_office_projection("office-1",&json!({"schemaVersion":"1.0","seq":77,"workspace":{"id":"office-1","name":"旧版"},"employees":[],"tasks":[],"events":[],"whiteboard":{}}),"cached")).await.unwrap();
         let upgraded = prepare(&host, &office, "office-1").await.unwrap();

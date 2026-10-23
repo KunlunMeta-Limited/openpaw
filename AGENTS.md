@@ -2,6 +2,14 @@
 
 本仓库复用 OpenPaw 引擎、工具和存储，在 openpaw-engine-host 中适配 Office 官方 HTTP/NDJSON 与固定版 OpenCode SDK。Linux 主开发，Windows 10/11 x64 原生支持；不适配 macOS。背景、交互和 T0—T8 以 docs/engine-host/master.md 为准，不能把计划写成已实现。
 
+## 主开发目录与产物
+
+唯一开发目录为 `/media/cheng/新加卷/workSpace/Office/openpaw`。每轮先核对该目录的分支、HEAD和用户改动；所有开发修改、提交、最新文档均在这里。缓存中的干净检出只用于验证准确提交，不得成为另一开发源；验证后确认本目录仍是最新候选。不得将本目录留在旧Tx分支而仅更新artifacts工作树。
+
+artifacts只保留真实会话/备份、必要成功与失败证据、当前运行依赖和用途/清理清单；重复测试clone、可重建依赖和停用debug二进制按清单清理。清理前核对进程、Git未提交内容及报告依赖，不删除原始失败以掩盖问题，不删除用户数据或密钥配置。
+
+发现或调整任何Office工程修改需求时，必须在用户可见更新及交付中明确提醒查看 `docs/engine-host/office-change-requests.md`，给出具体Rx章节、版本、原因和状态；Office仍须逐项人工批准。小写r2/r3是OpenPaw方案修订，大写Rx是Office修改申请，不得混为授权。
+
 ## 开始前
 
 1. 阅读本文件、docs/requirements/产品需求说明.md、docs/design/软件设计说明.md、相关规格、当前主 CHG 与 docs/governance/依赖与资料基线.md。
