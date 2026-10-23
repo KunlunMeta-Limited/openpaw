@@ -86,18 +86,16 @@ pub async fn exec_seatbelt(
 /// - System path read access for basic operation
 /// - Process execution and fork permissions
 fn build_seatbelt_profile(policy: &SandboxPolicy) -> String {
-    let mut rules = Vec::new();
-
-    // Default: deny everything
-    rules.push("(version 1)".to_string());
-    rules.push("(deny default)".to_string());
-
-    // Allow reading from system paths (needed for basic operation)
-    rules.push("(allow file-read* (subpath \"/usr\"))".to_string());
-    rules.push("(allow file-read* (subpath \"/System\"))".to_string());
-    rules.push("(allow file-read* (subpath \"/Library\"))".to_string());
-    rules.push("(allow file-read* (subpath \"/bin\"))".to_string());
-    rules.push("(allow file-read* (subpath \"/sbin\"))".to_string());
+    // Default: deny everything; allow reading system paths (needed for basic operation)
+    let mut rules = vec![
+        "(version 1)".to_string(),
+        "(deny default)".to_string(),
+        r#"(allow file-read* (subpath "/usr"))"#.to_string(),
+        r#"(allow file-read* (subpath "/System"))"#.to_string(),
+        r#"(allow file-read* (subpath "/Library"))"#.to_string(),
+        r#"(allow file-read* (subpath "/bin"))"#.to_string(),
+        r#"(allow file-read* (subpath "/sbin"))"#.to_string(),
+    ];
 
     // Allow reading home directory (needed for shell configs, etc.)
     if let Some(home) = dirs::home_dir() {
@@ -207,6 +205,7 @@ fn build_seatbelt_profile(policy: &SandboxPolicy) -> String {
 }
 
 /// Get the Seatbelt profile string for a given policy (for debugging/testing).
+#[cfg(test)]
 pub fn get_seatbelt_profile(policy: &SandboxPolicy) -> String {
     build_seatbelt_profile(policy)
 }
