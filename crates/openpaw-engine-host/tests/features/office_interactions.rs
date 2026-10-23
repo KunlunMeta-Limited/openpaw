@@ -937,7 +937,7 @@ async fn creation_http_scenario() {
         replies_before_restart,
         "未知/失败确认和重复动作均不能自动重发UI或重复分配"
     );
-    eprintln!("V09: ui.next 503恢复、领取后真实断链、SQLite登记拒绝、410/503确认未知及重启重复投递均通过；三个槽/Session只分配一次，未执行模型");
+    eprintln!("ui.next 503恢复、领取后真实断链、SQLite登记拒绝、410/503确认未知及重启重复投递均通过；三个槽/Session只分配一次，未执行模型");
     stop.cancel();
     serving.await.unwrap();
 }

@@ -345,3 +345,5 @@ D55已严格识别合法employee.create，经原唯一领取和作用域检查�
 真实DeepSeek r5-a的organize子Run完成，父计划organize-req用准确委派call ID确认完成，但开始时未in_progress，office_task_assignments漏关联，最终8卡而非7卡。主/五子执行及审批文件成功不能代替展示验收；原失败`/home/cheng/.cache/t6-real-model-20261024-r5-a/report.json`保留。按0007原r2允许的Store/投影职责，仅对实际started且未关联的delegate从后续已校验准确evidenceCallIds补绑定；已有绑定不移动，不改变普通工具动画、不按标题猜测，不新增存储/权限。精确回归及全量/真实模型复验另记。
 
 D57专项修复已通过：原inline分支修前4≠3，修后27项包含漏开始补关联、有开始保持和无证据拒合并/拒100%的反例；真实模型a原失败保留，最终新准确模型及完整结果仍待形成。
+
+2026-10-24真实DeepSeek r5-b（准确6a6a974）已通过：D56父/五子均完成，D57最终7卡/白板6步100%，准确报告/JSONL/产物与hash见0007验证记录。最终候选原27项结果以t6-agents-20261024-l报告为准；专项/模型修复通过不代替整阶段交付/PR。

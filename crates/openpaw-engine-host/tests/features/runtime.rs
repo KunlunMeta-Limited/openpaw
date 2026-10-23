@@ -155,7 +155,7 @@ async fn office_hundred_by_hundred_bindings_keep_identity_and_reject_overflow_wi
         before,
         "重启和幂等查找不能新增或修改工作区内容"
     );
-    eprintln!("V08: 100办公室×100真实空Session绑定、每间第101个拒绝、重启身份不变通过，耗时{:?}；不冒充10000个模型Run/网页任务容量验收", started.elapsed());
+    eprintln!("100办公室×100真实空Session绑定、每间第101个拒绝、重启身份不变通过，耗时{:?}；不冒充10000个模型Run/网页任务容量验收", started.elapsed());
 }
 async fn pending(host: &Host, s: &ClientScope) -> ApprovalView {
     tokio::time::timeout(Duration::from_secs(5), async {

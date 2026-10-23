@@ -885,7 +885,7 @@ async fn history_encoded_byte_budget_pages_without_losing_turns(base: &std::path
         50
     );
     server.shutdown().await.unwrap();
-    eprintln!("V08: 50个真实完成Run重启后按8MiB编码字节预算分为{pages}页，内容/稳定ID完整且无重复，无新增模型Run");
+    eprintln!("50个真实完成Run重启后按8MiB编码字节预算分为{pages}页，内容/稳定ID完整且无重复，无新增模型Run");
 }
 
 async fn web_cases(base: &std::path::Path) {
