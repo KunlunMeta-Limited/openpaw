@@ -289,3 +289,14 @@ D48继续开放：25c6426真实d轮未提交completed，因此错误恢复未触
 ## T5最新缺陷技术状态（2026-10-23，优先于前文历史开放记录）
 
 D45/D46/D47/D48/D49均为“修复已验证，待用户交付及本PR审核”，未填已合入关闭：0df3282完整27/27、浏览器产品53记录，原8765真实h-resume及correlation均passed。D45业务目标/3步骤100%且无call卡/技术note；D46原Provider错误/停止/恢复按安全分类回归，详情3015ms、65249ms无浮窗；D47原审批期限/输入相同、展示更新后只写一次；D48真实成功回执驱动查询和保存完成；D49追问位置任务100%，不强制再次写文件，混合新写仍被读证据拒绝。原c/d/e/f/g/h失败或复检否决记录均保留，外部验证器错误与生产缺陷分列，不以这些记录伪造全量一次成功。D37原验证结论保持，D36仍开放；Windows原生暂缓。最终文档SHA完整复验与hash绑定见artifacts/t5-delivery-20261023/final-review.json及0006最新验证章节；缺少该准确passed绑定时不能据本段提前交付。
+
+
+## T6本轮产品审查：D50/D51（已复现，未修复）
+
+OpenPaw审查c1e297a/当前Host0df3282。D50为成员投影与六常驻人物入口不一致：默认仅assistant/files/search三绑定，app-agent/review-agent/本现场code-agent真实actor.inspect返回scope_denied。这是用户点击常驻人物不能获知空闲/未启用信息的产品缺陷，原范围校验本身正确，禁止删除校验修复。拟以共同目录和可信成员解析补足。
+
+D51为actions::dispatch丢失目标：actor/employee校验后统一kind=menu；details::render只给空fields的通用会话目录，左侧三成员和已绑定人物都相同。拟保留目标身份/当前任务/结果与导航作用域，六类会话查询继续复用。真实修前HTTP/截图/trace在/home/cheng/.cache/office-product-audit-20261023-r2，详细见0007产品差距审查；修复/新回归待0007准确r2批准，不提前关闭。
+
+多Agent执行器、通用clarify、任务暂停/改派和模型附件是能力缺口，不为凑缺陷编号记成已存在实现的bug。新版Officefocus回归属于集中Rx R14；白板字形/原位菜单分别R12/R13，OpenPaw不能私改Office。大规模全Run/JSONL遍历只是待测性能风险，未实测不当已确诊缺陷。
+
+历史状态补登：D45—D49相关修复已随T5 PR#11合入f22cca1；前文“待本PR审核”保留原时点。D36未修、Windows原生暂缓不计通过。本轮D50/D51不受T5批准覆盖，不能因旧套件通过关闭。

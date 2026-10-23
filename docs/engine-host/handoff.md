@@ -2,17 +2,17 @@
 
 复制本节到每个 Tx PR 描述；不能只填“已完成”。T0原交付完成及0001当前修订分别见master第14节和0001首页，validation.md保留原时点证据。
 
-## 当前交接：T5已合入，T6 r1待审核（2026-10-23）
+## 当前交接：T5已合入，T6 r2产品/多Agent待审核（2026-10-23）
 
 T5 PR #11最终f276b00972f77d67d31e1d9b6862edb4c38111ef，已于20:46:12（Asia/Shanghai）合入f22cca18d3667ded5dfed35d06085b260cc5a32d。用户会话确认通过；GitHub reviews为空，不虚构平台Approve。M5当前批准交付范围完成，Windows原生仍暂缓，机器delivery双平台条件不改、不假记passed。
 
-唯一开发目录/Office/openpaw已从最新集成基线建立feat/engine-host-t6；三份原用户文档保持未提交，Office两份原架构文档不变。每轮核对HEAD/status、fetch并核实前序合入；本Tx在此开发，不在artifacts/验证clone开发。T6精确方案见[0007第4/9/10节](../changes/CHG-2026-0007.md)：官方续接/多页→持久边界/副作用→确认未知与容量→真实产品复验。批准准确r1前不改T6生产/测试代码，不创建PR。
+唯一开发目录/Office/openpaw已从最新集成基线建立feat/engine-host-t6；三份原用户文档保持未提交，Office两份原架构文档不变。每轮核对HEAD/status、fetch并核实前序合入；本Tx在此开发，不在artifacts/验证clone开发。T6精确方案见[0007第4/9/10节](../changes/CHG-2026-0007.md)：先六人物/精准详情→真实父子Run编排/任务交接→原官方续接/多页/持久边界/容量→完整产品复验。批准准确r2-product-agents前不改T6生产/测试代码，不创建PR。
 
 当前原演示仍为http://127.0.0.1:8765/office/与Host41949，已测实现0df3282，主目录合入f22cca1的生产源码相同；runtime-t5.json保留程序hash/路径，不伪称运行了文档提交号。原home、workspace、官方.env原位保留。T5最终f276b00的完整27/27和固定Office产品53条分别见/home/cheng/.cache/t5-pr-full-20261023-f/report.json、t5-pr-product-20261023-f/report.json，原8765真实DeepSeek证据入口仍为t5-live-weather-20261023-h-resume；这些是前序证据，不是T6实测。
 
 artifacts本轮从2313291899降到1292400457字节，释放约0.95GiB；两份停用程序/旧Office副本删除，122份未完全确源资源归档，三份停用日志无损gzip，原报告/失败/录像/账本/备份均保留。逐项清单artifacts/maintenance-20261023-pr11/cleanup.json，归档恢复与必要目录用途见[专用清理说明](../verification/CHG-2026-0006/工作区与产物清理.md)。仅一份当前Host程序；旧版本按清单原commit重建，回退须使用配套完整备份。
 
-**Office修改提醒：**所有Office修改仍集中待以后统一人工审核。[R11默认白板链接](office-change-requests.md#r11白板空链接不自动生成查看任务拆解)未批准、未修改。0007只允许在OpenPaw台账补候选，不据此改Office。以下T5段落保留当时时点，当前状态以本节与0006/0007首页为准。
+**Office修改提醒：**本轮已拉取最新76d774a，26资料不变，focus2测试失败；当前8765保持原已验证版本。新增R12字体、R13人物原位菜单、R14focus、R15文档、R16强回执，连同R11全部集中暂缓。[R11默认白板链接](office-change-requests.md#r11白板空链接不自动生成查看任务拆解)未批准、未修改。0007只允许在OpenPaw台账补候选，不据此改Office。以下T5段落保留当时时点，当前状态以本节与0006/0007首页为准。
 
 ## 当前T5产品复检交接（2026-10-23）
 
