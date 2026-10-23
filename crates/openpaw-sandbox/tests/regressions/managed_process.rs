@@ -88,7 +88,7 @@ async fn d08_cancel_reaps_a_child_tree_before_returning() {
         #[cfg(target_os = "linux")]
         {
             let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
-        eprintln!("managed tree after cleanup pid={pid} stat={stat:?}");
+            eprintln!("managed tree after cleanup pid={pid} stat={stat:?}");
             if let Ok(stat) = &stat {
                 let start = stat
                     .rsplit_once(") ")
