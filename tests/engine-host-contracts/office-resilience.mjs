@@ -83,7 +83,7 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
 
 
 // Browser transport loss is injected only in its isolated context; Host/Provider continue their real Run.
-export async function networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,waitFor,release,interrupt,restore}) {
+export async function networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,chooseOffice,select,waitFor,release,interrupt,restore}) {
   await fresh(page);await send('T6主动断网续接')
   const request=structuredClone(latestSend().request)
   const log=page.getByRole('log',{name:'对话内容'})
@@ -101,7 +101,17 @@ export async function networkProduct({page,context,report,output,readOffice,conv
     assert.equal(JSON.parse(db.prepare('SELECT data FROM host_runs WHERE id=?').get(parent).data).state,'running','浏览器断网不能取消真实Run')
     await page.screenshot({path:join(output,'t6-network-offline-detached.png'),fullPage:true})
   } finally {await context.setOffline(false);await restore()}
-  await page.getByRole('button',{name:'重新同步',exact:true}).click()
+  // 服务目录重建可能默认选中另一办公室；先经公开导航恢复本次请求的会话。
+  // history/resume发生在后台不代表当前可见的对话就是这个Run。
+  await chooseOffice(page)
+  await select(page,'T6主动断网续接')
+  const resync=page.getByRole('button',{name:'重新同步',exact:true})
+  let recoveryAction='重新同步'
+  if(await resync.isVisible())await resync.click()
+  else {
+    // 转发重启可能重建Office页面并收起聊天；公开展开操作会按原useEffect同步历史。
+    recoveryAction='转发恢复后选择原办公室及原会话触发官方history/resume'
+  }
   await waitFor(()=>report.browserRequests.filter(r=>r.request.type==='history').length>historyBefore&&report.browserRequests.some(r=>r.request.type==='resume'&&r.request.turnId===request.turnId))
   assert.equal(db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run,parent)
   assert.equal(report.modelRequests.length,requestsBefore,'续接不再次调用模型')
@@ -114,7 +124,53 @@ export async function networkProduct({page,context,report,output,readOffice,conv
   assert.equal(report.browserRequests.filter(r=>r.request.type==='send'&&r.request.turnId===request.turnId).length,1)
   const final=await waitFor(async()=>{const c=conv(await readOffice(),request.conversationId);return c?.tasks[0].status==='completed'?c:false})
   await page.screenshot({path:join(output,'t6-network-completed-same-run.png'),fullPage:true})
-  report.network={request,parent,requestsBefore,requestsAfter:report.modelRequests.length,transcript,final,trigger:'Chromium offline + SIGKILL isolated Office forwarding process; Host and Provider remain alive'}
+  report.network={request,parent,requestsBefore,requestsAfter:report.modelRequests.length,transcript,final,recoveryAction,trigger:'Chromium offline + SIGKILL isolated Office forwarding process; Host and Provider remain alive'}
   report.assertions.push('T6 actual Chromium offline loss detaches; public manual history/resume keeps one persisted Run, one model request and nonduplicated text')
   db.close()
+}
+
+// 仅在隔离浏览器中中止真实IndexedDB事务；不改Office源码、不模拟磁盘耗尽。
+export async function storageProduct({page,report,output,fresh,waitFor}) {
+  async function archive() {
+    return page.evaluate(async()=>{
+      const db=await new Promise((resolve,reject)=>{const r=indexedDB.open('pawoffice-chat',2);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)})
+      return new Promise((resolve,reject)=>{
+        const tx=db.transaction(['conversations','chat-pages'],'readonly')
+        const directories=tx.objectStore('conversations').getAll(),pages=tx.objectStore('chat-pages').getAll()
+        tx.oncomplete=()=>{db.close();resolve({directories:directories.result,pages:pages.result})}
+        tx.onabort=()=>{db.close();reject(tx.error??new Error('存档读取事务中止'))}
+      })
+    })
+  }
+  await fresh(page)
+  const box=page.getByRole('textbox',{name:'给办公室发送消息'})
+  await box.fill('存储拒绝前的原草稿')
+  await waitFor(async()=>JSON.stringify(await archive()).includes('存储拒绝前的原草稿'))
+  const before=await archive(),sends=report.browserRequests.filter(r=>r.request.type==='send').length
+  try {
+    await page.evaluate(()=>{
+      const original=IDBDatabase.prototype.transaction
+      globalThis.t6StorageAborts=[]
+      IDBDatabase.prototype.transaction=function(...args){
+        const tx=Reflect.apply(original,this,args)
+        if(this.name==='pawoffice-chat'&&args[1]==='readwrite'){
+          tx.addEventListener('abort',()=>globalThis.t6StorageAborts.push({mode:tx.mode,error:tx.error?.name??'explicit abort'}))
+          queueMicrotask(()=>tx.abort())
+        }
+        return tx
+      }
+      globalThis.t6RestoreStorage=()=>{IDBDatabase.prototype.transaction=original}
+    })
+    await box.fill('中止事务后的新草稿，只在内存中保留')
+    const alert=page.getByRole('alert').filter({hasText:/保存失败/})
+    await alert.waitFor()
+    const aborts=await page.evaluate(()=>globalThis.t6StorageAborts)
+    assert.ok(aborts.length>0,'必须实际中止浏览器事务，不能仅伪造错误消息')
+    const after=await archive()
+    assert.deepEqual(after,before,'写入中止后原目录、分页和草稿不得被覆盖')
+    assert.equal(report.browserRequests.filter(r=>r.request.type==='send').length,sends,'本场景不发送用户消息或启动模型')
+    await page.screenshot({path:join(output,'t6-storage-write-aborted-original-preserved.png'),fullPage:true})
+    report.storageFailure={trigger:'actual browser IndexedDB transaction.abort, isolated browser context only; not a quota/disk-full test',aborts,warning:await alert.innerText(),before,after}
+    report.assertions.push('T6 actual browser IndexedDB write abort shows save warning and preserves exact original archive; no model request')
+  } finally {await page.evaluate(()=>globalThis.t6RestoreStorage?.())}
 }

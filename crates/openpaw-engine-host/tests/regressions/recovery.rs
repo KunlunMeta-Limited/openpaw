@@ -112,6 +112,27 @@ fn child_fixture() {
     rt.block_on(async {
         let mut cfg = config(&base);
         let mut scope = scope();
+        if ["accepted", "text", "completed"].contains(&mode.as_str()) {
+            let provider: Arc<dyn openpaw_core::LlmProvider> = if mode == "completed" {
+                Arc::new(MockProvider::fixed("已可靠提交的终态文本"))
+            } else {
+                Arc::new(CrashBoundaryProvider { emit_text: mode == "text", requests: Default::default() })
+            };
+            let host = Host::with_provider(cfg, provider).await.unwrap();
+            let binding = host.open_session(scope.clone()).await.unwrap();
+            let run = host.submit_run(&scope, &binding.session_id, "边界输入已保存".into()).await.unwrap();
+            loop {
+                let current = host.get_run(&scope, &run.run_id).await.unwrap();
+                if mode == "accepted" || mode == "text" && current.text == "硬停前已落盘的部分文本" || mode == "completed" && current.state == RunState::Completed {
+                    let session = host.get_session(&scope, &binding.session_id).await.unwrap();
+                    assert!(session.messages.iter().any(|message| message.text() == "边界输入已保存"));
+                    println!("READY {} {}", run.run_id, binding.session_id);
+                    std::io::stdout().flush().unwrap();
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         let team = mode.starts_with("team-");
         if team {
             scope.namespace = "office".into();
@@ -161,6 +182,18 @@ fn child_fixture() {
         }
         loop {
             let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope).await.unwrap();
+            if mode.ends_with("locked") {
+                let db = rusqlite::Connection::open(config(&base).home.join("engine-host/host.db")).unwrap();
+                let waiting: u64 = db.query_row("SELECT COUNT(*) FROM host_events WHERE kind='tool_waiting_resource' AND json_extract(reference,'$.tool_name')='write_file'", [], |r| r.get(0)).unwrap();
+                let started: u64 = db.query_row("SELECT COUNT(*) FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.tool_name')='write_file'", [], |r| r.get(0)).unwrap();
+                if waiting == 1 {
+                    assert_eq!(started, 0);
+                    assert!(!config(&base).roots["project"].join("report.txt").exists());
+                    println!("READY {} {}", r.run_id, b.session_id);
+                    std::io::stdout().flush().unwrap();
+                    std::future::pending::<()>().await;
+                }
+            }
             let sleeping = if team {
                 let db=rusqlite::Connection::open(config(&base).home.join("engine-host/host.db")).unwrap();
                 let active:u64=db.query_row("SELECT COUNT(*) FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.tool_name')='sleep'",[],|r|r.get(0)).unwrap();
@@ -178,6 +211,49 @@ fn child_fixture() {
             let _ = rx.recv().await;
         }
     });
+}
+
+struct CrashBoundaryProvider {
+    emit_text: bool,
+    requests: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl openpaw_core::LlmProvider for CrashBoundaryProvider {
+    async fn complete(
+        &self,
+        _: openpaw_core::CompletionRequest,
+    ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+        unreachable!("Host应复用原流式执行入口")
+    }
+    async fn stream(
+        &self,
+        _: openpaw_core::CompletionRequest,
+    ) -> openpaw_core::Result<
+        futures::stream::BoxStream<'static, openpaw_core::Result<openpaw_core::StreamEvent>>,
+    > {
+        use futures::StreamExt;
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut events = vec![Ok(openpaw_core::StreamEvent::MessageStart)];
+        if self.emit_text {
+            events.push(Ok(openpaw_core::StreamEvent::TextDelta {
+                index: 0,
+                text: "硬停前已落盘的部分文本".into(),
+            }));
+        }
+        Ok(Box::pin(
+            futures::stream::iter(events).chain(futures::stream::pending()),
+        ))
+    }
+    fn capabilities(&self) -> openpaw_core::Capabilities {
+        openpaw_core::Capabilities::default()
+    }
+    fn name(&self) -> &str {
+        "crash-boundary"
+    }
+    fn default_model(&self) -> &str {
+        "crash-boundary"
+    }
 }
 
 async fn host_shell_fixture(base: &std::path::Path, cancel: bool, team: bool) {
@@ -415,38 +491,107 @@ fn host_test_process_running(pid: u32) -> bool {
 }
 #[tokio::test]
 async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval() {
-    for mode in ["written", "pending", "team-written", "team-pending"] {
+    for mode in [
+        "accepted",
+        "completed",
+        "written",
+        "pending",
+        "team-written",
+        "team-pending",
+        "approved-locked",
+        "team-approved-locked",
+        "text",
+    ] {
+        eprintln!("验证硬停边界：{mode}");
         let base = tempfile::tempdir().unwrap();
+        let resource = if mode.ends_with("locked") {
+            let meta = config(base.path()).roots["project"].join(".openpaw");
+            std::fs::create_dir_all(&meta).unwrap();
+            Some(
+                // 共享锁允许审批读取文件前置条件，只阻止批准后的独占写入。
+                openpaw_sandbox::file_lock::try_lock_shared(
+                    &meta.join("engine-host-resource.lock"),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
         let (mut process, line) = child(base.path(), mode);
         let ids: Vec<_> = line.split_whitespace().collect();
         let cfg = config(base.path());
+        let approvals: Vec<ApprovalView> = {
+            let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+            let mut q = db.prepare("SELECT data FROM host_approvals").unwrap();
+            q.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+                .collect()
+        };
         assert!(Host::start(cfg.clone()).await.is_err());
         process.0.kill().unwrap();
         process.0.wait().unwrap();
+        drop(resource);
         let report = cfg.roots["project"].join("report.txt");
         let before = std::fs::read(&report).ok();
         assert_eq!(before.is_some(), mode.ends_with("written"));
-        let host = Host::start(cfg.clone()).await.unwrap();
+        // 独立计数恢复后的Provider请求，不用模型固定回答掩盖意外重放。
+        let recovered_provider = Arc::new(CrashBoundaryProvider {
+            emit_text: false,
+            requests: Default::default(),
+        });
+        let host = Host::with_provider(cfg.clone(), recovered_provider.clone())
+            .await
+            .unwrap();
         let mut scope = scope();
         if mode.starts_with("team-") {
             scope.namespace = "office".into();
         }
         let run = host.get_run(&scope, ids[1]).await.unwrap();
-        assert_eq!(run.state, RunState::Interrupted);
+        let expected = if mode == "completed" {
+            RunState::Completed
+        } else {
+            RunState::Interrupted
+        };
+        assert_eq!(run.state, expected);
+        if mode == "text" {
+            assert_eq!(run.text, "硬停前已落盘的部分文本");
+        }
+        if mode == "completed" {
+            assert_eq!(run.text, "已可靠提交的终态文本");
+        }
         assert!(host.pending_approvals(&scope).await.unwrap().is_empty());
+        for approval in approvals {
+            assert!(
+                host.decide_approval(
+                    &scope,
+                    &approval.approval_id,
+                    approval.revision,
+                    approval.binding,
+                    true
+                )
+                .await
+                .is_err(),
+                "硬停前的批准/待审批回执不得在恢复后复用"
+            );
+        }
         assert_eq!(std::fs::read(&report).ok(), before);
         assert_eq!(
             host.open_session(scope.clone()).await.unwrap().session_id,
             ids[2]
         );
         host.shutdown().await.unwrap();
+        assert_eq!(
+            recovered_provider
+                .requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "恢复不允许重发模型请求"
+        );
         // 可重建索引实际删除再重启，不删Host权威元数据。
         std::fs::remove_file(cfg.home.join("index.db")).unwrap();
         let host = Host::start(cfg).await.unwrap();
-        assert_eq!(
-            host.get_run(&scope, ids[1]).await.unwrap().state,
-            RunState::Interrupted
-        );
+        assert_eq!(host.get_run(&scope, ids[1]).await.unwrap().state, expected);
         assert_eq!(std::fs::read(&report).ok(), before);
         host.shutdown().await.unwrap();
     }

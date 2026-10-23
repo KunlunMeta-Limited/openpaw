@@ -311,3 +311,17 @@ D51为actions::dispatch丢失目标：actor/employee校验后统一kind=menu；d
 - D53：同一真实业务步骤已通过原run_progress/tool_started准确关联委派，但projection额外添加同一子任务卡片，导致6步骤+5子卡重复、白板分母11。修复沿用原office_task_assignments，明确关联时复用原步骤卡/ID、保留真实子角色、独立task.assigned稳定ID；未关联子任务仍单独显示，不按相似标题猜所属。子执行完成但父未核验的步骤不能涂绿；协作模式的父核验read_file不再重发已委派步骤的交接动画。旧单Agent工具归属逻辑保留。
 
 修前证据/home/cheng/.cache/t6-real-model-20261023-b/report.json：执行层检查曾记passed，但最终快照tasks[0]=failed/71%，因此整体产品验收必须判未通过；保留该原报告，追加更严的UI终态/有界无重复卡片断言，不能沿用其passed做交付。原失败a为验收脚本审批locator错误，也保留。Office工程未改。
+
+
+## D54：流式当前消息仅在内存，Host硬停后部分回复丢失（已复现，修复待增量批准）
+
+原recovery子进程扩展在接受/输入、TextDelta可观察、终态三个边界真实kill。TextDelta边界重启后Run=interrupted且工具不重放，但text由“硬停前已落盘的部分文本”变为空；修前日志/home/cheng/.cache/t6-recovery-sync-20261023.log。进一步审查确认修前标记名“已落盘”是测试意图，现有get_run实际读取live，不证明持久化；测试保留这一用户可见丢失复现，不将内存读当持久屏障。当前store::save_run始终清text，get_run终态只还原完整JSONL assistant消息，尚未完成的Provider消息无检查点。
+
+拟复用原host_runs.data内已有RunView.text/text_truncated，增加有界、合并、非权威的展示检查点；消息/工具/usage仍原JSONL，检查点不进入模型上下文、不恢复执行。不得在同步delta回调阻塞磁盘。具体生命周期、失败处理、兼容/回退和文件范围在0007第12.2节；涉及持久字段语义超出原仅协作控制元数据批准，先人审，尚未修改生产。原失败断言不删除。
+
+
+## D55：新上游employee.create已领取但旧Host校验拒绝（源码确认，适配待增量批准）
+
+Office fa6ae1f新动作含name/role/sceneActorId，dto::ui_action未知动作返回false，Client::post(ui.next)将本次已消费结果判protocol_error，poller不能发送明确业务拒绝，页面最终超时。当前固定六角色满员会在浏览器禁加，故本轮没有声称从默认页面已复现添加；这是逐协议源码核对确定的新上游兼容缺口，不把它登记成Office缺陷。
+
+最小方案见0007第12.3节：严格识别合法新增动作，复用原唯一领取/持久动作/范围/期限，明确返回不支持动态角色且无副作用；不静默创建有权限Agent。新冻结/DTO/action修改尚未批准，未实施。动态添加的真实业务和权限方案另审，不拿“明确拒绝”说成完整创建成功。

@@ -1,7 +1,7 @@
 // Product acceptance only: real Host + frozen Office + independent Chromium.
 // The local OpenAI fixture is a deterministic Provider, never a chat bridge.
 import assert from 'node:assert/strict'
-import { teamProduct, networkProduct } from './office-resilience.mjs'
+import { teamProduct, networkProduct, storageProduct } from './office-resilience.mjs'
 import { createHash, randomBytes } from 'node:crypto'
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer } from 'node:http'
@@ -770,13 +770,14 @@ try {
   host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-team')
   await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
   await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
-  await networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,waitFor,
+  await networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,chooseOffice,select,waitFor,
     release:()=>{assert.ok(networkGate);networkGate()},
     interrupt:async()=>{officeProcess.p.kill('SIGKILL');await officeProcess.close},
     restore:async()=>{
       officeProcess=start(process.execPath,['server/dist/index.js'],office,{...childEnv,PORT:String(officePort),HOST:'127.0.0.1',PAWOFFICE_PUBLIC_ORIGIN:officeBase},'office-network-restored')
       await waitFor(async()=>{try{const r=await readOffice();return r.code===200&&conv(r,latestSend().request.conversationId)}catch{return false}},45000)
     }})
+  await storageProduct({page,report,output,fresh,waitFor})
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'
