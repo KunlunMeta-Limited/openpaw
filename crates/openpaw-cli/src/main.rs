@@ -27,6 +27,32 @@ fn default_workspace() -> PathBuf {
 
 fn main() {
     let cli = Cli::parse();
+    #[cfg(feature = "engine-host")]
+    if cli.engine_host {
+        #[cfg(feature = "sidecar")]
+        if cli.sidecar {
+            eprintln!("error: --engine-host and --sidecar cannot be enabled together");
+            std::process::exit(2);
+        }
+        let config = openpaw_engine_host::HostConfig {
+            hostname: cli.engine_host_hostname,
+            port: cli.engine_host_port,
+            // 合并 A 线：provider 解析顺序回到 `--provider` > `OPENPAW_ENGINE_PROVIDER` > `mock`。
+            // B 线原先只取 clap 默认值，环境变量被静默忽略，容器里改 `.env` 不生效。
+            provider: cli
+                .provider
+                .or_else(|| std::env::var("OPENPAW_ENGINE_PROVIDER").ok())
+                .unwrap_or_else(|| "mock".into()),
+            home: cli
+                .home
+                .or_else(|| std::env::var_os("OPENPAW_HOME").map(PathBuf::from))
+                .unwrap_or_else(openpaw_core::openpaw_home),
+            workspace: cli.workspace.unwrap_or_else(default_workspace),
+            ..openpaw_engine_host::HostConfig::default()
+        };
+        let code = openpaw_engine_host::run_blocking(config);
+        std::process::exit(code);
+    }
     // `--sidecar` short-circuits subcommands: the MCP server runs in-process.
     #[cfg(feature = "sidecar")]
     if cli.sidecar {
@@ -35,15 +61,7 @@ fn main() {
     }
     let code = match cli.command {
         Some(Command::Hello) => hello::run(),
-        Some(Command::Chat {
-            provider,
-            workspace,
-            home,
-        }) => chat::run(chat::ChatArgs {
-            provider,
-            workspace,
-            home,
-        }),
+        Some(Command::Chat(args)) => chat::run(args),
         Some(Command::Session { cmd }) => match cmd {
             session_cmd::Command::List { limit, home } => {
                 session_cmd::run_list(&resolve_home(home), limit)

@@ -1,0 +1,286 @@
+# B 线协议字典
+
+host 实现 `master-plan.md` 第 3.2 节规定的 OpenCode v1 子集。所有 SSE frame
+均为 `data: {"type":...,"properties":...}`，并且只发送连接建立之后发布的
+事件。
+
+| 路由 | 成功响应 | 错误响应 |
+|---|---|---|
+| `GET /global/health` | `{healthy:true}` | 启用鉴权时可能为 401 |
+| `POST /session` | `id,title,slug,directory,time` | 400 |
+| `GET /session` | session 摘要数组，最多 50 条 | 401 |
+| `GET /session/:id` | session 对象 | 404 |
+| `PATCH /session/:id` | 更新 title/archive 后的 session 对象 | 400, 404, 409 |
+| `DELETE /session/:id` | 删除非活动 session；204 | 404, 409 |
+| `GET /session/:id/message` | message 数组 | 404 |
+| `POST /session/:id/fork` | 具有新 ID 的根 session 对象 | 400, 404, 409 |
+| `POST /session/:id/revert` | 带 `revert.messageID` 的 session 对象 | 400, 404, 409 |
+| `POST /session/:id/unrevert` | 清除暂存回退后的 session 对象 | 404 |
+| `POST /session/:id/prompt_async` | 204 | 400, 404, 409 |
+| `POST /session/:id/abort` | `true` | 404 |
+| `GET /session/status` | 以 session id 为键的对象；busy 时可带脱敏 `activity` | 401 |
+| `GET /event` 及其别名 | SSE | 400, 404 |
+| `GET /provider` | `{all,connected}` | 401 |
+| `GET /permission` | pending permission 数组 | 401 |
+| `POST /permission/:id/reply` | 204 | 400, 404 |
+
+降级路由分别返回 `{}`（`/config`、`/mcp`）、`[]`（`/command`、`/project`、
+`/agent`、`/find/file`）或 204（`/session/:id/command`、`/session/:id/shell`、
+`/session/:id/summarize`）。v2 路由返回 404。
+
+## 字段规则
+
+- Session 的 `time.created` 和 `time.updated` 使用 Unix 毫秒。
+- 已归档 Session 额外返回正数 Unix 毫秒 `time.archived`；unarchive 请求写 `0`，响应省略该字段。
+- staged revert 返回 `revert.messageID`；请求 user 边界时保持原游标，请求可由
+  `TurnOutcome` 可靠关联的 `assistant` / `assistant_n` 边界时返回同回合 user 游标，
+  从而隐藏完整回合及尾部。旧消息或完整分支没有有效回合关联时，已验证的真实 assistant
+  按同会话顺序定位最近真实 user 输入，跳过非空且全部为 ToolResult 的 user 消息；没有此前输入时保持原游标。
+  未知或已隐藏 ID 仍拒绝；失败展示消息仍须有已验证的回合关联。
+  Branch 是新根会话，不返回 `parentID`。
+- `GET /session/:id/message` 将可完整匹配此前 assistant tool part 的纯 ToolResult
+  user 消息折叠到该 part 的 `state`；普通用户文本、混合内容和无法匹配的旧数据保持逐条投影。
+  因此 REST 历史与实时 SSE 均以 assistant tool part 表示 `running/completed/error`。
+- staged revert 期间 `GET /session/:id/message` 仍返回完整历史；`session.revert.messageID` 是客户端
+  计算可见前缀的权威游标。这样 Unrevert 只清除游标即可恢复显示，与 OpenCode 行为一致。
+- Text part 按输入顺序直接拼接，不插入分隔符；非文本 part 被忽略。
+- `message.part.delta` 使用 `partID`、`sessionID`、`messageID`、`field` 和
+  `delta`；tool state 为 `running`、`completed` 或 `error`。
+- Permission 使用 `id`、`sessionID`、`permission`、`patterns`、`metadata` 和
+  `always`。`once` 只批准当前请求；`always` 还会记住当前 session 的同名工具授权，
+  不跨 session 或 Host 重启继承。
+- Provider 为 `mock/mock-1`、`echo/echo-1`、`anthropic/claude-sonnet-4` 和
+  `openai/gpt-4o`。
+
+格式错误的 JSON 和不支持的 provider 返回 400；缺失或错误的 Basic Auth 返回
+401；未知 session 或 permission 返回 404；同一 session 发起第二个活动回合返回
+409。
+
+## Prompt 字段与执行语义
+
+| 字段 | 类型 | 必填 | 处理规则 |
+|---|---|---|---|
+| `model.providerID` | string | 否 | 缺失使用 host 默认值；只接受四个已登记 provider |
+| `model.modelID` | string | 否 | 缺失使用所选 provider 默认模型；空字符串返回 400 |
+| `parts[].type` | string | 否 | 只有 `text` 被处理，其他 part 忽略 |
+| `parts[].text` | string | text part 是 | 按数组顺序直接拼接，不插入分隔符 |
+| `text` | string | 否 | 兼容入口；存在时优先于 parts |
+
+provider 和 model 是本回合选择，不替换 SessionHandle 或创建共享 AgentLoop。
+Anthropic/OpenAI 缺少 API key 或 base URL 无效时，请求在预留 active turn 前返回
+400。fake provider 集成测试同时断言最终请求路径和 JSON body 中的 model。
+
+## Session 持久化字段
+
+| JSONL 事件 | 字段 | 用途 |
+|---|---|---|
+| `meta` | `id/provider/model/created_at` | session 身份和创建配置 |
+| `metadata` | `title` | 显式标题或首条用户文本前 80 字符 |
+| `metadata` | `cwd` | 创建时解析出的绝对 workspace，供重启恢复 |
+| `message` | core Message | user、assistant 和 tool result 历史 |
+| `session_metadata_v1` | `title/archived` | PATCH 的原子元数据更新；零 archived 表示恢复 |
+| `session_fork_origin_v1` | `sourceSessionID/ordinal` | 私有分支来源和同源序号，不投影为 `parentID` |
+| `session_revert_staged_v1` / `session_revert_cleared_v1` | `messageID` 或无字段 | 暂存或取消会话级回退 |
+| `session_revert_committed_v1` | `messageID/accept` | 与下一条 prompt 接收原子提交逻辑裁剪 |
+
+旧 session 没有 `metadata.cwd` 时回退 host CLI workspace。列表摘要直接只读这些
+字段和文件 mtime，不装载运行时对象。
+
+所有会话变更继续使用追加写 JSONL。staged revert 只持久化服务端规范化后的权威游标，完整历史
+继续保留在 REST message snapshot；客户端渲染、默认 Branch 和下一轮模型上下文按游标使用可见前缀。
+unrevert 在下一条 prompt 被接收前可以恢复。下一条 prompt 将回退和 turn accept
+写入同一条 committed 记录，之后 unrevert 为幂等 no-op。包含 committed 记录的数据不能直接交给
+不识别 `session_revert_committed_v1` 的旧 Host，否则旧 reader 会重新显示逻辑删除的尾部。
+
+`session.created` 和 `session.updated` 的 properties 固定为 `{sessionID,info}`，其中 `info`
+符合 `contracts/host-session-v1.schema.json`。archive、unarchive、rename、revert、unrevert 和
+revert commit 都发布完整的 `session.updated`。
+
+## SSE 顺序与响应边界
+
+## 实时活动摘要
+
+`GET /session/status` 的活动会话可以返回以下可选字段：
+
+```json
+{"session-id":{"type":"busy","activity":{"kind":"tool","tool":"read_file","task":"正在读取文件"}}}
+```
+
+`activity` 只用于驱动客户端状态条和 Office 人物提示，不写入 JSONL，也不携带工具
+参数、路径、文件内容或模型思考正文。`kind` 可为 `thinking`、`tool` 或
+`responding`；回合正常结束、失败和取消都会清除该字段。旧客户端忽略该可选字段即可。
+
+```text
+message.updated(user)
+message.part.updated(user text)  # 接收已持久化，先于后台执行
+session.status(busy)
+message.updated(assistant created)
+message.part.updated(empty text/reasoning)
+message.part.delta...
+message.part.updated(tool running/completed)
+message.updated(assistant completed)  # 每次 provider response
+session.status(idle)
+session.idle
+```
+
+非流式 provider 的 Final 内容由 AgentLoop 补成同样的 TextDelta/ThinkingDelta，host
+因此不需要为最后一个 response 建立特殊路径。工具循环中的每一个 assistant
+response 都在对应 `TurnUsage` 边界发送 completed 时间。
+
+## 错误矩阵
+
+| 条件 | HTTP | 是否改变 session |
+|---|---:|---|
+| JSON 无法解析、文本为空、provider/model/base URL 无效 | 400 | 否 |
+| PATCH 空对象、空标题、负 archived，或 fork/revert 边界非法 | 400 | 否 |
+| revert 提供 `partID` | 400 `unsupported_part_revert` | 否 |
+| Basic Auth 缺失或错误 | 401 | 否 |
+| session/permission 不存在，或 stale handle 正在删除 | 404 | 否 |
+| session 已 active 时 archive、fork、revert、DELETE 或第二个 prompt | 409 | 否 |
+| user JSONL append 失败 | 500 | 不加入内存，不启动 AgentLoop |
+| Office gateway 超时/拒绝/断开 | 原请求不变 | 仅日志，回合继续 |
+| v2 路由 | 404 | 否 |
+
+### CHG-2026-0022 消息替换与执行错误
+
+下一条 prompt 提交 staged revert 后，Host 使用同一公共消息投影计算删除 ID，
+依次发出 `message.removed`，再发清除游标的 `session.updated`，最后发布新 user 消息和正文。
+删除事件包含 `{sessionID,messageID}`，覆盖被裁剪的 user、assistant 与仅用于错误展示的消息。
+幂等重放、冲突或持久化失败不重复发出删除或正文事件；staged REST 仍保留完整历史。
+
+已接收回合执行失败仍保持 prompt 的 204，稳定 Gateway `TurnError/TurnOutcome` 不增加字段。
+OpenCode 兼容层先发布归属失败回合的 assistant `message.updated`，再发
+`session.error {sessionID,error}`，最后进入 idle。REST 对同一 assistant 返回 `info.error`。
+零输出失败可生成 `parts=[]` 的展示消息，绝不写入模型 `Session.messages`；其 Revert 边界
+可靠关联到同回合 user。fork 继续不复制 turn/admission/error 诊断状态。
+
+安全错误形状为 `{name,data:{message,code,isRetryable,statusCode?,providerID?}}`，约束见
+`contracts/host-message-events-v1.schema.json`。可靠 HTTP 状态保留；网络和流协议错误不猜测状态。
+摘要有界，过滤凭据、URL、路径及输入回显；不公开 responseBody、responseHeaders 或原始错误。
+取消沿用 cancelled，不发 API 失败。finish commit 的可选私有 `openCodeError` 与 terminal
+原子保存；旧记录缺字段时使用稳定分类，回退提交同步裁剪 metadata。旧 reader 可忽略新增字段。
+
+## 认证与就绪标记
+
+用户名和密码必须同时设置；两者均未设置时关闭鉴权。启用后 middleware 覆盖所有
+路由，401 带 `WWW-Authenticate: Basic realm="openpaw"`。host 仍只绑定
+`127.0.0.1`。按本项目中文日志约定，就绪行是
+`OpenPaw 引擎主机正在监听 http://127.0.0.1:<port>`；客户端和 Kunlun 只解析其中
+稳定的回环 URL，不依赖本地化前缀。该文案偏离 master-plan 的早期英文示例，兼容
+决策记录于 ADR-002。
+
+`GET /provider` 保留 `all/connected/default` 字段：all 列出四个支持协议及默认/有效配置模型；connected 是无重复子集，表示本地配置满足运行条件。
+mock/echo 需要有效通用生成配置；openai/anthropic 还需要非空 Key、合法 URL 和非空模型。
+无效网络配置不影响离线项；无效通用 token 配置使各协议都不可用。此判断不验证上游认证或网络连通性。
+default 保留显式 Host provider，即使不可用也不切换到 mock；实际模型请求明确返回配置错误或上游失败。
+字段契约见 `contracts/host-provider-v1.schema.json`，共享配置由 openpaw-llm::config 提供。
+
+## 图片与原生音频合同（CHG-2026-0026）
+
+POST message / prompt_async 接受 `parts:[{type:"file",mime,url,filename?}]`；url 限内联 data URL。
+纯附件请求有效，文本与附件顺序保留；直接 text 沿用优先规则。接收前校验 MIME/头/Base64、数量、大小和有效模型能力，
+非法输入400、原件或body超限413；同 requestID / messageID 的规范内容相同重放，字节、顺序、名称或模型不同409。
+最大4个/20 MiB原件、图片5 MiB、body32 MiB；具体 schema 见 contracts/host-prompt-v1.schema.json。
+
+REST 和即时 message.part.updated 使用相同 file id/attachmentID/MIME/data URL；工具 parts 保留 callID，
+completed 结果增加 attachments。GET /provider models 增加 capabilities.input 的 text/image/audio 布尔值，
+connected 仍只表示本地配置。所有媒体只出现在授权消息接口，Office 活动、CLI摘要/FTS和诊断不输出原件。
+Schemas 为 host-message-events-v1 和 host-provider-v1；旧 text 请求、tool 文本与 SSE 类型保持兼容。
+
+OpenWork 已有图片 file part 形状在 OpenPaw 契约测试中覆盖；其音频入口和 AI Office 界面尚未实现，本轮不修改客户端仓库。
+
+## 文本展示属性（CHG-2026-0027）
+
+现有 message / prompt_async 的 text part 接收可选 `synthetic:boolean`、`metadata:object`。
+带属性的文本保留独立内容块与输入顺序；直接 `text` 仍优先，忽略 part 的属性不迁移到正文。
+REST 和即时 `message.part.updated` 共用投影，保留属性及稳定 part ID；缺属性的旧纯文本入口沿用原合并行为。
+`synthetic=true` 只标记辅助正文，模型仍收到原 user 消息中的正文及附件，metadata 不进入模型内容。
+OpenWork 已有过滤消费该标记；`metadata.openworkAttachments` 是客户端业务键，Host/Store 不解释或下载其中的 URL。
+
+Store 的 `turn_accept_v1` 增加可选 `messagePresentation:{version:1,parts:[{blockIndex,auxiliary,metadata?}]}`。
+注解与 user/outcome/admission 同一事务接收；replay 检查版本、User 角色、唯一块编号和 Text 类型。
+Fork 在整体发布的分支文件中紧跟对应 Message 写 `message_presentation_v1:{messageID,presentation}`，并绑定新消息 ID；
+staged Revert/Unrevert 保留完整历史，提交回退同步裁剪注解。压缩不改变完整历史的属性或内联媒体原件。
+有展示属性的幂等指纹包含规范化块内容及属性，媒体使用 MIME/字节/名称，排除临时随机 attachmentID。
+
+自动标题来自首条输入中的非辅助文本，最多 80 字符；无真实正文的媒体输入使用“图片附件”或“音频附件”。
+已有显式标题与续聊标题保持优先。旧记录缺省无注解，已丢失属性的历史不按英文前缀猜测改写。
+该后端兼容修复不改变 OpenWork 的发送前中文组合输入行为。
+
+## AI PC 会话专属桌面桥接（CHG-2026-0026）
+
+稳定接口编号：`API-HOST-AI-PC-REGISTER-001` 对应 PUT 登记；`API-HOST-AI-PC-UNREGISTER-001` 对应 DELETE 撤销。CHG-2026-0028 补齐编号，既有路径、字段与失败语义保持下述合同。
+
+`PUT /session/{id}/ai-pc` 登记严格 JSON：`{"bridge_url":"http://host.docker.internal:PORT/ai-pc","token":"随机会话令牌"}`。仅接受 localhost、127.0.0.1、host.docker.internal 的 HTTP(S)，固定 `/ai-pc`，禁止用户信息、查询、片段与额外字段。请求限 8 KiB，令牌 32–256 个 ASCII 字母、数字、`-` 或 `_`。`DELETE` 同一路径撤销登记。
+
+两入口均受 Host Basic 认证保护，并要求已配置非空用户名与密码。无配置 503、无效认证 401、未知会话 404、活动回合 409、非法请求 400、成功 204。登记只在内存，Host 重启需重新登记；fork 不继承，成功删除会话清除登记，删除失败保留原登记。
+
+普通会话保留多模态注册表的 22 个工具（含 `read_attachment`）。登记会话动态增加 `ai_pc_current_context`（严格空对象）和 `ai_pc_history_search`（可选 keyword/application，最多 256 字；from_ms/to_ms 为非负 Unix 毫秒，起点不晚于终点），共 24 个。模型不能指定服务、会话、模式或凭据。包装器用可信 Host 会话 id 发 `POST /ai-pc/current` 或 `/history`，正文 `{"session_id":"真实身份","args":{...}}`，Bearer 使用登记令牌。不跟随重定向或系统代理，10 秒超时，响应最多 512 KiB，只接受 JSON 的 ok/empty/denied 状态。
+
+AI PC 每次查询检查令牌、受管会话及最新授权，交付前登记来源；受限检索只在授权片段上匹配。AI PC 会话的全局 `session_search` 拒绝调用并要求改用授权历史工具；普通会话的内置工具行为保持原合同。令牌不得进入工具声明、模型输入、journal、事件或日志。
+
+CHG-2026-0028 集成保留会话原生附件安装、回看与回合结束清理；AI PC 包装器透传媒体上下文给同一会话的内置工具。桌面当前/历史工具仍只返回授权文字 JSON、空媒体列表，不自动发送截图。
+
+### Everypaw 实时列窗扩展（CHG-2026-0029 / 06）
+
+上述登记请求、Basic、失败码与内存生命周期不变。成功 PUT 的 204 新增响应头 `openpaw-desktop-protocol: 1`、`openpaw-desktop-tools: ai_pc_list_windows,ai_pc_query_structure,ai_pc_read_text,ai_pc_capture_target,ai_pc_action_batch`。当前已登记工具共 29 个；普通会话仍为 22 个。仅旧 204 无扩展头时，桌面记录 `legacy` 并明确实时工具不可用，保留旧 current/history 与文字问答；404 记录 `unavailable`。头只列已实现扩展，不提前承诺后续动作种类。
+
+`ai_pc_list_windows` 参数严格为 `{}`，声明 ReadOnly/ParallelSafe。runtime 在真实接收回合获准 running 后，从持久 admission 取得 requestID/Host turn，以原取消 token、每次执行随机 generation 和所选 provider 实际 image_input 能力安装私有上下文；退出守卫只清除自身 generation。模型输入不能填写身份。
+
+Host 单次 POST `/ai-pc/windows`，Bearer 为原登记令牌，JSON 为 `{session_id, request_id, host_turn_id, generation, invocation_id, args:{}}`。invocation_id 是 Host 新生成 UUID，不能按工具名称、参数或并发顺序猜配 provider callID。Host generation 与结果中的能力进程 generation 是不同层次。
+
+成功响应严格为 `{protocol_version:1, invocation_id, delivery_id, status:"ok", projection:{...}}`，投影标记 `kind:"untrusted_ui_data"`，包括 observation_id/native generation/observed_at_ms、windows（id/app/process_id/title）、partial、估算器和必要原因。窗口是当前观察，界面文字不能作为指令；无窗口数量默认上限。窗口短 ID 绑定原聊天上下文、真实窗口存活 witness 和能力进程代次，本身不授予权限。
+
+Host 完整解析、校验身份/容量/活动代次后 POST `/ai-pc/ack`，正文 `{call:原完整可信调用, delivery_id:原唯一交付nonce}`；仅严格 `{status:"accepted"}` 视为桌面接纳该精确 ACK。桌面在响应与 ACK 时重新核对服务、Host、原回合/授权及当前应用权限。ACK 只执行短 Recorder 检查，不等待 UIA/native。结果交给模型的结构为 `{invocation_id,status,result:projection}`，无 token、应用完整路径或本地 acquired 原件。此状态表示 Host 解析接受，不表示 provider 接收或模型理解。
+
+工程限额：桥整体 HTTP 收包 3 秒、body 8 KiB；列窗 Host 等待 20 秒、结果 1 MiB，ACK/补充 cancel 各 2 秒；桌面 HTTP native 等待 10 秒、最多两个 detached acquisition 工作位，另留其余 HTTP 容量处理控制和旧工具。原生列窗目标预算 3 秒、实际内容约 8 MiB（含 JSON escaping/本地应用身份），IPC 帧仍为 64 MiB；标题在 16,383 UTF-16 单元处有界并报告 partial。默认模型投影 20,000 估算 token（utf8_bytes/4），还受现有用户交付字节预算约束，裁剪明确。短收包期限不充当 UIA 期限。
+
+取消正文为原调用，路径 `/ai-pc/cancel`。桌面在工作前建立取消 tombstone，晚到同 invocation 不执行；等待期间撤销、切换服务或停止后，实际迟到内容仅保存原调用本地证据，不生成/恢复模型结果。列窗显式保留 IPC 实际 completion：超时或 cancel 不丢弃同 ID/native generation 的真实结果；bounded acquisition 工作位保持到真实完成或进程断连。旧 background/01 路径保持原 discard 语义。Host future Drop 使用独立 64 项有界队列 try_send 补充 cancel，运行时退出或队满不保证送达；桌面原回合 Stop 是主路径。所有工具和控制均不自行重试。
+
+metadata worker 不初始化或调用 UIA，独立于 overview 的 COM apartment。各 worker 持有自己的原生对象，仅共享无 COM 的 ID/active/completed authority，统一执行每上下文 8 个非空视觉回合、总计 2048 个不同 ID 的软限及最新轮保护。同轮多个附件/工具采用并集；metadata 使用 `-wv` 命名空间，控件使用 `-v`，防止跨表碰撞。Complete/Abandon 有界异步广播，不等待卡住的 provider。后续 UIA 读取窗口引用须在能力进程内延续同一 witness、创建前后复核，不能把 HWND 当永久身份或跨 apartment 传递 Rc/COM。
+
+### Everypaw 实时结构扩展（CHG-0029 / 07）
+
+`ai_pc_query_structure` 通过同一受信封装单次 POST `/ai-pc/structure`。严格模型参数为 `generation`（原生观察代次）、`target_id`、可选 `directions`（默认 all）、`offset`（u32，默认 0）、`limit`（正 u64，默认 128，桌面钳制 1024）和 `boxes`（默认 false）。模型不能指定 context/session/Host turn/权限；外层 generation 仍是 Host 执行代次。
+
+方向逗号分隔、大小写无关并去空白：parent、child/children、previous/prev、next、sibling/siblings、all、none；空集合按 all。始终含起点，offset 独立作用于每个初始关系，parent 为直接父级（offset>0 跳过）；父级沿所选 parent/sibling 继续，子级/兄弟按所选 child 继续，止于原窗口。每次读取当前对象，不承诺冻结分页，无独立默认深度。
+
+实际取得上限为 1024 节点、8 MiB、3 秒及 8192 关系遍历操作；同步 UIA 调用之间检查期限，不承诺中断 provider。紧凑模型投影限 4096 估算 tokens（utf8_bytes/4），另受既有交付字节上限约束；包含一次观察元数据、必要节点关系/状态、短正文和明确 partial/truncated，坐标仅 boxes=true 且获准时出现，不常态附每节点 PID/时间/技术属性。原始取得与精确交付副本分别保存；原引用关闭、过期、移出边界、被替换、跨上下文/旧代次时失败，不按名称/路径/裸 HWND 重绑。返回及精确 ACK 重新投影并校验当前权限；停止、超时和迟到均延用原调用归属、不重试/恢复生成。结构工具使用与列窗相同的 Host/HTTP/ACK 期限和保留实际 completion 的原生通道。
+
+### Everypaw 实时正文分页（CHG-0029 / 08）
+
+`ai_pc_read_text` 为ReadOnly/ParallelSafe，通过同一可信调用及精确ACK单次POST `/ai-pc/text`。严格参数 `{generation,target_id,offset?,limit?}`，generation为原生代次；offset默认0、带符号UTF-16 code units，绝对值最多10,469,374；limit为正u64、默认4096，由桌面钳制16384。无媒体，无额外身份/权限字段或内部重试。
+
+每页实时读取原目标当前TextPattern，单次有界前缀probe最多10,485,760 UTF-16（独立工程上限），正offset至少4098并覆盖页后2单元边界/sentinel，负offset相对本次取得前缀末端。没有无界GetText(-1)/Value或跨页冻结全文缓存，不把TextUnit_Character移动量当UTF-16。返回 `text`、`range:{start,end,unit:"utf16_code_units"}`（半开）、`next`（无可用继续offset为null）、`length:{units,certainty:"exact"|"lower_bound"}`、请求范围、独立observation/time、partial/reason；仅取得前缀不能伪称精确全文长，负offset下界另标 `offset_basis:"bounded_prefix_end"`。若页末超过合法offset工程上限，next为null并明确partial/上限原因，不提供无法调用的next，也不把下界冒称全文结束。显式offset进入低代理项时向前对齐，页尾收回完整scalar；limit1可返回完整pair的2单元。无效UTF-16明确失败；每页间编辑可能重叠/遗漏，不能把旧观察实时补读。
+
+模型副本另限10240估算tokens（utf8_bytes/4），且受既有更小交付字节预算约束；裁剪后range.end/next严格跟随实际发送末端，完整取得页留本地。不改为摘要或第二模型。原窗口witness/保留对象、context/native generation不重绑；text_values与当前应用规则在取得、返回及ACK复查。Stop/超时后的真实completion保留在原invocation，不能重新生成或发给新回合；本页没有新增视觉ID，不推进8轮/2048ID保留计数。期限/结果容量沿用结构工具。
+
+### Everypaw 调用／点击批次（CHG-0029 / 10）
+
+登记头另列已实现 `ai_pc_action_batch`；其声明采用既有 `Write/NeverParallel`，沿用当前 auto/manual 工具审批。严格参数为 `{generation:"能力进程代次",steps:[{action:"invoke"|"click",target_id:"实时引用"}]}`，1–64 步，引用字符串 1–128 字节，不接受身份、凭据或额外字段。任务11在同一工具增加下文三种步骤。
+
+可信信封与精确解析 ACK 沿用上文，单次路径为 `/ai-pc/actions`，Host 等待 20 秒，响应最多 1 MiB；桌面最多等待 10 秒，native 期限 10 秒。结果投影 `{state,steps:[{index,action,target_id,state,error?}]}` 保留原顺序：completed 是实际返回成功；error 是已知失败；unknown 表示实际效果未确认；not_started 仅用于已确认没有启动的剩余步骤。工具失败仍可返回完整部分结果，Host 标记工具错误，模型自行决定下一次观察；不自动截图或查树。
+
+能力端对同一 Windows 桌面会话采用有界 FIFO：最多两个在途批次（一个执行、一个排队），每批完整串行；共享能力进程生命周期锁保证不会并存第二个本应用执行实例。读取保留各自既有有界 lane，不加入动作全局互斥。Stop、Host 取消／Drop 和桌面等待超时经独立 IPC Cancel 设置原 native 请求取消状态；未启动批次／步骤不执行，同步动作不能保证立即中断。HTTP 或生成结束不释放实际批次执行位置，只有 native 实际返回／进程确已结束后才释放。逐步进度以值形式独立回传并归档到原 invocation，迟到不能恢复生成或交给新回合。
+
+Invoke 使用原 UIA 对象的 InvokePattern，不支持时不悄悄改成点击；真实点击移动真实鼠标、尝试使原窗口到前台并发送鼠标输入，可能改变焦点和窗口前后。实时 ID 仍绑定 context/native generation/原窗口存活 witness。动作不使用冻结树路径，不跨上下文重绑，不逐步骤重新弹窗／重查信息分配规则。未知或失败动作均不自动重试、回滚或重放；原生对象不持久化为重启后可执行引用。
+
+### Everypaw 文字／快捷键／等待（CHG-0029 / 11）
+
+同一 `steps` 可混合 `{action:"set_text",target_id,text}`、`{action:"shortcut",target_id,key,modifiers?}`、`{action:"wait",delay_ms}`。text 必填、允许空串；modifiers 缺省为空串；delay_ms 是非负 signed32 毫秒，允许0、无附加产品上限，wait不接受target。整批形状和快捷键语法先严格验证才分发任何效果；实时目标/能力在各步执行时复核。结果步骤保留各自实际参数，wait没有target_id。
+
+key采用大小写不敏感、可选VK_前缀的单个虚拟键名，支持字母数字、F1–F24、NUMPAD0–9、导航/编辑、Windows、浏览器/媒体、OEM及明确IME键。modifiers独立以空格、加号、逗号或分号分隔，接受Control/CTRL、Alt/MENU、Shift、Win及相应VK_/左右名称；未知键拒绝，不静默忽略，key不能写成Ctrl+A。
+
+set_text 仅使用当前启用且非只读的 ValuePattern.SetValue 整值替换，不降级为剪贴板或模拟输入；shortcut将原窗口置前、聚焦当前目标并复核前台后发送真实键盘输入，可能改变焦点。已按下的多余修饰键先释放，保留所需修饰键，新增按键最后释放。部分SendInput保留已接受数量并报unknown，不补发、不回滚。wait由批次执行器每至多10毫秒检查取消，取消时保留此前completed、当前cancelled及后续not_started；停止仍不证明同步输入已经返回。
+
+仅动作批次的期限替换为 `10,000 + 已验证wait总毫秒`（native/桌面）和 `20,000 + 已验证wait总毫秒`（Host），使用u64检查求和。其他工具、HTTP收包/响应容量及ACK期限不变；现有悬浮问答180秒总体期限仍可能先请求取消。FIFO与实际完成占位沿用10，不因HTTP/生成先结束而放行下一批；未知输入和迟到结果仍只归原调用，不自动重发。
+
+### Everypaw 原始目标 PNG（CHG-0029 / 09）
+
+新增 `ai_pc_capture_target`，ReadOnly/ParallelSafe，严格参数 `{target_id:非空字符串≤128字节}`；登记回执的已实现工具追加此名称。可信上下文/单次调用/取消与精确 ACK 沿用06，路由为 `/ai-pc/capture`。所选模型的实际 image=false 或未声明时，Host 在原生分发前明确失败；不按模型名猜测，不转 OCR/其他 VLM/更换模型。
+
+成功响应可含 `media:[{id,mime:"image/png",data:标准Base64,filename:"target.png"}]`，截图必须恰一张，经现有 InlineMedia 验证原件再 ACK；非截图视觉工具禁止媒体。响应工程容量7 MiB供合法5 MiB原件Base64与元数据；主模型每图5 MiB、回合4张/20 MiB、请求32 MiB仍由已有媒体层执行，不缩放。工具文字只含不可变projection、来源/附件编号、实际宽高/范围和独立UIA/PNG/QPC时点；Base64只进入 ToolCallOutcome.media，由原AgentLoop送实际下一次provider请求。
+
+Everypaw 使用公开 Windows WGC HWND API、原窗口存活租约和物理坐标。子区域必须落入可验证窗口纹理；窗口无效、最小化、cloaked、无帧或几何变化明确失败，不恢复目标、不改读桌面。原件在既有screenshots目录，独立visual_png_sources记录来源，visual_tool_calls关联交付；不是后台历史截图。全局/接收服务screenshots、Restricted、原automatic grant与应用排除/未知身份在取得及返回/ACK时复核；既有四项UIA/metadata开关不充当截图授权。Picker完整presentation epoch变化后，仅留本地实际证据，不交付媒体。
+
+`GET /session/:id/message?turnID=<id>&textOnly=true` 为既有 `API-HOST-SESSION-004` 的可选窄读取扩展，仅返回指定回合assistant文字parts及原info/error；非法/缺turnID返回400，turnID不单独使用。默认完整REST、按messageID读取及公共附件投影保持兼容。Host仍先复制wire_messages完整快照再过滤，历史内存/CPU开销不保证恒定。Everypaw对任意大SSE行（不限媒体）增量丢弃到换行，单行保留≤1 MiB、总wire≤128 MiB且原180秒期限；每2秒和EOF/idle/error检查权威回合，失败回合明确失败，完成回合从窄REST恢复正文。正文/窄REST≤2 MiB，任一超限明确失败。合法同轮4张/20MiB图片不受旧8MiB累计限制；该容量并非无限历史保证，也不是图片token预算。

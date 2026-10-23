@@ -9,7 +9,52 @@ authors.workspace = true
 
 [features]
 default = []
-engine-host = []
+engine-host = [
+    "dep:axum",
+    "dep:async-trait",
+    "dep:base64",
+    "dep:chrono",
+    "dep:futures",
+    "dep:openpaw-core",
+    "dep:openpaw-engine",
+    "dep:openpaw-llm",
+    "dep:openpaw-store",
+    "dep:openpaw-tools",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:thiserror",
+    "dep:tracing",
+    "dep:tokio",
+    "dep:tokio-stream",
+    "dep:tokio-util",
+    "dep:uuid",
+]
+
+[dependencies]
+axum = { version = "0.8", optional = true, features = ["json"] }
+async-trait = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+openpaw-core = { workspace = true, optional = true }
+openpaw-engine = { workspace = true, optional = true }
+openpaw-llm = { workspace = true, optional = true }
+openpaw-store = { workspace = true, optional = true }
+openpaw-tools = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["signal"] }
+tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+tokio-util = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }

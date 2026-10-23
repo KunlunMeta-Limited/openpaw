@@ -38,6 +38,13 @@ pub enum MockMode {
     /// Streaming text: `stream()` emits MessageStart + N TextDeltas +
     /// Final; `complete()` returns the full text.
     StreamText { text: String, chunks: usize },
+    /// 功能：按固定间隔产生文本分片，用于验证 Host 在流式输出期间的取消顺序。
+    /// 约束：只用于测试；`delay_ms` 作用于首帧后的每个事件，不改变最终完整响应。
+    DelayedStreamText {
+        text: String,
+        chunks: usize,
+        delay_ms: u64,
+    },
 }
 
 impl Default for MockMode {
@@ -131,6 +138,26 @@ impl MockProvider {
         }
     }
 
+    /// 功能：创建在相邻流事件之间等待固定毫秒数的测试 provider。
+    /// 参数：`text` 为完整回复，`chunks` 为期望文本分片数，`delay_ms` 为事件间隔。
+    /// 返回：使用 `DelayedStreamText` 模式的确定性 MockProvider。
+    /// 错误：构造阶段无错误；空文本和过大分片数会在流生成时安全归一化。
+    /// 状态：每次调用递增 provider 调用计数，不访问网络或文件系统。
+    /// 并发与取消：延迟使用 Tokio timer；丢弃流或取消上层 future 会停止后续等待。
+    /// 权限：测试辅助入口，不读取凭据或扩大工具权限。
+    /// 关联：`TEST-HOST-CANCEL-001`、`CHG-2026-0012`。
+    pub fn stream_text_delayed(text: impl Into<String>, chunks: usize, delay_ms: u64) -> Self {
+        Self {
+            mode: MockMode::DelayedStreamText {
+                text: text.into(),
+                chunks,
+                delay_ms,
+            },
+            calls: Mutex::new(0),
+            model: "mock-1".to_string(),
+        }
+    }
+
     pub fn call_count(&self) -> u32 {
         *self.calls.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -156,6 +183,10 @@ fn content_and_stop(mode: &MockMode, n: u32) -> (Vec<ContentBlock>, StopReason) 
             StopReason::EndTurn,
         ),
         MockMode::StreamText { text, .. } => (
+            vec![ContentBlock::Text { text: text.clone() }],
+            StopReason::EndTurn,
+        ),
+        MockMode::DelayedStreamText { text, .. } => (
             vec![ContentBlock::Text { text: text.clone() }],
             StopReason::EndTurn,
         ),
@@ -229,7 +260,20 @@ impl LlmProvider for MockProvider {
         let n = self.next_call();
         let mode = resolve_mode(&self.mode, n).clone();
 
-        if let MockMode::StreamText { text, chunks } = mode {
+        if let MockMode::StreamText { text, chunks }
+        | MockMode::DelayedStreamText { text, chunks, .. } = mode
+        {
+            let delay_ms = match &self.mode {
+                MockMode::DelayedStreamText { delay_ms, .. } => *delay_ms,
+                MockMode::Scripted(steps) => steps
+                    .iter()
+                    .find_map(|step| match step {
+                        MockMode::DelayedStreamText { delay_ms, .. } => Some(*delay_ms),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                _ => 0,
+            };
             let resp = CompletionResponse {
                 content: vec![ContentBlock::Text { text: text.clone() }],
                 stop_reason: StopReason::EndTurn,
@@ -240,25 +284,42 @@ impl LlmProvider for MockProvider {
                     cache_creation_tokens: 0,
                 },
             };
-            let chunks = chunks.max(1);
-            let per_chunk = (text.chars().count() / chunks).max(1);
-            let mut events: Vec<Result<StreamEvent>> = vec![Ok(StreamEvent::MessageStart)];
+            let char_count = text.chars().count();
+            let chunks = chunks.max(1).min(char_count.max(1));
+            let per_chunk = (char_count / chunks).max(1);
+            let mut events: Vec<StreamEvent> = vec![StreamEvent::MessageStart];
             let mut offset = 0;
             for i in 0..chunks {
                 let take: usize = if i + 1 == chunks {
-                    text.chars().count() - offset
+                    char_count.saturating_sub(offset)
                 } else {
                     per_chunk
                 };
                 let delta: String = text.chars().skip(offset).take(take).collect();
                 offset += take;
-                events.push(Ok(StreamEvent::TextDelta {
+                events.push(StreamEvent::TextDelta {
                     index: 0,
                     text: delta,
-                }));
+                });
             }
-            events.push(Ok(StreamEvent::Final(Box::new(resp))));
-            return Ok(Box::pin(futures::stream::iter(events)));
+            events.push(StreamEvent::Final(Box::new(resp)));
+            if delay_ms == 0 {
+                return Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))));
+            }
+            let stream = futures::stream::unfold(
+                (events, 0usize, delay_ms),
+                |(events, index, delay_ms)| async move {
+                    if index >= events.len() {
+                        return None;
+                    }
+                    if index > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    let event = events[index].clone();
+                    Some((Ok(event), (events, index + 1, delay_ms)))
+                },
+            );
+            return Ok(Box::pin(stream));
         }
 
         // Non-streaming modes: single Final event (the trait default shape).
@@ -408,6 +469,38 @@ mod tests {
             Some(StreamEvent::Final(resp)) => assert_eq!(resp.text(), "hello world"),
             other => panic!("expected Final last, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn delayed_stream_waits_between_events() {
+        use futures::StreamExt;
+        let p = MockProvider::stream_text_delayed("cancel me", 3, 50);
+        let mut stream = p.stream(req("s")).await.unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            StreamEvent::MessageStart
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), stream.next())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), stream.next())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chunk_count_larger_than_text_is_safe() {
+        use futures::StreamExt;
+        let p = MockProvider::stream_text_delayed("x", 100, 0);
+        let events: Vec<_> = p.stream(req("s")).await.unwrap().collect().await;
+        assert_eq!(events.len(), 3);
+        let p = MockProvider::stream_text("", 0);
+        let events: Vec<_> = p.stream(req("s")).await.unwrap().collect().await;
+        assert_eq!(events.len(), 3);
     }
 
     #[tokio::test]

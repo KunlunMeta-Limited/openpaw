@@ -3,10 +3,11 @@
 //! Semantics mirror the upstream `run_turn` (see `docs/spikes/S1-agent-loop.md`
 //! for the call-tree outline and the E1/E2 split line).
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use openpaw_core::{
     classify_api_error, ApprovalManager, ApprovalRequest, CheckContext, CompletionRequest,
     ContentBlock, Error, GuardrailDecision, IterationBudget, LlmProvider, Message, Result,
@@ -20,6 +21,105 @@ use crate::events::{AgentEvent, ClassifierStatus};
 /// One model tool invocation extracted from a `ToolUse` block.
 type ToolUseCall = (String, String, serde_json::Value);
 
+#[derive(Default)]
+struct TurnRuntime {
+    active: bool,
+    cancel_token: Option<CancellationToken>,
+}
+
+struct ActiveTurnGuard<'a> {
+    runtime: &'a std::sync::Mutex<TurnRuntime>,
+    token: CancellationToken,
+    tool_host: &'a dyn ToolHost,
+}
+
+impl Drop for ActiveTurnGuard<'_> {
+    fn drop(&mut self) {
+        // 父回合 future 被 Host 强制 abort 时也必须先取消内部回合令牌，
+        // 让审批、Provider 和工具子任务统一停止，再释放实例级活动闸门。
+        self.token.cancel();
+        self.tool_host.set_media_context(Vec::new());
+        let mut runtime = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.cancel_token = None;
+        runtime.active = false;
+    }
+}
+
+enum PreparedToolInput {
+    Classified {
+        input: serde_json::Value,
+        decision: GuardrailDecision,
+    },
+    Rejected(ToolCallOutcome),
+    Cancelled,
+}
+
+/// 对明确限流或过载只允许一次重试，避免上游拥塞时放大请求。
+fn retry_limit_for_error(
+    error: &Error,
+    class: openpaw_core::ApiErrorClass,
+    configured_max: u32,
+) -> u32 {
+    if matches!(
+        error,
+        Error::RateLimited { .. }
+            | Error::ServerError {
+                status: 503 | 529,
+                ..
+            }
+    ) || class == openpaw_core::ApiErrorClass::RetryableOverloaded
+    {
+        configured_max.min(1)
+    } else {
+        configured_max
+    }
+}
+
+/// 识别已建立流中可通过重新请求恢复的协议截断；不修改 Core 的通用错误分类。
+fn retryable_stream_protocol_error(error: &Error) -> bool {
+    let detail = error.to_string().to_lowercase();
+    detail.contains("stream ended without final")
+        || detail.contains("utf-8 码点中间结束")
+        || detail.contains("sse data")
+        || detail.contains("finish_reason")
+        || detail.contains("[done]")
+        || detail.contains("arguments json")
+        || detail.contains("tool_use json")
+}
+
+fn response_contains_dsml_tool_call(response: &openpaw_core::CompletionResponse) -> bool {
+    response.content.iter().any(|block| {
+        let ContentBlock::Text { text } = block else {
+            return false;
+        };
+        let compact = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .replace('\u{ff5c}', "|")
+            .to_ascii_lowercase();
+        compact.contains("<||dsml||tool_calls>")
+            || compact.contains("<||dsml||invoke")
+            || compact.contains("</||dsml||tool_calls>")
+    })
+}
+
+fn add_usage(left: openpaw_core::Usage, right: openpaw_core::Usage) -> openpaw_core::Usage {
+    openpaw_core::Usage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        cache_read_tokens: left
+            .cache_read_tokens
+            .saturating_add(right.cache_read_tokens),
+        cache_creation_tokens: left
+            .cache_creation_tokens
+            .saturating_add(right.cache_creation_tokens),
+    }
+}
+
 /// The agent loop. Cheap to share (`Arc`); per-turn state lives in the
 /// [`openpaw_core::Session`] passed to [`AgentLoop::run_turn`].
 pub struct AgentLoop {
@@ -32,7 +132,7 @@ pub struct AgentLoop {
     max_tokens: u32,
     parallel_tools: bool,
     retry_policy: RetryPolicy,
-    cancel_token: std::sync::Mutex<Option<CancellationToken>>,
+    turn_runtime: std::sync::Mutex<TurnRuntime>,
     stream_timeout: Duration,
     compact_options: Option<crate::compaction::CompactOptions>,
     token_budget: std::sync::Mutex<Option<crate::token_budget::TokenBudgetTracker>>,
@@ -52,12 +152,12 @@ impl AgentLoop {
             parallel_tools: true,
             retry_policy: RetryPolicy {
                 max_retries: 3,
-                // Tests and offline providers retry fast.
+                // 保持 OpenPaw 原有快速退避；限流和过载另由错误分类限制为最多一次重试。
                 base_delay: Duration::from_millis(10),
                 max_delay: Duration::from_millis(200),
                 backoff_multiplier: 2.0,
             },
-            cancel_token: std::sync::Mutex::new(None),
+            turn_runtime: std::sync::Mutex::new(TurnRuntime::default()),
             stream_timeout: Duration::from_secs(120),
             compact_options: None,
             token_budget: std::sync::Mutex::new(None),
@@ -135,7 +235,7 @@ impl AgentLoop {
     }
 
     pub fn with_cancel_token(self, token: CancellationToken) -> Self {
-        *self.cancel_token_mut() = Some(token);
+        self.turn_runtime_mut().cancel_token = Some(token);
         self
     }
 
@@ -144,12 +244,38 @@ impl AgentLoop {
         self
     }
 
-    fn cancel_token_mut(&self) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
-        self.cancel_token.lock().unwrap_or_else(|e| e.into_inner())
+    fn turn_runtime_mut(&self) -> std::sync::MutexGuard<'_, TurnRuntime> {
+        self.turn_runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn current_cancel_token(&self) -> CancellationToken {
-        self.cancel_token_mut().clone().unwrap_or_default()
+        self.turn_runtime_mut()
+            .cancel_token
+            .clone()
+            .unwrap_or_default()
+    }
+
+    fn begin_turn(&self, token: CancellationToken) -> Result<ActiveTurnGuard<'_>> {
+        {
+            let mut runtime = self.turn_runtime_mut();
+            if runtime.active {
+                return Err(Error::session("agent loop already has an active turn"));
+            }
+            runtime.active = true;
+            runtime.cancel_token = Some(token.clone());
+        }
+        let guard = ActiveTurnGuard {
+            runtime: &self.turn_runtime,
+            token,
+            tool_host: &*self.tool_host,
+        };
+        self.budget.reset();
+        if let Some(tracker) = self.token_budget_mut().as_mut() {
+            tracker.reset();
+        }
+        Ok(guard)
     }
 
     fn is_cancelled(&self) -> bool {
@@ -172,28 +298,191 @@ impl AgentLoop {
         tools: &[ToolSpec],
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<StopReason> {
-        // Reset the cancellation token at the start of each turn — without
-        // this, a cancel from a previous turn blocks all future turns.
-        *self.cancel_token_mut() = Some(CancellationToken::new());
-        self.budget.reset();
+        let provider = Arc::clone(&self.provider);
+        let model = self.model.clone();
+        self.run_turn_inner(
+            session,
+            system,
+            tools,
+            event_sink,
+            CancellationToken::new(),
+            (provider, model),
+            (&mut Vec::new(), Vec::new()),
+        )
+        .await
+    }
+
+    /// 功能：使用调用方拥有的取消令牌执行一个回合。
+    /// 参数：参数含义与 [`run_turn`] 相同，`token` 为该回合的精确取消令牌。
+    /// 返回：最后一次模型响应的停止原因或引擎错误。
+    /// 错误：取消、provider、工具和审批错误按 `Result` 返回。
+    /// 状态：不会在入口替换令牌，因此调度空档内取消仍能命中本回合。
+    /// 并发与取消：令牌同时控制模型流、工具、审批和退避等待。
+    /// 权限：沿用执行器已配置的工具和审批策略。
+    /// 关联：`API-HOST-SESSION-007`、`REQ-B-HOST-006`。
+    pub async fn run_turn_with_cancel_token(
+        &self,
+        session: &mut openpaw_core::Session,
+        system: Option<String>,
+        tools: &[ToolSpec],
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        token: CancellationToken,
+    ) -> Result<StopReason> {
+        let provider = Arc::clone(&self.provider);
+        let model = self.model.clone();
+        self.run_turn_inner(
+            session,
+            system,
+            tools,
+            event_sink,
+            token,
+            (provider, model),
+            (&mut Vec::new(), Vec::new()),
+        )
+        .await
+    }
+
+    /// 功能：按单次请求选择 provider 和 model 执行回合，同时保留执行器的工具、护栏和审批状态。
+    /// 参数：前五个参数与 [`run_turn_with_cancel_token`] 相同；`provider_and_model` 为本次 provider 与模型标识。
+    /// 返回：最后一次模型响应的停止原因或引擎错误。
+    /// 错误：provider、工具、审批、取消和预算错误均不被吞掉。
+    /// 状态：只覆盖本次回合的模型来源，不修改执行器默认 provider/model。
+    /// 并发与取消：使用传入令牌控制精确回合，工具和审批仍共享执行器策略。
+    /// 权限：请求选择 provider 不得绕过 Host 的 provider 白名单和鉴权边界。
+    /// 关联：`API-HOST-SESSION-006`、`REQ-B-HOST-003`。
+    pub async fn run_turn_with_provider_and_cancel_token(
+        &self,
+        session: &mut openpaw_core::Session,
+        system: Option<String>,
+        tools: &[ToolSpec],
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        token: CancellationToken,
+        provider_and_model: (Arc<dyn LlmProvider>, String),
+    ) -> Result<StopReason> {
+        self.run_turn_inner(
+            session,
+            system,
+            tools,
+            event_sink,
+            token,
+            provider_and_model,
+            (&mut Vec::new(), Vec::new()),
+        )
+        .await
+    }
+
+    /// 功能：执行回合并收集每一条真实生成消息，独立于压缩后的上下文。
+    /// 参数：session、tools、sink 沿用回合输入，options 提供媒体快照和模型，generated 接收产出。
+    /// 返回：停止原因；完整消息交由入口提交。
+    /// 错误：模型、预算或工具媒体非法时返回既有错误。
+    /// 状态：更新模型上下文与本轮收集器；不写文件。
+    /// 并发与取消：每个执行器仅一个活动回合，取消由 options 令牌控制。
+    /// 权限：沿用工具分类、审批和工作区规则。
+    /// 关联：turn_execution::run_turn、CLI/Host 完整历史。
+    pub(crate) async fn run_turn_collect(
+        &self,
+        session: &mut openpaw_core::Session,
+        tools: &[ToolSpec],
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
+        options: crate::turn_execution::TurnOptions,
+        generated: &mut Vec<Message>,
+    ) -> Result<StopReason> {
+        let selection = options
+            .provider_and_model
+            .unwrap_or_else(|| (self.provider.clone(), self.model.clone()));
+        self.run_turn_inner(
+            session,
+            options.system,
+            tools,
+            sink,
+            options.cancel,
+            selection,
+            (generated, options.attachments),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // 中立入口保留原有参数；额外收集记录独立于上下文。
+    async fn run_turn_inner(
+        &self,
+        session: &mut openpaw_core::Session,
+        system: Option<String>,
+        tools: &[ToolSpec],
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        token: CancellationToken,
+        provider_and_model: (Arc<dyn LlmProvider>, String),
+        collection: (&mut Vec<Message>, Vec<openpaw_core::InlineMedia>),
+    ) -> Result<StopReason> {
+        let (generated, attachments) = collection;
+        let mut known_media = std::collections::HashMap::<String, openpaw_core::InlineMedia>::new();
+        for media in attachments
+            .iter()
+            .cloned()
+            .chain(openpaw_core::media::message_media(&session.messages))
+        {
+            if let Some(original) = known_media.get(&media.id) {
+                if original.mime != media.mime || original.data != media.data {
+                    return Err(Error::session(
+                        "attachment ID conflicts with original content",
+                    ));
+                }
+            }
+            known_media.insert(media.id.clone(), media);
+        }
+        let (provider, model) = provider_and_model;
+        // Engine 只持有调用方令牌的子令牌：外部取消会向下传播，但正常完成、
+        // panic 或父 future 被丢弃时的内部清理不能反向污染 Host 的终态判断。
+        let token = token.child_token();
+        let _active_turn = self.begin_turn(token.clone())?;
+        self.tool_host.set_media_context(attachments);
+        let mut turn_media = openpaw_core::media::message_media(
+            session
+                .messages
+                .last()
+                .map(std::slice::from_ref)
+                .unwrap_or(&[]),
+        );
+        self.tool_host
+            .remember_media(openpaw_core::media::message_media(&session.messages));
+        openpaw_core::media::validate_media(&turn_media, provider.model_capabilities(&model))?;
 
         loop {
-            // ① cancel check
+            // ① 检查取消
             if self.is_cancelled() {
                 return Ok(StopReason::EndTurn);
             }
 
-            // ③ budget consume (elastic; `expand` raises toward `max`)
-            if !(self.budget.expand(1) && self.budget.try_consume()) {
-                // Grace keeps one last iteration before giving up.
-                if !self.budget.try_grace() {
-                    return Ok(StopReason::EndTurn);
-                }
+            // ③ 先消费当前预算，再按需扩展；耗尽后仅允许一次禁用工具的最终答复。
+            // 固定预算不能调用 expand，因此必须先 try_consume，否则 `new(n)` 实际只会
+            // 运行 grace 那一次。最终答复不占工具迭代预算，也不能再次请求工具。
+            if !(self.budget.try_consume()
+                || (self.budget.expand(1) && self.budget.try_consume())
+                || self.budget.try_grace())
+            {
+                return self
+                    .finish_after_iteration_budget(
+                        session,
+                        system.as_deref(),
+                        &provider,
+                        &model,
+                        event_sink,
+                        generated,
+                    )
+                    .await;
             }
 
-            // ④ compaction: estimate once, decide, compact with a single
-            // summary call (E2; see docs/spikes/S1-agent-loop.md section 2 ④).
+            // ④ 上下文压缩：只估算一次，根据结果决定是否通过单次摘要调用压缩。
+            // （E2 语义见 docs/spikes/S1-agent-loop.md 第 2 节 ④。）
             if let Some(opts) = &self.compact_options {
+                let mut opts = opts.clone();
+                // 生产入口允许短历史压缩；仍以可保留的当前回合决定实际切点。
+                opts.min_messages_before_compact = opts.min_messages_before_compact.min(2);
+                opts.model_limit = opts
+                    .model_limit
+                    .min(provider.model_capabilities(&model).context_window as usize);
+                opts.keep_recent_pairs = opts
+                    .keep_recent_pairs
+                    .max((generated.len() + 2).div_ceil(2));
                 let tools_json_approx: usize =
                     tools.iter().map(|t| t.input_schema.to_string().len()).sum();
                 let estimated = crate::compaction::estimate_session_tokens(
@@ -202,11 +491,28 @@ impl AgentLoop {
                     tools_json_approx,
                 );
                 let trigger = crate::compaction::should_compact_with_options_estimated(
-                    session, opts, estimated,
+                    session,
+                    &opts,
+                    estimated.saturating_add(self.max_tokens as usize),
                 );
-                if trigger != crate::compaction::CompactTrigger::None {
-                    let compacted =
-                        crate::compaction::compact_session(&*self.provider, session, opts).await?;
+                let media_bytes: usize = openpaw_core::media::message_media(&session.messages)
+                    .iter()
+                    .map(|item| item.data.len())
+                    .sum();
+                if trigger != crate::compaction::CompactTrigger::None
+                    || media_bytes > 24 * 1024 * 1024
+                {
+                    let compacted = match cancel_or(
+                        &token,
+                        crate::compaction::compact_session_for_model(
+                            &*provider, &model, session, &opts,
+                        ),
+                    )
+                    .await
+                    {
+                        Some(result) => result?,
+                        None => return Ok(StopReason::EndTurn),
+                    };
                     if compacted > 0 {
                         let after = crate::compaction::estimate_session_tokens(
                             system.as_deref().unwrap_or(""),
@@ -221,9 +527,26 @@ impl AgentLoop {
                 }
             }
 
-            // ⑤ build request
+            // ⑤ 构造模型请求
+            if self.compact_options.is_some() {
+                let estimated = crate::compaction::estimate_session_tokens(
+                    system.as_deref().unwrap_or(""),
+                    session,
+                    tools
+                        .iter()
+                        .map(|tool| tool.input_schema.to_string().len())
+                        .sum(),
+                );
+                if estimated.saturating_add(self.max_tokens as usize)
+                    > provider.model_capabilities(&model).context_window as usize
+                {
+                    return Err(Error::context_too_long(
+                        "current input cannot fit the model context budget",
+                    ));
+                }
+            }
             let req = CompletionRequest {
-                model: self.model.clone(),
+                model: model.clone(),
                 system: system.clone(),
                 messages: session.messages.clone(),
                 tools: tools.to_vec(),
@@ -231,8 +554,8 @@ impl AgentLoop {
                 ..Default::default()
             };
 
-            // ⑥ stream with retry
-            let resp = match self.stream_with_retry(req, event_sink).await {
+            // ⑥ 带重试地读取模型流
+            let resp = match self.stream_with_retry(&provider, req, event_sink).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     if self.is_cancelled() {
@@ -242,7 +565,7 @@ impl AgentLoop {
                 }
             };
 
-            // ⑦ usage backfill (saturating — see Usage docs) + token budget
+            // ⑦ 累加用量（饱和加法，见 Usage 文档）并更新 token 预算
             let usage = resp.usage;
             session.total_input_tokens = session
                 .total_input_tokens
@@ -259,17 +582,18 @@ impl AgentLoop {
                 }
             }
 
-            // Assistant message backfill (may carry tool_use blocks).
-            session.messages.push(Message {
+            // 回填 assistant 消息（可能包含 tool_use 内容块）。
+            let assistant = Message {
                 role: openpaw_core::Role::Assistant,
                 content: resp.content.clone(),
                 ..Default::default()
-            });
+            };
+            let assistant = assistant.identified();
+            generated.push(assistant.clone());
+            session.messages.push(assistant);
 
             if resp.stop_reason != StopReason::ToolUse {
-                // Token-budget continuation: the model stopped, but if
-                // meaningful budget remains (and returns are not
-                // diminishing), nudge it to keep working.
+                // Token 预算继续：模型已停止，但仍有有效预算且收益未递减时，提示其继续工作。
                 let nudge = {
                     let mut guard = self.token_budget_mut();
                     match guard.as_mut() {
@@ -285,13 +609,15 @@ impl AgentLoop {
                     }
                 };
                 if let Some(nudge) = nudge {
-                    session.messages.push(Message::user_text(nudge));
+                    let nudge = Message::user_text(nudge).identified();
+                    generated.push(nudge.clone());
+                    session.messages.push(nudge);
                     continue;
                 }
                 return Ok(resp.stop_reason);
             }
 
-            // ⑧ collect tool_use blocks and dispatch
+            // ⑧ 收集 tool_use 内容块并分派工具
             let tool_uses: Vec<ToolUseCall> = resp
                 .content
                 .iter()
@@ -309,37 +635,181 @@ impl AgentLoop {
                 });
             }
             let results = self.execute_tools(tool_uses, event_sink).await;
+            let media: Vec<_> = results
+                .iter()
+                .flat_map(|block| {
+                    if let ContentBlock::ToolResult { media, .. } = block {
+                        media.clone()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            for item in &media {
+                if let Some(original) = known_media.get(&item.id) {
+                    if original.mime != item.mime || original.data != item.data {
+                        return Err(Error::session(
+                            "attachment ID conflicts with original content",
+                        ));
+                    }
+                } else {
+                    known_media.insert(item.id.clone(), item.clone());
+                }
+                if !turn_media.iter().any(|previous| previous.id == item.id) {
+                    turn_media.push(item.clone());
+                }
+            }
+            openpaw_core::media::validate_media(&turn_media, provider.model_capabilities(&model))?;
+            self.tool_host.remember_media(media);
 
-            // ⑨ backfill tool results as the next user message
-            // (tool_result blocks ride on the user role).
-            session.messages.push(Message {
+            // ⑨ 将工具结果作为下一条 user 消息回填（tool_result 内容块使用 user 角色承载）。
+            let tool_message = Message {
                 role: openpaw_core::Role::User,
                 content: results,
                 ..Default::default()
-            });
+            };
+            let tool_message = tool_message.identified();
+            generated.push(tool_message.clone());
+            session.messages.push(tool_message);
         }
     }
 
-    /// Stream a completion with classified retry. Text deltas are forwarded
-    /// to the sink; the assembled response is returned on `Final`.
+    async fn finish_after_iteration_budget(
+        &self,
+        session: &mut openpaw_core::Session,
+        system: Option<&str>,
+        provider: &Arc<dyn LlmProvider>,
+        model: &str,
+        event_sink: &mut (dyn FnMut(AgentEvent) + Send),
+        generated: &mut Vec<Message>,
+    ) -> Result<StopReason> {
+        let instruction = "工具调用轮次已达到上限。工具现已禁用。请仅依据已有消息和工具结果给出有效最终答复，遵循用户指定的语言和输出格式，如实说明必要的限制；不得再请求或声称调用任何工具。";
+        let final_system = match system {
+            Some(value) if !value.trim().is_empty() => format!("{value}\n\n{instruction}"),
+            _ => instruction.to_string(),
+        };
+        let req = CompletionRequest {
+            model: model.to_string(),
+            system: Some(final_system),
+            messages: session.messages.clone(),
+            tools: Vec::new(),
+            max_tokens: self.max_tokens,
+            ..Default::default()
+        };
+        // 预算耗尽后的候选答复先缓冲，校验通过后才发布给 Host。部分 OpenAI
+        // 兼容模型会把工具调用退化为 DSML 正文；若边生成边转发，协议标记会被
+        // UI 当成最终答复永久保存。
+        let mut buffered_events = Vec::new();
+        let mut resp = {
+            let mut buffered_sink = |event| buffered_events.push(event);
+            self.stream_with_retry(provider, req.clone(), &mut buffered_sink)
+                .await?
+        };
+        let mut total_usage = resp.usage;
+
+        if response_contains_dsml_tool_call(&resp) {
+            let mut repair_messages = req.messages.clone();
+            repair_messages.push(Message {
+                role: openpaw_core::Role::Assistant,
+                content: resp.content,
+                ..Default::default()
+            });
+            repair_messages.push(Message::user_text(
+                "上一份候选答复错误地输出了 DSML/工具调用协议。工具已经禁用，请不要更新任务状态或输出DSML工具调用协议。现在依据已有结果给出有效最终答复，保持用户要求的格式；合法JSON、XML或代码内容可以正常输出。",
+            ));
+            let repair_req = CompletionRequest {
+                messages: repair_messages,
+                ..req
+            };
+            buffered_events.clear();
+            resp = {
+                let mut buffered_sink = |event| buffered_events.push(event);
+                self.stream_with_retry(provider, repair_req, &mut buffered_sink)
+                    .await?
+            };
+            total_usage = add_usage(total_usage, resp.usage);
+        }
+
+        let has_final_text = resp
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()));
+        if resp.stop_reason == StopReason::ToolUse
+            || !has_final_text
+            || response_contains_dsml_tool_call(&resp)
+        {
+            return Err(Error::Provider(
+                "工具循环达到迭代上限后未返回可展示的最终答复".into(),
+            ));
+        }
+
+        for event in buffered_events {
+            event_sink(event);
+        }
+
+        let usage = total_usage;
+        session.total_input_tokens = session
+            .total_input_tokens
+            .saturating_add(usage.input_tokens);
+        session.total_output_tokens = session
+            .total_output_tokens
+            .saturating_add(usage.output_tokens);
+        event_sink(AgentEvent::TurnUsage { usage });
+        {
+            let mut guard = self.token_budget_mut();
+            if let Some(tracker) = guard.as_mut() {
+                tracker.record_turn(usage.input_tokens.saturating_add(usage.output_tokens) as u64);
+            }
+        }
+        let final_message = Message {
+            role: openpaw_core::Role::Assistant,
+            content: resp.content,
+            ..Default::default()
+        }
+        .identified();
+        generated.push(final_message.clone());
+        session.messages.push(final_message);
+        Ok(resp.stop_reason)
+    }
+
+    /// 功能：以分类重试策略读取一次 completion 流。
+    /// 状态：文本增量实时转发到回调，在 `Final` 到达时返回完整响应。
     async fn stream_with_retry(
         &self,
+        provider: &Arc<dyn LlmProvider>,
         req: CompletionRequest,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Result<openpaw_core::CompletionResponse> {
+        let has_media = !openpaw_core::media::message_media(&req.messages).is_empty();
         let mut attempts: u32 = 0;
         'outer: loop {
             let token = self.current_cancel_token();
-            let stream = match self.provider.stream(req.clone()).await {
+            let stream_result = tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    return Err(Error::Provider("stream cancelled by user".into()));
+                }
+                result = tokio::time::timeout(self.stream_timeout, provider.stream(req.clone())) => {
+                    result.unwrap_or_else(|_| Err(Error::timeout("provider stream connection timed out")))
+                }
+            };
+            let stream = match stream_result {
                 Ok(s) => s,
                 Err(e) => {
+                    let e = if has_media {
+                        openpaw_core::media::redact_error(e)
+                    } else {
+                        e
+                    };
                     let class = classify_api_error(&e);
+                    let retry_limit =
+                        retry_limit_for_error(&e, class, self.retry_policy.max_retries as u32);
                     if matches!(
                         class,
                         openpaw_core::ApiErrorClass::RetryableTransient
                             | openpaw_core::ApiErrorClass::RetryableOverloaded
                             | openpaw_core::ApiErrorClass::FallbackCandidate
-                    ) && attempts < self.retry_policy.max_retries as u32
+                    ) && attempts < retry_limit
                     {
                         attempts += 1;
                         let retry_after = match &e {
@@ -349,11 +819,15 @@ impl AgentLoop {
                             } => Some(*secs),
                             _ => None,
                         };
-                        tokio::time::sleep(
-                            self.retry_policy
-                                .delay_for_attempt_with_jitter(attempts as usize, retry_after),
-                        )
-                        .await;
+                        let delay = self
+                            .retry_policy
+                            .delay_for_attempt_with_jitter(attempts as usize, retry_after);
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = token.cancelled() => {
+                                return Err(Error::Provider("stream cancelled by user".into()));
+                            }
+                        }
                         continue;
                     }
                     return Err(e);
@@ -362,32 +836,177 @@ impl AgentLoop {
 
             futures::pin_mut!(stream);
             let mut final_resp: Option<openpaw_core::CompletionResponse> = None;
+            let mut message_start_emitted = false;
+            let mut saw_text_delta = false;
+            let mut saw_thinking_delta = false;
+            let mut emitted_visible_output = false;
+            let mut pending_thinking = String::new();
 
             loop {
-                let ev = tokio::select! {
-                    ev = stream.next() => ev,
+                let next = tokio::select! {
+                    biased;
                     _ = token.cancelled() => {
                         return Err(Error::Provider("stream cancelled by user".into()));
                     }
+                    result = tokio::time::timeout(self.stream_timeout, stream.next()) => result,
                 };
-                let Some(ev) = ev else { break };
-                match ev? {
-                    openpaw_core::StreamEvent::MessageStart => {
-                        event_sink(AgentEvent::MessageStart);
+                let ev = match next {
+                    Ok(Some(Ok(ev))) => ev,
+                    Ok(Some(Err(error))) => {
+                        let error = if has_media {
+                            openpaw_core::media::redact_error(error)
+                        } else {
+                            error
+                        };
+                        let class = classify_api_error(&error);
+                        let retry_limit = retry_limit_for_error(
+                            &error,
+                            class,
+                            self.retry_policy.max_retries as u32,
+                        );
+                        if !emitted_visible_output
+                            && (matches!(
+                                class,
+                                openpaw_core::ApiErrorClass::RetryableTransient
+                                    | openpaw_core::ApiErrorClass::RetryableOverloaded
+                                    | openpaw_core::ApiErrorClass::FallbackCandidate
+                            ) || retryable_stream_protocol_error(&error))
+                            && attempts < retry_limit
+                        {
+                            attempts += 1;
+                            let retry_after = match &error {
+                                Error::RateLimited {
+                                    retry_after_secs: Some(secs),
+                                    ..
+                                } => Some(*secs),
+                                _ => None,
+                            };
+                            let delay = self
+                                .retry_policy
+                                .delay_for_attempt_with_jitter(attempts as usize, retry_after);
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => {
+                                    return Err(Error::Provider("stream cancelled by user".into()));
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                            continue 'outer;
+                        }
+                        return Err(error);
                     }
+                    Ok(None) => break,
+                    Err(_) => {
+                        let timeout = Error::timeout("provider stream frame timed out");
+                        if !emitted_visible_output
+                            && attempts < self.retry_policy.max_retries as u32
+                        {
+                            attempts += 1;
+                            let delay = self.retry_policy.delay_for_attempt(attempts as usize);
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => {
+                                    return Err(Error::Provider("stream cancelled by user".into()));
+                                }
+                                _ = tokio::time::sleep(delay) => {}
+                            }
+                            continue 'outer;
+                        }
+                        return Err(timeout);
+                    }
+                };
+                match ev {
+                    // OpenAI 兼容网关可能先发空角色帧，再通过 SSE 返回可重试错误。
+                    // 暂存 MessageStart，直到出现可见内容或 Final，避免空帧阻断安全重试。
+                    openpaw_core::StreamEvent::MessageStart => {}
                     openpaw_core::StreamEvent::TextDelta { text, .. } => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        if !message_start_emitted {
+                            message_start_emitted = true;
+                            event_sink(AgentEvent::MessageStart);
+                        }
+                        if !pending_thinking.is_empty() {
+                            event_sink(AgentEvent::ThinkingDelta {
+                                text: std::mem::take(&mut pending_thinking),
+                            });
+                        }
+                        saw_text_delta = true;
+                        emitted_visible_output = true;
                         event_sink(AgentEvent::TextDelta { text });
                     }
                     openpaw_core::StreamEvent::ThinkingDelta { text, .. } => {
-                        event_sink(AgentEvent::ThinkingDelta { text });
+                        if text.is_empty() {
+                            continue;
+                        }
+                        saw_thinking_delta = true;
+                        pending_thinking.push_str(&text);
                     }
-                    // E1: buffered tool assembly — blocks arrive complete in
-                    // `Final`. Early dispatch during streaming is the E2
-                    // `streaming_tool_executor` evaluation.
+                    // E1：工具内容块在 `Final` 中完整到达后再组装；流式期间提前分派属于 E2
+                    // 的 `streaming_tool_executor` 评估范围。
                     openpaw_core::StreamEvent::ToolUseStart { .. }
                     | openpaw_core::StreamEvent::ToolUseInputDelta { .. }
                     | openpaw_core::StreamEvent::BlockStop { .. } => {}
                     openpaw_core::StreamEvent::Final(resp) => {
+                        if resp.stop_reason == StopReason::MaxTokens {
+                            return Err(Error::Provider(format!(
+                                "max_output_tokens exceeded before a complete response（limit={}）",
+                                req.max_tokens
+                            )));
+                        }
+                        // provider 可能返回合法的 Final/finish_reason，但 content 为空（或只有
+                        // thinking）。这不是可完成的用户回合：继续写入会产生“completed + 空
+                        // assistant”，让 Host 与 Gateway 都无法投影有效回复。无可见输出时
+                        // 按瞬时协议故障重试；已经发出可见增量后则直接失败，避免重复显示。
+                        let has_actionable_content = resp.content.iter().any(|block| {
+                            matches!(block, ContentBlock::ToolUse { .. })
+                                || matches!(block, ContentBlock::Text { text } if !text.trim().is_empty())
+                        });
+                        if !has_actionable_content {
+                            if !emitted_visible_output
+                                && attempts < self.retry_policy.max_retries as u32
+                            {
+                                attempts += 1;
+                                let delay = self.retry_policy.delay_for_attempt(attempts as usize);
+                                tokio::select! {
+                                    biased;
+                                    _ = token.cancelled() => {
+                                        return Err(Error::Provider("stream cancelled by user".into()));
+                                    }
+                                    _ = tokio::time::sleep(delay) => {}
+                                }
+                                continue 'outer;
+                            }
+                            return Err(Error::Provider(
+                                "OpenAI 流返回空响应，拒绝生成成功响应".into(),
+                            ));
+                        }
+                        // 某些 provider 只为非流式响应发送 Final；保持 AgentEvent 契约一致，
+                        // 使 Host 适配器能为每个模型响应分配独立消息编号。
+                        if !message_start_emitted {
+                            event_sink(AgentEvent::MessageStart);
+                        }
+                        if !pending_thinking.is_empty() {
+                            event_sink(AgentEvent::ThinkingDelta {
+                                text: std::mem::take(&mut pending_thinking),
+                            });
+                        }
+                        // 只发送 Final 的 provider 也要产生与真实流式 provider 相同的可观察文本/思考流，
+                        // 并以随后的 TurnUsage 事件作为响应结束边界。
+                        for block in &resp.content {
+                            match block {
+                                ContentBlock::Text { text } if !saw_text_delta => {
+                                    event_sink(AgentEvent::TextDelta { text: text.clone() });
+                                }
+                                ContentBlock::Thinking { thinking, .. } if !saw_thinking_delta => {
+                                    event_sink(AgentEvent::ThinkingDelta {
+                                        text: thinking.clone(),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
                         final_resp = Some(*resp);
                         break;
                     }
@@ -397,12 +1016,17 @@ impl AgentLoop {
             match final_resp {
                 Some(resp) => return Ok(resp),
                 None => {
-                    // Stream ended without Final (torn stream): retry while
-                    // budget remains, else fail.
-                    if attempts < self.retry_policy.max_retries as u32 {
+                    // 流在没有 Final 的情况下结束（断流）：预算允许时重试，否则返回失败。
+                    if !emitted_visible_output && attempts < self.retry_policy.max_retries as u32 {
                         attempts += 1;
-                        tokio::time::sleep(self.retry_policy.delay_for_attempt(attempts as usize))
-                            .await;
+                        let delay = self.retry_policy.delay_for_attempt(attempts as usize);
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {
+                                return Err(Error::Provider("stream cancelled by user".into()));
+                            }
+                            _ = tokio::time::sleep(delay) => {}
+                        }
                         continue 'outer;
                     }
                     return Err(Error::Provider("stream ended without Final event".into()));
@@ -443,18 +1067,34 @@ impl AgentLoop {
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Vec<ContentBlock> {
         let ctx = self.check_context();
+        let cancel = self.current_cancel_token();
 
         // ── Phase 1: classify ──────────────────────────────────────────
         let mut denied: Vec<ContentBlock> = Vec::new();
         let mut safe: Vec<ToolUseCall> = Vec::new();
-        let mut confirm: Vec<ToolUseCall> = Vec::new();
+        let mut confirm: Vec<(String, String, serde_json::Value, String)> = Vec::new();
 
         for (id, name, input) in tool_uses {
             event_sink(AgentEvent::ClassifierStatus {
                 tool_use_id: id.clone(),
                 status: ClassifierStatus::Checking,
             });
-            let decision = self.guardrail.check_with_context(&name, &input, &ctx).await;
+            let prepared = self.prepare_tool_input(&name, input, &ctx, &cancel).await;
+            let (input, decision) = match prepared {
+                PreparedToolInput::Classified { input, decision } => (input, decision),
+                PreparedToolInput::Rejected(outcome) => {
+                    denied.push(tool_result_block(&id, &name, &outcome));
+                    event_sink(tool_result_event(&id, &name, &outcome, None));
+                    continue;
+                }
+                PreparedToolInput::Cancelled => {
+                    let outcome = ToolCallOutcome::error("cancelled by user");
+                    denied.push(tool_result_block(&id, &name, &outcome));
+                    event_sink(tool_result_event(&id, &name, &outcome, None));
+                    continue;
+                }
+            };
+
             match decision {
                 GuardrailDecision::Deny(reason) => {
                     event_sink(AgentEvent::ClassifierStatus {
@@ -463,20 +1103,9 @@ impl AgentLoop {
                             reason: reason.clone(),
                         },
                     });
-                    event_sink(AgentEvent::ToolResult {
-                        tool_use_id: id.clone(),
-                        content: format!("blocked by guardrail: {reason}"),
-                        is_error: true,
-                        name: Some(name.clone()),
-                        duration_ms: None,
-                    });
-                    denied.push(ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content: format!("blocked by guardrail: {reason}"),
-                        is_error: true,
-                        name: Some(name),
-                        protected: false,
-                    });
+                    let outcome = ToolCallOutcome::error(format!("blocked by guardrail: {reason}"));
+                    event_sink(tool_result_event(&id, &name, &outcome, None));
+                    denied.push(tool_result_block(&id, &name, &outcome));
                 }
                 GuardrailDecision::Allow => {
                     event_sink(AgentEvent::ClassifierStatus {
@@ -490,9 +1119,11 @@ impl AgentLoop {
                 GuardrailDecision::Confirm(reason) => {
                     event_sink(AgentEvent::ClassifierStatus {
                         tool_use_id: id.clone(),
-                        status: ClassifierStatus::SuggestConfirm { reason },
+                        status: ClassifierStatus::SuggestConfirm {
+                            reason: reason.clone(),
+                        },
                     });
-                    confirm.push((id, name, input));
+                    confirm.push((id, name, input, reason));
                 }
             }
         }
@@ -505,30 +1136,69 @@ impl AgentLoop {
             let host = Arc::clone(&self.tool_host);
             let ctx = ctx.clone();
             let hook_chain = self.hook_chain.clone();
-            let handles = safe.into_iter().map(|(id, name, input)| {
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut metadata = Vec::with_capacity(safe.len());
+            for (index, (id, name, input)) in safe.into_iter().enumerate() {
+                event_sink(AgentEvent::ToolExecutionStart {
+                    tool_use_id: id.clone(),
+                    name: name.clone(),
+                    input: observable_tool_input(&name, &input),
+                });
+                let started = Instant::now();
+                metadata.push((id.clone(), name.clone(), started));
                 let host = Arc::clone(&host);
                 let ctx = ctx.clone();
                 let hooks = hook_chain.clone();
-                tokio::spawn(async move {
-                    let started = Instant::now();
-                    let outcome =
-                        execute_with_hooks(hooks.as_deref(), &*host, &name, input, &ctx).await;
-                    (id, name, started, outcome)
-                })
-            });
-            let done = futures::future::join_all(handles).await;
-            for joined in done {
-                let (id, name, started, outcome) = joined.unwrap_or_else(|e| {
-                    (
-                        "unknown".to_string(),
-                        "unknown".to_string(),
-                        Instant::now(),
-                        ToolCallOutcome::error(format!("tool task failed: {e}")),
-                    )
+                let cancel = cancel.clone();
+                tasks.spawn(async move {
+                    let outcome = std::panic::AssertUnwindSafe(execute_prepared_cancelled(
+                        hooks.as_deref(),
+                        &*host,
+                        &name,
+                        input,
+                        &ctx,
+                        &cancel,
+                    ))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| ToolCallOutcome::error("tool task panicked"));
+                    (index, outcome)
+                });
+            }
+            let mut completed: Vec<Option<ToolCallOutcome>> =
+                (0..metadata.len()).map(|_| None).collect();
+            let mut cancelled = false;
+            while !tasks.is_empty() {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        tasks.abort_all();
+                        break;
+                    }
+                    joined = tasks.join_next() => {
+                        let Some(joined) = joined else {
+                            break;
+                        };
+                        if let Ok((index, outcome)) = joined {
+                            completed[index] = Some(outcome);
+                        }
+                    }
+                }
+            }
+            drop(tasks);
+            for (index, (id, name, started)) in metadata.into_iter().enumerate() {
+                let outcome = completed[index].take().unwrap_or_else(|| {
+                    if cancelled {
+                        ToolCallOutcome::error("cancelled by user")
+                    } else {
+                        ToolCallOutcome::error("tool task failed")
+                    }
                 });
                 let duration_ms =
                     Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
                 event_sink(AgentEvent::ToolResult {
+                    media: outcome.media.clone(),
                     tool_use_id: id.clone(),
                     content: outcome.content.clone(),
                     is_error: outcome.is_error,
@@ -541,39 +1211,46 @@ impl AgentLoop {
                     is_error: outcome.is_error,
                     name: Some(name),
                     protected: false,
+                    media: outcome.media,
                 });
             }
         }
 
-        // ── Phase 3: confirm calls, serially, behind the approval gate ──
-        for (id, name, input) in confirm {
+        // ── 阶段 3：在审批门后串行执行确认调用 ─────────────────────────
+        for (id, name, input, reason) in confirm {
             let started = Instant::now();
-            let response = self
-                .approval
-                .request(ApprovalRequest::new(
-                    name.clone(),
-                    input.clone(),
-                    "guardrail confirm",
-                ))
-                .await;
+            let response = cancel_or(
+                &cancel,
+                self.approval
+                    .request(ApprovalRequest::new(name.clone(), input.clone(), reason)),
+            )
+            .await;
             let outcome = match response {
-                openpaw_core::ApprovalResponse::Approved => {
-                    execute_with_hooks(
+                None => ToolCallOutcome::error("cancelled by user"),
+                Some(openpaw_core::ApprovalResponse::Approved) => {
+                    event_sink(AgentEvent::ToolExecutionStart {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input: observable_tool_input(&name, &input),
+                    });
+                    execute_prepared_cancelled(
                         self.hook_chain.as_deref(),
                         &*self.tool_host,
                         &name,
                         input,
                         &ctx,
+                        &cancel,
                     )
                     .await
                 }
-                openpaw_core::ApprovalResponse::Denied { reason } => {
+                Some(openpaw_core::ApprovalResponse::Denied { reason }) => {
                     ToolCallOutcome::error(format!("denied by user: {reason}"))
                 }
             };
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             event_sink(AgentEvent::ToolResult {
+                media: outcome.media.clone(),
                 tool_use_id: id.clone(),
                 content: outcome.content.clone(),
                 is_error: outcome.is_error,
@@ -586,6 +1263,7 @@ impl AgentLoop {
                 is_error: outcome.is_error,
                 name: Some(name),
                 protected: false,
+                media: outcome.media,
             });
         }
 
@@ -600,35 +1278,30 @@ impl AgentLoop {
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
     ) -> Vec<ContentBlock> {
         let ctx = self.check_context();
+        let cancel = self.current_cancel_token();
         let mut results = Vec::with_capacity(tool_uses.len());
 
         for (id, name, input) in tool_uses {
             let started = Instant::now();
-
-            if let Err(reason) = self.tool_host.validate_input(&name, &input).await {
-                let content = format!("invalid input: {reason}");
-                event_sink(AgentEvent::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: content.clone(),
-                    is_error: true,
-                    name: Some(name.clone()),
-                    duration_ms: None,
-                });
-                results.push(ContentBlock::ToolResult {
-                    tool_use_id: id,
-                    content,
-                    is_error: true,
-                    name: Some(name),
-                    protected: false,
-                });
-                continue;
-            }
-
             event_sink(AgentEvent::ClassifierStatus {
                 tool_use_id: id.clone(),
                 status: ClassifierStatus::Checking,
             });
-            let decision = self.guardrail.check_with_context(&name, &input, &ctx).await;
+            let prepared = self.prepare_tool_input(&name, input, &ctx, &cancel).await;
+            let (input, decision) = match prepared {
+                PreparedToolInput::Classified { input, decision } => (input, decision),
+                PreparedToolInput::Rejected(outcome) => {
+                    event_sink(tool_result_event(&id, &name, &outcome, None));
+                    results.push(tool_result_block(&id, &name, &outcome));
+                    continue;
+                }
+                PreparedToolInput::Cancelled => {
+                    let outcome = ToolCallOutcome::error("cancelled by user");
+                    event_sink(tool_result_event(&id, &name, &outcome, None));
+                    results.push(tool_result_block(&id, &name, &outcome));
+                    continue;
+                }
+            };
 
             let outcome = match decision {
                 GuardrailDecision::Deny(reason) => {
@@ -647,22 +1320,34 @@ impl AgentLoop {
                             reason: reason.clone(),
                         },
                     });
-                    let response = self
-                        .approval
-                        .request(ApprovalRequest::new(name.clone(), input.clone(), reason))
-                        .await;
+                    let response = cancel_or(
+                        &cancel,
+                        self.approval.request(ApprovalRequest::new(
+                            name.clone(),
+                            input.clone(),
+                            reason,
+                        )),
+                    )
+                    .await;
                     match response {
-                        openpaw_core::ApprovalResponse::Approved => {
-                            execute_with_hooks(
+                        None => ToolCallOutcome::error("cancelled by user"),
+                        Some(openpaw_core::ApprovalResponse::Approved) => {
+                            event_sink(AgentEvent::ToolExecutionStart {
+                                tool_use_id: id.clone(),
+                                name: name.clone(),
+                                input: observable_tool_input(&name, &input),
+                            });
+                            execute_prepared_cancelled(
                                 self.hook_chain.as_deref(),
                                 &*self.tool_host,
                                 &name,
                                 input,
                                 &ctx,
+                                &cancel,
                             )
                             .await
                         }
-                        openpaw_core::ApprovalResponse::Denied { reason } => {
+                        Some(openpaw_core::ApprovalResponse::Denied { reason }) => {
                             ToolCallOutcome::error(format!("denied by user: {reason}"))
                         }
                     }
@@ -674,12 +1359,18 @@ impl AgentLoop {
                             reason: "guardrail allowed".into(),
                         },
                     });
-                    execute_with_hooks(
+                    event_sink(AgentEvent::ToolExecutionStart {
+                        tool_use_id: id.clone(),
+                        name: name.clone(),
+                        input: observable_tool_input(&name, &input),
+                    });
+                    execute_prepared_cancelled(
                         self.hook_chain.as_deref(),
                         &*self.tool_host,
                         &name,
                         input,
                         &ctx,
+                        &cancel,
                     )
                     .await
                 }
@@ -688,6 +1379,7 @@ impl AgentLoop {
             let duration_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             event_sink(AgentEvent::ToolResult {
+                media: outcome.media.clone(),
                 tool_use_id: id.clone(),
                 content: outcome.content.clone(),
                 is_error: outcome.is_error,
@@ -700,26 +1392,160 @@ impl AgentLoop {
                 is_error: outcome.is_error,
                 name: Some(name),
                 protected: false,
+                media: outcome.media,
             });
         }
 
         results
     }
+
+    async fn prepare_tool_input(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        ctx: &CheckContext,
+        cancel: &CancellationToken,
+    ) -> PreparedToolInput {
+        match cancel_or(cancel, self.tool_host.validate_input(name, &input)).await {
+            None => return PreparedToolInput::Cancelled,
+            Some(Err(reason)) => {
+                return PreparedToolInput::Rejected(ToolCallOutcome::error(format!(
+                    "invalid input: {reason}"
+                )))
+            }
+            Some(Ok(())) => {}
+        }
+
+        let mut final_input = input;
+        if let Some(chain) = self.hook_chain.as_deref() {
+            if chain.hook_count(HookPoint::BeforeToolCall) > 0 {
+                let payload =
+                    serde_json::json!({ "tool_name": name, "input": final_input.clone() });
+                match cancel_or(cancel, chain.run(HookPoint::BeforeToolCall, payload)).await {
+                    None => return PreparedToolInput::Cancelled,
+                    Some(HookDecision::Skip) => {
+                        return PreparedToolInput::Rejected(ToolCallOutcome::error(
+                            "blocked by hook",
+                        ))
+                    }
+                    Some(HookDecision::Continue) => {}
+                    Some(HookDecision::Replace(value)) => {
+                        let Some(replacement) = value.get("input").cloned() else {
+                            return PreparedToolInput::Rejected(ToolCallOutcome::error(
+                                "invalid hook replacement: missing input",
+                            ));
+                        };
+                        match cancel_or(cancel, self.tool_host.validate_input(name, &replacement))
+                            .await
+                        {
+                            None => return PreparedToolInput::Cancelled,
+                            Some(Err(reason)) => {
+                                return PreparedToolInput::Rejected(ToolCallOutcome::error(
+                                    format!("invalid input after hook: {reason}"),
+                                ))
+                            }
+                            Some(Ok(())) => final_input = replacement,
+                        }
+                    }
+                }
+            }
+        }
+
+        match cancel_or(
+            cancel,
+            self.guardrail.check_with_context(name, &final_input, ctx),
+        )
+        .await
+        {
+            None => PreparedToolInput::Cancelled,
+            Some(decision) => PreparedToolInput::Classified {
+                input: final_input,
+                decision,
+            },
+        }
+    }
 }
 
-/// Hook-aware wrapper around [`execute_one`].
-///
-/// Decision mapping — payload shape `{"tool_name", "input"}` (the
-/// AfterToolCall payload adds `"result"`):
-/// - `BeforeToolCall`: `Skip` → the host is never invoked and an error
-///   outcome (`"blocked by hook"`) is returned; `Continue` → run as-is;
-///   `Replace(val)` → run with `val["input"]` as the input.
-/// - `AfterToolCall`: `Replace(val)` rewrites `result.content` /
-///   `result.is_error` when present; any other shape is ignored.
-///
-/// Zero-overhead short-circuit: with no chain attached, or when no hooks
-/// are registered at either point, this is exactly [`execute_one`].
-async fn execute_with_hooks(
+async fn cancel_or<F>(cancel: &CancellationToken, future: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        result = future => Some(result),
+    }
+}
+
+fn tool_result_event(
+    id: &str,
+    name: &str,
+    outcome: &ToolCallOutcome,
+    duration_ms: Option<u64>,
+) -> AgentEvent {
+    AgentEvent::ToolResult {
+        media: outcome.media.clone(),
+        tool_use_id: id.to_string(),
+        content: outcome.content.clone(),
+        is_error: outcome.is_error,
+        name: Some(name.to_string()),
+        duration_ms,
+    }
+}
+
+/// 将活动事件限制为少量白名单字段，禁止携带文件正文、替换文本、命令和任意工具负载。
+fn observable_tool_input(name: &str, input: &serde_json::Value) -> serde_json::Value {
+    const MAX_FIELD_CHARS: usize = 512;
+    let keys: &[&str] = match name {
+        "web_search" => &["query"],
+        "web_fetch" | "web_extract" => &["url"],
+        "read_file" | "write_file" | "edit_file" | "notebook_edit" => &["path"],
+        "grep" => &["pattern", "path"],
+        "glob" => &["pattern"],
+        _ => &[],
+    };
+    let mut projected = serde_json::Map::new();
+    for key in keys {
+        let Some(value) = input.get(*key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let prefix = value.chars().take(MAX_FIELD_CHARS).collect::<String>();
+        projected.insert((*key).to_string(), serde_json::Value::String(prefix));
+    }
+    serde_json::Value::Object(projected)
+}
+
+fn tool_result_block(id: &str, name: &str, outcome: &ToolCallOutcome) -> ContentBlock {
+    ContentBlock::ToolResult {
+        tool_use_id: id.to_string(),
+        content: outcome.content.clone(),
+        is_error: outcome.is_error,
+        name: Some(name.to_string()),
+        protected: false,
+        media: outcome.media.clone(),
+    }
+}
+
+// 在工具 future 外层统一竞争取消信号，保证 Host 中止后不会继续等待阻塞工具或 After hook。
+// `biased` 使已经就绪的取消优先返回；底层 future 被丢弃后不得再向本回合发布结果。
+async fn execute_prepared_cancelled(
+    hooks: Option<&HookChain>,
+    host: &dyn ToolHost,
+    name: &str,
+    input: serde_json::Value,
+    ctx: &CheckContext,
+    cancel: &CancellationToken,
+) -> ToolCallOutcome {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => ToolCallOutcome::error("cancelled by user"),
+        outcome = execute_prepared(hooks, host, name, input, ctx) => outcome,
+    }
+}
+
+/// 功能：执行已通过最终输入校验、护栏和审批的工具调用，并应用 After hook。
+/// 约束：Before hook 已在安全分类前运行，本函数不得再次改写输入或重复授权。
+async fn execute_prepared(
     hook_chain: Option<&HookChain>,
     host: &dyn ToolHost,
     name: &str,
@@ -727,39 +1553,30 @@ async fn execute_with_hooks(
     ctx: &CheckContext,
 ) -> ToolCallOutcome {
     let Some(chain) = hook_chain else {
-        return execute_one(host, name, input, ctx).await;
-    };
-    let has_before = chain.hook_count(HookPoint::BeforeToolCall) > 0;
-    let has_after = chain.hook_count(HookPoint::AfterToolCall) > 0;
-    if !has_before && !has_after {
-        return execute_one(host, name, input, ctx).await;
-    }
-
-    // BeforeToolCall: block, rewrite the input, or proceed unchanged.
-    let input = if has_before {
-        let payload = serde_json::json!({ "tool_name": name, "input": input.clone() });
-        match chain.run(HookPoint::BeforeToolCall, payload).await {
-            HookDecision::Skip => return ToolCallOutcome::error("blocked by hook"),
-            HookDecision::Continue => input,
-            HookDecision::Replace(val) => val["input"].clone(),
-        }
-    } else {
-        input
+        return sanitize_outcome(execute_one(host, name, input, ctx).await);
     };
 
     let mut outcome = execute_one(host, name, input.clone(), ctx).await;
 
-    // AfterToolCall: observers may rewrite the outcome.
-    if has_after {
+    // AfterToolCall：观察者可以改写工具结果。
+    if chain.hook_count(HookPoint::AfterToolCall) > 0 {
         let payload = serde_json::json!({
             "tool_name": name,
             "input": input,
             "result": {
                 "content": outcome.content.clone(),
                 "is_error": outcome.is_error,
+                "media": outcome.media,
             },
         });
         if let HookDecision::Replace(val) = chain.run(HookPoint::AfterToolCall, payload).await {
+            outcome.media = match val.pointer("/result/media") {
+                Some(value) => match serde_json::from_value(value.clone()) {
+                    Ok(media) => media,
+                    Err(_) => return ToolCallOutcome::error("invalid media in hook replacement"),
+                },
+                None => Vec::new(),
+            };
             if let Some(content) = val.pointer("/result/content").and_then(|c| c.as_str()) {
                 outcome.content = content.to_string();
             }
@@ -768,20 +1585,267 @@ async fn execute_with_hooks(
             }
         }
     }
+    sanitize_outcome(outcome)
+}
+
+fn sanitize_outcome(mut outcome: ToolCallOutcome) -> ToolCallOutcome {
+    if outcome.is_error {
+        outcome.media.clear();
+    }
+    for media in &outcome.media {
+        if let Err(error) = media.bytes() {
+            return ToolCallOutcome::error(error.to_string());
+        }
+    }
     outcome
 }
 
-/// Validate → call, converting transport errors into error outcomes so a
-/// single failing tool never aborts the batch.
+/// 功能：校验后调用 ToolHost，并把传输错误转换为错误结果，避免单个失败中止批次。
 async fn execute_one(
     host: &dyn ToolHost,
     name: &str,
     input: serde_json::Value,
     ctx: &CheckContext,
 ) -> ToolCallOutcome {
-    let _ = ctx; // context-aware hosts arrive with E2 depth
+    let _ = ctx; // 支持上下文的 ToolHost 在 E2 阶段接入更深的检查。
     match host.call(name, input).await {
         Ok(outcome) => outcome,
         Err(e) => ToolCallOutcome::error(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn media_hook_replacements_are_validated_and_never_keep_stale_media() {
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::write(workspace.path().join("media.gif"), b"GIF89afixture")
+            .await
+            .unwrap();
+        let host = openpaw_tools::ToolRegistry::new(workspace.path());
+        let original =
+            openpaw_core::InlineMedia::from_bytes(b"GIF89afixture", "image/gif", None).unwrap();
+        for replacement in [
+            serde_json::json!({"result":{"content":"redacted"}}),
+            serde_json::json!({"result":{"is_error":true,"media":[original.clone()]}}),
+            serde_json::json!({"result":{"media":[{"id":"bad","mime":"image/gif","data":"???"}]}}),
+            serde_json::json!({"result":{"media":"wrong-shape"}}),
+        ] {
+            let mut chain = HookChain::new();
+            chain.register(HookPoint::AfterToolCall, "media-replacement", move |_| {
+                let replacement = replacement.clone();
+                async move {
+                    openpaw_plugins::HookResult {
+                        decision: HookDecision::Replace(replacement),
+                        modified_payload: None,
+                    }
+                }
+            });
+            let outcome = execute_prepared(
+                Some(&chain),
+                &host,
+                "read_file",
+                serde_json::json!({"path":"media.gif"}),
+                &CheckContext::default(),
+            )
+            .await;
+            assert!(outcome.media.is_empty());
+        }
+    }
+    use futures::stream::BoxStream;
+    use openpaw_core::{CompletionResponse, LlmProvider, Role, Session, StreamEvent};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmptyFinalProvider {
+        empty_calls: AtomicUsize,
+        calls: AtomicUsize,
+        stop_reason: StopReason,
+    }
+
+    struct ReasoningThenErrorProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ReasoningThenErrorProvider {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+            unreachable!("reasoning 重试回归测试只使用流式接口")
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                return Ok(Box::pin(futures::stream::iter([
+                    Ok(StreamEvent::ThinkingDelta {
+                        index: 0,
+                        text: "discarded attempt".into(),
+                    }),
+                    Err(Error::Provider("stream ended without Final event".into())),
+                ])));
+            }
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Final(
+                Box::new(CompletionResponse {
+                    content: vec![ContentBlock::Text {
+                        text: "recovered after reasoning".into(),
+                    }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: Default::default(),
+                }),
+            ))])))
+        }
+
+        fn capabilities(&self) -> openpaw_core::Capabilities {
+            Default::default()
+        }
+
+        fn name(&self) -> &str {
+            "reasoning-then-error"
+        }
+
+        fn default_model(&self) -> &str {
+            "reasoning-then-error"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for EmptyFinalProvider {
+        async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+            unreachable!("空响应回归测试只使用流式接口")
+        }
+
+        async fn stream(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut remaining = self.empty_calls.load(Ordering::SeqCst);
+            let empty = loop {
+                if remaining == 0 {
+                    break false;
+                }
+                match self.empty_calls.compare_exchange_weak(
+                    remaining,
+                    remaining - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break true,
+                    Err(current) => remaining = current,
+                }
+            };
+            let content = (!empty)
+                .then(|| ContentBlock::Text {
+                    text: "recovered".into(),
+                })
+                .into_iter()
+                .collect();
+            let response = CompletionResponse {
+                content,
+                stop_reason: self.stop_reason,
+                usage: Default::default(),
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(StreamEvent::Final(
+                Box::new(response),
+            ))])))
+        }
+
+        fn capabilities(&self) -> openpaw_core::Capabilities {
+            Default::default()
+        }
+
+        fn name(&self) -> &str {
+            "empty-final"
+        }
+
+        fn default_model(&self) -> &str {
+            "empty-final"
+        }
+    }
+
+    async fn run_empty_final_case(empty_calls: usize) -> (Result<StopReason>, Session, usize) {
+        let provider = Arc::new(EmptyFinalProvider {
+            empty_calls: AtomicUsize::new(empty_calls),
+            calls: AtomicUsize::new(0),
+            stop_reason: StopReason::EndTurn,
+        });
+        let agent =
+            AgentLoop::new(provider.clone()).with_retry_policy(RetryPolicy::new(1, 0, 0, 1.0));
+        let mut session = Session::new("empty-final", "empty-final");
+        session.messages.push(Message::user_text("hi"));
+        let result = agent.run_turn(&mut session, None, &[], &mut |_| {}).await;
+        (result, session, provider.calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn empty_success_response_is_retried_before_completion() {
+        let (result, session, calls) = run_empty_final_case(1).await;
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+        assert_eq!(calls, 2);
+        assert_eq!(session.messages.last().unwrap().text(), "recovered");
+    }
+
+    #[tokio::test]
+    async fn exhausted_empty_success_responses_fail_without_empty_assistant() {
+        let (result, session, calls) = run_empty_final_case(usize::MAX).await;
+        assert!(matches!(result, Err(Error::Provider(message)) if message.contains("空响应")));
+        assert_eq!(calls, 2);
+        assert_eq!(session.messages.len(), 1);
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| message.role != Role::Assistant || !message.content.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_attempt_can_retry_without_leaking_partial_events() {
+        let provider = Arc::new(ReasoningThenErrorProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let agent =
+            AgentLoop::new(provider.clone()).with_retry_policy(RetryPolicy::new(1, 0, 0, 1.0));
+        let mut session = Session::new("reasoning-retry", "reasoning-then-error");
+        session.messages.push(Message::user_text("hi"));
+        let mut events = Vec::new();
+        let result = agent
+            .run_turn(&mut session, None, &[], &mut |event| events.push(event))
+            .await;
+        assert_eq!(result.unwrap(), StopReason::EndTurn);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ThinkingDelta { text } if text.contains("discarded attempt")
+        )));
+        assert_eq!(
+            session.messages.last().unwrap().text(),
+            "recovered after reasoning"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_tokens_is_not_persisted_as_a_completed_assistant_response() {
+        let agent = AgentLoop::new(Arc::new(EmptyFinalProvider {
+            empty_calls: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            stop_reason: StopReason::MaxTokens,
+        }));
+        let mut session = Session::new("max-tokens", "max-tokens");
+        session
+            .messages
+            .push(Message::user_text("write a long answer"));
+        let mut events = Vec::new();
+        let result = agent
+            .run_turn(&mut session, None, &[], &mut |event| events.push(event))
+            .await;
+        assert!(matches!(
+            result,
+            Err(Error::Provider(message)) if message.contains("max_output_tokens")
+        ));
+        assert_eq!(session.messages.len(), 1);
+        assert!(events.is_empty());
     }
 }

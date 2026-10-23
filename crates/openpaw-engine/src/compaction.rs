@@ -1,15 +1,21 @@
-//! Context compaction — E2 minimal rewrite (token estimate + threshold
-//! trigger + single summary), semantics aligned to the upstream pipeline
-//! (see docs/spikes/S1-agent-loop.md section 2 ④).
-//!
-//! Deliberately deferred: microcompact sweeps, snip compaction, cached
-//! microcompact, PTL retry, time-based decay, post-compact file/skill
-//! reinjection.
+//! 功能：估算模型上下文并用单次摘要压缩旧历史，确定性保留媒体编号与工具配对。
+//! 输入输出边界：中立 Session 和 Provider；原件只留在调用方完整历史中。
+//! 禁止承担：不写会话文件、不按 Base64 推断计费、不删除受保护的当前回合。
+//! 关联：CHG-2026-0026、docs/spikes/S1-agent-loop.md。
 
 use openpaw_core::{
     CompactType, CompletionRequest, ContentBlock, Error, LlmProvider, Message, Result, Role,
     Session,
 };
+
+// 媒体估算是固定的本地预算提示，不是 token 上界或模型计费；字节限制单独精确检查。
+fn media_tokens(media: &openpaw_core::InlineMedia) -> usize {
+    if media.mime.starts_with("image/") {
+        4096
+    } else {
+        8192
+    }
+}
 
 /// CJK-aware token estimate: ASCII ≈ /4, CJK ideographs/kana/hangul ≈ ×1.5,
 /// other multibyte ≈ ×1.8 (same-source formula).
@@ -30,8 +36,14 @@ pub fn estimate_tokens(text: &str) -> usize {
     (ascii_len as f64 / 4.0 + cjk_len as f64 * 1.5 + other_len as f64 * 1.8).ceil() as usize
 }
 
-/// Estimate the full context size: system + every message block + the
-/// serialized tool schemas (approximation).
+/// 功能：粗估系统、消息与工具的上下文用量。
+/// 参数：system、session 与工具 schema 估计值。
+/// 返回：本地预算提示；媒体按类型固定估算。
+/// 错误：无；不代表上游计费或精确 token。
+/// 状态：只读。
+/// 并发与取消：同步。
+/// 权限：不输出媒体原件。
+/// 关联：AgentLoop 自动压缩。
 pub fn estimate_session_tokens(system: &str, session: &Session, tools_json_approx: usize) -> usize {
     let mut total = estimate_tokens(system) + tools_json_approx;
     for msg in &session.messages {
@@ -42,13 +54,12 @@ pub fn estimate_session_tokens(system: &str, session: &Session, tools_json_appro
                 ContentBlock::ToolUse { input, .. } => {
                     total += estimate_tokens(&serde_json::to_string(input).unwrap_or_default());
                 }
-                ContentBlock::ToolResult { content, .. } => total += estimate_tokens(content),
-                ContentBlock::Image { url, data, .. } => {
-                    total += estimate_tokens(url);
-                    if let Some(d) = data {
-                        total += d.len() / 4;
-                    }
+                ContentBlock::ToolResult { content, media, .. } => {
+                    total +=
+                        estimate_tokens(content) + media.iter().map(media_tokens).sum::<usize>();
                 }
+                ContentBlock::Image { .. } => total += 4096,
+                ContentBlock::Audio { media } => total += media_tokens(media),
                 ContentBlock::Document { url, data, .. } => {
                     total += estimate_tokens(url);
                     if let Some(d) = data {
@@ -185,9 +196,24 @@ fn format_for_summary(messages: &[Message]) -> String {
                     let preview: String = thinking.chars().take(100).collect();
                     buf.push_str(&format!("[{role} thinking] {preview}...\n"));
                 }
-                ContentBlock::Image { url, .. } | ContentBlock::Document { url, .. } => {
-                    buf.push_str(&format!("[{role} media] {url}\n"));
+                ContentBlock::Image {
+                    id,
+                    media_type,
+                    filename,
+                    ..
+                } => {
+                    buf.push_str(&format!(
+                        "[{role} image] ID={} MIME={} name={}\n",
+                        id.as_deref().unwrap_or("legacy"),
+                        media_type.as_deref().unwrap_or("unknown"),
+                        filename.as_deref().unwrap_or("")
+                    ));
                 }
+                ContentBlock::Audio { media } => buf.push_str(&format!(
+                    "[{role} audio] ID={} MIME={}\n",
+                    media.id, media.mime
+                )),
+                ContentBlock::Document { .. } => buf.push_str(&format!("[{role} document]\n")),
                 ContentBlock::CompactBoundary { .. } | ContentBlock::Unknown(_) => {}
             }
         }
@@ -243,11 +269,33 @@ pub fn create_compact_boundary_message(
     }
 }
 
-/// Single-summary compaction: protect the head, summarize the middle via
-/// one LLM call, keep the recent tail. Returns the number of compacted
-/// messages (0 = nothing to do).
+/// 功能：用默认模型压缩可替换的旧消息并保留合法工具链与媒体编号。
+/// 参数：provider、session、压缩阈值与保护范围。
+/// 返回：被摘要替换的消息数；无可替换内容返回零。
+/// 错误：摘要调用失败、空白或未完整结束；失败不修改消息。
+/// 状态：成功时替换模型上下文，完整持久化由入口处理。
+/// 并发与取消：异步调用；调用者负责 checkpoint 与取消。
+/// 权限：摘要只收到媒体描述，不收到原件。
+/// 关联：TurnExecution、CLI/Host。
 pub async fn compact_session(
     provider: &dyn LlmProvider,
+    session: &mut Session,
+    opts: &CompactOptions,
+) -> Result<usize> {
+    compact_session_for_model(provider, provider.default_model(), session, opts).await
+}
+
+/// 功能：使用回合所选模型压缩旧消息，避免覆盖模型时误用默认值。
+/// 参数：provider、model、session 和保护范围。
+/// 返回：被替换消息数。
+/// 错误：摘要失败或未完整结束。
+/// 状态：成功后更新模型视图，原件与完整产出由入口保留。
+/// 并发与取消：调用方通过取消令牌和 checkpoint 保护。
+/// 权限：不发送媒体原件给摘要模型。
+/// 关联：AgentLoop 自动压缩。
+pub(crate) async fn compact_session_for_model(
+    provider: &dyn LlmProvider,
+    model: &str,
     session: &mut Session,
     opts: &CompactOptions,
 ) -> Result<usize> {
@@ -272,7 +320,7 @@ pub async fn compact_session(
 
     let transcript = format_for_summary(&old_messages);
     let req = CompletionRequest {
-        model: provider.default_model().to_string(),
+        model: model.to_string(),
         system: Some(COMPACTION_SYSTEM.to_string()),
         messages: vec![Message::user_text(transcript)],
         max_tokens: 2048,
@@ -283,7 +331,22 @@ pub async fn compact_session(
         .complete(req)
         .await
         .map_err(|e| Error::session(format!("compaction summary failed: {e}")))?;
-    let summary_text = resp.text();
+    if resp.stop_reason != openpaw_core::StopReason::EndTurn || resp.text().trim().is_empty() {
+        return Err(Error::session("compaction summary is incomplete"));
+    }
+    let mut summary_text = resp.text();
+    // 编号清单由程序保留，不依赖摘要模型记忆原件或解读文件名。
+    let mut media = openpaw_core::media::message_media(&old_messages);
+    media.sort_by(|a, b| a.id.cmp(&b.id));
+    media.dedup_by(|a, b| a.id == b.id);
+    for item in media {
+        summary_text.push_str(&format!(
+            "\nAttachment {} ({}, {}): use read_attachment to inspect original.",
+            item.id,
+            item.mime,
+            item.filename.as_deref().unwrap_or("")
+        ));
+    }
 
     session.messages.clear();
     session.messages.extend(protected_head);
@@ -417,6 +480,7 @@ mod tests {
                 is_error: false,
                 name: None,
                 protected: false,
+                media: Vec::new(),
             }],
             ..Default::default()
         });

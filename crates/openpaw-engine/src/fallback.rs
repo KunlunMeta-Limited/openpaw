@@ -126,6 +126,10 @@ impl LlmProvider for FallbackCompressProvider {
         self.primary.capabilities()
     }
 
+    fn model_capabilities(&self, model: &str) -> Capabilities {
+        self.primary.model_capabilities(model)
+    }
+
     fn name(&self) -> &str {
         self.primary.name()
     }

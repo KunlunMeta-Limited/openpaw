@@ -16,12 +16,19 @@ use crate::sse::{AnthropicStreamAssembler, SseDecoder};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+fn anthropic_image(media: &openpaw_core::InlineMedia) -> Result<serde_json::Value> {
+    Ok(
+        serde_json::json!({"type":"image", "source":{"type":"base64","media_type":media.mime,"data":media.model_data()?}}),
+    )
+}
+
 pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     default_model: String,
     client: reqwest::Client,
     stream_client: reqwest::Client,
+    model_capabilities: std::collections::HashMap<String, Capabilities>,
 }
 
 impl AnthropicProvider {
@@ -32,6 +39,7 @@ impl AnthropicProvider {
             default_model: default_model.into(),
             client: complete_client(),
             stream_client: stream_client(),
+            model_capabilities: Default::default(),
         }
     }
 
@@ -40,7 +48,32 @@ impl AnthropicProvider {
         self
     }
 
-    fn build_body(&self, req: &CompletionRequest, stream: bool) -> serde_json::Value {
+    fn endpoint(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        }
+    }
+
+    /// 功能：设置逐模型媒体声明。
+    /// 参数：配置快照。
+    /// 返回：Provider。
+    /// 错误：无；配置阶段校验。
+    /// 状态：替换能力目录。
+    /// 并发与取消：构造时执行。
+    /// 权限：不访问上游。
+    /// 关联：ConfigSnapshot。
+    pub fn with_model_capabilities(
+        mut self,
+        capabilities: std::collections::HashMap<String, Capabilities>,
+    ) -> Self {
+        self.model_capabilities = capabilities;
+        self
+    }
+
+    fn build_body(&self, req: &CompletionRequest, stream: bool) -> Result<serde_json::Value> {
         let model = if req.model.is_empty() {
             self.default_model.clone()
         } else {
@@ -52,13 +85,48 @@ impl AnthropicProvider {
             4096
         };
 
-        // Messages: pass core Messages through; the serde shapes match the
-        // Anthropic wire format. ToolResult blocks ride on user messages.
-        let messages: Vec<serde_json::Value> = req
-            .messages
-            .iter()
-            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null))
-            .collect();
+        let mut messages = Vec::new();
+        for message in &req.messages {
+            let mut caps = self.model_capabilities(&model);
+            caps.audio_input = false;
+            openpaw_core::media::validate_media(
+                &openpaw_core::media::message_media(std::slice::from_ref(message)),
+                caps,
+            )?;
+            let mut content = Vec::new();
+            for block in &message.content {
+                use openpaw_core::ContentBlock;
+                match block {
+                    ContentBlock::Image { .. } | ContentBlock::Audio { .. } => {
+                        if let Some(media) = openpaw_core::media::block_media(block)? {
+                            content.push(anthropic_image(&media)?);
+                        }
+                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content: text,
+                        is_error,
+                        media,
+                        ..
+                    } => {
+                        let mut parts = vec![serde_json::json!({"type":"text","text":text})];
+                        for item in media {
+                            parts.push(anthropic_image(item)?);
+                        }
+                        content.push(serde_json::json!({"type":"tool_result","tool_use_id":tool_use_id,"is_error":is_error,
+                            "content":if media.is_empty() { serde_json::json!(text) } else { serde_json::json!(parts) }}));
+                    }
+                    ContentBlock::CompactBoundary { .. } => {}
+                    _ => content.push(
+                        serde_json::to_value(block)
+                            .map_err(|_| Error::session("invalid content block"))?,
+                    ),
+                }
+            }
+            if !content.is_empty() {
+                messages.push(serde_json::json!({"role":message.role,"content":content}));
+            }
+        }
 
         let tools: Vec<serde_json::Value> = req
             .tools
@@ -87,15 +155,14 @@ impl AnthropicProvider {
         if let Some(t) = req.temperature {
             body["temperature"] = serde_json::json!(t);
         }
-        body
+        if body.to_string().len() > openpaw_core::media::MAX_REQUEST_BYTES {
+            return Err(Error::session("model request exceeds byte limit"));
+        }
+        Ok(body)
     }
-}
-
-#[async_trait]
-impl LlmProvider for AnthropicProvider {
-    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
-        let body = self.build_body(&req, false);
-        let url = format!("{}/v1/messages", self.base_url);
+    async fn complete_request(&self, req: CompletionRequest) -> Result<CompletionResponse> {
+        let body = self.build_body(&req, false)?;
+        let url = self.endpoint();
         let resp = self
             .client
             .post(&url)
@@ -123,12 +190,12 @@ impl LlmProvider for AnthropicProvider {
         Ok(parsed)
     }
 
-    async fn stream(
+    async fn stream_request(
         &self,
         req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
-        let body = self.build_body(&req, true);
-        let url = format!("{}/v1/messages", self.base_url);
+        let body = self.build_body(&req, true)?;
+        let url = self.endpoint();
         let resp = self
             .stream_client
             .post(&url)
@@ -171,24 +238,54 @@ impl LlmProvider for AnthropicProvider {
                         return None;
                     }
                     match stream.next().await {
-                        Some(Ok(bytes)) => {
-                            for frame in decoder.feed(&bytes) {
-                                queue.extend(assembler.absorb(&frame));
+                        Some(Ok(bytes)) => match decoder.feed(&bytes) {
+                            Ok(frames) => {
+                                for frame in frames {
+                                    match assembler.absorb(&frame) {
+                                        Ok(events) => queue.extend(events.into_iter().map(Ok)),
+                                        Err(error) => {
+                                            queue.push_back(Err(error));
+                                            finished = true;
+                                            break;
+                                        }
+                                    }
+                                }
                             }
-                        }
+                            Err(error) => {
+                                queue.push_back(Err(error));
+                                finished = true;
+                            }
+                        },
                         Some(Err(e)) => {
                             queue.push_back(Err(e));
                             finished = true; // don't finalize after a read error
                         }
                         None => {
-                            for frame in decoder.finish() {
-                                queue.extend(assembler.absorb(&frame));
-                            }
-                            match assembler.finalize() {
-                                Ok(resp) => {
-                                    queue.push_back(Ok(StreamEvent::Final(Box::new(resp))));
+                            match decoder.finish() {
+                                Ok(frames) => {
+                                    for frame in frames {
+                                        match assembler.absorb(&frame) {
+                                            Ok(events) => queue.extend(events.into_iter().map(Ok)),
+                                            Err(error) => {
+                                                queue.push_back(Err(error));
+                                                finished = true;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
-                                Err(e) => queue.push_back(Err(e)),
+                                Err(error) => {
+                                    queue.push_back(Err(error));
+                                    finished = true;
+                                }
+                            }
+                            if !finished {
+                                match assembler.finalize() {
+                                    Ok(resp) => {
+                                        queue.push_back(Ok(StreamEvent::Final(Box::new(resp))));
+                                    }
+                                    Err(error) => queue.push_back(Err(error)),
+                                }
                             }
                             finished = true;
                         }
@@ -197,9 +294,48 @@ impl LlmProvider for AnthropicProvider {
             },
         )))
     }
+}
+
+#[async_trait]
+impl LlmProvider for AnthropicProvider {
+    async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
+        let media = !openpaw_core::media::message_media(&req.messages).is_empty();
+        self.complete_request(req).await.map_err(|error| {
+            if media {
+                openpaw_core::media::redact_error(error)
+            } else {
+                error
+            }
+        })
+    }
+
+    async fn stream(
+        &self,
+        req: CompletionRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        let media = !openpaw_core::media::message_media(&req.messages).is_empty();
+        let stream = self.stream_request(req).await.map_err(|error| {
+            if media {
+                openpaw_core::media::redact_error(error)
+            } else {
+                error
+            }
+        })?;
+        Ok(Box::pin(stream.map(move |result| {
+            result.map_err(|error| {
+                if media {
+                    openpaw_core::media::redact_error(error)
+                } else {
+                    error
+                }
+            })
+        })))
+    }
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            image_input: false,
+            audio_input: false,
             tool_use: true,
             prompt_caching: true,
             streaming: true,
@@ -211,6 +347,16 @@ impl LlmProvider for AnthropicProvider {
 
     fn name(&self) -> &str {
         "anthropic"
+    }
+
+    fn model_capabilities(&self, model: &str) -> Capabilities {
+        let mut caps = self.capabilities();
+        if let Some(declared) = self.model_capabilities.get(model) {
+            caps.image_input = declared.image_input;
+            caps.context_window = declared.context_window;
+        }
+        caps.audio_input = false;
+        caps
     }
 
     fn default_model(&self) -> &str {
@@ -250,6 +396,7 @@ mod tests {
                         is_error: false,
                         name: None,
                         protected: false,
+                        media: Vec::new(),
                     }],
                     ..Default::default()
                 },
@@ -257,7 +404,7 @@ mod tests {
             tools: vec![ToolSpec::new("read_file", "reads")],
             ..Default::default()
         };
-        let body = p.build_body(&req, false);
+        let body = p.build_body(&req, false).unwrap();
         assert_eq!(body["model"], json!("claude-sonnet-4"));
         assert_eq!(body["max_tokens"], json!(100));
         assert_eq!(body["system"], json!("be brief"));

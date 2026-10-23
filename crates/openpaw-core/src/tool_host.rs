@@ -7,12 +7,14 @@ use async_trait::async_trait;
 use crate::provider::ToolSpec;
 use crate::Result;
 
-/// Result of a single tool invocation, ready to be fed back into the LLM
-/// transcript as a `tool_result` block.
+/// 功能：保存单次工具执行的文字、结构化结果及内联媒体，供模型续轮使用。
 ///
 /// Stability: stable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallOutcome {
+    /// 功能：与文本结果关联的内联附件。Stability: unstable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<crate::InlineMedia>,
     /// Plain-text content for the `tool_result` block. Non-text content is
     /// summarised inline (e.g. `[image: 12 KB png]`).
     pub content: String,
@@ -24,19 +26,37 @@ pub struct ToolCallOutcome {
 }
 
 impl ToolCallOutcome {
+    /// 功能：构建成功的纯文本工具结果。
+    /// 参数：content 为正文。
+    /// 返回：媒体列表为空的成功结果。
+    /// 错误：无。
+    /// 状态：无。
+    /// 并发与取消：同步。
+    /// 权限：无。
+    /// 关联：富结果可随后添加 media。Stability: stable.
     pub fn ok(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
             structured: None,
+            media: Vec::new(),
         }
     }
 
+    /// 功能：构建不携带媒体的工具失败结果。
+    /// 参数：content 为可展示错误。
+    /// 返回：错误结果。
+    /// 错误：无。
+    /// 状态：无。
+    /// 并发与取消：同步。
+    /// 权限：调用者应过滤敏感内容。
+    /// 关联：AgentLoop。Stability: stable.
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: true,
             structured: None,
+            media: Vec::new(),
         }
     }
 }
@@ -50,6 +70,26 @@ use serde::{Deserialize, Serialize};
 pub trait ToolExecutor: Send + Sync {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>>;
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolCallOutcome>;
+
+    /// 功能：安装当前回合可见附件。
+    /// 参数：经过有效历史边界裁剪的原件。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：替换会话范围的临时查找表。
+    /// 并发与取消：调用者独占回合；结束必须清空。
+    /// 权限：不授予其他会话读取权。
+    /// 关联：read_attachment。Stability: unstable.
+    fn set_media_context(&self, _media: Vec<crate::InlineMedia>) {}
+
+    /// 功能：发布经过 Hook 和预算校验的本回合附件。
+    /// 参数：合法工具结果原件。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：加入临时查找表。
+    /// 并发与取消：回合结束调用 set_media_context 清空。
+    /// 权限：仅当前会话。
+    /// 关联：Engine 工具续轮。Stability: unstable.
+    fn remember_media(&self, _media: Vec<crate::InlineMedia>) {}
 }
 
 /// Input validation runs before guardrails; failures short-circuit the

@@ -77,6 +77,17 @@ fn root_help_lists_all_twelve_subcommands_and_version() {
         help.contains("Usage:"),
         "root help must render a usage block:\n{help}"
     );
+    #[cfg(feature = "engine-host")]
+    for flag in [
+        "--engine-host",
+        "--engine-host-hostname",
+        "--engine-host-port",
+    ] {
+        assert!(
+            help.contains(flag),
+            "root help must mention `{flag}`:\n{help}"
+        );
+    }
 }
 
 #[test]
@@ -109,7 +120,18 @@ fn each_subcommand_help_carries_key_names() {
     // (subcommand, substrings that must appear in its rendered help).
     let cases: &[(&str, &[&str])] = &[
         ("hello", &["echo"]),
-        ("chat", &["--provider", "--workspace", "--home"]),
+        (
+            "chat",
+            &[
+                "--provider",
+                "--workspace",
+                "--home",
+                "--base-url",
+                "--model",
+                "--max-output-tokens",
+                "--permissions",
+            ],
+        ),
         ("session", &["list", "show", "search"]),
         ("memory", &["list", "search", "show", "delete"]),
         ("evolve", &["status", "reset"]),

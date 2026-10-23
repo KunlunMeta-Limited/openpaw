@@ -1,0 +1,26 @@
+FROM rust:1.88-bookworm AS build
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY \
+    RUSTUP_TOOLCHAIN=1.88.0
+
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked --features engine-host -p openpaw-cli
+
+FROM rust:1.88-bookworm
+
+COPY --from=build /src/target/release/openpaw /usr/local/bin/openpaw
+
+ENV OPENPAW_HOME=/data/openpaw \
+    OPENPAW_ENGINE_PERMISSIONS=manual
+
+RUN mkdir -p /data/openpaw
+VOLUME ["/data/openpaw"]
+EXPOSE 8788
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=12 \
+  CMD if [ -n "$OPENCODE_SERVER_USERNAME" ]; then curl -fsS -u "$OPENCODE_SERVER_USERNAME:$OPENCODE_SERVER_PASSWORD" http://127.0.0.1:8788/global/health; else curl -fsS http://127.0.0.1:8788/global/health; fi
+
+CMD ["openpaw", "--engine-host", "--engine-host-hostname", "0.0.0.0", "--engine-host-port", "8788"]

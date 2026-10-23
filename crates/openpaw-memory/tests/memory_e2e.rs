@@ -1,17 +1,14 @@
 //! M3 core acceptance: nine MemoryType × frontmatter snapshot roundtrip
 //! through FsMemoryStore, dual-domain (User vs Project) isolation, search by
 //! query/category/limit, and deletion.
-
-use std::future::Future;
-use std::pin::pin;
-use std::task::{Context, Poll, Waker};
-
 use openpaw_core::{MemoryProvider, MemorySearchQuery};
 use openpaw_memory::{
     Confidence, FsMemoryStore, MemoryFrontmatter, MemoryStore, MemoryType, Scope, Source,
 };
 use openpaw_store::FrontmatterDoc;
-
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, Waker};
 fn block_on<F: Future>(fut: F) -> F::Output {
     // FsMemoryStore's async trait methods never actually park (no internal
     // await points), so the standard no-op waker plus a yield loop suffices
@@ -26,7 +23,6 @@ fn block_on<F: Future>(fut: F) -> F::Output {
         }
     }
 }
-
 fn memory_type_slug(t: MemoryType) -> &'static str {
     match t {
         MemoryType::Fact => "fact",
@@ -40,7 +36,6 @@ fn memory_type_slug(t: MemoryType) -> &'static str {
         MemoryType::Intention => "intention",
     }
 }
-
 fn source_slug(s: Source) -> &'static str {
     match s {
         Source::Reflection => "reflection",
@@ -49,7 +44,6 @@ fn source_slug(s: Source) -> &'static str {
         Source::Agent => "agent",
     }
 }
-
 fn confidence_slug(c: Confidence) -> &'static str {
     match c {
         Confidence::Low => "low",
@@ -57,7 +51,6 @@ fn confidence_slug(c: Confidence) -> &'static str {
         Confidence::High => "high",
     }
 }
-
 /// One memory per MemoryType, persisted then read back; every frontmatter
 /// field must round-trip exactly, and the on-disk YAML key set must match the
 /// expected snapshot (skipped-empty fields excluded).
@@ -65,7 +58,6 @@ fn confidence_slug(c: Confidence) -> &'static str {
 fn nine_memory_types_frontmatter_snapshot_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsMemoryStore::new(dir.path().join("user"), None);
-
     // (type, source, confidence, zone, description, pinned, tags)
     type Spec = (
         MemoryType,
@@ -159,7 +151,6 @@ fn nine_memory_types_frontmatter_snapshot_roundtrip() {
             vec![],
         ),
     ];
-
     for (i, (memory_type, source, confidence, zone, description, pinned, tags)) in
         specs.iter().enumerate()
     {
@@ -182,12 +173,10 @@ fn nine_memory_types_frontmatter_snapshot_roundtrip() {
         let (id, created) = (fm.id.clone(), fm.created);
         let body = format!("memory body {i}: {description}\n");
         MemoryStore::put(&store, Scope::User, fm, &body).unwrap();
-
         let loaded = MemoryStore::get(&store, &id).unwrap().unwrap();
         assert_eq!(loaded.id(), id);
         assert_eq!(loaded.scope, Scope::User);
         assert_eq!(loaded.body, body);
-
         let got = &loaded.frontmatter;
         assert_eq!(got.id, id);
         assert_eq!(
@@ -207,14 +196,12 @@ fn nine_memory_types_frontmatter_snapshot_roundtrip() {
         assert_eq!(got.sm2_interval_days, 0);
         assert!(got.sm2_next_review.is_none());
         assert!(got.extra.is_empty());
-
         // Snapshot: exact on-disk frontmatter key set and serialized values.
         let raw: FrontmatterDoc<serde_json::Value> =
             openpaw_store::read_doc(&loaded.source_path).unwrap();
         let obj = raw.frontmatter.as_object().unwrap();
         let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
         keys.sort_unstable();
-
         let mut expected_keys: Vec<&str> = vec![
             "confidence",
             "created",
@@ -238,7 +225,6 @@ fn nine_memory_types_frontmatter_snapshot_roundtrip() {
             keys, expected_keys,
             "frontmatter key-set snapshot mismatch for {memory_type:?}"
         );
-
         assert_eq!(obj["memory_type"], memory_type_slug(*memory_type));
         assert_eq!(obj["source"], source_slug(*source));
         assert_eq!(obj["confidence"], confidence_slug(*confidence));
@@ -257,7 +243,6 @@ fn nine_memory_types_frontmatter_snapshot_roundtrip() {
         }
     }
 }
-
 /// User and Project memories live in disjoint directories; a scope-scoped
 /// delete cannot reach the other domain, and a store without a project root
 /// never sees project-domain records.
@@ -267,17 +252,14 @@ fn dual_domain_user_project_isolation() {
     let user_root = dir.path().join("user-domain");
     let project_root = dir.path().join("project-domain");
     let store = FsMemoryStore::new(user_root.clone(), Some(project_root.clone()));
-
     let mut mu = MemoryFrontmatter::new(Source::User, Confidence::High, vec!["user".into()]);
     mu.zone = "user-zone".into();
     let id_u = mu.id.clone();
     MemoryStore::put(&store, Scope::User, mu, "user domain body\n").unwrap();
-
     let mut mp = MemoryFrontmatter::new(Source::Agent, Confidence::Low, vec!["project".into()]);
     mp.zone = "project-zone".into();
     let id_p = mp.id.clone();
     MemoryStore::put(&store, Scope::Project, mp, "project domain body\n").unwrap();
-
     // Files live in disjoint directories and carry the right scope tag.
     let lu = MemoryStore::get(&store, &id_u).unwrap().unwrap();
     let lp = MemoryStore::get(&store, &id_p).unwrap().unwrap();
@@ -285,11 +267,9 @@ fn dual_domain_user_project_isolation() {
     assert!(lp.source_path.starts_with(&project_root));
     assert_eq!(lu.scope, Scope::User);
     assert_eq!(lp.scope, Scope::Project);
-
     // A User-scope delete cannot remove a Project-domain record.
     assert!(!MemoryStore::delete(&store, Scope::User, &id_p).unwrap());
     assert!(MemoryStore::get(&store, &id_p).unwrap().is_some());
-
     // A store bound to the user domain only cannot see the project domain.
     let user_only = FsMemoryStore::new(user_root, None);
     assert!(MemoryStore::get(&user_only, &id_p).unwrap().is_none());
@@ -298,14 +278,12 @@ fn dual_domain_user_project_isolation() {
         .iter()
         .all(|m| m.scope == Scope::User));
 }
-
 /// MemoryProvider::search over FsMemoryStore: query text, category (zone)
 /// filter, and limit semantics (total counted before truncation).
 #[test]
 fn provider_search_by_query_category_limit() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsMemoryStore::new(dir.path().join("user"), None);
-
     let mut a = MemoryFrontmatter::new(Source::User, Confidence::High, vec![]);
     a.zone = "rust".into();
     a.description = "borrow checker deep dive".into();
@@ -316,15 +294,12 @@ fn provider_search_by_query_category_limit() {
         "the borrow checker explains lifetimes\n",
     )
     .unwrap();
-
     let mut b = MemoryFrontmatter::new(Source::Reflection, Confidence::Medium, vec![]);
     b.zone = "rust".into();
     MemoryStore::put(&store, Scope::User, b, "prefer slices over vec arguments\n").unwrap();
-
     let mut c = MemoryFrontmatter::new(Source::Agent, Confidence::Low, vec![]);
     c.zone = "go".into();
     MemoryStore::put(&store, Scope::User, c, "goroutines leak without cancel\n").unwrap();
-
     // query text match.
     let hits = block_on(MemoryProvider::search(
         &store,
@@ -336,7 +311,6 @@ fn provider_search_by_query_category_limit() {
     ));
     assert_eq!(hits.entries.len(), 1);
     assert!(hits.entries[0].content.contains("borrow checker"));
-
     // category maps to zone; empty query matches everything in the category.
     let hits = block_on(MemoryProvider::search(
         &store,
@@ -348,7 +322,6 @@ fn provider_search_by_query_category_limit() {
     ));
     assert_eq!(hits.total, 2);
     assert_eq!(hits.entries.len(), 2);
-
     // limit truncates entries but keeps the pre-truncation total.
     let hits = block_on(MemoryProvider::search(
         &store,
@@ -360,7 +333,6 @@ fn provider_search_by_query_category_limit() {
     ));
     assert_eq!(hits.total, 3);
     assert_eq!(hits.entries.len(), 1);
-
     // query miss.
     let hits = block_on(MemoryProvider::search(
         &store,
@@ -373,25 +345,21 @@ fn provider_search_by_query_category_limit() {
     assert_eq!(hits.total, 0);
     assert!(hits.entries.is_empty());
 }
-
 /// Deletion removes the file and is reflected by every read path, including
 /// the async provider bridge that tries both scopes.
 #[test]
 fn delete_roundtrip_and_provider_remove() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsMemoryStore::new(dir.path().join("user"), None);
-
     let m = MemoryFrontmatter::new(Source::User, Confidence::Medium, vec!["t".into()]);
     let id = m.id.clone();
     let path = MemoryStore::put(&store, Scope::User, m, "to be deleted\n").unwrap();
     assert!(path.exists());
     assert!(MemoryStore::get(&store, &id).unwrap().is_some());
-
     assert!(MemoryStore::delete(&store, Scope::User, &id).unwrap());
     assert!(MemoryStore::get(&store, &id).unwrap().is_none());
     assert!(!path.exists());
     assert!(!MemoryStore::delete(&store, Scope::User, &id).unwrap());
-
     // Provider-side removal across both scopes.
     let m2 = MemoryFrontmatter::new(Source::User, Confidence::Medium, vec![]);
     let id2 = m2.id.clone();

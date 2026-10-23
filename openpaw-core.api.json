@@ -23,6 +23,7 @@
         "async fn stream (& self , req : CompletionRequest ,) -> Result < BoxStream < 'static , Result < StreamEvent > > >",
         "fn capabilities (& self) -> Capabilities",
         "fn default_model (& self) -> & str",
+        "fn model_capabilities (& self , _model : & str) -> Capabilities",
         "fn name (& self) -> & str"
       ],
       "name": "LlmProvider"
@@ -62,7 +63,9 @@
     {
       "methods": [
         "async fn call (& self , name : & str , args : serde_json :: Value) -> Result < ToolCallOutcome >",
-        "async fn list_tools (& self) -> Result < Vec < ToolSpec > >"
+        "async fn list_tools (& self) -> Result < Vec < ToolSpec > >",
+        "fn remember_media (& self , _media : Vec < crate :: InlineMedia >)",
+        "fn set_media_context (& self , _media : Vec < crate :: InlineMedia >)"
       ],
       "name": "ToolExecutor"
     },
@@ -119,6 +122,7 @@
     "struct InMemoryProvider",
     "struct InboundSink",
     "struct InjectionRecord",
+    "struct InlineMedia",
     "struct IterationBudget",
     "struct KnowledgeCandidate",
     "struct MemoryEntry",

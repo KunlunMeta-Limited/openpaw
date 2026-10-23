@@ -22,6 +22,7 @@ use crate::web::{web_extract, web_fetch, web_search};
 pub struct ToolRegistry {
     workspace: PathBuf,
     specs: Vec<ToolSpec>,
+    media: std::sync::RwLock<std::collections::HashMap<String, openpaw_core::InlineMedia>>,
 }
 
 impl ToolRegistry {
@@ -41,6 +42,7 @@ impl ToolRegistry {
         specs.extend(plan_mode::specs());
         specs.push(structured_output::spec());
         specs.push(session_search::spec());
+        specs.push(crate::meta::read_attachment::spec());
         specs.push(bash::spec());
         specs.push(clipboard::spec());
         specs.push(sleep::spec());
@@ -50,6 +52,7 @@ impl ToolRegistry {
         Self {
             workspace: workspace.into(),
             specs,
+            media: Default::default(),
         }
     }
 
@@ -61,6 +64,24 @@ impl ToolRegistry {
 
 #[async_trait]
 impl ToolExecutor for ToolRegistry {
+    fn set_media_context(&self, media: Vec<openpaw_core::InlineMedia>) {
+        *self
+            .media
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = media
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect();
+    }
+    fn remember_media(&self, media: Vec<openpaw_core::InlineMedia>) {
+        let mut cache = self
+            .media
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        for item in media {
+            cache.entry(item.id.clone()).or_insert(item);
+        }
+    }
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
         Ok(self.specs.clone())
     }
@@ -68,6 +89,32 @@ impl ToolExecutor for ToolRegistry {
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolCallOutcome> {
         let ws = self.workspace.clone();
         match name {
+            "read_attachment" => {
+                let media = args
+                    .get("attachmentID")
+                    .and_then(|value| value.as_str())
+                    .and_then(|id| {
+                        self.media
+                            .read()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .get(id)
+                            .cloned()
+                    });
+                match media {
+                    Some(media) => {
+                        media.bytes()?;
+                        let mut outcome = ToolCallOutcome::ok(format!(
+                            "Attachment {} ({})",
+                            media.id, media.mime
+                        ));
+                        outcome.media.push(media);
+                        Ok(outcome)
+                    }
+                    None => Ok(ToolCallOutcome::error(
+                        "attachment not found in current visible session",
+                    )),
+                }
+            }
             "read_file" => read::run(&ws, args).await,
             "write_file" => write::run(&ws, args).await,
             "edit_file" => edit::run(&ws, args).await,
@@ -109,9 +156,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolRegistry::new(dir.path());
 
-        assert_eq!(host.tool_names().len(), 21);
+        assert_eq!(host.tool_names().len(), 22);
         let listed = host.list_tools().await.unwrap();
-        assert_eq!(listed.len(), 21);
+        assert_eq!(listed.len(), 22);
 
         // Roundtrip through the host: write then read.
         host.call(

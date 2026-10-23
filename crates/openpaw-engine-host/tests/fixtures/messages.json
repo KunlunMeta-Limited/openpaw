@@ -1,0 +1,83 @@
+[
+  {
+    "info": {
+      "id": "msg-user",
+      "sessionID": "session-id",
+      "role": "user",
+      "time": {
+        "created": 0,
+        "completed": 0
+      }
+    },
+    "parts": [
+      {
+        "id": "prt-user-text",
+        "messageID": "msg-user",
+        "sessionID": "session-id",
+        "type": "text",
+        "text": "hello"
+      },
+      {
+        "type": "file",
+        "mime": "image/gif",
+        "filename": "sample.gif",
+        "url": "data:image/gif;base64,R0lGODlhZml4dHVyZQ==",
+        "attachmentID": "att-fixture",
+        "id": "prt-user-file",
+        "messageID": "msg-user",
+        "sessionID": "session-id"
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg-assistant",
+      "sessionID": "session-id",
+      "role": "assistant",
+      "time": {
+        "created": 1,
+        "completed": 2
+      }
+    },
+    "parts": [
+      {
+        "id": "prt-reasoning",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "reasoning",
+        "text": "checking"
+      },
+      {
+        "id": "prt-tool",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "tool",
+        "callID": "tool-use-id",
+        "tool": "read_file",
+        "state": {
+          "status": "completed",
+          "input": {},
+          "output": "ok",
+          "error": "",
+          "durationMs": 5
+        },
+        "attachments": [
+          {
+            "type": "file",
+            "mime": "image/gif",
+            "filename": "sample.gif",
+            "url": "data:image/gif;base64,R0lGODlhZml4dHVyZQ==",
+            "attachmentID": "att-fixture"
+          }
+        ]
+      },
+      {
+        "id": "prt-assistant-text",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "text",
+        "text": "done"
+      }
+    ]
+  }
+]

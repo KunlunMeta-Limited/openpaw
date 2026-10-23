@@ -136,6 +136,7 @@ fn demo_transcript() -> Vec<Message> {
                     is_error: true,
                     name: Some("bash".into()),
                     protected: false,
+                    media: Vec::new(),
                 },
             ],
             ..Default::default()

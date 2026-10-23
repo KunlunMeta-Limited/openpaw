@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openpaw.local/contracts/host-session-status-v1.schema.json",
+  "title": "OpenPaw 会话状态响应契约 v1",
+  "description": "约束 Host 查询当前活动会话状态的响应；空对象表示没有活动回合，键为会话编号。",
+  "type": "object",
+  "additionalProperties": {
+    "$ref": "#/$defs/sessionStatus"
+  },
+  "$defs": {
+    "sessionStatus": {
+      "title": "单个会话状态",
+      "description": "以会话编号为键的 queued 或 busy 回合状态对象。",
+      "type": "object",
+      "required": ["type", "turnID", "userMessageID"],
+      "properties": {
+        "type": {
+          "title": "状态类型",
+          "description": "会话当前活动状态；等待全局容量为 queued，执行中为 busy。",
+          "type": "string",
+          "enum": ["queued", "busy"]
+        },
+        "turnID": {
+          "title": "回合编号",
+          "description": "当前活动回合的稳定编号。",
+          "type": "string",
+          "minLength": 1
+        },
+        "userMessageID": {
+          "title": "用户消息编号",
+          "description": "触发当前回合的用户消息稳定编号。",
+          "type": "string",
+          "minLength": 1
+        },
+        "queuePosition": {
+          "title": "队列位置",
+          "description": "queued 状态下当前 FIFO 队列的 1 基位置；晋升竞争窗口可省略。",
+          "type": "integer",
+          "minimum": 1
+        },
+        "activity": {
+          "title": "脱敏活动摘要",
+          "description": "busy 状态下可选的活动类别、工具白名单名和中文短提示。",
+          "type": "object",
+          "required": ["kind", "task"],
+          "properties": {
+            "kind": { "type": "string", "minLength": 1 },
+            "tool": { "type": "string", "minLength": 1 },
+            "task": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

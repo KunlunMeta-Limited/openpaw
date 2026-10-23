@@ -2,13 +2,46 @@
 //! rewrites the session with a boundary + summary (M2 exit: thresholds
 //! covered at three levels — unit tests cover None/Proactive/HardLimit
 //! over the decision function; this file proves the loop wiring).
-
-use std::sync::Arc;
-
-use openpaw_core::{ContentBlock, Message, Session, StopReason};
+use openpaw_core::{
+    Capabilities, CompletionRequest, CompletionResponse, ContentBlock, LlmProvider, Message,
+    Result, Session, StopReason, StreamEvent,
+};
 use openpaw_engine::{AgentEvent, AgentLoop, CompactOptions};
 use openpaw_llm::{MockMode, MockProvider};
-
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+struct PendingCompactionProvider {
+    dropped: Arc<AtomicBool>,
+}
+struct DropFlag(Arc<AtomicBool>);
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+#[async_trait::async_trait]
+impl LlmProvider for PendingCompactionProvider {
+    async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+        let _drop = DropFlag(Arc::clone(&self.dropped));
+        std::future::pending().await
+    }
+    async fn stream(
+        &self,
+        _request: CompletionRequest,
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent>>> {
+        unreachable!("compaction must be cancelled before the regular provider stream")
+    }
+    fn capabilities(&self) -> Capabilities {
+        Default::default()
+    }
+    fn name(&self) -> &str {
+        "pending-compaction"
+    }
+    fn default_model(&self) -> &str {
+        "pending-compaction-1"
+    }
+}
 fn big_session(pairs: usize) -> Session {
     let mut s = Session::new("compact-test", "mock");
     for i in 0..pairs {
@@ -21,7 +54,6 @@ fn big_session(pairs: usize) -> Session {
     }
     s
 }
-
 #[tokio::test]
 async fn compaction_triggers_and_rewrites_session() {
     // Script: call #1 = summary (provider.complete), call #2 = the turn's
@@ -41,7 +73,6 @@ async fn compaction_triggers_and_rewrites_session() {
     });
     let mut session = big_session(10);
     let before_len = session.messages.len();
-
     let log: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink_log = Arc::clone(&log);
     let mut sink = move |ev: AgentEvent| {
@@ -52,7 +83,6 @@ async fn compaction_triggers_and_rewrites_session() {
         .await
         .unwrap();
     assert_eq!(stop, StopReason::EndTurn);
-
     // Session was rewritten: shorter, with a boundary marker.
     assert!(
         session.messages.len() < before_len,
@@ -66,21 +96,18 @@ async fn compaction_triggers_and_rewrites_session() {
         .flat_map(|m| m.content.iter())
         .any(|b| matches!(b, ContentBlock::CompactBoundary { .. }));
     assert!(boundary, "a compact boundary must be present");
-
     // Summary content reached the session.
     let summary_present = session
         .messages
         .iter()
         .any(|m| m.text().contains("[Context Summary]"));
     assert!(summary_present, "summary must ride into the session");
-
     // The loop emitted CompactionPerformed.
     let events = log.lock().unwrap_or_else(|e| e.into_inner());
     assert!(events.iter().any(
         |e| matches!(e, AgentEvent::CompactionPerformed { before_tokens, after_tokens }
             if after_tokens < before_tokens)
     ));
-
     // The final assistant reply is the second script step.
     assert_eq!(
         session.messages.last().unwrap().text(),
@@ -89,7 +116,6 @@ async fn compaction_triggers_and_rewrites_session() {
     // Two provider calls total: summary (complete) + turn (stream).
     assert_eq!(p.call_count(), 2);
 }
-
 #[tokio::test]
 async fn compaction_skipped_below_threshold() {
     let p = Arc::new(MockProvider::fixed("plain reply"));
@@ -98,7 +124,6 @@ async fn compaction_skipped_below_threshold() {
         ..Default::default()
     });
     let mut session = big_session(10);
-
     let log: Arc<std::sync::Mutex<Vec<AgentEvent>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink_log = Arc::clone(&log);
     let mut sink = move |ev: AgentEvent| {
@@ -109,7 +134,6 @@ async fn compaction_skipped_below_threshold() {
         .await
         .unwrap();
     assert_eq!(stop, StopReason::EndTurn);
-
     assert!(!log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -122,4 +146,39 @@ async fn compaction_skipped_below_threshold() {
         .iter()
         .flat_map(|m| m.content.iter())
         .all(|b| !matches!(b, ContentBlock::CompactBoundary { .. })));
+}
+#[tokio::test]
+async fn cancellation_drops_pending_compaction_provider() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let provider = Arc::new(PendingCompactionProvider {
+        dropped: Arc::clone(&dropped),
+    });
+    let loop_ = AgentLoop::new(provider).with_compact_options(CompactOptions {
+        model_limit: 800,
+        keep_recent_pairs: 2,
+        min_messages_before_compact: 4,
+        ..Default::default()
+    });
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let mut session = big_session(10);
+    let mut sink = |_event: AgentEvent| {};
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cancel.cancel();
+    });
+    let started = std::time::Instant::now();
+    let stop = loop_
+        .run_turn_with_cancel_token(&mut session, None, &[], &mut sink, token)
+        .await
+        .unwrap();
+    canceller.await.unwrap();
+    assert_eq!(stop, StopReason::EndTurn);
+    assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    assert!(dropped.load(Ordering::SeqCst));
+    assert!(session
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .all(|block| !matches!(block, ContentBlock::CompactBoundary { .. })));
 }

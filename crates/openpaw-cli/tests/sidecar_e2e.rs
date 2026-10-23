@@ -17,6 +17,10 @@ struct SidecarProc {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    /// Responses that arrived before the one currently awaited, kept so an
+    /// out-of-order frame is never dropped (dropping it used to hang the next
+    /// wait forever instead of failing the assertion).
+    pending: std::collections::HashMap<i64, Value>,
 }
 
 impl SidecarProc {
@@ -37,6 +41,7 @@ impl SidecarProc {
             child,
             stdin: Some(stdin),
             stdout,
+            pending: std::collections::HashMap::new(),
         }
     }
 
@@ -58,13 +63,20 @@ impl SidecarProc {
         rmcp::serde_json::from_str(line.trim()).expect("sidecar frame is valid JSON")
     }
 
-    /// Frames until the response with `id` arrives (defensive skip of
-    /// anything else the server might emit first).
+    /// The response with `id`, buffering (not discarding) earlier frames.
     fn recv_response(&mut self, id: i64) -> Value {
+        if let Some(frame) = self.pending.remove(&id) {
+            return frame;
+        }
         loop {
             let frame = self.recv();
-            if frame.get("id").and_then(Value::as_i64) == Some(id) {
-                return frame;
+            match frame.get("id").and_then(Value::as_i64) {
+                Some(other) if other == id => return frame,
+                Some(other) => {
+                    self.pending.insert(other, frame);
+                }
+                // Notifications carry no id and are not responses.
+                None => continue,
             }
         }
     }

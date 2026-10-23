@@ -206,6 +206,98 @@ impl SessionDb {
 
     // ===== Session CRUD =====
 
+    /// 功能：在取得 SQLite 写锁之后读取并原子替换单会话可见索引。
+    /// 参数：home 为目录范围，id 为合法会话身份。
+    /// 返回：本次已提交快照。
+    /// 错误：路径/投影/索引失败返回脱敏 CatalogError。
+    /// 状态：仅替换 transcript 管理字段和消息；保留审计、标签、pin、token 等字段。
+    /// 并发与取消：IMMEDIATE 事务先于快照读取，防止旧快照覆盖并发刷新。
+    /// 权限：不信任旧索引路径，不改 JSONL 或 schema。
+    /// 关联：CLI chat 与 session search。
+    pub fn refresh_transcript(
+        &self,
+        home: &Path,
+        id: &str,
+    ) -> std::result::Result<crate::catalog::Snapshot, crate::catalog::CatalogError> {
+        use crate::catalog::{self, CatalogError};
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| CatalogError("session index lock failed".into()))?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .map_err(|_| CatalogError("cannot acquire session index write transaction".into()))?;
+        let snapshot = match catalog::read(home, id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // 损坏记录不能继续从陈旧 FTS 暴露已隐藏或未提交正文。
+                if catalog::valid_id(id) {
+                    tx.execute("DELETE FROM messages WHERE session_id=?1", [id])
+                        .map_err(|_| {
+                            CatalogError("cannot invalidate transcript messages".into())
+                        })?;
+                    tx.execute("UPDATE sessions SET message_count=0 WHERE id=?1", [id])
+                        .map_err(|_| CatalogError("cannot invalidate transcript count".into()))?;
+                    tx.commit().map_err(|_| {
+                        CatalogError("cannot commit transcript invalidation".into())
+                    })?;
+                }
+                return Err(error);
+            }
+        };
+        let messages = snapshot.transcript.visible_messages(id);
+        let modified = snapshot
+            .updated_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let updated: String = tx
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, 'unixepoch')",
+                [modified],
+                |row| row.get(0),
+            )
+            .map_err(|_| CatalogError("cannot resolve transcript update timestamp".into()))?;
+        let parent = snapshot
+            .transcript
+            .mutation
+            .fork_origin
+            .as_ref()
+            .map(|origin| &origin.source_session_id);
+        let result = (|| -> Result<()> {
+            tx.execute("INSERT INTO sessions (id,model,provider,created_at,updated_at,message_count,jsonl_path,title,workspace_id,parent_session_id)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                ON CONFLICT(id) DO UPDATE SET model=excluded.model,provider=excluded.provider,
+                created_at=excluded.created_at,updated_at=excluded.updated_at,message_count=excluded.message_count,
+                jsonl_path=excluded.jsonl_path,title=excluded.title,workspace_id=excluded.workspace_id,
+                parent_session_id=COALESCE(excluded.parent_session_id,sessions.parent_session_id)",
+                params![id,snapshot.meta.model,snapshot.meta.provider,snapshot.meta.created_at.to_rfc3339(),updated,
+                    messages.iter().filter(|m| m.role == Role::User).count() as i64,snapshot.path.to_string_lossy(),
+                    snapshot.transcript.title(),snapshot.meta.workspace_id.as_deref().unwrap_or("default"),parent])?;
+            tx.execute("DELETE FROM messages WHERE session_id=?1", [id])?;
+            for (seq, message) in messages.iter().enumerate() {
+                let text = message.text();
+                if text.is_empty() {
+                    continue;
+                }
+                let preview: String = text.chars().take(500).collect();
+                let role = if message.role == Role::User {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                tx.execute("INSERT INTO messages (session_id,role,seq,text_preview,full_text,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![id,role,seq as i64,preview,text,updated])?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        result.map_err(|_| CatalogError(format!("session {id}: cannot refresh index; check index.db permissions and preserve audit data")))?;
+        Ok(snapshot)
+    }
+
     pub fn upsert_session(&self, meta: &SessionMeta, jsonl_path: &Path) -> Result<()> {
         let workspace_id = meta
             .workspace_id
@@ -880,6 +972,80 @@ fn now_rfc3339(conn: &Connection) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transcript_refresh_preserves_audit_and_flags_and_never_accumulates_messages() {
+        use crate::transcript::{SessionMutationEvent, SessionRevertStagedV1};
+        let home = tempfile::tempdir().unwrap();
+        let meta = openpaw_core::SessionMeta::new("echo-1", "echo");
+        let path = home
+            .path()
+            .join("sessions")
+            .join(format!("{}.jsonl", meta.id));
+        let mut writer = crate::SessionWriter::create(&path).unwrap();
+        writer.append(&SessionEvent::Meta(meta.clone())).unwrap();
+        let mut message = openpaw_core::Message::user_text("hidden cache sentinel");
+        message.uuid = Some("user-id".into());
+        writer.append(&SessionEvent::Message(message)).unwrap();
+        let db = SessionDb::open(home.path().join("index.db")).unwrap();
+        db.refresh_transcript(home.path(), &meta.id).unwrap();
+        db.with_conn(|conn| {
+            conn.execute_batch("INSERT INTO audit_log(source,actor,event,target,detail,ts) VALUES ('test','user','preserve','audit','sentinel','2026'); UPDATE sessions SET is_pinned=1,tags='[\"sentinel\"]',total_input_tokens=123;")?;
+            Ok(())
+        }).unwrap();
+        let version = db.schema_version().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let home = home.path();
+                let id = &meta.id;
+                scope.spawn(move || {
+                    let db = SessionDb::open(home.join("index.db")).unwrap();
+                    for _ in 0..4 {
+                        db.refresh_transcript(home, id).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(db.get_session_messages(&meta.id, 100).unwrap().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        writer
+            .append(
+                &SessionMutationEvent::RevertStaged(SessionRevertStagedV1 {
+                    message_id: "user-id".into(),
+                })
+                .to_session_event(),
+            )
+            .unwrap();
+        db.refresh_transcript(home.path(), &meta.id).unwrap();
+        assert!(db.search("sentinel", 10).unwrap().is_empty());
+        writer
+            .append(&SessionMutationEvent::RevertCleared.to_session_event())
+            .unwrap();
+        db.refresh_transcript(home.path(), &meta.id).unwrap();
+        assert_eq!(db.search("sentinel", 10).unwrap().len(), 1);
+        let corrupt =
+            crate::transcript::encode(&serde_json::json!({"title":123}), "session_metadata_v1");
+        writer.append(&corrupt).unwrap();
+        assert!(db.refresh_transcript(home.path(), &meta.id).is_err());
+        assert!(db.search("sentinel", 10).unwrap().is_empty());
+        assert_eq!(db.schema_version().unwrap(), version);
+        db.with_conn(|conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE event='preserve'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(count, 1);
+            let fields: (i64, String, i64) = conn.query_row(
+                "SELECT is_pinned,tags,total_input_tokens FROM sessions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(fields, (1, "[\"sentinel\"]".into(), 123));
+            Ok(())
+        })
+        .unwrap();
+    }
     use super::*;
     use openpaw_core::Message;
 

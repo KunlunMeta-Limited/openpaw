@@ -1,0 +1,201 @@
+[
+  {
+    "type": "session.created",
+    "properties": {
+      "id": "session-id",
+      "title": "New session",
+      "slug": "session-id",
+      "directory": "/workspace",
+      "time": {
+        "created": 0,
+        "updated": 0
+      },
+      "sessionID": "session-id"
+    }
+  },
+  {
+    "type": "session.updated",
+    "properties": {
+      "id": "session-id",
+      "title": "Fixture session",
+      "slug": "session-id",
+      "directory": "/workspace",
+      "time": {
+        "created": 0,
+        "updated": 1
+      },
+      "sessionID": "session-id"
+    }
+  },
+  {
+    "type": "session.status",
+    "properties": {
+      "sessionID": "session-id",
+      "status": {
+        "type": "busy"
+      }
+    }
+  },
+  {
+    "type": "message.updated",
+    "properties": {
+      "info": {
+        "id": "msg-user",
+        "sessionID": "session-id",
+        "role": "user",
+        "time": {
+          "created": 0,
+          "completed": 0
+        }
+      }
+    }
+  },
+  {
+    "type": "message.part.updated",
+    "properties": {
+      "part": {
+        "id": "prt-text",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "text",
+        "text": ""
+      }
+    }
+  },
+  {
+    "type": "message.part.updated",
+    "properties": {
+      "part": {
+        "type": "file",
+        "mime": "image/gif",
+        "filename": "sample.gif",
+        "url": "data:image/gif;base64,R0lGODlhZml4dHVyZQ==",
+        "attachmentID": "att-fixture",
+        "id": "prt-user-file",
+        "messageID": "msg-user",
+        "sessionID": "session-id"
+      }
+    }
+  },
+  {
+    "type": "message.part.updated",
+    "properties": {
+      "part": {
+        "id": "prt-reasoning",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "reasoning",
+        "text": ""
+      }
+    }
+  },
+  {
+    "type": "message.part.delta",
+    "properties": {
+      "partID": "prt-text",
+      "sessionID": "session-id",
+      "messageID": "msg-assistant",
+      "field": "text",
+      "delta": "fixture"
+    }
+  },
+  {
+    "type": "message.part.updated",
+    "properties": {
+      "part": {
+        "id": "prt-tool",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "tool",
+        "callID": "tool-use-id",
+        "tool": "read_file",
+        "state": {
+          "status": "running",
+          "input": {},
+          "output": "",
+          "error": ""
+        }
+      }
+    }
+  },
+  {
+    "type": "message.part.updated",
+    "properties": {
+      "part": {
+        "id": "prt-tool",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "tool",
+        "callID": "tool-use-id",
+        "tool": "read_file",
+        "state": {
+          "status": "completed",
+          "input": {},
+          "output": "ok",
+          "error": ""
+        }
+      }
+    }
+  },
+  {
+    "type": "message.part.updated",
+    "properties": {
+      "part": {
+        "id": "prt-tool-error",
+        "messageID": "msg-assistant",
+        "sessionID": "session-id",
+        "type": "tool",
+        "callID": "tool-use-error",
+        "tool": "read_file",
+        "state": {
+          "status": "error",
+          "input": {},
+          "output": "",
+          "error": "failed"
+        }
+      }
+    }
+  },
+  {
+    "type": "permission.asked",
+    "properties": {
+      "id": "permission-id",
+      "sessionID": "session-id",
+      "permission": "bash",
+      "patterns": [
+        "command summary"
+      ],
+      "metadata": {},
+      "always": []
+    }
+  },
+  {
+    "type": "permission.replied",
+    "properties": {
+      "sessionID": "session-id",
+      "requestID": "permission-id"
+    }
+  },
+  {
+    "type": "todo.updated",
+    "properties": {
+      "sessionID": "session-id",
+      "todos": []
+    }
+  },
+  {
+    "type": "session.status",
+    "properties": {
+      "sessionID": "session-id",
+      "status": {
+        "type": "idle"
+      }
+    }
+  },
+  {
+    "type": "session.idle",
+    "properties": {
+      "sessionID": "session-id"
+    }
+  }
+]
