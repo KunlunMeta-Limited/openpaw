@@ -8,6 +8,14 @@
 
 主开发目录已同步至`/Office/openpaw`的feat/engine-host-t5，三份用户改动保留未提交。旧artifacts工作树清洁移除，提交/分支与备份仍在。8765升级、原会话真实模型/任务/白板/文件证据及清理结果见0006验证记录，不能将8766旧演示当作8765已升级。Windows原生按用户决定暂缓，不计通过。
 
+## T5 r2/r3最新可验收实现（2026-10-23）
+
+原实现0df3282完整27/27、固定d150b96产品53条记录通过，原8765真实模型h-resume与账本对账passed。当前服务使用该已测程序，原天气Session/官方.env保持；原会话可联网、审批写入、更新业务目标/步骤、刷新追问、查看文件正文及创建预授权办公室。D45—D49修复已验证、未合入；旧段落关于未升级/审批不重开的描述保留原时点，以本节和0006最新章节为准。
+
+真实证据入口：/home/cheng/.cache/t5-live-weather-20261023-h-resume/report.json、correlation.json、04b任务中心/07正文截图及trace/video；6145字节产物路径reports/长沙天气-2026-10-23-闭环终验.md。日期追问任务100%，office-reserved-3独立Session，详情3015ms、观察65249ms无超时浮窗。对账按原ApprovalView的status=approved、consumed=true及完整binding核对，不修改事实。旧验证脚本失误、错误报告复检及UI停止误发测试均在0006验证记录保留。
+
+最终文档候选重新完整27项，准确提交/报告hash/运行与候选binaryhash由仓库外artifacts/t5-delivery-20261023/final-review.json绑定；只有manifest的passed和准确checkout_head支持交付核查。人审、T5 PR和合入仍待发生，不开始T6。Windows原生继续暂缓，Office工程不改；请特别查看office-change-requests.md的R11，默认白板链接仍保留，未获Office实施授权。
+
 ## 任务与审核基线
 
 - 编码前CHG提案版本、逐文件原因/方法/复用/标准、方案批准人/时间/证据及Git对象：
