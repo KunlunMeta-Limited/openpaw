@@ -17,12 +17,57 @@ impl Host {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub async fn query(&self, scope: &ClientScope, request: QueryRequest) -> HostResult<QueryPage> {
+        self.query_with_cancel(scope, request, &CancellationToken::new())
+            .await
+    }
+    /// 功能：在UI期限内查询原存储，并允许取消资源等待。
+    /// 参数：scope/request沿用原查询，cancel为操作token。
+    /// 返回：原有界页。
+    /// 错误：取消、删除、范围或原存储读取错误。
+    /// 状态：只读，不创建原技能/目标/Todo。
+    /// 并发与取消：根锁等待可取消；阻塞读取已经派发则等待join后返回。
+    /// 权限：与原query一致，结束前再次检查删除墓碑。
+    /// 关联：REQ-OP-014；API-HOST-QUERY。 需求/设计REQ-OP-014。
+    pub(crate) async fn query_with_cancel(
+        &self,
+        scope: &ClientScope,
+        request: QueryRequest,
+        cancel: &CancellationToken,
+    ) -> HostResult<QueryPage> {
+        let file = matches!(&request.kind, QueryKind::File { .. });
+        let mut page = self.query_detail_page(scope, request, cancel).await?.0;
+        if !file {
+            for item in &mut page.items {
+                bound_json(item);
+            }
+        }
+        Ok(page)
+    }
+    /// 功能：在同次原查询读取中取得稳定内容边界用于详情导航。
+    /// 参数：scope/request/cancel沿用只读查询。
+    /// 返回：查询页及只保存于导航的内容摘要。
+    /// 错误：沿用原查询的权限、取消和数据错误。
+    /// 状态：摘要不保存正文；数据改变必须重新打开详情。
+    /// 并发与取消：摘要与本页来自同次读取，不跨页拼接不同版本。
+    /// 权限：沿用完整作用域与文件根授权。
+    /// 关联：REQ-OP-014；CHG-2026-0006第9.3节。 需求/设计REQ-OP-014。
+    pub(crate) async fn query_detail_page(
+        &self,
+        scope: &ClientScope,
+        request: QueryRequest,
+        cancel: &CancellationToken,
+    ) -> HostResult<(QueryPage, String)> {
+        if cancel.is_cancelled() {
+            return Err(HostError::new("cancelled", "查询已取消"));
+        }
         let id = request.session_id.clone();
         let scope = scope.clone();
+        let final_scope = scope.clone();
         let binding = self
             .inner
             .store
             .call(move |db| {
+                db.check_live_scope(&scope)?;
                 let b = db.binding(&id)?;
                 check_scope(&b, &scope)?;
                 Ok(b)
@@ -34,11 +79,10 @@ impl Host {
             .get(&binding.root_id)
             .cloned()
             .ok_or_else(|| HostError::new("scope_denied", "查询根未授权"))?;
-        let file_query = matches!(&request.kind, QueryKind::File { .. });
         let _guard = if matches!(&request.kind, QueryKind::History | QueryKind::ToolResults) {
             None
         } else {
-            Some(root.acquire(false, &CancellationToken::new()).await?)
+            Some(root.acquire(false, cancel).await?)
         };
         let mut items = match request.kind {
             QueryKind::History | QueryKind::ToolResults => {
@@ -85,11 +129,11 @@ impl Host {
                         QueryKind::Skills=>{
                             openpaw_tools::safety::resolve(&home,"skills").map_err(|_|HostError::new("scope_denied","用户技能根越界"))?;
                             openpaw_tools::safety::resolve(&root.path,".openpaw/skills").map_err(|_|HostError::new("scope_denied","项目技能根越界"))?;
-                            root.skills.list_readonly_checked().map_err(|_|HostError::new("invalid_input","技能数据损坏、越界或不可读取"))?.into_iter().map(|s|serde_json::json!({"frontmatter":s.frontmatter,"body":bounded(&s.body)})).collect()
+                            root.skills.list_readonly_checked().map_err(|_|HostError::new("invalid_input","技能数据损坏、越界或不可读取"))?.into_iter().map(|s|serde_json::json!({"frontmatter":s.frontmatter,"body":s.body})).collect()
                         },
                         QueryKind::Goals=>{
                             openpaw_tools::safety::resolve(&root.path,".openpaw/goals").map_err(|_|HostError::new("scope_denied","目标根越界"))?;
-                            root.goals.list_readonly_checked().map_err(|_|HostError::new("invalid_input","目标数据损坏、越界或不可读取"))?.into_iter().map(|d|serde_json::json!({"frontmatter":d.frontmatter,"body":bounded(&d.body)})).collect()
+                            root.goals.list_readonly_checked().map_err(|_|HostError::new("invalid_input","目标数据损坏、越界或不可读取"))?.into_iter().map(|d|serde_json::json!({"frontmatter":d.frontmatter,"body":d.body})).collect()
                         },
                         QueryKind::Todo=>openpaw_tools::meta::todo::read(&root.path).map_err(|_|HostError::new("invalid_input","Todo数据损坏或不可读取"))?.into_iter().map(|t|serde_json::to_value(t).map_err(HostError::storage)).collect::<HostResult<Vec<_>>>()?,
                         _=>return Err(HostError::new("unsupported","未知查询类型")),
@@ -97,6 +141,12 @@ impl Host {
                 }).await.map_err(HostError::storage)??
             }
         };
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serde_json::to_vec(&items)
+            .map_err(HostError::storage)?
+            .hash(&mut hasher);
+        let signature = format!("{:016x}", hasher.finish());
         let start = request.offset.min(items.len());
         let end = start
             .saturating_add(if request.limit == 0 {
@@ -106,16 +156,15 @@ impl Host {
             })
             .min(items.len());
         let next_cursor = (end < items.len()).then_some(end);
-        items = items
-            .drain(start..end)
-            .map(|mut value| {
-                if !file_query {
-                    bound_json(&mut value);
-                }
-                value
-            })
-            .collect();
-        Ok(QueryPage { items, next_cursor })
+        items = items.drain(start..end).collect();
+        self.inner
+            .store
+            .call(move |db| db.check_live_scope(&final_scope))
+            .await?;
+        if cancel.is_cancelled() {
+            return Err(HostError::new("cancelled", "查询已取消"));
+        }
+        Ok((QueryPage { items, next_cursor }, signature))
     }
 }
 fn bounded(s: &str) -> String {

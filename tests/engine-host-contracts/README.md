@@ -27,3 +27,8 @@ loopback fixture server because this SDK's SSE ignores config.fetch.
 
 T4/T5/T6 must add real Office/browser acceptance. T7 must run the fixed SDK
 against the real Host. Passing T0 fixtures is not evidence of those features.
+
+
+T5扩展仍使用office-product.mjs：真实冻结Office生产Node、独立Chromium、Host、原OpenAI HTTP Provider及原读/写/bash工具。新增22—27截图和trace/video关联审批前文件不存在、拒绝不落盘、批准后真实报告内容/哈希、六类详情、命令运行/停止防延迟副作用及删除后文件保留。测试只使用新建临时根和确定性凭据，不读取用户.env，不删除用户原天气会话；报告明确sourceDirty和提交号，不把开发运行当最终准确版本证据。
+
+新增Rust显式入口host_office_interactions（真实HTTP协议呈现）与host_office_delete（账本/索引/墓碑/恢复）。D37保留原managed_process_regressions目标，重复记录每次退出码及PID/状态，不能只取最后一轮成功。真实DeepSeek演示须另记，不能由确定性Provider冒充。Linux本机验证与Windows原生未执行分开；不通过WSL或交叉编译声明Windows已验。

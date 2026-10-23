@@ -161,6 +161,8 @@ impl HostApproval {
         let run = self.control.run_id.clone();
         self.store
             .call(move |db| {
+                let current = db.get_run(&run)?;
+                db.binding(&current.session_id)?; // 同一Store序列检查删除意图，旧批准不能跨删除消费。
                 let mut a = db
                     .approvals()?
                     .into_iter()
@@ -230,6 +232,8 @@ impl HostApproval {
         let timeout_ms = i64::try_from(self.timeout.as_millis()).unwrap_or(i64::MAX);
         self.store
             .call(move |db| {
+                let run = db.get_run(&binding.run_id)?;
+                db.binding(&run.session_id)?;
                 if db.approvals()?.iter().any(|a| {
                     a.binding.run_id == binding.run_id && a.binding.call_id == binding.call_id
                 }) {

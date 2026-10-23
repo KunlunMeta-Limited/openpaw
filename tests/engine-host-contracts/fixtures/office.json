@@ -252,5 +252,73 @@
     "nextCursor": "",
     "hasMore": false,
     "activeTurnId": ""
+  },
+  "t5Actions": [
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "conversation.delete"
+    },
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "actor.inspect",
+      "actorId": "office-lead"
+    },
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "employee.inspect",
+      "employeeId": "developer"
+    },
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "task.start",
+      "taskId": "run-1"
+    },
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "task.block",
+      "taskId": "run-1"
+    },
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "task.complete",
+      "taskId": "run-1"
+    },
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "task.assign",
+      "taskId": "run-1",
+      "assigneeId": "developer"
+    },
+    {
+      "id": "t5-action",
+      "teamId": "office-1",
+      "conversationId": "conversation-1",
+      "action": "dialog.action",
+      "interactionId": "original-context",
+      "optionId": "next"
+    }
+  ],
+  "t5UiResponse": {
+    "type": "ui.respond",
+    "interactionId": "new-action-id",
+    "presentation": {
+      "target": "result",
+      "success": false,
+      "message": "不支持任务暂停；真实Run未改变。"
+    }
   }
 }

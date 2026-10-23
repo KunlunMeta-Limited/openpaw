@@ -90,6 +90,21 @@ struct Active {
 struct Registry {
     closing: bool,
     active: HashMap<String, Active>,
+    deletions: usize,
+}
+/// 用途：让持久删除与原关闭注册表共同持有存储生命周期。
+/// 字段：共享Host所有权。
+/// 来源去向：共享删除入口到后台删除任务。
+/// 约束：HTTP取消或任务异常也必须归还预留，关闭不得抢先关闭Store。
+/// 稳定性：Host内部实现。
+/// 关联：需求/设计REQ-OP-014；DES-OP-009。
+pub(crate) struct DeletionGuard(Host);
+impl Drop for DeletionGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.deletions -= 1;
+        self.0.inner.idle.notify_waiters();
+    }
 }
 struct Observer {
     store: Store,
@@ -251,6 +266,7 @@ impl Host {
         self.inner
             .store
             .call(move |db| {
+                db.check_live_scope(&scope)?;
                 if let Some(binding) = db.bindings()?.into_iter().find(|b| b.scope == scope) {
                     return Ok(binding);
                 }
@@ -342,7 +358,7 @@ impl Host {
     /// 状态：映射与Accepting状态同事务保存，执行仍用原AgentLoop。
     /// 并发与取消：短接受锁仅覆盖查重/持久化，不占用推理、查询、取消或审批。
     /// 权限：重试同样校验固定会话归属；键不是授权。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
     pub(crate) async fn submit_idempotent(
         &self,
         scope: &ClientScope,
@@ -406,6 +422,7 @@ impl Host {
             .store
             .call(move |db| {
                 let b = db.binding(&sid)?;
+                db.check_live_scope(&s)?;
                 check_scope(&b, &s)?;
                 Ok(b)
             })
@@ -557,7 +574,10 @@ impl Host {
                 control.clone(),
                 Duration::from_secs(self.inner.config.approval_timeout_secs),
             ));
+            let session_id=view.session_id.clone();
+            let progress_enabled=self.inner.store.call(move |db| Ok(db.binding(&session_id)?.scope.namespace=="office")).await?;
             let tools = Arc::new(HostTools {
+                progress_enabled,
                 registry: openpaw_tools::ToolRegistry::new(&root.path),
                 allowed: self.inner.config.tools.clone(),
                 root: root.clone(),
@@ -569,8 +589,11 @@ impl Host {
                 .list_tools()
                 .await
                 .map_err(|_| HostError::new("invalid_input", "工具装配失败"))?;
-            let system =
-                run_system_prompt(&root.path, &self.inner.config.tools, chrono::Utc::now());
+            let mut system = run_system_prompt(&root.path, &self.inner.config.tools, chrono::Utc::now());
+            if progress_enabled {
+                system.push_str("\n多步骤任务先调用report_progress声明清晰的业务步骤（例如查询当天资料、保存weather_changsha.md、整理行程答复），再逐步报告。步骤标题使用用户能理解的中文，不含工具名/call ID/内部Run术语。文件步骤标题包含保存和目标路径。真实文件成功写入前不得报告已保存；网络成功仅代表取回正文，还须核对日期、地点和来源，不能把反爬/错误页当实时天气。普通问答无需强行拆步骤。report_progress仅报告元数据，不代替实际联网/写文件。completed需引用本轮成功工具调用ID；无工具的整理答复先报告in_progress，由Host在最终可靠完成后确认。暂时失败可重试，不新建重复步骤，未取得有效资料要如实说明。\n");
+                system.push_str("每个步骤开始前用{\"type\":\"update\",\"stepId\":\"该步骤ID\",\"state\":\"in_progress\"}报告；真实操作成功且内容核验后立即报告completed并填evidenceCallIds，再进入下一步。每次update必须带type。证据只用本轮工具响应对应的真实调用ID，不能猜工具名:路径、序号或时间戳；如Host返回恢复提示，逐字复制与该步骤匹配的callId修正输入，原权限/审批不变。成功工具结果末尾的[Host执行回执]提供本次准确callId，report_progress成功响应列出当前步骤。依照本轮清单推进，不沿用历史中漏报或报错后的做法；有真实依据就修正报告，不能用“以实际结果为准”代替进度更新。最终回复前检查全部步骤，不能只创建计划而忘记更新。\n");
+            }
             let provider = Arc::new(RunProvider {
                 inner: self.inner.provider.clone(),
                 context: system.clone(),
@@ -620,15 +643,8 @@ impl Host {
                 RunStatus::Cancelled => RunState::Cancelled,
                 RunStatus::TimedOut => RunState::TimedOut,
             };
-            if outcome.error.is_some() {
-                view.error = Some(HostError::new(
-                    match outcome.status {
-                        RunStatus::Cancelled => "cancelled",
-                        RunStatus::TimedOut => "timeout",
-                        _ => "interrupted",
-                    },
-                    "运行未正常完成；详情见会话事实",
-                ));
+            if let Some(error)=outcome.error.as_ref() {
+                view.error=Some(safe_run_error(&error.to_string(),view.state));
             }
             Ok::<(), HostError>(())
         }
@@ -839,6 +855,7 @@ impl Host {
         self.inner
             .store
             .call(move |db| {
+                db.check_live_scope(&scope)?;
                 let mut a = db
                     .approvals()?
                     .into_iter()
@@ -868,9 +885,9 @@ impl Host {
             })
             .await
     }
-    /// 功能：等待所有预留和活动Run完成实际清理。
+    /// 功能：等待所有预留、活动Run和已接受的持久删除完成实际清理。
     /// 参数：self为共享Host。
-    /// 返回：无返回值，返回即活动注册表为空。
+    /// 返回：无返回值，返回即活动注册表与删除预留均为空。
     /// 错误：非法范围、状态冲突或存储故障明确上报；无失败分支的读取不产生错误。
     /// 状态：不取消运行；Notify与注册表检查避免丢唤醒。
     /// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
@@ -881,14 +898,11 @@ impl Host {
             let notified = self.inner.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .active
-                .is_empty()
-            {
+            let idle = {
+                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.active.is_empty() && state.deletions == 0
+            };
+            if idle {
                 return;
             }
             notified.await;
@@ -945,6 +959,20 @@ impl Host {
             }
         }
         Ok(())
+    }
+
+    /// 功能：在已校验聊天恢复后请求重新展示该会话的待审批菜单。
+    /// 参数：scope为轮次服务已核对的完整作用域。
+    /// 返回：无。
+    /// 错误：无；未启用Office时无操作。
+    /// 状态：不创建运行、不延长审批期限、不批准工具。
+    /// 并发与取消：短锁内发送瞬时通知；原展示任务自行关闭HTTP。
+    /// 权限：调用者必须先完成会话及办公室范围校验。
+    /// 关联：需求REQ-OP-013；设计DES-OP-008。
+    pub(crate) async fn refresh_office_ui(&self, scope: &ClientScope) {
+        if let Some(office) = self.inner.office.lock().await.as_ref() {
+            office.refresh_ui(scope);
+        }
     }
 
     /// 功能：读取已恢复且可继续接受运行的就绪状态。
@@ -1045,6 +1073,15 @@ fn run_system_prompt(
     prompt.push_str(&format!(
         "Available network tools: web_search={search}, web_fetch={fetch}.\n"
     ));
+    if tools.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "write_file" | "edit_file" | "todo_add" | "todo_update" | "bash"
+        )
+    }) {
+        // 工具调用只是提出精确输入；真正执行前原审批服务会阻塞，模型不能用文字等待代替菜单。
+        prompt.push_str("本轮受控写入/命令工具由Host负责人工审批。用户要求执行且等待审批时，请先发起对应的真实工具调用：该调用会被Host拦截并显示审批菜单，批准前不会执行副作用。不要仅输出拟写内容并结束回复来等待一个尚未创建的菜单。只有工具成功结果才能证明操作完成；拒绝、过期或取消后不得绕过审批或自行重复申请，除非用户明确再次提出请求。普通bash是本机当前用户权限执行，工作区锁不构成OS隔离。\n");
+    }
     // 升级沿用同一会话；旧assistant可能反复声称缺工具，必须明确当前可信上下文的边界。
     // 不修改旧消息或给会话添加虚构事实，实际权限仍由本轮spec/注册表约束。
     prompt.push_str("\n【本轮服务端运行事实】历史回复不代表本轮能力。历史assistant关于没有联网工具、没有系统时钟或无法解除限制的说法可能来自旧配置，也可能是旧错误，不能作为本轮的权限或能力依据。本轮实际可调用工具以当前请求的tools清单为准；当前UTC时间和主机本地时间已在上文提供，回答日期时依据这些时间及用户地点，不从文件名或旧回复猜日期。不得因为历史反复否定就继续否定本轮已提供的能力。\n");
@@ -1056,6 +1093,94 @@ fn run_system_prompt(
         prompt.push_str("本轮未启用联网工具。历史上曾联网成功也不授予本轮权限；不得声称完成实时查询。主机已提供本轮时间，不能把缺少网络工具说成没有任何时间依据。\n");
     }
     prompt
+}
+
+impl Host {
+    /// 功能：在原关闭注册表预留一次持久删除。
+    /// 参数：self为共享Host。
+    /// 返回：后台删除必须持有至完成的守卫。
+    /// 错误：关闭已开始则拒绝新删除。
+    /// 状态：复用idle通知，不建立另一套运行注册表。
+    /// 并发与取消：与shutdown的closing检查共用同一互斥锁。
+    /// 权限：仅已校验范围的共享删除入口使用。
+    /// 关联：需求/设计REQ-OP-014；DES-OP-009。
+    pub(crate) fn reserve_deletion(&self) -> HostResult<DeletionGuard> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closing {
+            return Err(HostError::new("closing", "Host正在关闭，未接受新的删除"));
+        }
+        state.deletions += 1;
+        Ok(DeletionGuard(self.clone()))
+    }
+
+    /// 功能：取消并等待目标会话的实际运行清理。
+    /// 参数：session为已登记删除意图的会话ID。
+    /// 返回：目标活动预留完全释放后结束。
+    /// 错误：无；持久删除仍由调用方负责。
+    /// 状态：不关闭或取消其他会话。
+    /// 并发与取消：不跨await持注册表锁；Notify防丢唤醒。
+    /// 权限：仅共享删除协调器调用。
+    /// 关联：REQ-OP-014；API-HOST-DELETE。 需求/设计REQ-OP-014。
+    pub(crate) async fn quiesce_session(&self, session: &str) {
+        loop {
+            let notified = self.inner.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let active: Vec<_> = state
+                    .active
+                    .values()
+                    .filter(|a| a.session == session)
+                    .collect();
+                if active.is_empty() {
+                    return;
+                }
+                for a in active {
+                    a.control.cancel.cancel();
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+/// 功能：把运行失败分类为可安全公开的固定中文说明。
+/// 参数：raw仅在内存中用于分类，state为真实运行终态。
+/// 返回：稳定错误种类及不含上游正文的说明。
+/// 错误：未知错误收敛到通用失败，不推断为超时。
+/// 状态：不重试、不改运行结果，不丢弃原JSONL诊断。
+/// 并发与取消：纯计算，无等待。
+/// 权限：不向浏览器回显原始错误、路径或密钥。
+/// 关联：需求/设计REQ-OP-012；DES-OP-007。
+pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
+    let (kind, message) = if state == RunState::Cancelled {
+        ("cancelled", "已停止，实际操作已清理")
+    } else if raw.contains("invalid OpenAI streamed tool arguments") {
+        (
+            "provider_arguments",
+            "模型返回的工具参数格式无效，本轮未完成；已完成操作不会自动重做",
+        )
+    } else if raw.contains("finish_reason") || raw.contains("stream ended") {
+        ("provider_stream", "模型连接未完整返回，本轮未完成")
+    } else if raw.contains("provider stream idle")
+        || raw.contains("provider connection idle")
+        || raw.contains("compaction summary idle")
+    {
+        ("stream_idle", "模型服务长时间未响应，本轮已结束并完成清理")
+    } else if raw.contains("tool execution budget exceeded") {
+        ("tool_timeout", "操作执行时间超过预算，已等待实际清理")
+    } else if state == RunState::TimedOut {
+        ("run_timeout", "本次任务超过运行预算，已等待实际清理")
+    } else if raw.starts_with("store error:") {
+        ("storage_unavailable", "保存运行记录失败，本轮未确认完成")
+    } else {
+        (
+            "run_failed",
+            "本次任务未完成，请查看对话中的已完成事项后再决定是否重试",
+        )
+    };
+    HostError::new(kind, message)
 }
 
 #[cfg(test)]

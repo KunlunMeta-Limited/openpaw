@@ -64,3 +64,13 @@ required-features = ["engine-host"]
 
 [lints]
 workspace = true
+
+[[test]]
+name = "host_office_interactions"
+path = "tests/features/office_interactions.rs"
+required-features = ["engine-host"]
+
+[[test]]
+name = "host_office_delete"
+path = "tests/regressions/office_delete.rs"
+required-features = ["engine-host"]

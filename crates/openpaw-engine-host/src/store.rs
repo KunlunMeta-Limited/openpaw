@@ -139,6 +139,83 @@ impl Store {
     }
 }
 impl Db {
+    /// 功能：读取当前Run最后一份业务步骤派生事实。
+    /// 参数：run为可信运行标识。
+    /// 返回：已有计划或无计划。
+    /// 错误：SQL或已存JSON损坏明确上报。
+    /// 状态：只读，不为旧Run补造计划。
+    /// 并发与取消：由原单写Store串行调用，无资源锁。
+    /// 权限：校验Run和Session删除门禁。
+    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    pub(crate) fn progress(&self, run: &str) -> HostResult<Option<serde_json::Value>> {
+        let view = self.get_run(run)?;
+        self.binding(&view.session_id)?;
+        let raw:Option<String>=self.conn.query_row("SELECT reference FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[run],|r|r.get(0)).optional().map_err(HostError::storage)?;
+        raw.map(|v| serde_json::from_str(&v).map_err(HostError::storage))
+            .transpose()
+    }
+
+    /// 功能：将步骤报告与原Run及真实调用绑定，持久化后通知投影。
+    /// 参数：binding为引擎可信最终调用绑定，value为报告输入。
+    /// 返回：已提交或重复内容无需追加时为空。
+    /// 错误：范围、取消、假完成、容量或存储失败明确拒绝。
+    /// 状态：每Run最多256次有效报告，原host_events保留固定分母和证据。
+    /// 并发与取消：状态检查和追加处于原Store单写命令，不等待审批或工作区锁。
+    /// 权限：仅Office绑定的同Run report_progress，不批准其他工具。
+    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    pub(crate) fn report_progress(
+        &mut self,
+        binding: &openpaw_core::ToolCallBinding,
+        value: &serde_json::Value,
+    ) -> HostResult<()> {
+        let run = self.get_run(&binding.run_id)?;
+        if self.binding(&run.session_id)?.scope.namespace != "office"
+            || binding.tool_name != "report_progress"
+            || binding.input != *value
+        {
+            return Err(HostError::new(
+                "scope_denied",
+                "步骤报告不属于当前Office运行",
+            ));
+        }
+        let previous = self.progress(&run.run_id)?;
+        let mut stmt=self.conn.prepare("SELECT reference FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([&run.run_id], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let mut started = Vec::new();
+        for row in rows {
+            started.push(
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?,
+            );
+        }
+        let next = crate::task_progress::update(previous.clone(), value, &run, &started).map_err(
+            |mut error| {
+                if error.kind == "invalid_progress" {
+                    // 拒绝仍是拒绝；仅提供可恢复的本轮证据标识，不替模型选择或确认完成。
+                    error
+                        .message
+                        .push_str(&crate::task_progress::recovery_hint(&run, &started));
+                }
+                error
+            },
+        )?;
+        if previous.as_ref() == Some(&next) {
+            return Ok(());
+        }
+        let count:u64=self.conn.query_row("SELECT COUNT(*) FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1",[&run.run_id],|r|r.get(0)).map_err(HostError::storage)?;
+        if count >= 256 {
+            return Err(HostError::new(
+                "capacity_exceeded",
+                "本轮步骤报告已达256次上限",
+            ));
+        }
+        let revision = self.bump("run_progress", &next.to_string())?;
+        let _ = self.notices.send(HostNotice::Changed { revision });
+        Ok(())
+    }
+
     fn open(
         home: PathBuf,
         roots: BTreeMap<String, PathBuf>,
@@ -156,7 +233,7 @@ impl Db {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(HostError::storage)?;
-        if !(0..=3).contains(&version) {
+        if !(0..=4).contains(&version) {
             return Err(HostError::new(
                 "unsupported",
                 "不支持的Host数据版本，拒绝写入",
@@ -182,7 +259,11 @@ impl Db {
         SELECT team,data,sync_state FROM host_office_projection LIMIT 0;
         CREATE TABLE IF NOT EXISTS host_requests(session TEXT NOT NULL,key TEXT NOT NULL,request TEXT NOT NULL,run TEXT NOT NULL UNIQUE,PRIMARY KEY(session,key));
         SELECT session,key,request,run FROM host_requests LIMIT 0;
-        PRAGMA user_version=3;
+        CREATE TABLE IF NOT EXISTS host_session_deletions(scope TEXT PRIMARY KEY,session TEXT NOT NULL UNIQUE,phase TEXT NOT NULL,created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS host_office_decisions(approval_id TEXT PRIMARY KEY,display_id TEXT NOT NULL UNIQUE,scope TEXT NOT NULL,expires_at INTEGER NOT NULL,state TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS host_office_actions(action_id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,expires_at INTEGER NOT NULL,context TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS host_office_scene(event_id TEXT PRIMARY KEY,command_id TEXT NOT NULL,expires_at INTEGER NOT NULL,status TEXT NOT NULL);
+        PRAGMA user_version=4;
         COMMIT;").map_err(HostError::storage)?;
         for (id, path) in roots {
             let prior = conn.query_row("SELECT path FROM host_roots WHERE id=?1", [&id], |r| {
@@ -342,10 +423,13 @@ impl Db {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub(crate) fn binding(&self, id: &str) -> HostResult<SessionBinding> {
-        self.bindings()?
+        let binding = self
+            .bindings()?
             .into_iter()
             .find(|b| b.session_id == id)
-            .ok_or_else(|| HostError::new("not_found", "会话不存在"))
+            .ok_or_else(|| HostError::new("not_found", "会话不存在"))?;
+        self.check_live_scope(&binding.scope)?;
+        Ok(binding)
     }
     /// 功能：从原账本和宿主事实生成Run当前视图。
     /// 参数：id为Run稳定ID。
@@ -392,6 +476,14 @@ impl Db {
                     if let Some(t) = tools.get_mut(&call_id) {
                         t.state = if success { "completed" } else { "failed" }.into();
                     }
+                }
+                SessionEvent::RunFinished {
+                    run_id,
+                    error: Some(error),
+                    ..
+                // 历史通用错误可从账本细分；宿主已锁存的存储等确定分类不能被通用错误覆盖。
+                } if run_id == id && run.error.as_ref().is_none_or(|e| matches!(e.kind.as_str(), "interrupted" | "run_failed" | "timeout" | "cancelled")) => {
+                    run.error = Some(crate::service::safe_run_error(&error, run.state));
                 }
                 _ => {}
             }
@@ -461,13 +553,17 @@ impl Db {
     /// 状态：request仅作精确重试比较，不用于恢复模型历史。
     /// 并发与取消：单写线程；先提交关联再允许执行副作用。
     /// 权限：作用域由共享服务校验，键不是授权。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
     pub(crate) fn save_run_with_request(
         &mut self,
         mut run: RunView,
         offset: usize,
         request: Option<(String, String)>,
     ) -> HostResult<RunView> {
+        // 接受和删除都经过同一单写队列：预留后发生的删除必须拒绝接受。
+        if matches!(run.state, RunState::Accepting | RunState::Accepted) {
+            self.check_live_scope(&self.binding(&run.session_id)?.scope)?;
+        }
         // 取消不能被稍晚开始的执行任务逆转为running。
         if run.state == RunState::Running
             && self
@@ -534,6 +630,7 @@ impl Db {
         binding: SessionBinding,
         session: Session,
     ) -> HostResult<()> {
+        self.check_live_scope(&binding.scope)?;
         let path = self.path(&binding.session_id)?;
         let mut writer = SessionWriter::create(path).map_err(HostError::storage)?;
         writer
@@ -798,7 +895,7 @@ impl Db {
     /// 状态：只读，不创建会话或Run。
     /// 并发与取消：Store单写序列读取。
     /// 权限：调用方必须校验会话归属。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub(crate) fn request_for_key(
         &self,
         session: &str,
@@ -820,7 +917,7 @@ impl Db {
     /// 状态：只读，不回放运行。
     /// 并发与取消：Store单写序列读取。
     /// 权限：调用方必须校验范围。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
     pub(crate) fn request_key(&self, run: &str) -> HostResult<String> {
         Ok(self
             .conn
@@ -838,7 +935,7 @@ impl Db {
     /// 状态：只读原账本，不复制历史。
     /// 并发与取消：Store单写序列读取。
     /// 权限：调用方校验会话归属。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
     pub(crate) fn run_input(&self, run: &RunView) -> HostResult<(usize, String)> {
         let offset: usize = self
             .conn
@@ -882,7 +979,7 @@ impl Db {
     /// 状态：复用既有导入标记和JSONL，不保存第二份历史。
     /// 并发与取消：Store单写序列读取。
     /// 权限：外部导入仍是不可信文本，不产生工具或授权事实。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
     pub(crate) fn imported_turns(&self, session: &str) -> HostResult<Vec<(usize, String, String)>> {
         let marker:Option<(usize,usize)>=self.conn.query_row("SELECT event_offset,count FROM host_context_import WHERE session=?1 AND complete=1",[session],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(HostError::storage)?;
         let Some((offset, count)) = marker else {
@@ -912,6 +1009,26 @@ impl Db {
         Ok(turns)
     }
     fn recover(&mut self) -> HostResult<()> {
+        // 删除意图必须先于恢复writer；否则残留绑定会让已经删除的会话复活。
+        let pending: Vec<(String, String)> = {
+            let mut q = self
+                .conn
+                .prepare("SELECT scope,session FROM host_session_deletions WHERE phase!='deleted'")
+                .map_err(HostError::storage)?;
+            let rows = q
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(HostError::storage)?;
+            rows.collect::<Result<_, _>>().map_err(HostError::storage)?
+        };
+        for (scope, session) in pending {
+            self.purge_session(&scope, &session)?;
+        }
+        self.conn
+            .execute(
+                "UPDATE host_office_decisions SET state='expired' WHERE state='active'",
+                [],
+            )
+            .map_err(HostError::storage)?;
         for b in self.bindings()? {
             let path = self.path(&b.session_id)?;
             let writer = SessionWriter::open_append(&path).map_err(HostError::storage)?;
@@ -1004,6 +1121,511 @@ impl Db {
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(HostError::storage)?;
+        Ok(())
+    }
+}
+
+impl Db {
+    /// 功能：拒绝已登记删除意图的完整范围。
+    /// 参数：scope为可信会话范围。
+    /// 返回：未删除时成功。
+    /// 错误：删除中或已删除返回session_deleted；存储错误透传。
+    /// 状态：只读墓碑，禁止旧ID重新创建。
+    /// 并发与取消：单写序列，与接受和删除原子排序。
+    /// 权限：不将ID当认证凭据。
+    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    pub(crate) fn check_live_scope(&self, scope: &ClientScope) -> HostResult<()> {
+        if self.deletion(scope)?.is_some() {
+            return Err(HostError::new(
+                "session_deleted",
+                "会话已删除或正在删除，请新建会话",
+            ));
+        }
+        Ok(())
+    }
+    /// 功能：读取最小删除墓碑。
+    /// 参数：scope为完整可信范围。
+    /// 返回：可选中性删除视图。
+    /// 错误：SQL或序列化错误。
+    /// 状态：不包含正文、输入或输出。
+    /// 并发与取消：单写线程只读。
+    /// 权限：精确范围查找。
+    /// 关联：REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    pub(crate) fn deletion(&self, scope: &ClientScope) -> HostResult<Option<DeleteView>> {
+        let key = serde_json::to_string(scope).map_err(HostError::storage)?;
+        self.conn
+            .query_row(
+                "SELECT session,phase FROM host_session_deletions WHERE scope=?1",
+                [key],
+                |r| {
+                    Ok(DeleteView {
+                        session_id: r.get(0)?,
+                        phase: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(HostError::storage)
+    }
+    /// 功能：持久化删除意图并关闭目标会话的审批。
+    /// 参数：scope为可信完整范围。
+    /// 返回：既有或新建的删除视图。
+    /// 错误：不存在、权限或SQL错误。
+    /// 状态：先保存墓碑再取消；重复调用不新建会话。
+    /// 并发与取消：单写排序；不等待网络或运行清理。
+    /// 权限：仅目标范围，不修改工作区文件。
+    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    pub(crate) fn begin_delete(&mut self, scope: &ClientScope) -> HostResult<DeleteView> {
+        if let Some(v) = self.deletion(scope)? {
+            return Ok(v);
+        }
+        let binding = self
+            .bindings()?
+            .into_iter()
+            .find(|b| b.scope == *scope)
+            .ok_or_else(|| HostError::new("not_found", "会话不存在"))?;
+        let key = serde_json::to_string(scope).map_err(HostError::storage)?;
+        self.conn
+            .execute(
+                "INSERT INTO host_session_deletions VALUES(?1,?2,'deleting',?3)",
+                params![
+                    key,
+                    binding.session_id,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )
+            .map_err(HostError::storage)?;
+        for mut a in self.approvals()? {
+            if self
+                .runs()?
+                .iter()
+                .any(|r| r.session_id == binding.session_id && r.run_id == a.binding.run_id)
+                && (a.status == "pending" || a.status == "approved" && !a.consumed)
+            {
+                a.status = "cancelled".into();
+                self.save_approval(a)?;
+            }
+        }
+        self.conn
+            .execute(
+                "UPDATE host_office_decisions SET state='cancelled' WHERE scope=?1",
+                [&key],
+            )
+            .map_err(HostError::storage)?;
+        self.conn
+            .execute(
+                "UPDATE host_session_deletions SET phase='cancelling' WHERE scope=?1",
+                [key],
+            )
+            .map_err(HostError::storage)?;
+        Ok(DeleteView {
+            session_id: binding.session_id,
+            phase: "cancelling".into(),
+        })
+    }
+    /// 功能：实际清理结束后前进删除阶段。
+    /// 参数：scope和session为墓碑身份。
+    /// 返回：删除完成。
+    /// 错误：任何物理删除或索引清理失败保留意图并报错。
+    /// 状态：先移除账本和派生正文，最后保留最小墓碑；不回滚副作用。
+    /// 并发与取消：只在目标Run完成清理后调用；恢复时先于writer打开。
+    /// 权限：只删除本会话及自动损尾备份，保留项目和用户备份。
+    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    pub(crate) fn purge_session(&mut self, scope: &str, session: &str) -> HostResult<()> {
+        let phase: String = self
+            .conn
+            .query_row(
+                "SELECT phase FROM host_session_deletions WHERE scope=?1 AND session=?2",
+                params![scope, session],
+                |r| r.get(0),
+            )
+            .map_err(HostError::storage)?;
+        if phase == "deleted" {
+            return Ok(());
+        }
+        self.conn.execute("UPDATE host_session_deletions SET phase='purging' WHERE scope=?1 AND phase!='deleted'",[scope]).map_err(HostError::storage)?;
+        self.writers.remove(session);
+        let path = self.path(session)?;
+        let remove = |path: &std::path::Path| match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(HostError::storage(e)),
+        };
+        remove(&path)?;
+        let prefix = format!("{session}.jsonl.torn-");
+        if let Some(parent) = path.parent() {
+            match std::fs::read_dir(parent) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(HostError::storage)?;
+                        let name = entry.file_name();
+                        let name = name.to_string_lossy();
+                        if let Some(suffix) = name
+                            .strip_prefix(&prefix)
+                            .and_then(|s| s.strip_suffix(".bak"))
+                        {
+                            if suffix.split_once('-').is_some_and(|(a, b)| {
+                                !a.is_empty()
+                                    && !b.is_empty()
+                                    && a.bytes().all(|c| c.is_ascii_digit())
+                                    && b.bytes().all(|c| c.is_ascii_digit())
+                            }) {
+                                remove(&entry.path())?;
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(HostError::storage(e)),
+            }
+        }
+        self.index
+            .delete_session(session)
+            .map_err(HostError::storage)?;
+        let run_ids: Vec<_> = self
+            .runs()?
+            .into_iter()
+            .filter(|r| r.session_id == session)
+            .map(|r| r.run_id)
+            .collect();
+        let tx = self.conn.transaction().map_err(HostError::storage)?;
+        for id in &run_ids {
+            tx.execute("DELETE FROM host_events WHERE kind='approval' AND reference IN (SELECT id FROM host_approvals WHERE run=?1)",[id]).map_err(HostError::storage)?;
+            tx.execute("DELETE FROM host_office_decisions WHERE approval_id IN (SELECT id FROM host_approvals WHERE run=?1)",[id]).map_err(HostError::storage)?;
+            tx.execute("DELETE FROM host_approvals WHERE run=?1", [id])
+                .map_err(HostError::storage)?;
+            tx.execute("DELETE FROM host_office_calls WHERE run=?1", [id])
+                .map_err(HostError::storage)?;
+            tx.execute(
+                "DELETE FROM host_office_scene WHERE event_id LIKE ?1",
+                [format!("{id}:%")],
+            )
+            .map_err(HostError::storage)?;
+            tx.execute("DELETE FROM host_events WHERE reference=?1 OR CASE WHEN json_valid(reference) THEN json_extract(reference,'$.run_id')=?1 ELSE 0 END",[id]).map_err(HostError::storage)?;
+        }
+        tx.execute(
+            "DELETE FROM host_events WHERE reference=?1 OR reference LIKE ?2",
+            params![session, format!("{session}:%")],
+        )
+        .map_err(HostError::storage)?;
+        for sql in [
+            "DELETE FROM host_runs WHERE session=?1",
+            "DELETE FROM host_requests WHERE session=?1",
+            "DELETE FROM host_context_import WHERE session=?1",
+        ] {
+            tx.execute(sql, [session]).map_err(HostError::storage)?;
+        }
+        tx.execute("DELETE FROM host_office_actions WHERE scope=?1", [scope])
+            .map_err(HostError::storage)?;
+        // 清除缓存正文但保留seq；下一次prepare分配更高完整版本，不重置协调器。
+        let target: ClientScope = serde_json::from_str(scope).map_err(HostError::storage)?;
+        if target.namespace == "office" {
+            let saved: Option<String> = tx
+                .query_row(
+                    "SELECT data FROM host_office_projection WHERE team=?1",
+                    [&target.slot_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(HostError::storage)?;
+            if let Some(saved) = saved {
+                let mut snapshot: serde_json::Value =
+                    serde_json::from_str(&saved).map_err(HostError::storage)?;
+                if let Some(convs) = snapshot["conversations"].as_array_mut() {
+                    convs.retain(|c| c["id"] != target.conversation_id);
+                }
+                let seq = snapshot["seq"]
+                    .as_u64()
+                    .filter(|n| *n < 9007199254740991)
+                    .ok_or_else(|| HostError::new("sequence_conflict", "快照序号耗尽"))?;
+                snapshot["seq"] = serde_json::json!(seq + 1);
+                tx.execute(
+                    "UPDATE host_office_projection SET data=?2,sync_state='pending' WHERE team=?1",
+                    params![
+                        target.slot_id,
+                        serde_json::to_string(&snapshot).map_err(HostError::storage)?
+                    ],
+                )
+                .map_err(HostError::storage)?;
+            }
+        }
+        tx.execute("DELETE FROM host_bindings WHERE id=?1", [session])
+            .map_err(HostError::storage)?;
+        tx.execute(
+            "UPDATE host_session_deletions SET phase='deleted' WHERE scope=?1",
+            [scope],
+        )
+        .map_err(HostError::storage)?;
+        tx.commit().map_err(HostError::storage)?;
+        let mut live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        for id in run_ids {
+            live.remove(&id);
+        }
+        drop(live);
+        let revision = self.bump("deleted", session)?;
+        self.publish(revision);
+        Ok(())
+    }
+    /// 功能：按实际开始时最近的业务计划关联调用与步骤，避免历史动画随进度移动。
+    /// 参数：run为当前运行ID。
+    /// 返回：调用ID到原计划步骤下标的映射；没有计划的调用由投影归主目标。
+    /// 错误：SQL或已存计划/执行绑定损坏。
+    /// 状态：只读重建，不新增另一套调用或动画账本。
+    /// 并发与取消：在原Store序列内按revision读取，无网络或资源锁。
+    /// 权限：只使用同Run的已存计划和实际tool_started事实。
+    /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
+    pub(crate) fn office_task_assignments(
+        &self,
+        run: &str,
+    ) -> HostResult<std::collections::BTreeMap<String, usize>> {
+        let mut stmt = self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('run_progress','tool_started') AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([run], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(HostError::storage)?;
+        let mut current = None;
+        let mut assignments = std::collections::BTreeMap::new();
+        for row in rows {
+            let (kind, raw) = row.map_err(HostError::storage)?;
+            let v: serde_json::Value = serde_json::from_str(&raw).map_err(HostError::storage)?;
+            if kind == "run_progress" {
+                current = v["steps"]
+                    .as_array()
+                    .and_then(|steps| steps.iter().position(|s| s["state"] == "in_progress"));
+            } else if let (Some(index), Some(call)) = (current, v["call_id"].as_str()) {
+                assignments.insert(call.to_owned(), index);
+            }
+        }
+        Ok(assignments)
+    }
+    /// 功能：读取永久办公室分配事实，不使用有期限的UI导航记录。
+    /// 参数：无。
+    /// 返回：原host_events中按提交顺序保存的创建归属。
+    /// 错误：SQL或JSON损坏，不能当成尚无办公室。
+    /// 状态：只读；删除会话不删除办公室归属。
+    /// 并发与取消：复用唯一Store线程，不持文件锁。
+    /// 权限：仅返回控制标识与显示名称，无密钥或消息正文。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.10节。
+    pub(crate) fn office_creations(&self) -> HostResult<Vec<serde_json::Value>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT reference FROM host_events WHERE kind='office_created' ORDER BY revision",
+            )
+            .map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        rows.map(|r| {
+            serde_json::from_str(&r.map_err(HostError::storage)?).map_err(HostError::storage)
+        })
+        .collect()
+    }
+    /// 功能：在真实Session创建后可靠登记一次办公室分配。
+    /// 参数：action/slot/name/session为已审核创建动作及固定绑定。
+    /// 返回：首次提交成功；同动作同内容重试保持不变。
+    /// 错误：动作或槽冲突、绑定不匹配、SQL失败。
+    /// 状态：沿用host_events和数据版本，不创建第二套业务数据库。
+    /// 并发与取消：Store串行；外层创建门及投影门覆盖分配到UI响应。
+    /// 权限：再次验证Office命名空间和main会话绑定，根仍由Host配置决定。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.10节。
+    pub(crate) fn save_office_creation(
+        &self,
+        action: &str,
+        slot: &str,
+        name: &str,
+        session: &str,
+    ) -> HostResult<()> {
+        let record =
+            serde_json::json!({"action_id":action,"slot_id":slot,"name":name,"session_id":session});
+        for old in self.office_creations()? {
+            if old["action_id"] == action {
+                return if old == record {
+                    Ok(())
+                } else {
+                    Err(HostError::new(
+                        "scope_conflict",
+                        "相同创建动作的内容发生冲突",
+                    ))
+                };
+            }
+            if old["slot_id"] == slot {
+                return Err(HostError::new("scope_conflict", "办公室槽已经分配"));
+            }
+        }
+        let binding = self.binding(session)?;
+        if binding.scope.namespace != "office"
+            || binding.scope.slot_id != slot
+            || binding.scope.conversation_id != "main"
+        {
+            return Err(HostError::new("scope_denied", "办公室创建缺少真实固定会话"));
+        }
+        let revision = self.bump("office_created", &record.to_string())?;
+        self.publish(revision);
+        Ok(())
+    }
+    /// 功能：登记已领取UI动作或有限导航上下文。
+    /// 参数：id/scope/kind/state/expiry/context仅含控制标识。
+    /// 返回：首次动作true，重复ID不覆盖原范围。
+    /// 错误：SQL或序列化错误。
+    /// 状态：清除过期元数据，每会话最多64个导航。
+    /// 并发与取消：单写序列提交后才分派。
+    /// 权限：上下文不保存消息正文或凭据。
+    /// 关联：REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    pub(crate) fn office_action(
+        &self,
+        id: &str,
+        scope: &ClientScope,
+        kind: &str,
+        state: &str,
+        expiry: i64,
+        context: &serde_json::Value,
+    ) -> HostResult<bool> {
+        self.conn
+            .execute(
+                "DELETE FROM host_office_actions WHERE expires_at<?1",
+                [chrono::Utc::now().timestamp_millis()],
+            )
+            .map_err(HostError::storage)?;
+        let key = serde_json::to_string(scope).map_err(HostError::storage)?;
+        if kind == "navigation" {
+            self.conn.execute("UPDATE host_office_actions SET kind='navigation',status=?3,expires_at=?4,context=?5 WHERE action_id=?1 AND scope=?2",params![id,key,state,expiry,serde_json::to_string(context).map_err(HostError::storage)?]).map_err(HostError::storage)?;
+        }
+        let n = self
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO host_office_actions VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    id,
+                    key,
+                    kind,
+                    state,
+                    expiry,
+                    serde_json::to_string(context).map_err(HostError::storage)?
+                ],
+            )
+            .map_err(HostError::storage)?;
+        self.conn.execute("DELETE FROM host_office_actions WHERE scope=?1 AND kind='navigation' AND action_id NOT IN (SELECT action_id FROM host_office_actions WHERE scope=?1 AND kind='navigation' ORDER BY expires_at DESC LIMIT 64)",[key]).map_err(HostError::storage)?;
+        Ok(n == 1)
+    }
+    /// 功能：读取同范围未过期的导航标识。
+    /// 参数：id为原对话框ID，scope为当前动作范围。
+    /// 返回：仅控制上下文。
+    /// 错误：过期、越界或SQL错误。
+    /// 状态：不重置期限。
+    /// 并发与取消：只读单写队列。
+    /// 权限：跨会话不可复用按钮。
+    /// 关联：REQ-OP-014；API-OFFICE-UI。 需求/设计REQ-OP-014。
+    pub(crate) fn office_navigation(
+        &self,
+        id: &str,
+        scope: &ClientScope,
+    ) -> HostResult<serde_json::Value> {
+        self.check_live_scope(scope)?;
+        let key = serde_json::to_string(scope).map_err(HostError::storage)?;
+        let value:Option<String>=self.conn.query_row("SELECT context FROM host_office_actions WHERE action_id=?1 AND scope=?2 AND kind='navigation' AND expires_at>?3",params![id,key,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).optional().map_err(HostError::storage)?;
+        serde_json::from_str(
+            &value.ok_or_else(|| HostError::new("ui_expired", "详情按钮已过期，请重新打开"))?,
+        )
+        .map_err(HostError::storage)
+    }
+    /// 功能：保存审批展示尝试，保持共享审批为唯一授权。
+    /// 参数：approval/display/scope/expiry/state为已核对控制字段。
+    /// 返回：提交完成。
+    /// 错误：SQL错误。
+    /// 状态：新尝试覆盖旧展示ID，期限不延长。
+    /// 并发与取消：单写序列。
+    /// 权限：不保存另一份批准或输入正文。
+    /// 关联：REQ-OP-013；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    pub(crate) fn office_decision(
+        &self,
+        approval: &str,
+        display: &str,
+        scope: &ClientScope,
+        expiry: i64,
+        state: &str,
+    ) -> HostResult<()> {
+        // 显示任务可能刚从HTTP返回，此时删除已经提交；不能重建已清除的展示记录。
+        self.check_live_scope(scope)?;
+        self.conn.execute("INSERT INTO host_office_decisions VALUES(?1,?2,?3,?4,?5) ON CONFLICT(approval_id) DO UPDATE SET display_id=excluded.display_id,state=excluded.state",params![approval,display,serde_json::to_string(scope).map_err(HostError::storage)?,expiry,state]).map_err(HostError::storage)?;
+        Ok(())
+    }
+}
+
+impl Db {
+    /// 功能：只根据可靠的真实开始观察事实判断是否允许场景交接。
+    /// 参数：run/call为当前运行的精确工具标识。
+    /// 返回：原工具开始事件存在时为真。
+    /// 错误：SQL读取失败。
+    /// 状态：拒绝、校验失败或审批过期均不能借终态伪造执行动画。
+    /// 并发与取消：投影同次Store读取，不持工作区锁。
+    /// 权限：仅适配器可信Run/call。
+    /// 关联：需求/设计REQ-OP-015；DES-OP-007。
+    pub(crate) fn office_call_started(&self, run: &str, call: &str) -> HostResult<bool> {
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.call_id')=?2)",params![run,call],|r|r.get(0)).map_err(HostError::storage)
+    }
+
+    /// 功能：登记有限场景反馈并清除过期去重键。
+    /// 参数：event/command为真实事实和唯一命令标识，expiry为原观察期限，state为投递状态。
+    /// 返回：登记完成。
+    /// 错误：SQL错误。
+    /// 状态：不保存正文，不在重启时重投。
+    /// 并发与取消：单写序列，无网络等待。
+    /// 权限：仅Office适配器内部。
+    /// 关联：REQ-OP-015；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    pub(crate) fn office_scene(
+        &self,
+        event: &str,
+        command: &str,
+        expiry: i64,
+        state: &str,
+    ) -> HostResult<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        self.conn
+            .execute("DELETE FROM host_office_scene WHERE expires_at<?1", [now])
+            .map_err(HostError::storage)?;
+        self.conn
+            .execute(
+                "INSERT INTO host_office_scene VALUES(?1,?2,?3,?4) ON CONFLICT(event_id) DO UPDATE SET status=excluded.status WHERE command_id=excluded.command_id",
+                params![event, command, expiry, state],
+            )
+            .map_err(HostError::storage)?;
+        Ok(())
+    }
+}
+
+impl Db {
+    /// 功能：记录UI响应的送达事实，不能回滚已经提交的业务删除。
+    /// 参数：id/scope为领取对象，status为delivered或unconfirmed。
+    /// 返回：状态提交完成。
+    /// 错误：SQL错误。
+    /// 状态：只存控制标识；导航期限不重置，过期记录按原规则清除。
+    /// 并发与取消：单写队列，不等待网络。
+    /// 权限：完整scope匹配，保留删除后的有限UI未确认诊断。
+    /// 关联：需求/设计REQ-OP-014；DAT-HOST-INTERACTION。
+    pub(crate) fn office_action_state(
+        &self,
+        id: &str,
+        scope: &ClientScope,
+        status: &str,
+    ) -> HostResult<()> {
+        self.conn
+            .execute(
+                "UPDATE host_office_actions SET status=?3 WHERE action_id=?1 AND scope=?2",
+                params![
+                    id,
+                    serde_json::to_string(scope).map_err(HostError::storage)?,
+                    status
+                ],
+            )
+            .map_err(HostError::storage)?;
+        // purge已移除含导航内容的原动作；仅补最小回执，不能因410让已删除会话复活。
+        let key = serde_json::to_string(scope).map_err(HostError::storage)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO host_office_actions SELECT ?1,?2,'receipt',?3,?4,'{}' WHERE EXISTS(SELECT 1 FROM host_session_deletions WHERE scope=?2 AND phase='deleted')",
+            params![id,key,if status=="delivered" {"deleted_ui_confirmed"} else {"deleted_ui_unconfirmed"},chrono::Utc::now().timestamp_millis()+600000],
+        ).map_err(HostError::storage)?;
         Ok(())
     }
 }
@@ -1131,6 +1753,54 @@ mod office_regressions {
             })
             .await
             .unwrap();
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn deleted_ui_receipt_has_no_navigation_body_and_cannot_revive_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let cfg = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(cfg).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "delete-receipt".into(),
+        };
+        host.open_session(scope.clone()).await.unwrap();
+        let s = scope.clone();
+        host.inner
+            .store
+            .call(move |db| {
+                db.office_action(
+                    "delete-action",
+                    &s,
+                    "conversation.delete",
+                    "claimed",
+                    chrono::Utc::now().timestamp_millis() + 50000,
+                    &json!({"private":"must be removed"}),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.delete_session(&scope).await.unwrap();
+        let s = scope.clone();
+        host.inner.store.call(move|db|{
+            db.office_action_state("delete-action",&s,"unconfirmed")?;
+            let (kind,status,body):(String,String,String)=db.conn.query_row("SELECT kind,status,context FROM host_office_actions WHERE action_id='delete-action'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(HostError::storage)?;
+            assert_eq!((kind.as_str(),status.as_str(),body.as_str()),("receipt","deleted_ui_unconfirmed","{}"));
+            assert!(db.office_navigation("delete-action",&s).is_err());
+            assert!(db.office_decision("late-approval","late-display",&s,chrono::Utc::now().timestamp_millis()+10000,"unknown").is_err());
+            let now=chrono::Utc::now().timestamp_millis();
+            db.office_scene("run:terminal","original",now+10000,"queued")?;
+            db.office_scene("run:terminal","original",now+10000,"forwarded")?;
+            db.office_scene("run:terminal","forged",now+30000,"completed")?;
+            let (id,status,expires):(String,String,i64)=db.conn.query_row("SELECT command_id,status,expires_at FROM host_office_scene WHERE event_id='run:terminal'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(HostError::storage)?;
+            assert_eq!((id.as_str(),status.as_str(),expires),("original","forwarded",now+10000));
+            Ok(())
+        }).await.unwrap();
+        assert!(host.open_session(scope).await.is_err());
         host.shutdown().await.unwrap();
     }
 }

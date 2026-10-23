@@ -2,6 +2,20 @@
 
 复制本节到每个 Tx PR 描述；不能只填“已完成”。T0原交付完成及0001当前修订分别见master第14节和0001首页，validation.md保留原时点证据。
 
+## 当前T5产品复检交接（2026-10-23）
+
+原r1准确ff7f161完整27项和产品证据保留，不能替代当前r2/r3。用户已分别明确批准OpenPaw r2-product和r3-upstream，当前实施中，尚未交付验收或创建T5 PR。精确方法及标准见0006第9.9/9.10与10.4/10.5节。新版Office固定d150b96，原七messages/四chat操作不变，增加新建办公室动作与官方office呈现；危险审批仍为confirmation。全部Office修改仍暂缓，R6已由上游覆盖撤回，R11默认链接未批准。
+
+主开发目录已同步至`/Office/openpaw`的feat/engine-host-t5，三份用户改动保留未提交。旧artifacts工作树清洁移除，提交/分支与备份仍在。8765升级、原会话真实模型/任务/白板/文件证据及清理结果见0006验证记录，不能将8766旧演示当作8765已升级。Windows原生按用户决定暂缓，不计通过。
+
+## T5 r2/r3最新可验收实现（2026-10-23）
+
+原实现0df3282完整27/27、固定d150b96产品53条记录通过，原8765真实模型h-resume与账本对账passed。当前服务使用该已测程序，原天气Session/官方.env保持；原会话可联网、审批写入、更新业务目标/步骤、刷新追问、查看文件正文及创建预授权办公室。D45—D49修复已验证、未合入；旧段落关于未升级/审批不重开的描述保留原时点，以本节和0006最新章节为准。
+
+真实证据入口：/home/cheng/.cache/t5-live-weather-20261023-h-resume/report.json、correlation.json、04b任务中心/07正文截图及trace/video；6145字节产物路径reports/长沙天气-2026-10-23-闭环终验.md。日期追问任务100%，office-reserved-3独立Session，详情3015ms、观察65249ms无超时浮窗。对账按原ApprovalView的status=approved、consumed=true及完整binding核对，不修改事实。旧验证脚本失误、错误报告复检及UI停止误发测试均在0006验证记录保留。
+
+最终文档候选重新完整27项，准确提交/报告hash/运行与候选binaryhash由仓库外artifacts/t5-delivery-20261023/final-review.json绑定；只有manifest的passed和准确checkout_head支持交付核查。人审、T5 PR和合入仍待发生，不开始T6。Windows原生继续暂缓，Office工程不改；请特别查看office-change-requests.md的R11，默认白板链接仍保留，未获Office实施授权。
+
 ## 任务与审核基线
 
 - 编码前CHG提案版本、逐文件原因/方法/复用/标准、方案批准人/时间/证据及Git对象：
@@ -238,3 +252,43 @@ r7在线演示已升级为8ad8f1c，部署/备份`artifacts/live-office-20261022
 ## 当前T4平台交接：PR #10已创建（2026-10-23）
 
 https://github.com/KunlunMeta-Limited/openpaw/pull/10 ，base=merge/ai-ofice-react-overagent，创建head4a8847324aaf904be9ea8af5a7caca6af68bb8e5；准确完整27/27与真实产品b通过。用户交付验收绑定9831f59；创建前后元数据登记不改变生产源码。平台OPEN待非作者审核/合入，用户创建前批准不是平台Approve。下一合法步骤仅处理本PR审核/修复；实际审核和合入后补最终head/merge再启动T5提案。Windows暂缓及云端账单/额度未执行不计通过；原delivery门禁冲突、首轮环境失败和天气输出质量观察都在0005及外部清单保留。
+
+
+## 当前交接：T4已合入，T5编码前待审（2026-10-23）
+
+[PR #10](https://github.com/KunlunMeta-Limited/openpaw/pull/10)已MERGED，最终head e7ce707，集成merge 37f0a35729fb64639f0e1a8b8a8a4799e1dca9d3，合入北京时间09:43:00。用户会话确认，API reviews为空；准确完整27/27/产品证据和云端未启动/Windows暂缓详0005第12节，旧候选状态保留历史。此处不将Windows写通过、不声称天气每句解释正确。
+
+T5分支feat/engine-host-t5从此merge创建；唯一主CHG [0006 r1](../changes/CHG-2026-0006.md)，第2/4/9/10节分别说明用户目标、文件理由、实施和演示。当前只准备提案，未改生产/测试或Office，原8765演示无需重填.env。新方案批准后才按六包开发；重点先处理菜单操作级超时、唯一UI领取器、复用六类query、真正删除与墓碑，以及D37命令开放门禁。下一Tx T6还未开始。
+
+
+## 当前交接：T5 r1已批准，实施与真实产品验证中
+
+2026-10-23用户“审核通过 继续”批准0006 r1，精确对象8c06787:docs/changes/CHG-2026-0006.md。功能代码在feat/engine-host-t5内实施；未验收不称完成，不创建PR、不开始T6。Office冻结和原8765演示保持，用户.env不改。
+
+测试中的具体提示词：`T5-拒绝报告`先读取两文件、出现写入菜单后拒绝，磁盘refused.txt不得出现；新建会话`T5-允许报告`批准后才生成reports/T5报告.md，人物详情→文件产物读取实际磁盘内容；`T5-命令慢任务`批准后出现真实command子任务，停止后延迟文件不得出现。这些是确定性HTTP Provider测试标记，真实DeepSeek使用自然语言请求并另行保留证据，不能把标记当生产特定逻辑。
+
+升级前先停新Run、失效审批、等待工具/进程清理、备份完整home再启动v4；回退须旧完整home备份，不单独退host.db。删除不可自动逆操作；工作区报告不随聊天删除。具体专项和完整结果见0006验证记录，Windows原生仍未执行。
+
+
+T5验收操作细节：原Office展开聊天会隐藏决策面板；拟写入后先点“收起聊天”，核对路径/操作再点“允许本次”或“拒绝”，随后展开聊天查看真实工具结果。人物或左侧OpenPaw助手→六类详情→文件产物→打开报告，关闭使用“关闭详情”。此为原界面行为，不修改Office。确定性产品提示词T5-拒绝报告/T5-允许报告/T5-命令慢任务仅用于固定HTTP测试Provider，不能向真实模型承诺具有相同脚本行为；真实DeepSeek使用明确的读取/写入/停止自然语言请求并核对账本和磁盘。
+
+删除后的UI成功与业务完成分开：若业务已清除而ui.respond过期，Host保留不含正文的短期deleted_ui_unconfirmed诊断，不能恢复会话。Host关闭等待已经接受的删除，不在Store关闭后孤立清理任务。Linux进程清理无法确认时保持执行所有权，可能延长cancelling/关闭；不能报告已经完成。
+
+
+## T5 r1技术交接（待准确交付人审）
+
+源码已提供Host::delete_session、单ui.next、原Approval菜单、六类detail-v1及真实任务分配/有限scene.say。实际模块/协议/测试/失败与I01—I14对账集中[0006 M5核查](../verification/CHG-2026-0006/验证记录.md#m5逐项核查与交付边界)；准确c951b2b原完整27项及固定Office真实产品通过，最终核查文档HEAD另完整复验并由`artifacts/t5-delivery-20261023-a/manifest.json`绑定。Windows原生仍暂缓，不自行标M5完成或创建PR。
+
+真实模型演示输入：`请调用read_file读取README.md和notes.txt，再用write_file生成reports/演示报告.md，逐字包含两文件标记，并总结目标；写入前等待我在审批菜单确认，不执行命令。` 收起聊天→核对操作（完整拟写内容可在人物→工具结果查看）→拒绝验证无文件；新请求允许后→人物/左侧OpenPaw助手→文件产物→打开报告。六类目录是原存储真实查询，不增加技能调度/管理。shell需单独明确配置并每次审批，不保证模型不提额外目录核查，不能自动批准未知命令。
+
+双页竞争已验证同call仅一次真实执行。原Office非持久菜单不会给事后新开的页面补发；两页同时处理会话可能触发原存档冲突保护，按原提示刷新/重开，再走原UI删除。final-d失败记录和同后台会话reopen-delete-b恢复成功分开保留，不隐藏错误；删除不移除实际项目报告，不新建Run或重放工具。v4回退须升级前完整home备份。原8765/原天气会话保持，隔离示例数据与用户工作目录分开；未批准Office Rx继续不实施。
+
+
+## T5复审通过与PR交接（2026-10-23）
+
+用户已针对81a9fc1交付授权“审查实现是否都已经完成，完成就可以提交PR”；现六工作包及I01—I14、r2/r3验收技术复审通过，0006第1节登记本次交付授权，PR审核/合入仍待发生。完整n报告27/27和产品53条通过，当前8765程序与准确候选二进制一致；本次登记提交另完整复验，PR证据统一artifacts/t5-pr-20261023-a/。Office所有申请继续集中暂缓，R11未实施；Windows原生仍未验证，未修改delivery门禁。下一步只处理T5唯一主PR及审核，不提前实施T6。
+
+
+## T5 PR #11审核交接（2026-10-23）
+
+PR https://github.com/KunlunMeta-Limited/openpaw/pull/11 已创建，目标merge/ai-ofice-react-overagent；创建head b4f431d完整27/27、固定Office产品53条通过。主CHG、master M5、索引和本交接同步真实OPEN状态；当前只等待非作者审核/合入，T6不提前开工。后续仅元数据登记提交仍完整复验并更新同一PR。push云端13项因账单/额度未启动；原Windows门禁保留、原生验收按用户暂缓。Office全部Rx仍待统一审核，尤其R11未实施，默认链接保留。8765原配置和程序已恢复，通过原会话真实UI/history检查，没有新模型请求；最终证据及当前head位于artifacts/t5-pr-20261023-a/review.json。

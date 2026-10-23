@@ -2,11 +2,16 @@
 //! 输入输出：可信本机配置、浏览器协议、共享Host事实。
 //! 依赖：现有Host、reqwest与Office冻结协议。
 //! 禁止职责：不创建第二套引擎、工具、账本或审批系统。
+mod actions;
+mod approvals;
 mod chat;
 mod client;
+mod details;
 mod dto;
 mod projection;
+mod scene;
 mod turns;
+mod workspaces;
 
 use crate::{HostConfig, HostError, HostResult};
 use serde::{Deserialize, Serialize};
@@ -54,15 +59,23 @@ pub struct OfficeConfig {
     /// 稳定性：T4新增，保持冻结Office协议。
     /// 关联：需求/设计REQ-OP-010；DES-OP-007。
     pub names: BTreeMap<String, String>,
+    /// 用途：等待页面创建后才发布的预授权槽。
+    /// 字段：不重复的槽ID列表，缺省为空。
+    /// 来源去向：可信本机TOML到创建分配器。
+    /// 约束：只能引用Host现有槽；名称不是磁盘路径。
+    /// 稳定性：可选字段，旧配置仍立即初始化全部槽。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.10节。
+    #[serde(default)]
+    pub creation_slots: Vec<String>,
 }
 impl OfficeConfig {
-    /// 功能：校验Office连接和只读授权，不进行网络调用。
+    /// 功能：校验Office连接和显式工具授权，不进行网络调用。
     /// 参数：host为所属Host配置。
     /// 返回：全部约束满足时成功。
     /// 错误：地址、来源、名称、槽或写工具非法。
     /// 状态：不读取或输出密钥内容。
     /// 并发与取消：启动阶段只读，不持运行资源锁。
-    /// 权限：Office T4仅开放已审核的读取工具。
+    /// 权限：默认只读，显式写工具仍必须经过共享审批。
     /// 关联：需求/设计REQ-OP-010；DES-OP-007；CHG-2026-0005。
     pub(crate) fn validate(&self, host: &HostConfig) -> HostResult<()> {
         let url = reqwest::Url::parse(&self.base_url)
@@ -103,6 +116,15 @@ impl OfficeConfig {
                 return Err(HostError::new("invalid_input", "Office名称或槽无效"));
             }
         }
+        let mut reserved = std::collections::BTreeSet::new();
+        for slot in &self.creation_slots {
+            if !host.slots.contains_key(slot) || !reserved.insert(slot) {
+                return Err(HostError::new(
+                    "invalid_input",
+                    "创建预留槽必须唯一且已授权",
+                ));
+            }
+        }
         for id in host.slots.keys() {
             if !dto::scene_id(id) {
                 return Err(HostError::new("invalid_input", "Office槽不符合官方ID约束"));
@@ -111,12 +133,23 @@ impl OfficeConfig {
         if host.tools.iter().any(|name| {
             !matches!(
                 name.as_str(),
-                "read_file" | "glob" | "grep" | "todo_list" | "think" | "web_search" | "web_fetch"
+                "read_file"
+                    | "glob"
+                    | "grep"
+                    | "todo_list"
+                    | "think"
+                    | "web_search"
+                    | "web_fetch"
+                    | "write_file"
+                    | "edit_file"
+                    | "todo_add"
+                    | "todo_update"
+                    | "bash"
             )
         }) {
             return Err(HostError::new(
                 "unsupported",
-                "Office T4不开放写入或执行工具",
+                "Office未开放此工具；写工具需逐次审批，命令须逐次审批并受托管进程清理约束",
             ));
         }
         Ok(())

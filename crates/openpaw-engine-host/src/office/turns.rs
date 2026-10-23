@@ -6,6 +6,20 @@ use super::dto::{self, ChatRequest, HistoryRequest};
 use crate::{ClientScope, Host, HostError, HostResult, RunState, RunView};
 use serde_json::{json, Value};
 
+// 在轮次服务统一核对创建事实；不能让猜到预留槽ID的请求先于office.create建会话。
+async fn check_active(host: &Host, scope: &ClientScope) -> HostResult<()> {
+    let config = host
+        .inner
+        .config
+        .office
+        .as_ref()
+        .ok_or_else(|| HostError::new("scope_denied", "Office未启用"))?;
+    if !super::workspaces::active(host, config, &scope.slot_id).await? {
+        return Err(HostError::new("scope_denied", "办公室尚未创建"));
+    }
+    Ok(())
+}
+
 /// 功能：可靠接受官方send或返回同一轮次的原Run。
 /// 参数：host为共享服务，scope为已校验范围，request为send载荷。
 /// 返回：新接受或已存在的Run。
@@ -13,12 +27,13 @@ use serde_json::{json, Value};
 /// 状态：原JSONL记录消息；元数据仅保存幂等关联。
 /// 并发与取消：Host短接受锁防并发重试重复执行；脱离HTTP不取消执行。
 /// 权限：工作根只来自Host配置，不能由请求指定。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) async fn accept(
     host: &Host,
     scope: &ClientScope,
     request: ChatRequest,
 ) -> HostResult<RunView> {
+    check_active(host, scope).await?;
     if request.turn_id.starts_with("legacy:") {
         return Err(HostError::new("invalid_input", "legacy:为升级历史保留前缀"));
     }
@@ -53,20 +68,22 @@ pub(super) async fn accept(
 /// 参数：host为共享服务，scope为完整范围，turn为客户端轮次ID。
 /// 返回：原Run视图。
 /// 错误：不存在、越界或存储错误。
-/// 状态：不创建Session或Run；升级旧Run仍使用原身份。
+/// 状态：不创建Session或Run；活动轮次仅通知原作用域重展示审批，不改变业务状态。
 /// 并发与取消：在Store单写序列读取；取消另走共享服务。
 /// 权限：逐项匹配namespace/team/conversation。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
 pub(super) async fn find(host: &Host, scope: &ClientScope, turn: &str) -> HostResult<RunView> {
-    let scope = scope.clone();
+    check_active(host, scope).await?;
+    let lookup_scope = scope.clone();
     let turn = turn.to_owned();
-    host.inner
+    let run = host
+        .inner
         .store
         .call(move |db| {
             let binding = db
                 .bindings()?
                 .into_iter()
-                .find(|b| b.scope == scope)
+                .find(|b| b.scope == lookup_scope)
                 .ok_or_else(|| HostError::new("not_found", "会话不存在"))?;
             for run in db
                 .runs()?
@@ -79,23 +96,30 @@ pub(super) async fn find(host: &Host, scope: &ClientScope, turn: &str) -> HostRe
             }
             Err(HostError::new("not_found", "轮次不存在"))
         })
-        .await
+        .await?;
+    if !run.state.is_terminal() {
+        host.refresh_office_ui(scope).await;
+    }
+    Ok(run)
 }
 /// 功能：从Run输入边界和原JSONL投影稳定分页历史。
 /// 参数：host为共享服务，scope为完整范围，request为已校验分页请求。
 /// 返回：官方历史页，不含工具结果伪用户轮次。
 /// 错误：非法游标、账本或存储错误。
-/// 状态：空会话返回空页，不创建绑定或启动模型。
+/// 状态：空会话返回空页；成功读取仅通知重展示审批，不创建绑定、启动模型或改变期限。
 /// 并发与取消：单一Store读取序列；游标绑定既存Run身份，新追加不移动边界。
 /// 权限：只读取指定且已配置的会话范围。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
 pub(super) async fn history(
     host: &Host,
     scope: &ClientScope,
     request: HistoryRequest,
 ) -> HostResult<Value> {
-    let scope = scope.clone();
-    host.inner.store.call(move|db|{
+    check_active(host, scope).await?;
+    let history_scope = scope.clone();
+    let page = host.inner.store.call(move|db|{
+        let scope = history_scope;
+        db.check_live_scope(&scope)?;
         let Some(binding)=db.bindings()?.into_iter().find(|b|b.scope==scope) else {
             if !request.cursor.is_empty(){return Err(HostError::new("invalid_input","游标不属于此会话"));}
             return Ok(json!({"turns":[],"nextCursor":"","hasMore":false,"activeTurnId":""}));
@@ -126,7 +150,9 @@ pub(super) async fn history(
         }
         let active=turns.last().filter(|t|t["state"]=="pending").and_then(|t|t["id"].as_str()).unwrap_or("");
         Ok(json!({"turns":turns,"nextCursor":if start>0{format!("before:{}",rows[start].1)}else{String::new()},"hasMore":start>0,"activeTurnId":active}))
-    }).await
+    }).await?;
+    host.refresh_office_ui(scope).await;
+    Ok(page)
 }
 /// 功能：映射官方聊天状态。
 /// 参数：run为真实Run视图。
@@ -135,7 +161,7 @@ pub(super) async fn history(
 /// 状态：只读，不把中断伪装恢复执行。
 /// 并发与取消：取消清理完成前保持pending。
 /// 权限：无。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) fn state(run: &RunView) -> &'static str {
     if run.text_truncated || dto::units(&run.text) > 50000 {
         return "error";
@@ -154,10 +180,13 @@ pub(super) fn state(run: &RunView) -> &'static str {
 /// 状态：不泄露Provider响应和配置密钥。
 /// 并发与取消：纯计算。
 /// 权限：无。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) fn message(run: &RunView) -> String {
     if state(run) != "error" {
         return String::new();
+    }
+    if let Some(error) = &run.error {
+        return error.message.clone();
     }
     match run.state {
         RunState::Interrupted => "Host重启中断，未自动重放工具",

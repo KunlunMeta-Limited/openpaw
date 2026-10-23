@@ -52,6 +52,28 @@ async fn d08_cancel_reaps_a_child_tree_before_returning() {
     })
     .await
     .unwrap();
+    #[cfg(target_os = "linux")]
+    let identities: Vec<_> = ["worker.pid", "grandchild.pid"]
+        .iter()
+        .map(|name| {
+            let pid = std::fs::read_to_string(dir.path().join(name))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            eprintln!("managed tree before cancel pid={pid} stat={stat}");
+            (
+                pid,
+                stat.rsplit_once(") ")
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .nth(19)
+                    .unwrap()
+                    .to_owned(),
+            )
+        })
+        .collect();
     cancel.cancel();
     let result = tokio::time::timeout(Duration::from_secs(10), task)
         .await
@@ -63,6 +85,26 @@ async fn d08_cancel_reaps_a_child_tree_before_returning() {
             .unwrap()
             .parse::<u32>()
             .unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            eprintln!("managed tree after cleanup pid={pid} stat={stat:?}");
+            if let Ok(stat) = &stat {
+                let start = stat
+                    .rsplit_once(") ")
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .nth(19)
+                    .unwrap();
+                if identities
+                    .iter()
+                    .any(|(old, identity)| *old == pid && identity != start)
+                {
+                    continue;
+                }
+            }
+        }
         assert!(
             !process_is_running(pid),
             "process {pid} remains alive after cleanup"
@@ -123,7 +165,10 @@ fn t2_child_process() {
         .unwrap();
     std::fs::write("worker.pid", std::process::id().to_string()).unwrap();
     std::fs::write("grandchild.pid", child.id().to_string()).unwrap();
-    std::fs::write("ready", "ready").unwrap();
+    while !Path::new("grandchild.ready").exists() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    std::fs::write("ready", "worker and grandchild ready").unwrap();
     let _ = child.wait().unwrap();
 }
 #[test]
@@ -131,6 +176,7 @@ fn t2_grandchild_process() {
     if !Path::new("t2-worker-marker").exists() {
         return;
     }
+    std::fs::write("grandchild.ready", "grandchild actually running").unwrap();
     loop {
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -142,7 +188,12 @@ fn process_is_running(pid: u32) -> bool {
         Ok(stat) => stat
             .rsplit_once(") ")
             .is_some_and(|(_, rest)| !rest.starts_with('Z')),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            false
+        }
         Err(e) => panic!("cannot inspect process {pid}: {e}"),
     }
 }
@@ -243,4 +294,45 @@ async fn d08_builder_timeout_cleans_delayed_descendant_side_effects() {
         !dir.path().join("leaked").exists(),
         "timed-out descendant still wrote a file"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn d37_normal_leader_exit_stops_background_descendant_before_return() {
+    let dir = tempfile::tempdir().unwrap();
+    // 后代关闭继承输出，确保不能依赖管道EOF作为退出证明。
+    let result = Sandbox::new(SandboxPolicy::None)
+        .unwrap()
+        .exec(
+            "(exec >/dev/null 2>&1; sleep 30) & echo $! > background.pid",
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, 0);
+    let pid = std::fs::read_to_string(dir.path().join("background.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        !process_is_running(pid),
+        "background process {pid} alive after normal return"
+    );
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn d37_normal_leader_exit_prevents_delayed_side_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = Sandbox::new(SandboxPolicy::None)
+        .unwrap()
+        .exec(
+            "(exec >/dev/null 2>&1; sleep 0.1; echo bad > leaked) &",
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.exit_code, 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!dir.path().join("leaked").exists());
 }

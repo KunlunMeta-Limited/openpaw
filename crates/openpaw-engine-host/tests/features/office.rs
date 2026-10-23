@@ -255,7 +255,7 @@ async fn suite() {
     server.shutdown().await.unwrap();
     let mut writes = cfg.clone();
     writes.tools.push("write_file".into());
-    assert!(writes.validate().is_err());
+    assert!(writes.validate().is_ok());
     let restarted = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed("不应执行")))
         .await
         .unwrap();
@@ -747,7 +747,7 @@ async fn web_cases(base: &std::path::Path) {
     cfg.tools.extend(["web_search".into(), "web_fetch".into()]);
     cfg.validate().unwrap();
     let mut invalid = cfg.clone();
-    invalid.tools.push("bash".into());
+    invalid.tools.push("notebook_edit".into());
     assert!(invalid.validate().is_err());
     let provider = Arc::new(MockProvider::scripted(vec![
         MockMode::ToolUse {

@@ -128,3 +128,32 @@ test('product evidence validates actual Host/Office protocol values through pinn
     assert.ok(JSON.stringify(event).length < 32000)
   }
 })
+
+
+test('T5 all real UI actions and scoped new-ID responses obey frozen schemas',()=>{
+  for(const action of f.t5Actions){assertProtocolValue(action);officeUiActionSchema.parse(action)}
+  officeRequestSchema.parse(f.t5UiResponse)
+  assert.notEqual(f.t5UiResponse.interactionId,f.t5Actions.at(-1).interactionId)
+  const invalid=structuredClone(f.t5Actions[0]);invalid.runId='invented';assert.equal(officeUiActionSchema.safeParse(invalid).success,false)
+  const detail=structuredClone(f.dialog);detail.presentation.content.fields=[{label:'unicode',value:'😀'.repeat(1000)}];officeRequestSchema.parse(detail)
+  detail.presentation.content.fields[0].value='x'.repeat(2001);assert.equal(officeRequestSchema.safeParse(detail).success,false)
+  const wrongScope=structuredClone(f.sceneCommand);wrongScope.command.sceneId='other-team';assert.equal(relayMessageSchema.safeParse(wrongScope).success,false)
+})
+
+
+test('latest official office.create action and scoped office response use real schemas',()=>{
+  const action={id:'create-1',teamId:'',conversationId:'',action:'office.create',name:'研究办公室'};
+  officeUiActionSchema.parse(action);
+  officeRequestSchema.parse({type:'ui.respond',interactionId:action.id,presentation:{target:'office',snapshot:f.snapshot}});
+  for(const changed of [{...action,teamId:'office-1'},{...action,conversationId:'main'},{...action,name:''},{...action,name:'x'.repeat(41)},{...action,root:'/tmp/untrusted'}])
+    assert.equal(officeUiActionSchema.safeParse(changed).success,false);
+});
+
+test('choice custom input is bounded and distinct from confirmation authorization',()=>{
+  const request={...f.decision,decision:{id:'choice-1',kind:'choice',title:'选择资料范围',options:[{id:'latest',label:'最新资料'},{id:'all',label:'全部资料'}]}};
+  assert.equal(officeRequestSchema.parse(request).decision.allowCustom,true);
+  assert.equal(officeRequestSchema.safeParse({...request,decision:{...request.decision,options:[{id:'custom',label:'冲突选项'},{id:'all',label:'全部资料'}]}}).success,false);
+  const result={teamId:'office-1',conversationId:'main',decisionId:'choice-1',choiceId:'custom',label:'其他',customText:'指定气象来源'};
+  officeResultSchema('decision.request').parse(result);
+  for(const customText of ['', 'x'.repeat(1001)]) assert.equal(officeResultSchema('decision.request').safeParse({...result,customText}).success,false);
+});
