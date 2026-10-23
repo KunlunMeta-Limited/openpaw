@@ -449,6 +449,10 @@ mod action_regressions {
         assert!(ui_action(&boundary));
         boundary["name"] = json!("😀".repeat(80));
         assert!(ui_action(&boundary));
+        boundary["name"] = json!("\u{feff} \u{feff}");
+        assert!(!ui_action(&boundary));
+        boundary["name"] = json!("\u{0085}");
+        assert!(ui_action(&boundary));
         boundary["role"] = json!(" role ");
         assert!(ui_action(&boundary));
     }

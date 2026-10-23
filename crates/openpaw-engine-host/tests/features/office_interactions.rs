@@ -153,7 +153,10 @@ async fn interaction_scenario() {
             }
             "ui.respond" => {
                 s.responses.push(r.clone());
-                if s.expire_delete_reply && r["interactionId"] == "delete-6" {
+                if s.expire_delete_reply
+                    && (r["interactionId"] == "delete-6"
+                        || r["interactionId"] == "create-member-expired")
+                {
                     return (axum::http::StatusCode::GONE,Json(json!({"code":410,"msg":"expired","data":{"reasonCode":"UI_REQUEST_EXPIRED"}}))).into_response();
                 }
                 json!({"interactionId":r["interactionId"],"delivered":true})
@@ -304,6 +307,50 @@ async fn interaction_scenario() {
     assert_eq!(
         std::fs::read_dir(&cfg.roots["r"]).unwrap().count(),
         files_before
+    );
+    let cross_scope = action(
+        &shared,
+        "create-member-cross-scope",
+        "employee.create",
+        json!({"name":"新成员","role":"","sceneActorId":"file-agent","teamId":"not-authorized"}),
+    )
+    .await;
+    assert_eq!(cross_scope["presentation"]["success"], false);
+    assert!(cross_scope["presentation"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("scope_denied"));
+    shared.lock().await.expire_delete_reply = true;
+    let expired = action(
+        &shared,
+        "create-member-expired",
+        "employee.create",
+        json!({"name":"新成员","sceneActorId":"file-agent"}),
+    )
+    .await;
+    assert_eq!(expired["presentation"]["success"], false);
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {
+            let db=rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+            let status:String=db.query_row("SELECT status FROM host_office_actions WHERE action_id='create-member-expired'",[],|r|r.get(0)).unwrap();
+            if status=="unconfirmed"{break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    shared.lock().await.expire_delete_reply = false;
+    assert_eq!(
+        shared
+            .lock()
+            .await
+            .responses
+            .iter()
+            .filter(|r| r["interactionId"] == "create-member-expired")
+            .count(),
+        1
+    );
+    assert_eq!(
+        serde_json::to_value(host.snapshot_and_subscribe(&scope).await.unwrap().0).unwrap(),
+        serde_json::to_value(&sessions_before).unwrap()
     );
     let mut inspected = std::collections::BTreeMap::new();
     for (employee, actor, name) in [
