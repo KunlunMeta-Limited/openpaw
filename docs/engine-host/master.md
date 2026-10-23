@@ -1103,7 +1103,7 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 | M2 / T2 | 拒绝无副作用、批准输入一致、进程树可清理 | [T2任务卡](#tx-t2)；D05—D11、D34/D35及执行矩阵 | 已完成本轮范围：用户确认审核，PR #6实际合入；Windows原生验证按原决定暂缓，未执行不算通过 | [OpenPaw #6](https://github.com/KunlunMeta-Limited/openpaw/pull/6)，head 53243079b5d969486ff72f83102b6e0fd7890f7d，merge 3a159a41c5440df6ce0cbbedb4edc7b0a87fe428；Linux完整26/26；用户会话确认审核，页面无独立Review；[0003履历](../changes/CHG-2026-0003.md#12-验证和审批记录) |
 | M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；[0004第9/10节](../changes/CHG-2026-0004.md#9-影响数据流和实现)的H01—H12 | 已完成本轮批准范围并合入；Linux准确交付与合入head均完整26/26，Windows按用户明确指示暂缓、未验证 | [OpenPaw #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)，head 825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52；2026-10-21 19:16:12合入；用户会话确认、API无独立Review；[0004履历](../changes/CHG-2026-0004.md#12-验证和审批记录)保留CI未启动与门禁例外冲突 |
 | M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；[0005第12节](../changes/CHG-2026-0005.md#12-验证和审批记录)及真实M4证据 | 已完成本轮批准只读范围并合入；用户验收9831f59，最终e7ce707完整27/27/产品passed；Windows原生暂缓，不是双平台发布 | [PR #10](https://github.com/KunlunMeta-Limited/openpaw/pull/10)，head e7ce70700f06843c8bfa4112f0f6bfbc00971eb2，merge 37f0a35729fb64639f0e1a8b8a8a4799e1dca9d3，2026-10-23 09:43:00；用户会话确认，API reviews为空；D36/D37及天气输出限制保留 |
-| M5 / T5 | 常规产品闭环：审批写产物、六类详情、删除及真实动画 | [0006第9节方案/第10节I01—I14](../changes/CHG-2026-0006.md#9-影响数据流和实现)、[第15.3节](#office-t5-workpackages)、[M5核查](#milestone-m5) | r2/r3及D45—D49实现技术核查通过：0df完整27/27、真实浏览器53记录及原8765模型h-resume/账本passed；最终文档候选外部manifest完整复验，交付人审待发生；Windows暂缓 | 未创建；方案批准已登记，交付验收、PR审核/合入待发生 |
+| M5 / T5 | 常规产品闭环：审批写产物、六类详情、删除及真实动画 | [0006第9节方案/第10节I01—I14](../changes/CHG-2026-0006.md#9-影响数据流和实现)、[第15.3节](#office-t5-workpackages)、[M5核查](#milestone-m5) | r2/r3及D45—D49实现复审通过：准确81a9fc1完整27/27、产品53条及原8765真实模型/账本passed；用户授权完成复审后提PR，Windows原生暂缓 | 待创建；交付验收已登记，PR审核/合入尚未发生 |
 | M6 / T6 | 故障恢复可重复；已批准扩展单独验收 | [演示步骤7](#product-demo)、[T6任务卡](#tx-t6)；故障矩阵、新版detach/cancel及180秒单连接限制；纳入范围的Rx另验 | 待实施；R1/R2/R4未批准，扩展未实施 | 未创建；若批准跨仓扩展，全部必要PR及Rx版本一起记录 |
 | M7 / T7 | 固定SDK可复用同一Host | [T7任务卡](#tx-t7)；真实SDK请求/事件迭代/审批/abort及Office并用 | 待实施 | 未创建；不声明OpenWork桌面已验收 |
 | M8 / T8 | Linux/Windows可启动、演示、备份和恢复的交付包 | [完整演示](#product-demo)、[T8任务卡](#tx-t8)；原生双平台、真实Provider、发布候选与用户验收 | 待实施 | 未创建；T8主PR及最终集成到main的PR分别追踪 |
@@ -1633,3 +1633,7 @@ PR #10最终e7ce707已于北京时间09:43:00合入37f0a35；用户会话确认�
 实现0df3282已完成完整27/27及固定Office d150b96产品53条记录；原8765天气Run ab9e301e1ed5412f9e18d463530d7d99的目标/3步骤100%、刷新同一审批/一次写入6145字节、日期追问100%、新建办公室独立Session和真实文件正文均有网页/JSONL/DB/磁盘对账，详情3015ms、观察65249ms无超时浮窗。功能事实、严格校验/失败/恢复边界及截图定位统一见[0006最终验证章节](../verification/CHG-2026-0006/验证记录.md#r2r3最终linux实现原8765真实模型与交付绑定)，不新增里程碑审核总单。
 
 最终文档提交须完整复验，准确HEAD、完整/产品报告hash、运行程序hash和真实模型证据统一由仓库外artifacts/t5-delivery-20261023/final-review.json绑定，未passed不得提前提PR。M5仍待用户对该准确交付提交验收、PR审核及合入；Windows原生暂缓，T6未开始。Office工程没有新增修改，R11默认白板链接仍保留，集中申请单继续待人工审核。主开发目录为/Office/openpaw，用户5份原改动保留，清理与必要备份用途见0006专用清理说明。
+
+### T5交付复审与提PR授权（2026-10-23）
+
+用户针对准确81a9fc1交付明确要求复审实现、完成即可提交PR；六工作包及I01—I14、r2/r3验收均已核对，Linux完整27/27、产品53条、原8765真实模型与账本证据通过，详见0006第1/12节及专用验证记录。Office修改仍全部暂缓，R11默认链接继续保留；Windows原生未执行，不修改门禁或假记双平台通过。本次仅同步验收/PR交接事实，准确登记提交另完整复验后创建T5 PR到merge/ai-ofice-react-overagent。创建、平台审核及合入分别登记，M5尚未完成，不开始T6。
