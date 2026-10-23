@@ -535,6 +535,7 @@ try {
   await send('后台办公室读取README.md和notes.txt并总结',markerA);
   report.t5.readOtherOffice=structuredClone(latestSend().request);
   assert.equal(report.t5.readOtherOffice.teamId,'office-2');
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click();
   const notice=page.getByRole('region',{name:'真实运行验收待决定提示',exact:true});
   await notice.getByRole('button',{name:'允许本次',exact:true}).waitFor();
   await page.screenshot({path:join(output,'29-t5-background-office-direct-approval.png'),fullPage:true});

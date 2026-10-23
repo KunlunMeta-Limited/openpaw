@@ -151,7 +151,12 @@ async fn delete_pending_approval_cancels_only_target_and_old_approval_cannot_wri
 }
 #[tokio::test]
 async fn pending_delete_intent_is_recovered_before_reopening_or_reading_a_corrupt_ledger() {
-    for (phase, missing) in [("deleting", false), ("purging", false), ("purging", true)] {
+    for (phase, missing) in [
+        ("deleting", false),
+        ("cancelling", false),
+        ("purging", false),
+        ("purging", true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let cfg = config(dir.path());
         let host = Host::start(cfg.clone()).await.unwrap();
@@ -269,5 +274,57 @@ async fn delete_running_command_waits_for_cleanup_and_preserves_other_session() 
         .submit_run(&a, &sa.session_id, "revive".into())
         .await
         .is_err());
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn metadata_purge_failure_after_ledger_removal_recovers_without_revival() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let host = Host::start(cfg.clone()).await.unwrap();
+    let target = scope("metadata-failure");
+    let keep = scope("unrelated");
+    let binding = host.open_session(target.clone()).await.unwrap();
+    let other = host.open_session(keep.clone()).await.unwrap();
+    host.submit_run(
+        &target,
+        &binding.session_id,
+        "remove private history".into(),
+    )
+    .await
+    .unwrap();
+    host.wait_idle().await;
+    let ledger = cfg
+        .home
+        .join("sessions")
+        .join(format!("{}.jsonl", binding.session_id));
+    let db_path = cfg.home.join("engine-host/host.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute_batch("CREATE TRIGGER stop_purge BEFORE DELETE ON host_bindings BEGIN SELECT RAISE(FAIL,'injected metadata cleanup failure'); END;").unwrap();
+    assert!(host.delete_session(&target).await.is_err());
+    assert!(
+        !ledger.exists(),
+        "物理删除发生后，元数据事务失败不能声称回滚了历史"
+    );
+    assert!(host.open_session(target.clone()).await.is_err());
+    let phase: String = db
+        .query_row(
+            "SELECT phase FROM host_session_deletions WHERE session=?1",
+            [&binding.session_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(phase, "purging");
+    host.shutdown().await.unwrap();
+    db.execute_batch("DROP TRIGGER stop_purge").unwrap();
+    drop(db);
+    let host = Host::start(cfg.clone()).await.unwrap();
+    assert_eq!(host.delete_session(&target).await.unwrap().phase, "deleted");
+    assert!(host.open_session(target).await.is_err());
+    assert_eq!(
+        host.open_session(keep).await.unwrap().session_id,
+        other.session_id
+    );
+    assert!(!ledger.exists());
     host.shutdown().await.unwrap();
 }
