@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,waitFor,release}) {
+export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release}) {
   const roles=[['research','command','code-agent','李研'],['organize','files','file-agent','周理'],['draft','draft','app-agent','陈书'],['review','review','review-agent','刘市'],['audit','search','data-agent','赵审']]
   let exportIndex=0
   async function scene(label) {
@@ -15,7 +15,7 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   }
   // Use the existing user control to keep this walkthrough free of idle coffee traffic.
   // The preceding unmodified full product journey keeps default idle behavior; its traffic failure is retained separately.
-  await page.reload();await page.getByRole('button',{name:'关闭空闲闲聊',exact:true}).click()
+  await page.reload();await chooseOffice(page);await page.getByRole('button',{name:'关闭空闲闲聊',exact:true}).click()
   await fresh(page);await send('T6真实五人协作')
   const request=structuredClone(latestSend().request)
   await page.getByRole('button',{name:'收起聊天',exact:true}).click()
@@ -79,4 +79,39 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   assert.equal(new Set(actors.map(a=>a.request.actorId)).size,6);assert.equal(members.length,6)
   report.t6={request,parent,children,handoffs,actors,members,final,scene:snapshot,model:'deterministic real HTTP Provider; animation pacing only in test fixture; real Host execution'}
   report.assertions.push('T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five observed office.visit completions; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards')
+}
+
+
+// Browser transport loss is injected only in its isolated context; Host/Provider continue their real Run.
+export async function networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,waitFor,release}) {
+  await fresh(page);await send('T6主动断网续接')
+  const request=structuredClone(latestSend().request)
+  const log=page.getByRole('log',{name:'对话内容'})
+  await waitFor(async()=>(await log.innerText()).includes('断网前已保存的真实文本。'))
+  const db=new DatabaseSync(join(output,'host-data/engine-host/host.db'),{readOnly:true})
+  const parent=db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run
+  const requestsBefore=report.modelRequests.length
+  const historyBefore=report.browserRequests.filter(r=>r.request.type==='history').length
+  try {
+    await context.setOffline(true)
+    await waitFor(async()=>(await log.innerText()).includes('回复未完成'))
+    assert.equal(JSON.parse(db.prepare('SELECT data FROM host_runs WHERE id=?').get(parent).data).state,'running','浏览器断网不能取消真实Run')
+    await page.screenshot({path:join(output,'t6-network-offline-detached.png'),fullPage:true})
+  } finally {await context.setOffline(false)}
+  await page.getByRole('button',{name:'重新同步',exact:true}).click()
+  await waitFor(()=>report.browserRequests.filter(r=>r.request.type==='history').length>historyBefore&&report.browserRequests.some(r=>r.request.type==='resume'&&r.request.turnId===request.turnId))
+  assert.equal(db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run,parent)
+  assert.equal(report.modelRequests.length,requestsBefore,'续接不再次调用模型')
+  await page.screenshot({path:join(output,'t6-network-resumed-same-run.png'),fullPage:true})
+  release()
+  await waitFor(async()=>(await log.innerText()).includes('断网后继续同一个Run。'))
+  await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:15000})
+  const transcript=await log.innerText()
+  assert.equal(transcript.split('断网前已保存的真实文本。').length-1,1,'snapshot替换后不重复拼接文本')
+  assert.equal(report.browserRequests.filter(r=>r.request.type==='send'&&r.request.turnId===request.turnId).length,1)
+  const final=await waitFor(async()=>{const c=conv(await readOffice(),request.conversationId);return c?.tasks[0].status==='completed'?c:false})
+  await page.screenshot({path:join(output,'t6-network-completed-same-run.png'),fullPage:true})
+  report.network={request,parent,requestsBefore,requestsAfter:report.modelRequests.length,transcript,final}
+  report.assertions.push('T6 actual Chromium offline loss detaches; public manual history/resume keeps one persisted Run, one model request and nonduplicated text')
+  db.close()
 }

@@ -385,7 +385,7 @@ pub(crate) fn project(value: Option<Value>, run: &RunView) -> HostResult<(Vec<Va
     let mut completed = 0;
     let steps=plan.steps.iter().enumerate().map(|(index,s)| {
         // 纯整理步骤没有工具证据，只能在最终文本已可靠保存且Run正常结束后确认。
-        let answer = ["整理","总结","答复","交付"].iter().any(|v|s.title.contains(v));
+        let answer = ["整理","总结","汇总","答复","交付"].iter().any(|v|s.title.contains(v));
         let done=s.state=="completed" || run.state==RunState::Completed && !run.text.trim().is_empty() && !needs_write(&s.title) && answer;
         if done {completed+=1;}
         let waiting=s.evidence.iter().any(|id|run.tools.iter().any(|t|&t.call_id==id && matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")));

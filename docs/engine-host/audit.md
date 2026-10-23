@@ -303,3 +303,11 @@ D51为actions::dispatch丢失目标：actor/employee校验后统一kind=menu；d
 
 
 2026-10-23 D50/D51修复进展：agents.rs统一六人物与成员，actions不再丢employee/actor，details含真实字段与作用域导航，原HTTP夹具逐一验证六人物/六成员同目标、返回保留身份及陌生人物拒绝通过。独立子任务详情只经持久父子引用定位准确子账本，工作区共享分类明确标注。尚待真实浏览器逐点击证据与准确完整套件，当前不将D50/D51登记为最终关闭；原修前截图/HTTP保留。
+
+
+## T6真实模型再核查：D52/D53（已复现，实现修正待完整重验）
+
+- D52：真实DeepSeek五子Run正常结束、目标报告存在且标记/hash可核验，但计划最后一步“王明汇总五位真实结果并引用报告路径”不匹配原纯答复白名单（只有整理/总结/答复/交付），导致页面主目标failed/71%。修复只补“汇总”同义业务动作；仍要求非写入步骤、真实非空答复且Run正常终态，不将失败/取消或文件步骤自动完成。源码task_progress::project；回归delegated_business_step_keeps_one_card_owner_and_stable_assignment同时验证纯汇总和真实派发证据。
+- D53：同一真实业务步骤已通过原run_progress/tool_started准确关联委派，但projection额外添加同一子任务卡片，导致6步骤+5子卡重复、白板分母11。修复沿用原office_task_assignments，明确关联时复用原步骤卡/ID、保留真实子角色、独立task.assigned稳定ID；未关联子任务仍单独显示，不按相似标题猜所属。子执行完成但父未核验的步骤不能涂绿；协作模式的父核验read_file不再重发已委派步骤的交接动画。旧单Agent工具归属逻辑保留。
+
+修前证据/home/cheng/.cache/t6-real-model-20261023-b/report.json：执行层检查曾记passed，但最终快照tasks[0]=failed/71%，因此整体产品验收必须判未通过；保留该原报告，追加更严的UI终态/有界无重复卡片断言，不能沿用其passed做交付。原失败a为验收脚本审批locator错误，也保留。Office工程未改。

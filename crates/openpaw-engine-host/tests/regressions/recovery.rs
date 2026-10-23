@@ -81,10 +81,14 @@ fn child_fixture() {
         return;
     };
     let base = std::path::PathBuf::from(std::env::var_os("OPENPAW_T3_FIXTURE_BASE").unwrap());
-    if mode == "host-shell-cancel" || mode == "host-shell-shutdown" {
+    if mode.contains("-shell-") {
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(host_shell_fixture(&base, mode.ends_with("cancel")));
+            .block_on(host_shell_fixture(
+                &base,
+                mode.ends_with("cancel"),
+                mode.starts_with("team-"),
+            ));
         return;
     }
     if mode == "lock-exclusive" || mode == "lock-shared" {
@@ -106,8 +110,14 @@ fn child_fixture() {
     }
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let cfg = config(&base);
-        let provider = Arc::new(MockProvider::scripted(vec![
+        let mut cfg = config(&base);
+        let mut scope = scope();
+        let team = mode.starts_with("team-");
+        if team {
+            scope.namespace = "office".into();
+            cfg.agents = Some(AgentsConfig {enabled:true,tools:[("draft".into(),cfg.tools.clone())].into(),..Default::default()});
+        }
+        let mut responses = vec![
             MockMode::ToolUse {
                 tool_name: "write_file".into(),
                 input: json!({"path":"report.txt","content":"once"}),
@@ -119,23 +129,25 @@ fn child_fixture() {
                 text: "waiting".into(),
             },
             MockMode::Fixed("done".into()),
-        ]));
+        ];
+        if team {responses.insert(0,MockMode::ToolUse {tool_name:"delegate_task".into(),input:json!({"role_id":"draft","title":"保存真实验收报告","instructions":"写report.txt并等待下一步","acceptance":"记录真实写入结果"}),text:"分配任务".into()});}
+        let provider=Arc::new(MockProvider::scripted(responses));
         let host = Host::with_provider(cfg, provider).await.unwrap();
-        let b = host.open_session(scope()).await.unwrap();
+        let b = host.open_session(scope.clone()).await.unwrap();
         let r = host
-            .submit_run(&scope(), &b.session_id, "write".into())
+            .submit_run(&scope, &b.session_id, "write".into())
             .await
             .unwrap();
         loop {
-            let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope()).await.unwrap();
+            let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope).await.unwrap();
             if let Some(a) = snapshot.pending_approvals.first() {
-                if mode == "pending" {
+                if mode.ends_with("pending") {
                     println!("READY {} {}", r.run_id, b.session_id);
                     std::io::stdout().flush().unwrap();
                     std::future::pending::<()>().await;
                 }
                 host.decide_approval(
-                    &scope(),
+                    &scope,
                     &a.approval_id,
                     a.revision,
                     a.binding.clone(),
@@ -148,12 +160,17 @@ fn child_fixture() {
             let _ = rx.recv().await;
         }
         loop {
-            let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope()).await.unwrap();
-            if snapshot.runs.iter().any(|r| {
+            let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope).await.unwrap();
+            let sleeping = if team {
+                let db=rusqlite::Connection::open(config(&base).home.join("engine-host/host.db")).unwrap();
+                let active:u64=db.query_row("SELECT COUNT(*) FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.tool_name')='sleep'",[],|r|r.get(0)).unwrap();
+                active==1
+            } else { snapshot.runs.iter().any(|r| {
                 r.tools
                     .iter()
                     .any(|t| t.tool_name == "sleep" && t.state == "running")
-            }) {
+            }) };
+            if sleeping {
                 println!("READY {} {}", r.run_id, b.session_id);
                 std::io::stdout().flush().unwrap();
                 std::future::pending::<()>().await;
@@ -163,9 +180,18 @@ fn child_fixture() {
     });
 }
 
-async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
+async fn host_shell_fixture(base: &std::path::Path, cancel: bool, team: bool) {
     let mut cfg = config(base);
     cfg.tools = vec!["bash".into()];
+    let mut scope = scope();
+    if team {
+        scope.namespace = "office".into();
+        cfg.agents = Some(AgentsConfig {
+            enabled: true,
+            tools: [("research".into(), vec!["bash".into()])].into(),
+            ..Default::default()
+        });
+    }
     cfg.api_key_env = Some("OPENPAW_T3_MODEL_SECRET".into());
     cfg.basic_username_env = Some("OPENPAW_T3_BASIC_USER".into());
     cfg.basic_password_env = Some("OPENPAW_T3_BASIC_SECRET".into());
@@ -175,23 +201,27 @@ async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
         "\"{}\" --exact host_tool_worker --nocapture",
         std::env::current_exe().unwrap().display()
     );
-    let provider = Arc::new(MockProvider::scripted(vec![
+    let mut responses = vec![
         MockMode::ToolUse {
             tool_name: "bash".into(),
             input: json!({"command":command}),
             text: "proposed shell".into(),
         },
         MockMode::Fixed("done".into()),
-    ]));
+    ];
+    if team {
+        responses.insert(0, MockMode::ToolUse {tool_name:"delegate_task".into(),input:json!({"role_id":"research","title":"核验隔离子进程","instructions":"运行已提供的受控进程测试命令","acceptance":"取消或关闭后真实进程树退出"}),text:"安排独立同事".into()});
+    }
+    let provider = Arc::new(MockProvider::scripted(responses));
     let host = Host::with_provider(cfg.clone(), provider).await.unwrap();
-    let b = host.open_session(scope()).await.unwrap();
+    let b = host.open_session(scope.clone()).await.unwrap();
     let run = host
-        .submit_run(&scope(), &b.session_id, "run approved fixture".into())
+        .submit_run(&scope.clone(), &b.session_id, "run approved fixture".into())
         .await
         .unwrap();
     let a = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope()).await.unwrap();
+            let (snapshot, mut rx) = host.snapshot_and_subscribe(&scope.clone()).await.unwrap();
             if let Some(a) = snapshot.pending_approvals.into_iter().next() {
                 break a;
             }
@@ -200,8 +230,14 @@ async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
     })
     .await
     .unwrap();
+    if team {
+        assert_ne!(a.binding.run_id, run.run_id, "必须是实际子Run的原审批");
+        let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+        let count:u64=db.query_row("SELECT COUNT(*) FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.child_run')=?2",rusqlite::params![&run.run_id,&a.binding.run_id],|r|r.get(0)).unwrap();
+        assert_eq!(count, 1, "子工具必须经持久父子所属验证");
+    }
     assert!(!root.join("worker.pid").exists(), "批准前不能创建进程");
-    host.decide_approval(&scope(), &a.approval_id, a.revision, a.binding, true)
+    host.decide_approval(&scope.clone(), &a.approval_id, a.revision, a.binding, true)
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -211,7 +247,7 @@ async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
     })
     .await
     .unwrap();
-    let view = host.get_run(&scope(), &run.run_id).await.unwrap();
+    let view = host.get_run(&scope.clone(), &run.run_id).await.unwrap();
     assert_eq!(view.tools[0].state, "running");
     let lock_path = root.join(".openpaw/engine-host-resource.lock");
     assert_eq!(
@@ -223,14 +259,20 @@ async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
     );
     if cancel {
         assert_eq!(
-            host.cancel_run(&scope(), &run.run_id).await.unwrap().state,
+            host.cancel_run(&scope.clone(), &run.run_id)
+                .await
+                .unwrap()
+                .state,
             RunState::Cancelling
         );
         tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
             .await
             .unwrap();
         assert_eq!(
-            host.get_run(&scope(), &run.run_id).await.unwrap().state,
+            host.get_run(&scope.clone(), &run.run_id)
+                .await
+                .unwrap()
+                .state,
             RunState::Cancelled
         );
     } else {
@@ -254,8 +296,11 @@ async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
     );
     drop(guard);
     if cancel {
-        let (snapshot, _) = host.snapshot_and_subscribe(&scope()).await.unwrap();
-        let history = host.get_session(&scope(), &b.session_id).await.unwrap();
+        let (snapshot, _) = host.snapshot_and_subscribe(&scope.clone()).await.unwrap();
+        let history = host
+            .get_session(&scope.clone(), &b.session_id)
+            .await
+            .unwrap();
         let displayed = format!(
             "{}{}",
             serde_json::to_string(&snapshot).unwrap(),
@@ -269,7 +314,11 @@ async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
     // 即使旧Host克隆仍存在，关闭确认后数据目录也必须可重新独占。
     let reopened = Host::start(cfg).await.unwrap();
     assert_eq!(
-        reopened.get_run(&scope(), &run.run_id).await.unwrap().state,
+        reopened
+            .get_run(&scope.clone(), &run.run_id)
+            .await
+            .unwrap()
+            .state,
         RunState::Cancelled
     );
     reopened.shutdown().await.unwrap();
@@ -277,7 +326,12 @@ async fn host_shell_fixture(base: &std::path::Path, cancel: bool) {
 
 #[test]
 fn h10_h11_host_shell_credentials_tree_cleanup_and_resource_release() {
-    for mode in ["host-shell-cancel", "host-shell-shutdown"] {
+    for mode in [
+        "host-shell-cancel",
+        "host-shell-shutdown",
+        "team-shell-cancel",
+        "team-shell-shutdown",
+    ] {
         let base = tempfile::tempdir().unwrap();
         let log_path = base.path().join("fixture.log");
         let log = std::fs::File::create(&log_path).unwrap();
@@ -361,7 +415,7 @@ fn host_test_process_running(pid: u32) -> bool {
 }
 #[tokio::test]
 async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval() {
-    for mode in ["written", "pending"] {
+    for mode in ["written", "pending", "team-written", "team-pending"] {
         let base = tempfile::tempdir().unwrap();
         let (mut process, line) = child(base.path(), mode);
         let ids: Vec<_> = line.split_whitespace().collect();
@@ -371,19 +425,26 @@ async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_app
         process.0.wait().unwrap();
         let report = cfg.roots["project"].join("report.txt");
         let before = std::fs::read(&report).ok();
-        assert_eq!(before.is_some(), mode == "written");
+        assert_eq!(before.is_some(), mode.ends_with("written"));
         let host = Host::start(cfg.clone()).await.unwrap();
-        let run = host.get_run(&scope(), ids[1]).await.unwrap();
+        let mut scope = scope();
+        if mode.starts_with("team-") {
+            scope.namespace = "office".into();
+        }
+        let run = host.get_run(&scope, ids[1]).await.unwrap();
         assert_eq!(run.state, RunState::Interrupted);
-        assert!(host.pending_approvals(&scope()).await.unwrap().is_empty());
+        assert!(host.pending_approvals(&scope).await.unwrap().is_empty());
         assert_eq!(std::fs::read(&report).ok(), before);
-        assert_eq!(host.open_session(scope()).await.unwrap().session_id, ids[2]);
+        assert_eq!(
+            host.open_session(scope.clone()).await.unwrap().session_id,
+            ids[2]
+        );
         host.shutdown().await.unwrap();
         // 可重建索引实际删除再重启，不删Host权威元数据。
         std::fs::remove_file(cfg.home.join("index.db")).unwrap();
         let host = Host::start(cfg).await.unwrap();
         assert_eq!(
-            host.get_run(&scope(), ids[1]).await.unwrap().state,
+            host.get_run(&scope, ids[1]).await.unwrap().state,
             RunState::Interrupted
         );
         assert_eq!(std::fs::read(&report).ok(), before);

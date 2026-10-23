@@ -1,7 +1,7 @@
 // Product acceptance only: real Host + frozen Office + independent Chromium.
 // The local OpenAI fixture is a deterministic Provider, never a chat bridge.
 import assert from 'node:assert/strict'
-import { teamProduct } from './office-resilience.mjs'
+import { teamProduct, networkProduct } from './office-resilience.mjs'
 import { createHash, randomBytes } from 'node:crypto'
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer } from 'node:http'
@@ -32,6 +32,7 @@ const processes = []
 let browser, context, providerServer, page, webFixtureServer, webBase
 const webFixture = { requests: [], active: 0, cancelled: 0 }
 const teamGates = new Map()
+let networkGate
 const delay = ms => new Promise(r => setTimeout(r, ms))
 async function waitFor(fn, timeout = 30000) {
   const deadline = Date.now() + timeout
@@ -201,6 +202,12 @@ function provider() {
         finish({content:'T5工具结果：'+writeResult.content});return
       }
       if (prompt.includes('MODEL-ERROR')) { res.writeHead(401); res.end('controlled authentication failure'); return }
+      if (prompt==='T6主动断网续接') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        const chunk=text=>res.write('data: '+JSON.stringify({choices:[{index:0,delta:{content:text},finish_reason:null}]})+'\n\n');
+        chunk('断网前已保存的真实文本。');
+        networkGate=()=>{chunk('断网后继续同一个Run。');res.write('data: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\n');res.end('data: [DONE]\n\n');networkGate=undefined};return;
+      }
       if (prompt==='长连接180秒验收') {
         res.writeHead(200,{'content-type':'text/event-stream'});
         const chunk=text=>res.write('data: '+JSON.stringify({choices:[{index:0,delta:{content:text},finish_reason:null}]})+'\n\n');
@@ -762,7 +769,8 @@ try {
   await writeFile(config,(await readFile(config,'utf8'))+'\n[agents]\nenabled = true\n')
   host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-team')
   await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
-  await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,waitFor,release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
+  await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
+  await networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,waitFor,release:()=>{assert.ok(networkGate);networkGate()}})
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'
