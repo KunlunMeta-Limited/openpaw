@@ -151,29 +151,38 @@ async fn delete_pending_approval_cancels_only_target_and_old_approval_cannot_wri
 }
 #[tokio::test]
 async fn pending_delete_intent_is_recovered_before_reopening_or_reading_a_corrupt_ledger() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = config(dir.path());
-    let host = Host::start(cfg.clone()).await.unwrap();
-    let a = scope("crash");
-    let binding = host.open_session(a.clone()).await.unwrap();
-    host.shutdown().await.unwrap();
-    let ledger = cfg
-        .home
-        .join("sessions")
-        .join(format!("{}.jsonl", binding.session_id));
-    std::fs::write(&ledger, "unreadable intermediate corruption\n").unwrap();
-    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
-    db.execute(
-        "INSERT INTO host_session_deletions VALUES(?1,?2,'deleting',0)",
-        rusqlite::params![serde_json::to_string(&a).unwrap(), binding.session_id],
-    )
-    .unwrap();
-    drop(db);
-    let host = Host::start(cfg).await.unwrap();
-    assert!(!ledger.exists());
-    assert_eq!(host.delete_session(&a).await.unwrap().phase, "deleted");
-    assert!(host.open_session(a).await.is_err());
-    host.shutdown().await.unwrap();
+    for (phase, missing) in [("deleting", false), ("purging", false), ("purging", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let host = Host::start(cfg.clone()).await.unwrap();
+        let a = scope("crash");
+        let binding = host.open_session(a.clone()).await.unwrap();
+        host.shutdown().await.unwrap();
+        let ledger = cfg
+            .home
+            .join("sessions")
+            .join(format!("{}.jsonl", binding.session_id));
+        std::fs::write(&ledger, "unreadable intermediate corruption\n").unwrap();
+        let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+        db.execute(
+            "INSERT INTO host_session_deletions VALUES(?1,?2,?3,0)",
+            rusqlite::params![
+                serde_json::to_string(&a).unwrap(),
+                binding.session_id,
+                phase
+            ],
+        )
+        .unwrap();
+        drop(db);
+        if missing {
+            std::fs::remove_file(&ledger).unwrap();
+        }
+        let host = Host::start(cfg).await.unwrap();
+        assert!(!ledger.exists());
+        assert_eq!(host.delete_session(&a).await.unwrap().phase, "deleted");
+        assert!(host.open_session(a).await.is_err());
+        host.shutdown().await.unwrap();
+    }
 }
 #[tokio::test]
 async fn deletion_io_failure_keeps_durable_intent_and_retries_after_problem_is_removed() {

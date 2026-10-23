@@ -17,7 +17,7 @@ async fn v1_metadata_upgrades_atomically_and_future_schema_is_rejected() {
     host.shutdown().await.unwrap();
     let path = cfg.home.join("engine-host/host.db");
     let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("DROP TABLE host_office_projection; DROP TABLE host_context_import; DROP TABLE host_office_calls; PRAGMA user_version=1;").unwrap();
+    db.execute_batch("DROP TABLE host_office_projection; DROP TABLE host_context_import; DROP TABLE host_office_calls; DROP TABLE host_requests; DROP TABLE host_session_deletions; DROP TABLE host_office_decisions; DROP TABLE host_office_actions; DROP TABLE host_office_scene; PRAGMA user_version=1;").unwrap();
     drop(db);
     let host = Host::start(cfg.clone()).await.unwrap();
     host.shutdown().await.unwrap();
@@ -30,6 +30,48 @@ async fn v1_metadata_upgrades_atomically_and_future_schema_is_rejected() {
     db.pragma_update(None, "user_version", 99).unwrap();
     drop(db);
     assert!(Host::start(cfg).await.is_err());
+}
+
+#[tokio::test]
+async fn real_v3_without_new_tables_upgrades_without_rewriting_existing_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = config(tmp.path());
+    let host = Host::start(cfg.clone()).await.unwrap();
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "v3-existing".into(),
+    };
+    let binding = host.open_session(scope.clone()).await.unwrap();
+    let run = host
+        .submit_run(&scope, &binding.session_id, "existing v3 history".into())
+        .await
+        .unwrap();
+    host.wait_idle().await;
+    host.shutdown().await.unwrap();
+    let path = cfg
+        .home
+        .join("sessions")
+        .join(format!("{}.jsonl", binding.session_id));
+    let before = std::fs::read(&path).unwrap();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    db.execute_batch("DROP TABLE host_session_deletions; DROP TABLE host_office_decisions; DROP TABLE host_office_actions; DROP TABLE host_office_scene; PRAGMA user_version=3;").unwrap();
+    drop(db);
+    let host = Host::start(cfg.clone()).await.unwrap();
+    assert_eq!(
+        host.get_run(&scope, &run.run_id).await.unwrap().state,
+        RunState::Completed
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    host.delete_session(&scope).await.unwrap();
+    assert!(!path.exists());
+    host.shutdown().await.unwrap();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    assert_eq!(
+        db.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
+            .unwrap(),
+        4
+    );
 }
 
 #[test]

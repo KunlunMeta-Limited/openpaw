@@ -565,7 +565,9 @@ try {
   report.t5.processes=await waitFor(async()=>{try{return await Promise.all(['parent','child'].map(async role=>({role,pid:Number(await readFile(join(workspace,'managed-'+role+'.pid'),'utf8'))})))}catch{return false}});
   for(const item of report.t5.processes){assert.ok(item.pid>0);if(process.platform==='linux')item.before=await readFile('/proc/'+item.pid+'/stat','utf8')}
   await page.screenshot({path:join(output,'25-t5-real-shell-running.png'),fullPage:true});
-  await delay(800);await expand(page);await page.getByRole('button',{name:'停止生成',exact:true}).click();
+  await delay(2500);
+  await page.screenshot({path:join(output,'25b-t5-live-scene-handoff.png'),fullPage:true});
+  await expand(page);await page.getByRole('button',{name:'停止生成',exact:true}).click();
   await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:15000});
   // Office先清除本地生成标记；以真实cancel业务回执作为Host完成清理的界限。
   report.t5.cancelAcknowledged=await waitFor(()=>report.browserRequests.findLast(r=>r.request.type==='cancel'&&r.request.turnId===report.t5.shellRequest.turnId)?.json?.data?.stopped===true);
@@ -585,6 +587,16 @@ try {
   assert.equal(await readFile(join(workspace,'reports/T5报告.md'),'utf8'),artifact);
   report.t5.deletedHistory=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version:'1.0',teamId:'office-1',conversationId:report.t5.approveRequest.conversationId,type:'history'})}).then(r=>({status:r.status}));
   assert.notEqual(report.t5.deletedHistory.status,200);
+  const modelCountAfterDelete=report.modelRequests.length;
+  report.t5.deletedRetries=[];
+  for(const type of ['send','resume','cancel']) {
+    const request=type==='send'?report.t5.approveRequest:{version:'1.0',teamId:'office-1',conversationId:report.t5.approveRequest.conversationId,type,turnId:report.t5.approveRequest.turnId};
+    const r=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});
+    const body=await r.text();assert.ok(!body.includes('"type":"done"'));
+    assert.ok(r.status!==200||body.includes('"type":"error"'),'已删会话不能假成功');
+    report.t5.deletedRetries.push({type,http:r.status,body});
+  }
+  assert.equal(report.modelRequests.length,modelCountAfterDelete,'旧请求不能复活会话或调用模型');
   await page.screenshot({path:join(output,'27-t5-deleted-conversation-artifact-preserved.png'),fullPage:true});
   report.assertions.push('T5: real browser reject leaves no artifact; confirm executes exact original write_file once','T5: blocked approval snapshot and six original read-only detail categories; generated file matches actual disk hash','T5: actual bash working/assignment, explicit stop prevents delayed descendant side effect','T5: official conversation.delete removes snapshot/history and keeps workspace artifact');
   const saved=structuredClone((await readOffice()).data.snapshot)

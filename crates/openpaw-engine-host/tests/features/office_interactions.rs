@@ -100,6 +100,7 @@ struct Fixture {
     decisions: Vec<serde_json::Value>,
     confirm: bool,
     wrong_scope: bool,
+    expire_delete_reply: bool,
 }
 async fn interaction_scenario() {
     use axum::{extract::State, routing::post, Json, Router};
@@ -114,7 +115,8 @@ async fn interaction_scenario() {
     async fn handle(
         State(shared): State<Arc<Mutex<Fixture>>>,
         Json(r): Json<Value>,
-    ) -> Json<Value> {
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
         let mut s = shared.lock().await;
         let actors: Vec<_> = ["office-lead", "file-agent", "data-agent", "code-agent"]
             .iter()
@@ -150,6 +152,9 @@ async fn interaction_scenario() {
             }
             "ui.respond" => {
                 s.responses.push(r.clone());
+                if s.expire_delete_reply && r["interactionId"] == "delete-6" {
+                    return (axum::http::StatusCode::GONE,Json(json!({"code":410,"msg":"expired","data":{"reasonCode":"UI_REQUEST_EXPIRED"}}))).into_response();
+                }
                 json!({"interactionId":r["interactionId"],"delivered":true})
             }
             "decision.request" => {
@@ -162,7 +167,7 @@ async fn interaction_scenario() {
             }
             _ => panic!("unexpected request {r}"),
         };
-        Json(json!({"code":200,"msg":"fixture","data":data}))
+        Json(json!({"code":200,"msg":"fixture","data":data})).into_response()
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -303,18 +308,21 @@ async fn interaction_scenario() {
     )
     .await;
     assert_eq!(forged["presentation"]["success"], false);
-    let unsupported = action(
-        &shared,
-        "task-5",
-        "task.block",
-        json!({"taskId":format!("run:{}",r.run_id)}),
-    )
-    .await;
-    assert_eq!(unsupported["presentation"]["success"], false);
-    assert_eq!(
-        host.get_run(&scope, &r.run_id).await.unwrap().state,
-        RunState::Completed
-    );
+    for (i, kind) in ["task.start", "task.block", "task.complete", "task.assign"]
+        .iter()
+        .enumerate()
+    {
+        let mut extra = json!({"taskId":format!("run:{}",r.run_id)});
+        if *kind == "task.assign" {
+            extra["assigneeId"] = json!("assistant");
+        }
+        let unsupported = action(&shared, &format!("task-5-{i}"), kind, extra).await;
+        assert_eq!(unsupported["presentation"]["success"], false);
+        assert_eq!(
+            host.get_run(&scope, &r.run_id).await.unwrap().state,
+            RunState::Completed
+        );
+    }
     shared.lock().await.confirm = false;
     host.submit_run(&scope, &b.session_id, "reject second write".into())
         .await
@@ -339,6 +347,51 @@ async fn interaction_scenario() {
         .await
         .unwrap();
     assert!(!cfg.roots["r"].join("wrong-scope.txt").exists());
+    // 一次排队32个真实HTTP点击，超过处理并发16；每个ID只回应一次，不能无界派生任务。
+    {
+        let mut s = shared.lock().await;
+        for i in 0..32 {
+            s.actions.push_back(json!({"id":format!("pressure-{i}"),"teamId":"office-1","conversationId":"ui-test","action":"employee.inspect","employeeId":"assistant"}));
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let n = shared
+                .lock()
+                .await
+                .responses
+                .iter()
+                .filter(|r| {
+                    r["interactionId"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with("pressure-"))
+                })
+                .count();
+            if n == 32 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    {
+        let s = shared.lock().await;
+        for i in 0..32 {
+            let id = format!("pressure-{i}");
+            let replies: Vec<_> = s
+                .responses
+                .iter()
+                .filter(|r| r["interactionId"] == id)
+                .collect();
+            assert_eq!(replies.len(), 1);
+            assert_eq!(
+                replies[0]["presentation"]["content"]["template"],
+                "detail-v1"
+            );
+        }
+    }
+    shared.lock().await.expire_delete_reply = true;
     let deleted = action(&shared, "delete-6", "conversation.delete", json!({})).await;
     assert_eq!(deleted["presentation"]["success"], true);
     assert!(
@@ -349,6 +402,18 @@ async fn interaction_scenario() {
     );
     assert!(host.open_session(scope).await.is_err());
     server.shutdown().await.unwrap();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let (status, context): (String, String) = db
+        .query_row(
+            "SELECT status,context FROM host_office_actions WHERE action_id='delete-6'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (status.as_str(), context.as_str()),
+        ("deleted_ui_unconfirmed", "{}")
+    );
     stop.cancel();
     serving.await.unwrap();
 }
