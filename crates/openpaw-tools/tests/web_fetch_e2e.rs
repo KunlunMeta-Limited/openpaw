@@ -214,3 +214,82 @@ async fn redirect_is_followed_to_mock_page() {
         res.content
     );
 }
+
+#[tokio::test]
+async fn r7_fresh_bypasses_cache_without_changing_legacy_output() {
+    let _guard = lock_env();
+    set_gate();
+    let addr = spawn_mock(vec![
+        http_html("<h1>FIRST</h1>"),
+        http_html("<h1>SECOND</h1>"),
+    ]);
+    let url = format!("http://{addr}/fresh");
+    let first = web_fetch::run(Path::new("."), json!({"url":url}))
+        .await
+        .unwrap();
+    let cached = web_fetch::run(Path::new("."), json!({"url":url}))
+        .await
+        .unwrap();
+    let fresh = web_fetch::run(Path::new("."), json!({"url":url,"fresh":true}))
+        .await
+        .unwrap();
+    clear_gate();
+    assert_eq!(first.content, cached.content);
+    assert!(
+        fresh.content.contains("SECOND"),
+        "fresh must fetch a new response: {}",
+        fresh.content
+    );
+    assert!(fresh.content.contains(&url));
+    assert!(fresh.content.contains("retrieved_at_unix_ms:"));
+}
+
+#[tokio::test]
+async fn d41_unknown_length_body_is_rejected_before_end_of_stream() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _guard = lock_env();
+    set_gate();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/oversized", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 8192];
+        let _ = stream.read(&mut request).await;
+        if stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let chunk = vec![b'a'; 64 * 1024];
+        for _ in 0..96 {
+            if stream.write_all(b"10000\r\n").await.is_err()
+                || stream.write_all(&chunk).await.is_err()
+                || stream.write_all(b"\r\n").await.is_err()
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+    });
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        web_fetch::run(Path::new("."), json!({"url":url})),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    clear_gate();
+    let result = result
+        .expect("oversized response must fail before waiting for its terminator")
+        .unwrap();
+    assert!(
+        result.is_error && result.content.contains("too large"),
+        "{}",
+        result.content
+    );
+}

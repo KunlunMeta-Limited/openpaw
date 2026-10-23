@@ -172,3 +172,64 @@ Host仍占位。T1的llm::assemble_provider、RunObserver/SessionWriter与T2的T
 原AgentLoop/RunContext/RunObserver、Provider装配、SessionWriter/Reader/SessionDb、ToolRegistry与Environment、OS文件锁均直接复用；新增Host模块只管理核心没有的运行注册/绑定/审批消费/根锁/恢复及协议无关查询。Skill/Goal新增checked只读入口仍调用原解析器，不改旧容错列表；有界文本提取沿用原read_file，带行号输出保留。没有修改core/engine/sandbox/chat.rs，也未修改Office。
 
 新Host开发中已核查取消与状态竞争、真实句柄关闭、数据库故障锁存、根身份配置变更及索引损坏恢复；这些为本次新增实现的测试修正，不补造既有OpenPaw D编号。对照0004 H01—H12的准确交付与剩余限制以专用验证记录为准。
+
+## T4 r6：真实网页发现的D38/D39
+
+| ID | 根因、修复与边界 | 回归/当前状态 |
+|---|---|---|
+| D38 | service.live与store::get_run分别直接拼接跨assistant文字，工具前说明紧贴下一条标题；在原types.rs引入Host内部共用RunText，可靠消息保存后延迟分隔，消息内原文不变，4MiB计入分隔；核心/JSONL不修改 | 原host_office精确文本断言修复前失败，修复后通过；inline验证分块换行、空消息、中文预算；真实网页/精确HEAD完整结果登记于0005验证记录，不提前关闭 |
+| D39 | send/resume接受拒绝原用409/503，Office按官方协议转通用502；仅六类可恢复拒绝用HTTP200单条官方error，安全白名单，无新Run/假done；前置4xx和存储503、JSON控制操作保留 | host_office修复前409不满足官方错误事件断言；修复后覆盖请求/历史冲突、忙、容量、缺失及无副作用；真实双浏览器与完整结果见0005验证记录 |
+
+复用判定：延展原live/Store、原错误分类、原Office事件和原产品runner；新增仅Host内部展示累积器与接受错误私有映射。无独立解析器/存储/Provider或Office改动。D36/D37仍开放，T4仅只读工具，不因通过本轮测试关闭shell清理风险。
+
+r6修复实现6530dec的D38/D39已获定向、完整27项和实际网页/在线DeepSeek验证；属于“修复已验证、待交付与PR审核”，不伪造已合入关闭。D36/D37仍开放，Windows原生未执行。原失败报告及复验哈希见0005验证记录。
+
+## T4 r7：原Web工具复用与缺陷
+
+Host默认五项与两层配置校验未开放Web、模型缺当前时间属于接入能力缺口；原搜索/抓取主体可复用，不另写天气服务。按0005 r7仅开放web_search/web_fetch，web_extract职责重叠暂不开放；Office无改动。
+
+| ID | 源码原因与修复 | 复现/回归/状态 |
+|---|---|---|
+| D40 | 注册表Web分支未传调用级取消，搜索自动正文使用分离JoinHandle；原tools内增加取消入口、搜索托管任务取消并等待，Host原观察器/锁不复制 | tool_runtime的d40_inflight修复前等待超时退出101，修复后实际HTTP等待取消；私有d40_auto_fetch_tasks_close_before_cancel_returns检查两个真实连接关闭；预取消旧实现已正确，作为保留回归，不虚称修复前失败；最终验证见0005记录 |
+| D41 | 未知长度响应先bytes读完才判断5MiB；改为chunk追加前检查，超限即错误且不缓存 | web_fetch_e2e::d41_unknown_length_body_is_rejected_before_end_of_stream修复前等待终止块超时退出101，修复后提前拒绝；最终验证见0005记录 |
+
+抓取fresh只绕本地缓存，不保证站点/CDN日期；DNS预查不是连接时地址固定，当前不声称完全防DNS重绑定。D36/D37保持开放，不因本轮Web修复开放shell/写工具。Windows原生仍按用户安排暂缓；不以Linux验证替代。
+
+
+### D42：在线DeepSeek发现的Bing结果误解析（开放，未修复）
+
+真实8765/DeepSeek调用web_search的tool_result第一项包含“rguments.length”等大段脚本，模型明确反馈搜索无有效天气条目。证据：`artifacts/t4-r7-deepseek-20261022-b/本轮专用会话.jsonl`，call `call_00_B8MtJSVzQJ7t6ryl6lcb5779`；c轮独立再现。源码`web_search/adapters/bing.rs::parse_bing_html`遍历`html.split("class=\"b_algo\"")`，连结果容器前的首段也走宽泛href/标题兜底，页面脚本可进入输出并消耗模型上下文；不能由HTTP200/非空列表认定有效结果。
+
+本轮r7未修改该适配器，不写已修复/已关闭。拟在同一T4主CHG后续修订中登记准确适配器/既有测试路径与批准对象：只解析真实结果容器，剔除script/style等非结果，零结果/挑战页保留明确语义；扩充原web_search_e2e的无b_algo、头部脚本加真实结果、相邻结果及原重定向/域名过滤回归，再用真实网络验证。不能用Host临时字符串清洗或降低断言掩盖。当前天气查询通过实际web_fetch获得有效来源，不等于该搜索缺陷已解决。
+
+
+### D43：已启用能力下旧会话仍沿用“无联网/时钟”断言（现场复现，待修正）
+
+用户原session `50f53b9517a94dac9aefde208f73d58c`含多轮r7前否定能力的assistant历史；升级后短句追问仍重复否定。2026-10-22真实8765浏览器原会话重现，`artifacts/t4-r7-existing-before-20261022-a/report.json`failed，无Web任务；不是Office预览，也不是新模型配置未加载。源码确认每Run已构建当前system和工具，原r7提示未明确旧自述与本轮能力的优先关系；此前只测新会话漏此路径。
+
+拟仅增强原Host私有system的能力/历史边界，原引擎仍决策并实际调用允许工具；原历史不清空、不写伪事实。回归覆盖禁网历史→同根同Session启用→再次关闭及原网页短句/刷新连续追问。模型是否遵守以在线真实旧会话为准，捕获system字段存在不能单独判为修好；不通过重写历史、强制每个问题联网或天气硬编码修补。
+
+
+### D43复核与D44：实际请求对比（2026-10-22，仍待修复）
+
+仅增强Host开头system的候选在原对话短句“长沙天气”真实浏览器仍失败：`artifacts/t4-d43-existing-after-20261022-a/report.json`，无Web调用。原先“明确历史边界即可解决”的私有方案不成立；runtime 16项通过只证明结构，不能作为模型实际使用工具的证据。
+
+用隔离复制的同Session、原Host/AgentLoop/OpenAiProvider截获实际HTTP正文：当前时钟与七项tool均存在，末条真实用户问题不变。用户原生DeepSeek端点上同历史temperature=0对比：原开头/短中文开头各零tool_calls；相同可信system放到当前用户文本前，两次均请求web_search/web_fetch。诊断没有执行工具，不能当作天气或浏览器成功；D43保持开放。证据：`artifacts/t4-d43-wire-diagnostic-20261022-a/{actual-wire-body.json,native-compare.json,manifest.json}`；不含模型凭据，隔离数据未回写原会话。
+
+D44：CompletionRequest.system_blocks已有“优先于system”的公开约定，而openpaw-llm/src/openai.rs::build_messages完全忽略它；这不等于原Host本轮信息丢失（原Host未设置blocks），但阻碍使用既有动态上下文接口。拟在0005第9.11节r8补齐原Provider及实际wire回归、Host私有委托；D42在原Bing解析器独立修复。新增范围均待人工审核，尚未实施，不借r7批准越界。Office不改，D36/D37仍开放。
+
+
+### D42/D43/D44修复候选专项结果（r8，未代替交付验收）
+
+D44原HTTP请求回归修复前两项失败，真实wire只发IGNORED_FALLBACK而丢弃blocks；修复后原mock_server_contract全部11项通过，含complete/stream、优先级/空块、历史原序、混合结果文本及多工具响应连续。D42两项污染用例修复前均失败（首项导航而非真实条目、5个伪结果），修复后原web_search_e2e全部34项通过；容器解析不承诺远端检索相关性。
+
+D43原Host运行/恢复套件及旧历史开关回归通过；真实原会话首次未用特殊提示，“长沙天气”实际2次搜索+3次抓取。a取证误读原始metadata.tools导致报告失败，原账本与官方投影补对账5个call均匹配；首轮AM/PM本地时间解释不可靠，不据其认定实况有效。候选b加强通用时区/数据日期约束后，同conversation刷新追问2次fresh抓取，原API current时间2026-10-22T20:15、Asia/Shanghai和18.7等字段与页面相符；随后日期和再次普通短句均实际验证。来源current估计不等于本站独立观测，模型自然语言其他推断不作已核实事实。
+
+此处均为专项/候选事实，最终准确干净HEAD完整27项与同二进制部署复验另在交付清单核对；三缺陷仍待最终技术核查/用户验收/PR，不因候选成功写已关闭。旧失败与r7批准对象完整保留，D36/D37开放，Office零修改，Windows原生暂缓。
+
+
+## D42/D43/D44最终Linux技术核查（已验证，待交付与PR审核）
+
+当前结论覆盖前述“未修复/候选”时点，旧失败保留。准确实现932e278完整27/27及原产品旅程通过；D42原解析回归验证只产出结果容器、不混入脚本/导航，不宣称公网相关性完美；D44原HTTP请求测试验证blocks优先与工具链相邻；D43同会话开关权限/日期产品回归和原用户会话在线三轮全部通过。工具、来源URL/时间、Run/call、任务和账本对账，证据集中0005验证记录M4核查与外部delivery清单。三项为“修复已验证，待用户交付验收及PR审核/合入”，不写closed或已发布。
+
+输出质量观察（未定性为新增代码缺陷）：原生DeepSeek将Open-Meteo daily.weather_code=55称作“小毛毛雨”，与代码释义不符；“不用带伞/无雨”和更新频率等推断亦不由原始字段充分证明。本轮逐项数值、时区/日期、URL确已匹配，但不把全部气象解释算通过；后续若将气象解释正确性作为产品承诺，先在本主CHG评审范围和可验证标准，不新增天气专用后端来掩盖通用模型输出问题。D36/D37及Windows暂缓边界不变；T4只读不受未开放shell能力冒充保护，T5开放前仍必须审核D37。

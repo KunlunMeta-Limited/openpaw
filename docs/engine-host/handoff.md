@@ -43,7 +43,7 @@
 | 场景步骤 | 真实执行/存储证据（Session/Run/call） | 聊天/messages/seq证据 | 页面截图/文件哈希/进程证据 | 状态/未通过原因 |
 |---|---|---|---|---|
 
-说明实际支持的按钮和动画。任务/白板必须来自真实运行，人物是功能角色；202/forwarded/delivered分别不是页面应用/动画完成/副作用成功。T4/T5产品演示必须真服务真浏览器；T0的Schema夹具只证明协议基线。R1未获批时写明180秒/刷新取消，不以SDK通过代替Office产品旅程。
+说明实际支持的按钮和动画。任务/白板必须来自真实运行，人物是功能角色；202/forwarded/delivered分别不是页面应用/动画完成/副作用成功。T4/T5产品演示必须真服务真浏览器；T0的Schema夹具只证明协议基线。新版写明180秒单连接与history/resume/cancel；旧R1四URL不实施，不以SDK通过代替Office产品旅程。
 
 ## 验证
 
@@ -107,3 +107,134 @@ T4应直接Rust调用上述接口，按Office固定Schema新增自己的DTO/NDJS
 ## T3 PR状态（2026-10-21）
 
 共同[PR #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)已创建，目标merge/ai-ofice-react-overagent，来源feat/engine-host-t3；创建head `b5a2c2a2a44902139ad27cf6f2cd9a2b8859e27d`。0004/0001交付验收已通过，平台非作者审核与合入尚未发生，T4仍不开始。CI平台账单未启动、本地交付门禁不能表示Windows暂缓两种情况分列于0004最新记录，不自改规则或伪填通过。PR元数据登记版本仍执行完整验证，后续获批并合入后再同步真实merge及M3完成。
+
+## T3实际合入与T4待审方案（2026-10-21）
+
+前述各段保留当时状态，当前以此补登为准：#7已合入，head825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52，GitHub mergedAt=2026-10-21T11:16:12Z。用户已确认PR完成；API无独立Review，不编造Approve。0001/0004交付验收保持4263529，合入head另已Linux完整26/26复验；Windows本轮暂缓、未验证，支持和T8目标保留。
+
+下一阶段[0005第4/9/10节](../changes/CHG-2026-0005.md)提供准确文件范围、聊天/业务两通道方案、模型配置和O01—O10产品验收。当前只是提案待审，没有Office聊天代码或新配置段；原/health和Host::submit_run可用，/office/chat仍404。现场Office独立协议验证与Host smoke均有仓库外证据，但不是T4真实对话验收。
+
+## T4前置：统一.env模型配置
+
+CHG-2026-0005 r2仅批准配置子范围，完整Office方案仍待审核。CLI/Host默认读取OPENPAW_HOME/.env或用户目录/.openpaw/.env；复制仓库.env.example，填写DeepSeek密钥后执行openpaw config show和openpaw chat。--env-file可显式选择文件，chat --home仅选数据存储；文件只在启动时读取。
+
+Host命令保持openpaw engine-host --config /absolute/path/host.toml。TOML明确的provider/model/base_url/api_key_env优先；沿用.env请省略这些字段。根、工具和办公室绑定仍只来自TOML，不能用.env覆盖权限。旧load/start嵌入式API保持原行为。本轮不修改Office、不开T4 PR，不把模型配置或独立健康检查算成M4完成。Linux/Windows实测结果见0005验证记录，未运行不能当通过。
+
+配置实现提交f70d43763c24c595d44c0b6ee6bdea52c2de2760已通过Linux原26项全量，见0005专用验证记录与仓库外准确head报告。Windows原生没有环境，未计通过；真实DeepSeek只在用户填入密钥后连接。该结果仅覆盖配置子范围，不改变T4/M4和Office页面未接入的状态。
+
+## 历史T4 r3旧版交接（仅旧b221a44；新版见本文末r4）
+
+用户明确“那继续完成T4”，本轮在同一0005内恢复原完整方案，保留r2统一模型配置；不修改Office原工程。T3历史待审文字保留当时语境，当前#7已实际合入。T4用户交付验收、PR审核和合入仍待发生。
+
+1. 安装/构建：`cargo build --locked -p openpaw-cli --features engine-host,sidecar`。模型只需填写原生`OPENPAW_HOME/.env`或`~/.openpaw/.env`，模板见仓库`.env.example`；`openpaw config show`只显示有效配置和密钥有无。不要把密钥发聊天或放入VITE_*。
+2. 复制`host-config.example.toml`到本机自选路径，修改home、roots、slots并启用示例office段。要沿用.env须删去示例的显式provider="echo"；其余模型字段也可省略。T4只开放read_file/glob/grep/todo_list/think，配置写工具明确拒绝；旧无office配置仍只有健康服务。
+3. Office密钥是独立的官方`PAWOFFICE_API_KEY`系统环境，Host和Fastify使用同一值；模型密钥仍只在原生.env中。默认本机演示可使用公开的`pawoffice-demo-key`，正式部署使用受保护的服务环境配置；不把Office密钥当模型密钥，也不把二者输出到诊断。
+4. 启动Host：`openpaw engine-host --config /absolute/path/host.toml --port 41949`。随机端口模式`--port 0`可从发现行读实际地址；生产可使用同源代理固定公开路径。独立部署只监听loopback，来源须与office.allowed_origins精确匹配；代理须正确转发来源与上游Host。
+5. Office保持冻结源码只读，在隔离副本构建。**构建之前**设置公开`VITE_PAWOFFICE_CHAT_URL=http://127.0.0.1:41949/office/chat`，再执行原`npm ci`与`npm run build:full`。Fastify按官方PORT/HOST/PAWOFFICE_API_KEY启动`node server/dist/index.js`。只在构建后设置VITE变量不会改变静态页面；浏览器需刷新载入新构建。
+6. 页面发送消息后，真实请求经过Host→原引擎→Provider；工具请求执行原工具。业务同步独立通过官方messages，不能从health200推断页面已应用快照。`applied`与`cached`在宿主日志和host_office_projection.sync_state分开登记，完整seq/内容在外发前持久化；halted代表冲突/认证/协议问题，先人工核对所有者/数据，不盲目删库或抬序号。
+
+源码导航：`src/office/chat.rs`严格v1与断开取消，`dto.rs`类型/Unicode边界，`client.rs`官方messages，`projection.rs`任务/事件/白板及worker，`service.rs::submit_with_history`复用原接受流程，`store.rs`原JSONL/元数据迁移与恢复，`tool_host.rs`仅补资源等待事实。没有Node聊天bridge，没有新引擎或会话存储。
+
+### 可执行Linux/Windows产品验收
+
+先准备Node24、Rust及原生Chromium。PowerShell使用`$env:变量='值'`，Linux使用`export 变量='值'`，其余同一Node入口，不要求Docker或WSL。设置：
+
+~~~text
+OPENPAW_OFFICE_SOURCE=<只读Office原仓库绝对路径>
+OPENPAW_CHROMIUM=<已安装且与Playwright版本匹配的Chromium可执行文件>
+OPENPAW_NPM_CLI=<npm11的npm-cli.js路径，可自动从PATH或标准布局发现>
+~~~
+
+执行`node tests/engine-host-contracts/office-product.mjs`。默认在系统临时目录创建全新证据目录；可选`OPENPAW_OFFICE_PRODUCT_OUTPUT`指定仓库外不存在目录。runner只在隔离clone按锁文件执行npm ci --prefer-offline --ignore-scripts并完整构建Office，安装/构建各有300秒等待上限；默认自行构建Host组合feature，以免前面offline smoke的默认构建覆盖二进制。可选`OPENPAW_HOST_BINARY`仅用于明确验证已有准确构建。全量入口新增TEST-OFFICE-PRODUCT，保留原26项，统一执行27项；缺Office源/浏览器明确失败而非skip。
+
+自动化全量验收还须设置仓库外空`OPENPAW_HOME`，避免使用开发者个人.env影响默认模型断言；真实模型演示独立运行，不能因此删除个人配置。
+
+runner的本地OpenAI协议fixture只用于确定性测试模型：回答取自原read_file真实结果（两个随机文件标记），不能直接写浏览器答案/伪造快照。真实DeepSeek验证另外保存。产物含命令与退出码、模型请求、浏览器POST和被动CDP NDJSON、官方messages/read结果、截图、录像、trace、原JSONL与host.db；密钥不采集。CDP只观察网络，不能clone/tee fetch保活，否则会破坏停止测试。
+
+v1限制保留：浏览器180秒预算，刷新/断线取消，无Run ID/续接游标；T5才交付菜单/详情/写入审批，R1长任务扩展须按Rx另行批准。Windows原生本机未执行，不能据脚本可移植或Linux结果记通过。准确结果与剩余项见0005专用验证记录。
+
+## 当前T4 r4交付交接（新版协议，待人工验收）
+
+Office固定02dbac4419e325efda9fa6293060037bd60da5e5；隔离源码/home/cheng/.cache/ai-office-react-latest-20261022-v2。旧r3直连/VITE配置/断开取消说明仅适用于旧版，不用于新版部署。Host运行时用实际监听地址注册chat.url；浏览器始终走Office同源/api/pawoffice/chat。四操作/状态/容量/安全按master第4节，0005第9.7节是本轮实施依据。
+
+T5须复用本轮conversationId目录、turn/Run映射和每办公室seq，实现带conversationId的单ui.next、审批/详情/删除；当前删除不支持。T6负责>180秒重连、并发订阅/慢消费者、磁盘及崩溃加固，不实施旧R1四URL。原用户Office两文档和OpenPaw旧工作区不改。Windows原生用户暂缓，不记通过。新版a67ad97完整27/27及真实8765 DeepSeek网页已完成，准确证据见0005验证记录；不沿用旧版测试，不代替人工验收。
+
+
+新版操作方法：保持OpenPaw原生.env；Host TOML的office.base_url填Office Node根地址，office.api_key_env引用PAWOFFICE_专用系统变量，allowed_origins仍填浏览器准确源。先启动任一服务均可，Host会重试同步。Office原生npm ci、npm run build:full、Node server/dist/index.js启动，不设置旧VITE聊天地址；打开/office/后选择办公室、新会话并发送。Host实际端口自动注册；同办公室可切换A/B，刷新history→resume，停止按钮显式cancel。删除按钮对应后端T5尚未实现，不能用于本阶段验收。
+
+产品脚本仍为node tests/engine-host-contracts/office-product.mjs，沿用上面的OPENPAW_OFFICE_SOURCE/CHROMIUM/NPM_CLI和输出变量；来源必须含02dbac4。新版runner在全新浏览器操作会话、真实读取文件、切换/刷新/停止、另一个浏览器发现会话，并保存网络、场景导出、录像、官方快照和原JSONL。确定性Provider用于自动化，用户真实模型另做网页验收，互不代替。
+
+
+新版现场入口：`http://127.0.0.1:8765/office/`，Host41949；源码使用固定02dbac4的隔离构建，原Office工作区不动。升级记录与停写备份：`artifacts/live-office-20261022-r4/upgrade-backup.json`、`upgrade-result.json`；原11绑定全部保留，模型仍用户原生.env。真实网页报告`artifacts/t4-new-office-live-final-20261022/report.json`，白板真实点击/阅读截图`artifacts/t4-new-office-live-whiteboard-20261022/`；不是只用HTTP200判断可用。
+
+供用户重复演示：刷新页面，点击“新会话”，输入“请实际调用read_file读取README.md和notes.txt，比较两份内容并给出完整标记，不要修改文件”。应返回PAW-REAL-README-20261021与PAW-REAL-NOTES-20261021；聊天可展开/折叠，折叠后等待场景文字绘制再点协作白板查看当前请求。再新建B并输入“只回复B会话已连接”，通过顶部标签切换，刷新后从目录恢复；停止按钮只有运行时显示。删除按钮、审批、详情和主动交接未实现，留T5，不把闲聊动画当执行证据。
+
+D37原生Linux取消回归有间歇失败，未修复，失败与20次复检见0005记录；本T4没有开放shell。T5方案在开放写入/shell前必须审核该清理边界，不能把本轮27/27当作D37已关闭。当前T4仍待用户验收，未创建PR；Windows暂缓未运行。
+
+
+## 全功能覆盖交接补充（0005 r5文档规划）
+
+按master第15节F01—F49检查固定Office版本；T4 r4当前证据不自动覆盖本次新增用例。T4.2补目录/草稿/搜索/分页/复制/Markdown的真实网页验收；完成技术核查后仍由用户验收，再提PR，不提前开始T5。
+
+T5未来主CHG按六个工作包逐文件写可审核方案：T5.1审批/后台通知，T5.2 action/六类详情，T5.3共享删除与墓碑恢复，T5.4任务/人物/白板/统计口径，T5.5真实慢工具动画，T5.6写工具开放门禁。特别注意既有store.recover中的delete_session只是索引重建，不能替代完整删除。
+
+D37 Linux取消回归间歇失败必须在开放shell前定位修复并稳定验证，不能以最后一轮完整绿色代替修复。Windows原生继续按用户安排暂缓，未执行不记通过。地图/会议/插件属于原生共存回归；服务器动态创建办公室与自动无感长任务续接等是待决候选，不是已支持功能。
+
+本次r5文档规划已获用户授权同步，不授权T5实现或Office修改。每Tx仍受前序PR批准合入、对应主CHG和Office独立Rx约束。普通后续工作不另建治理CHG。
+
+用户要求Office申请暂不允许通过，统一保存于[集中台账](office-change-requests.md)，合适时统一审核。后续新发现Office问题只补台账，不改Office/不创建Office实施PR；现有官方能力继续由Host适配。
+
+## T4 r6实施交接边界（2026-10-22）
+
+用户已批准0005 r6（准确对象见该单首页），本轮仅D38/D39和原T4.2网页验收扩充。RunText在Host内统一live/原JSONL投影消息边界，原消息事实与数据库版本不变；旧浏览器缓存须官方history同步。send/resume六类可恢复接受拒绝改HTTP200单条官方error；直连客户端必须检查事件，不能只认HTTP成功。前置4xx、存储故障及history/cancel的JSON语义不变；原Office仍可能把上游非2xx映射通用502。
+
+测试延展原host_office及office-product.mjs，后者使用固定Office原服务/独立Chromium验证Markdown复制、草稿/搜索/键盘、25轮分页失败原游标重试和双浏览器历史冲突；失败报告保留，准确结果见0005验证记录。在线DeepSeek另记，不冒充确定性Provider结果。当前未获得本轮交付验收、无T4 PR、不进入T5；Office所有申请仍暂缓，Windows原生未执行，D36/D37继续开放。
+
+r6本轮技术证据：`6530dec02b331965e5e64e1d75aa3eaae5bfa7f3`完整27/27，报告`/home/cheng/.cache/t4-r6-full-20261022-b/report.json`；线上8765已运行同源稳定二进制，home升级前完整备份在`artifacts/live-office-20261022-r6/host-home-before`。在线证据`artifacts/t4-r6-deepseek-20261022-b/`含既有缓存前后、DeepSeek消息与任务中心截图、视频/trace/账本对账。Office仍冻结02dbac4，不改其文件；当前交付验收pending，无PR/合入。最终含本段文档的版本须另完整检查，报告以专用记录指向的最终路径为准。
+
+## T4 r7实施交接：公开网页（Office不改）
+
+用户已批准0005 r7-web并明确Office不能改动。当前Host复用原工具，只需在Host TOML显式配置：
+
+```toml
+tools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch"]
+```
+
+省略tools仍是五个本地默认，配置DeepSeek不自动允许外部HTTP。模型沿用官方.env，无需重填；Host使用原reqwest/系统代理，不传模型凭据。每Run system提供可信UTC/系统本地偏移，实时查询建议搜索fetch_content=false后web_fetch(fresh=true)验证来源；fresh不是站点数据日期保障。API/NDJSON/四操作与Office快照不变，Web调用仍是原AgentLoop与JSONL事实，原任务/白板承担显示。
+
+D40在tools内解决网络等待取消和搜索子任务回收；D41在读取时限制5MiB。当前public工具默认入口保留；取消不能通过drop代替shell/写入清理。测试环回门控只用于隔离测试进程，真实演示不得启用。原浏览器runner增加真实HTTP工具/刷新不重复抓取/并行/停止证据；确定性页面不是实时天气，在线DeepSeek单独核验来源日期与截图/账本关联。准确提交、完整27项及在线结果见0005专用验证记录，不沿用r6通过结论。
+
+Office冻结02dbac4只读，现有用户编辑保留；T5未开始，无T4 PR/用户交付批准。Windows原生继续暂缓，不计通过。运行配置/二进制升级先备份，回退不清账本、不重放工具；用原官方history重新同步旧页面。
+
+
+r7在线演示已升级为8ad8f1c，部署/备份`artifacts/live-office-20261022-r7/`，完整27项`/home/cheng/.cache/t4-r7-full-20261022-a/report.json`、产品回归`/home/cheng/.cache/t4-r7-full-product-20261022-a/report.json`均通过。线上用户入口仍http://127.0.0.1:8765/office/；刷新后新建会话输入0005的O13提示词即可，不必修改Office或模型.env。既有“不能联网”回复是历史事实，不会被覆盖。
+
+真实DeepSeek证据`artifacts/t4-r7-deepseek-20261022-b/`：实际2次搜索、4次fresh抓取，气象来源长沙站当日19:30实况与回复一致；c轮另验证官网当日预报及任务/白板completed终态。b轮页面done后第一次快照仍running，按异步同步机制补取官方read与SQLite/JSONL确认completed，补证保留在对账文件；c轮等待终态再截图。搜索现存D42脚本污染未修，下一次精确修订审批前不扩大文件范围，不把所有联网能力或T4整体标完成。
+
+
+## r8原会话联网失败修复交接（0005第9.11节）
+
+用户已批准ceffe709:r8-context。原8765“今天是几号”tab对应conversation 074aead8-85fc-4cc4-a24f-40cb48343f0f / Session 50f53b9517a94dac9aefde208f73d58c；旧r7及仅加强开头system候选真实失败。诊断已证明原请求工具/时间存在，但DeepSeek沿用旧历史；新增私有RunProvider复用原blocks，把可信本轮信息邻近当前真实用户，原OpenAI适配器落实该布局。Bing污染修原工具，各自有先失败后通过测试。Office工程和模型.env均未动。
+
+候选真实原会话短句/刷新追问/日期已实际产生工具、可信日期和对应任务；外部浏览器a报告误断言原始metadata.tools而失败，原记录与补充对账保留；其首轮AM/PM解释不可靠，已加强通用来源时间约束，不据此确认实况。b/c/d原会话、普通短句实际请求和账本对账记录见0005验证记录。没有新建对话/特殊提示来替代验收；公开天气API给出的current/forecast不冒充本站独立观测。
+
+上述为候选证据，最终准确HEAD的27项和部署后原会话复验由外部交付清单逐项记录；未实际通过前不写通过。Windows原生暂缓，所有Office Rx仍待审，T4未获用户交付验收/PR，不开始T5。诊断拷贝/临时截获程序不进入工程或部署，最终直接使用用户原生.env与原Provider，无常驻代理/新桥接。
+
+
+## 当前T4交接入口：r8最终技术核查（2026-10-22）
+
+以下为当前状态，前面r3—r8候选段落保留当时事实。准确实现`932e2783d4b1ec016303708f4eec18e8c483a3c5`完整27/27、真实固定Office产品旅程和原生DeepSeek原会话三轮均通过；完整哈希/逐项M4映射集中0005专用验证记录“r8最终交付与M4核查”，不复制第二套协议或验收状态。现场`http://127.0.0.1:8765/office/`，原tab“今天是几号”，conversation 074aead8-85fc-4cc4-a24f-40cb48343f0f，原生模型.env无需重填。
+
+实现源码/配置/Office本轮不再改变；当前仅同步CHG、需求/设计、master里程碑、缺陷台账与本文，然后对登记head完整复验。最终handoff外部清单记录源码与文档提交关系、27项真实结果/产品二进制哈希和线上既有证据，路径`artifacts/t4-r8-handoff-delivery-20261022-a/manifest.json`，缺报告不能提前写通过。
+
+下一步严格为：用户明确验收准确T4交付对象→独立T4 PR到merge/ai-ofice-react-overagent→当前head非作者审核与实际合入→同步0005/INDEX/master和交接→T5编码前主CHG提案。泛化继续不填人工验收；GitHub CLI当前已确认Fou-out-keep登录、查询该head分支没有PR。没有进行作者批准、自动合入或T5实现。Windows原生仍暂缓，D36/D37未修，天气数值与URL对账不保证气象术语/建议的所有解释正确，Office全部Rx仍未批准。
+
+
+## 当前T4交接状态更新：用户交付验收通过（2026-10-23）
+
+本会话用户明确“继续往下进行，通过”，验收准确9831f595bfb4a14f1fa647e01bf80e166b109d1c及复审披露的当前只读范围和限制。0005独立交付字段已登记；上段“未验收”保留历史时点。本轮仅审批/状态/里程碑文档登记，生产源码及Office不改，完整复验后创建目标merge/ai-ofice-react-overagent的T4 PR。平台审核与合入未发生，T5仍不得开工；实际PR编号/head随后补登。Windows、云端未启动、D36/D37、天气表述质量和Office Rx待审均保持原边界。
+
+
+## 当前T4平台交接：PR #10已创建（2026-10-23）
+
+https://github.com/KunlunMeta-Limited/openpaw/pull/10 ，base=merge/ai-ofice-react-overagent，创建head4a8847324aaf904be9ea8af5a7caca6af68bb8e5；准确完整27/27与真实产品b通过。用户交付验收绑定9831f59；创建前后元数据登记不改变生产源码。平台OPEN待非作者审核/合入，用户创建前批准不是平台Approve。下一合法步骤仅处理本PR审核/修复；实际审核和合入后补最终head/merge再启动T5提案。Windows暂缓及云端账单/额度未执行不计通过；原delivery门禁冲突、首轮环境失败和天气输出质量观察都在0005及外部清单保留。

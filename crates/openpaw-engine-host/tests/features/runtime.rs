@@ -13,6 +13,7 @@ fn config(base: &std::path::Path) -> HostConfig {
     let root = base.join("项目 workspace");
     std::fs::create_dir_all(&root).unwrap();
     HostConfig {
+        office: None,
         home: base.join("home"),
         roots: [("project".into(), root)].into(),
         slots: (1..=5)
@@ -779,4 +780,224 @@ async fn h08_acceptance_failure_does_not_start_tools_or_replay_input() {
         1
     );
     reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tool_waiting_resource_is_distinct_from_execution_and_can_be_cancelled() {
+    let base = tempfile::tempdir().unwrap();
+    let cfg = config(base.path());
+    std::fs::write(cfg.roots["project"].join("read.txt"), "not-yet-read").unwrap();
+    let provider = MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "read_file".into(),
+            input: json!({"path":"read.txt"}),
+            text: "读取".into(),
+        },
+        MockMode::Fixed("done".into()),
+    ]);
+    let host = Host::with_provider(cfg.clone(), Arc::new(provider))
+        .await
+        .unwrap();
+    let guard = openpaw_sandbox::file_lock::try_lock_exclusive(
+        &cfg.roots["project"].join(".openpaw/engine-host-resource.lock"),
+    )
+    .unwrap();
+    let s = scope(1);
+    let binding = host.open_session(s.clone()).await.unwrap();
+    let run = host
+        .submit_run(&s, &binding.session_id, "读取read.txt".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let view = host.get_run(&s, &run.run_id).await.unwrap();
+            if view.tools.iter().any(|t| t.state == "awaiting_resource") {
+                assert!(!view.tools.iter().any(|t| t.state == "running"));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    host.cancel_run(&s, &run.run_id).await.unwrap();
+    host.wait_idle().await;
+    assert_eq!(
+        host.get_run(&s, &run.run_id).await.unwrap().state,
+        RunState::Cancelled
+    );
+    drop(guard);
+    host.shutdown().await.unwrap();
+}
+
+struct ContextProvider(std::sync::Mutex<Vec<CompletionRequest>>);
+#[async_trait]
+impl LlmProvider for ContextProvider {
+    async fn complete(&self, req: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
+        MockProvider::fixed("context checked").complete(req).await
+    }
+    async fn stream(
+        &self,
+        req: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        self.0.lock().unwrap().push(req.clone());
+        MockProvider::fixed("context checked").stream(req).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn default_model(&self) -> &str {
+        "context-fixture"
+    }
+    fn name(&self) -> &str {
+        "context-fixture"
+    }
+}
+#[tokio::test]
+async fn r7_actual_model_request_has_trusted_time_and_only_configured_web_tools() {
+    for enabled in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = config(tmp.path());
+        let mut cfg: HostConfig = serde_json::from_value(
+            json!({"home":original.home,"roots":original.roots,"slots":original.slots}),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tools,
+            vec!["read_file", "glob", "grep", "todo_list", "think"]
+        );
+        if enabled {
+            cfg.tools.extend(["web_search".into(), "web_fetch".into()]);
+        }
+        let provider = Arc::new(ContextProvider(std::sync::Mutex::new(Vec::new())));
+        let before = chrono::Utc::now();
+        let host = Host::with_provider(cfg, provider.clone()).await.unwrap();
+        let s = scope(1);
+        let binding = host.open_session(s.clone()).await.unwrap();
+        host.submit_run(&s, &binding.session_id, "what is today?".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        let after = chrono::Utc::now();
+        let records = provider.0.lock().unwrap().clone();
+        assert_eq!(records.len(), 1);
+        let system = records[0].system.as_ref().unwrap();
+        let tools: Vec<_> = records[0].tools.iter().map(|t| t.name.clone()).collect();
+        let timestamp = |prefix: &str| {
+            chrono::DateTime::parse_from_rfc3339(
+                system.lines().find_map(|l| l.strip_prefix(prefix)).unwrap(),
+            )
+            .unwrap()
+        };
+        let utc = timestamp("Current UTC time: ");
+        let local = timestamp("Host local time: ");
+        assert_eq!(utc.timestamp_millis(), local.timestamp_millis());
+        assert!(utc >= before && utc <= after);
+        assert_eq!(tools.iter().any(|x| x == "web_search"), enabled);
+        assert_eq!(tools.iter().any(|x| x == "web_fetch"), enabled);
+        assert!(system.contains(if enabled {
+            "fresh=true"
+        } else {
+            "Network tools are not enabled"
+        }));
+        drop(records);
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn d43_reopened_session_uses_current_capabilities_without_rewriting_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let original = config(tmp.path());
+    let cfg: HostConfig = serde_json::from_value(
+        json!({"home":original.home,"roots":original.roots,"slots":original.slots}),
+    )
+    .unwrap();
+    let s = scope(1);
+    let denial = "这一轮我没有联网工具，也没有系统时钟。再问一次答案不会变。";
+    let old = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed(denial)))
+        .await
+        .unwrap();
+    let binding = old.open_session(s.clone()).await.unwrap();
+    for _ in 0..3 {
+        old.submit_run(&s, &binding.session_id, "长沙天气".into())
+            .await
+            .unwrap();
+        old.wait_idle().await;
+    }
+    let history = old
+        .get_session(&s, &binding.session_id)
+        .await
+        .unwrap()
+        .messages;
+    assert_eq!(history.len(), 6);
+    old.shutdown().await.unwrap();
+    drop(old);
+
+    for enabled in [true, false] {
+        let mut current = cfg.clone();
+        if enabled {
+            current
+                .tools
+                .extend(["web_search".into(), "web_fetch".into()]);
+        }
+        let capture = Arc::new(ContextProvider(std::sync::Mutex::new(Vec::new())));
+        let host = Host::with_provider(current, capture.clone()).await.unwrap();
+        assert_eq!(
+            host.open_session(s.clone()).await.unwrap().session_id,
+            binding.session_id
+        );
+        let before = chrono::Utc::now();
+        host.submit_run(&s, &binding.session_id, "长沙天气".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        let requests = capture.0.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(
+            serde_json::to_value(&request.messages[..history.len()]).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+        assert_eq!(request.messages.last().unwrap().text(), "长沙天气");
+        assert_eq!(request.tools.iter().any(|t| t.name == "web_fetch"), enabled);
+        assert_eq!(
+            request.tools.iter().any(|t| t.name == "web_search"),
+            enabled
+        );
+        let system = request.system.as_ref().unwrap();
+        let blocks = request
+            .system_blocks
+            .as_ref()
+            .expect("本轮上下文不能只在历史开头");
+        assert_eq!(&blocks.stable, system);
+        assert_eq!(&blocks.dynamic, system);
+        let now = chrono::DateTime::parse_from_rfc3339(
+            system
+                .lines()
+                .find_map(|l| l.strip_prefix("Current UTC time: "))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(now >= before && now <= chrono::Utc::now());
+        // 不只检查工具字段：旧assistant自述必须被明确标为历史，不能当作当前能力授权。
+        assert!(system.contains("历史回复不代表本轮能力"));
+        assert!(system.contains(if enabled {
+            "本轮已启用联网工具"
+        } else {
+            "本轮未启用联网工具"
+        }));
+        let saved = host.get_session(&s, &binding.session_id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved.messages[..history.len()]).unwrap(),
+            serde_json::to_value(&history).unwrap()
+        );
+        assert!(!saved
+            .messages
+            .iter()
+            .any(|m| m.text().contains("历史回复不代表本轮能力")));
+        host.shutdown().await.unwrap();
+        drop(host);
+    }
 }

@@ -256,7 +256,7 @@ pub struct RunView {
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
     pub revision: u64,
-    /// 用途：供展示的累计文本；事实仍来自JSONL。
+    /// 用途：供展示的累计文本；跨有文字的assistant消息补足段落空行，原事实仍来自JSONL。
     /// 字段：String，宿主类型字段。
     /// 来源去向：共享Host内部与可信Rust适配器。
     /// 约束：只在已授权会话及配置根内使用。
@@ -532,4 +532,172 @@ pub struct ToolView {
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
     pub state: String,
+}
+
+/// 用途：实时delta与原账本共用的消息展示累积器，不改写模型事实。
+/// 字段：text为已显示前缀，boundary延迟消息分隔，limit为可选UTF-8字节预算，truncated记录溢出。
+/// 来源去向：可靠assistant消息边界/文字块到Host展示视图。
+/// 约束：消息内部原样保留；空消息不造回复；跨消息只补足两换行。
+/// 稳定性：Host内部实现，不改变JSONL、公共DTO或数据库版本。
+/// 关联：需求/设计REQ-OP-010；DES-OP-007、DES-OP-009。
+#[derive(Default)]
+pub(crate) struct RunText {
+    text: String,
+    boundary: bool,
+    limit: Option<usize>,
+    truncated: bool,
+}
+impl RunText {
+    /// 功能：创建有界实时展示缓冲。
+    /// 参数：limit为包含分隔符的UTF-8字节上限。
+    /// 返回：空累积器。
+    /// 错误：无。
+    /// 状态：溢出后保留已接受前缀，不拆开UTF-8字符。
+    /// 并发与取消：无内部锁，由调用方原live锁保护。
+    /// 权限：仅Host内部，不产生或授权工具操作。
+    /// 关联：需求/设计REQ-OP-010；DES-OP-007。
+    pub(crate) fn bounded(limit: usize) -> Self {
+        Self {
+            limit: Some(limit),
+            ..Self::default()
+        }
+    }
+    /// 功能：按同一规则追加一个消息内的文字块或流分块。
+    /// 参数：chunk为模型原文，不做trim或Markdown修补。
+    /// 返回：无。
+    /// 错误：无；超过预算标记truncated并拒绝该块及后续块。
+    /// 状态：只在新消息首个非换行字符到来时补足段落边界。
+    /// 并发与取消：同步内存更新；调用方管理live锁和通知。
+    /// 权限：仅展示，不修改原消息或执行上下文。
+    /// 关联：需求/设计REQ-OP-010；DES-OP-007、DES-OP-009。
+    pub(crate) fn append(&mut self, chunk: &str) {
+        if chunk.is_empty() || self.truncated {
+            return;
+        }
+        let leading = chunk.bytes().take_while(|b| *b == b'\n').count();
+        // 前导换行可能跨多个delta；在看到正文前保持待分隔，才能与整块恢复一致。
+        let body_started = leading < chunk.len();
+        let padding = if self.boundary && body_started {
+            let trailing = self
+                .text
+                .bytes()
+                .rev()
+                .take_while(|b| *b == b'\n')
+                .take(2)
+                .count();
+            2usize.saturating_sub(trailing.saturating_add(leading))
+        } else {
+            0
+        };
+        if self.limit.is_some_and(|limit| {
+            self.text
+                .len()
+                .saturating_add(padding)
+                .saturating_add(chunk.len())
+                > limit
+        }) {
+            self.truncated = true;
+            return;
+        }
+        for _ in 0..padding {
+            self.text.push('\n');
+        }
+        self.text.push_str(chunk);
+        if body_started {
+            self.boundary = false;
+        }
+    }
+    /// 功能：在可靠assistant消息记录完成后标记下一条文字边界。
+    /// 参数：无。
+    /// 返回：无。
+    /// 错误：无。
+    /// 状态：不立即追加字符；空、Thinking或纯工具消息不会制造空段落。
+    /// 并发与取消：调用方先等待事实保存成功，再在原live锁下调用。
+    /// 权限：仅Host投影，不修改Provider上下文。
+    /// 关联：需求/设计REQ-OP-010；DES-OP-007。
+    pub(crate) fn end_message(&mut self) {
+        self.boundary = !self.text.is_empty();
+    }
+    /// 功能：读取已接受的展示文本。
+    /// 参数：无。
+    /// 返回：当前前缀的借用。
+    /// 错误：无。
+    /// 状态：只读，不增加尾随分隔符。
+    /// 并发与取消：调用方保证共享访问同步。
+    /// 权限：调用方须先校验Run范围。
+    /// 关联：需求/设计REQ-OP-010；DES-OP-007。
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+    /// 功能：读取实时字节预算溢出标记。
+    /// 参数：无。
+    /// 返回：是否曾拒绝溢出分块。
+    /// 错误：无。
+    /// 状态：只读；终态可由原账本恢复完整文本。
+    /// 并发与取消：调用方保证共享访问同步。
+    /// 权限：仅Host展示状态。
+    /// 关联：需求/设计REQ-OP-010；DES-OP-007。
+    pub(crate) fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+#[cfg(test)]
+mod text_tests {
+    use super::RunText;
+
+    #[test]
+    fn message_boundaries_preserve_chunks_and_original_whitespace() {
+        for (first, second, expected) in [
+            ("说明。", "# 标题", "说明。\n\n# 标题"),
+            ("说明。\n", "\n# 标题", "说明。\n\n# 标题"),
+            ("说明。\n\n", "\n# 标题", "说明。\n\n\n# 标题"),
+            ("", "# 标题", "# 标题"),
+        ] {
+            let mut persisted = RunText::default();
+            persisted.append(first);
+            persisted.end_message();
+            persisted.append(second);
+            assert_eq!(persisted.text(), expected);
+            let mut live = RunText::bounded(1024);
+            for c in first.chars() {
+                live.append(&c.to_string());
+            }
+            live.end_message();
+            live.append("");
+            live.end_message();
+            for c in second.chars() {
+                live.append(&c.to_string());
+            }
+            live.end_message();
+            assert_eq!(live.text(), persisted.text());
+        }
+        let mut text = RunText::default();
+        text.append("块一");
+        text.append("块二");
+        text.end_message();
+        text.end_message();
+        text.append("块三");
+        assert_eq!(text.text(), "块一块二\n\n块三");
+    }
+
+    #[test]
+    fn byte_limit_counts_separator_and_keeps_utf8_prefix() {
+        let mut text = RunText::bounded(8);
+        text.append("中");
+        text.end_message();
+        text.append("文");
+        assert_eq!(text.text(), "中\n\n文");
+        assert!(!text.truncated());
+        text.append("!");
+        text.append("ignored");
+        assert_eq!(text.text(), "中\n\n文");
+        assert!(text.truncated());
+        let mut overflow = RunText::bounded(7);
+        overflow.append("中");
+        overflow.end_message();
+        overflow.append("文");
+        assert_eq!(overflow.text(), "中");
+        assert!(overflow.truncated());
+    }
 }

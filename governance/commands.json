@@ -446,6 +446,19 @@
         "linux",
         "windows"
       ]
+    },
+    {
+      "id": "TEST-OFFICE-PRODUCT",
+      "argv": [
+        "node",
+        "tests/engine-host-contracts/office-product.mjs"
+      ],
+      "suite": "contracts",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ]
     }
   ]
 }

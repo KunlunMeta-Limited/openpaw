@@ -1,24 +1,256 @@
 {
-  "chatRequest": {"version":"1.0","teamId":"office-1","conversationId":"conversation-1","messages":[{"role":"user","content":"查看文件并说明结果"}]},
-  "chatEvents": [{"type":"status","phase":"thinking"},{"type":"status","phase":"streaming"},{"type":"delta","text":"已读取结果。"},{"type":"done"}],
-  "chatError": {"type":"error","message":"Run interrupted"},
-  "snapshot": {
-    "schemaVersion":"1.0","seq":1,"workspace":{"id":"office-1","name":"研发办公室"},
-    "employees":[{"id":"developer","name":"开发","sceneActorId":"code-agent","role":"开发","online":true}],
-    "tasks":[{"id":"run-1","title":"读取文件","assigneeId":"developer","status":"running","progress":-1,"updatedAt":"2026-10-20T01:00:00Z","summary":"等待执行"}],
-    "events":[{"id":"event-1","kind":"task.assigned","taskId":"run-1","employeeId":"developer","fromEmployeeId":"developer","summary":"分配读取工作","occurredAt":"2026-10-20T01:00:00Z"}]
+  "chatRequest": {
+    "version": "1.0",
+    "teamId": "office-1",
+    "conversationId": "conversation-1",
+    "messages": [
+      {
+        "role": "user",
+        "content": "查看文件并说明结果"
+      }
+    ],
+    "type": "send",
+    "turnId": "turn-1"
   },
-  "decision": {"type":"decision.request","teamId":"office-1","timeoutMs":60000,"decision":{"id":"display-1","actorId":"office-lead","kind":"confirmation","title":"允许本次写入？","description":"仅针对当前工具输入","confirmLabel":"允许一次","rejectLabel":"拒绝"}},
-  "dialog": {"type":"ui.respond","interactionId":"interaction-1","presentation":{"target":"dialog","content":{"template":"detail-v1","title":"会话历史","description":"第 1 页","fields":[{"label":"消息","value":"已完成读取"}],"actions":[{"id":"history:next","label":"下一页"}]}}},
-  "uiAction": {"id":"interaction-1","teamId":"office-1","action":"actor.inspect","actorId":"office-lead"},
-  "sceneCommand": {"teamId":"office-1","command":{"protocolVersion":"2.0","sceneId":"office-1","commandId":"scene-1","type":"activity.start","capability":"scene.say","participants":[{"entityId":"office-lead","role":"actor"}],"params":{"text":"开始读取","durationMs":2000}}},
+  "chatEvents": [
+    {
+      "type": "snapshot",
+      "text": "",
+      "state": "pending",
+      "message": ""
+    },
+    {
+      "type": "status",
+      "phase": "thinking"
+    },
+    {
+      "type": "status",
+      "phase": "streaming"
+    },
+    {
+      "type": "delta",
+      "text": "已读取结果。"
+    },
+    {
+      "type": "done"
+    }
+  ],
+  "chatError": {
+    "type": "error",
+    "message": "Run interrupted"
+  },
+  "snapshot": {
+    "schemaVersion": "1.0",
+    "seq": 1,
+    "workspace": {
+      "id": "office-1",
+      "name": "研发办公室"
+    },
+    "conversations": [
+      {
+        "employees": [
+          {
+            "id": "developer",
+            "name": "开发",
+            "sceneActorId": "code-agent",
+            "role": "开发",
+            "online": true
+          }
+        ],
+        "tasks": [
+          {
+            "id": "run-1",
+            "title": "读取文件",
+            "assigneeId": "developer",
+            "status": "running",
+            "progress": -1,
+            "updatedAt": "2026-10-20T01:00:00Z",
+            "summary": "等待执行"
+          }
+        ],
+        "events": [
+          {
+            "id": "event-1",
+            "kind": "task.assigned",
+            "taskId": "run-1",
+            "employeeId": "developer",
+            "fromEmployeeId": "developer",
+            "summary": "分配读取工作",
+            "occurredAt": "2026-10-20T01:00:00Z"
+          }
+        ],
+        "id": "conversation-1",
+        "title": "读取文件"
+      }
+    ]
+  },
+  "decision": {
+    "type": "decision.request",
+    "teamId": "office-1",
+    "timeoutMs": 60000,
+    "decision": {
+      "id": "display-1",
+      "actorId": "office-lead",
+      "kind": "confirmation",
+      "title": "允许本次写入？",
+      "description": "仅针对当前工具输入",
+      "confirmLabel": "允许一次",
+      "rejectLabel": "拒绝"
+    },
+    "conversationId": "conversation-1"
+  },
+  "dialog": {
+    "type": "ui.respond",
+    "interactionId": "interaction-1",
+    "presentation": {
+      "target": "dialog",
+      "content": {
+        "template": "detail-v1",
+        "title": "会话历史",
+        "description": "第 1 页",
+        "fields": [
+          {
+            "label": "消息",
+            "value": "已完成读取"
+          }
+        ],
+        "actions": [
+          {
+            "id": "history:next",
+            "label": "下一页"
+          }
+        ]
+      }
+    }
+  },
+  "uiAction": {
+    "id": "interaction-1",
+    "teamId": "office-1",
+    "action": "actor.inspect",
+    "actorId": "office-lead",
+    "conversationId": "conversation-1"
+  },
+  "sceneCommand": {
+    "teamId": "office-1",
+    "command": {
+      "protocolVersion": "2.0",
+      "sceneId": "office-1",
+      "commandId": "scene-1",
+      "type": "activity.start",
+      "capability": "scene.say",
+      "participants": [
+        {
+          "entityId": "office-lead",
+          "role": "actor"
+        }
+      ],
+      "params": {
+        "text": "开始读取",
+        "durationMs": 2000
+      }
+    },
+    "conversationId": "conversation-1"
+  },
   "responses": {
-    "applied":{"code":200,"msg":"OK","data":{"teamId":"office-1","seq":1,"status":"applied"}},
-    "cached":{"code":202,"msg":"Cached","data":{"teamId":"office-1","seq":1,"status":"cached"}},
-    "ignored":{"code":200,"msg":"Ignored","data":{"teamId":"office-1","seq":1,"status":"ignored","reasonCode":"STALE_SEQ"}},
-    "emptyUi":{"code":200,"msg":"OK","data":{"actions":[]}},
-    "decision":{"code":200,"msg":"OK","data":{"teamId":"office-1","decisionId":"display-1","choiceId":"confirm","label":"允许一次"}},
-    "conflict":{"code":409,"msg":"Snapshot conflict","data":{"reasonCode":"SEQ_CONFLICT","details":{},"issues":[]}},
-    "expired":{"code":410,"msg":"Expired","data":{"reasonCode":"UI_REQUEST_EXPIRED","details":{},"issues":[]}}
+    "applied": {
+      "code": 200,
+      "msg": "OK",
+      "data": {
+        "teamId": "office-1",
+        "seq": 1,
+        "status": "applied"
+      }
+    },
+    "cached": {
+      "code": 202,
+      "msg": "Cached",
+      "data": {
+        "teamId": "office-1",
+        "seq": 1,
+        "status": "cached"
+      }
+    },
+    "ignored": {
+      "code": 200,
+      "msg": "Ignored",
+      "data": {
+        "teamId": "office-1",
+        "seq": 1,
+        "status": "ignored",
+        "reasonCode": "STALE_SEQ"
+      }
+    },
+    "emptyUi": {
+      "code": 200,
+      "msg": "OK",
+      "data": {
+        "actions": []
+      }
+    },
+    "decision": {
+      "code": 200,
+      "msg": "OK",
+      "data": {
+        "teamId": "office-1",
+        "decisionId": "display-1",
+        "choiceId": "confirm",
+        "label": "允许一次",
+        "conversationId": "conversation-1"
+      }
+    },
+    "conflict": {
+      "code": 409,
+      "msg": "Snapshot conflict",
+      "data": {
+        "reasonCode": "SEQ_CONFLICT",
+        "details": {},
+        "issues": []
+      }
+    },
+    "expired": {
+      "code": 410,
+      "msg": "Expired",
+      "data": {
+        "reasonCode": "UI_REQUEST_EXPIRED",
+        "details": {},
+        "issues": []
+      }
+    }
+  },
+  "historyRequest": {
+    "version": "1.0",
+    "type": "history",
+    "teamId": "office-1",
+    "conversationId": "conversation-1",
+    "cursor": "",
+    "limit": 20
+  },
+  "resumeRequest": {
+    "version": "1.0",
+    "type": "resume",
+    "teamId": "office-1",
+    "conversationId": "conversation-1",
+    "turnId": "turn-1"
+  },
+  "cancelRequest": {
+    "version": "1.0",
+    "type": "cancel",
+    "teamId": "office-1",
+    "conversationId": "conversation-1",
+    "turnId": "turn-1"
+  },
+  "historyPage": {
+    "turns": [
+      {
+        "id": "turn-1",
+        "user": "读取文件",
+        "assistant": "已读取结果。",
+        "state": "complete",
+        "error": ""
+      }
+    ],
+    "nextCursor": "",
+    "hasMore": false,
+    "activeTurnId": ""
   }
 }

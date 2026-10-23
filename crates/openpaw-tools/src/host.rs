@@ -191,6 +191,12 @@ impl ToolExecutor for ToolRegistry {
             context.execution_started(name, &args).await?;
         }
         match name {
+            "web_fetch" => {
+                web_fetch::run_cancellable(&self.workspace, args, context.cancel()).await
+            }
+            "web_search" => {
+                web_search::run_cancellable(&self.workspace, args, context.cancel()).await
+            }
             "bash" => {
                 bash::run_with_context(
                     &self.workspace,

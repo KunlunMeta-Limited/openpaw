@@ -1,0 +1,550 @@
+// Product acceptance only: real Host + frozen Office + independent Chromium.
+// The local OpenAI fixture is a deterministic Provider, never a chat bridge.
+import assert from 'node:assert/strict'
+import { createHash, randomBytes } from 'node:crypto'
+import { spawn, execFileSync } from 'node:child_process'
+import { createServer } from 'node:http'
+import { createServer as tcpServer } from 'node:net'
+import { mkdir, readFile, writeFile, access, readdir, realpath } from 'node:fs/promises'
+import { dirname, join, resolve, relative, delimiter } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { tmpdir } from 'node:os'
+import { once } from 'node:events'
+import { officeRequestSchema, officeResultSchema, officeSnapshotSchema } from './upstream-office/packages/protocol/src/office-integration.ts'
+import { chatEventSchema, chatOperationSchema, chatHistoryPageSchema, chatCancelResultSchema } from './upstream-office/packages/protocol/src/chat.ts'
+import { assertProtocolValue, responseEnvelopeSchema } from './upstream-office/packages/protocol/src/schema.ts'
+
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+const manifest = JSON.parse(await readFile(join(root, 'docs/engine-host/contracts/sources.json'), 'utf8'))
+const source = process.env.OPENPAW_OFFICE_SOURCE
+if (!source) throw new Error('OPENPAW_OFFICE_SOURCE must name the read-only Office checkout')
+const output = process.env.OPENPAW_OFFICE_PRODUCT_OUTPUT
+  ? resolve(process.env.OPENPAW_OFFICE_PRODUCT_OUTPUT)
+  : join(tmpdir(), 'openpaw-office-product-' + Date.now() + '-' + randomBytes(3).toString('hex'))
+if (!relative(root, output).startsWith('..')) throw new Error('Evidence must be outside the repository')
+await mkdir(output, { recursive: false })
+const report = { startedAt: new Date().toISOString(), platform: process.platform, commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim(), officeCommit: manifest.office.commit,
+  sourceDirty: Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: root }).toString().trim()),
+  provider: 'deterministic OpenAI protocol fixture; actual AgentLoop and tools', commands: [], browserRequests: [], browserErrors: [], modelRequests: [], messages: [], assertions: [], result: 'running' }
+const processes = []
+let browser, context, providerServer, page, webFixtureServer, webBase
+const webFixture = { requests: [], active: 0, cancelled: 0 }
+const delay = ms => new Promise(r => setTimeout(r, ms))
+async function waitFor(fn, timeout = 30000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) { const value = await fn(); if (value) return value; await delay(100) }
+  throw new Error('Condition was not met before timeout')
+}
+function start(command, args, cwd, env, label) {
+  const log = { label, command, args, cwd, startedAt: new Date().toISOString() }
+  report.commands.push(log)
+  const p = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  let stdout = '', stderr = ''
+  p.stdout.on('data', b => { stdout += b.toString() })
+  p.stderr.on('data', b => { stderr += b.toString() })
+  p.on('error', e => { log.error = e.message })
+  p.on('exit', (code, signal) => { log.exitCode = code; log.signal = signal })
+  const close = once(p, 'close')
+  const item = { p, label, close, stdout: () => stdout, save: async () => { await writeFile(join(output, label + '.stdout.log'), stdout); await writeFile(join(output, label + '.stderr.log'), stderr) } }
+  processes.push(item)
+  return item
+}
+async function run(command, args, cwd, env, label) {
+  const item = start(command, args, cwd, env, label)
+  // Bound installation/build waits and retain a real failed exit rather than hanging the suite.
+  const timer = setTimeout(() => item.p.kill('SIGKILL'), 300000)
+  try { await item.close } finally { clearTimeout(timer); await item.save() }
+  if (item.p.exitCode !== 0) throw new Error(label + ' failed; see its log')
+}
+async function npmCli() {
+  const pathNpm = []
+  for (const directory of (process.env.PATH ?? '').split(delimiter)) { try { const file = await realpath(join(directory, 'npm')); if (file.endsWith('.js')) pathNpm.push(file) } catch { /* Windows uses npm-cli.js layout below */ } }
+  const candidates = [process.env.OPENPAW_NPM_CLI, process.env.npm_execpath, ...pathNpm,
+    join(dirname(process.execPath), 'node_modules/npm/bin/npm-cli.js'),
+    join(dirname(process.execPath), '../lib/node_modules/npm/bin/npm-cli.js'),
+    '/usr/share/nodejs/npm/bin/npm-cli.js'].filter(Boolean)
+  for (const candidate of candidates) { try { await access(candidate); return resolve(candidate) } catch { /* try next platform layout */ } }
+  throw new Error('Set OPENPAW_NPM_CLI to the installed npm-cli.js (no shell shim required)')
+}
+async function freePort() { const s = tcpServer(); s.listen(0, '127.0.0.1'); await once(s, 'listening'); const p = s.address().port; await new Promise(r => s.close(r)); return p }
+const childEnv = { ...process.env, OPENPAW_HOME: join(output, 'model-home'), OPENAI_API_KEY: 'deterministic-provider-key', PAWOFFICE_API_KEY: 'deterministic-office-key' }
+async function officePost(base, request) {
+  assertProtocolValue(request); officeRequestSchema.parse(request)
+  assert.ok(Buffer.byteLength(JSON.stringify(request)) <= 65536)
+  const r = await fetch(base + '/api/pawoffice/messages', { method: 'POST', headers: { 'content-type': 'application/json', Authorization: 'Bearer deterministic-office-key' }, body: JSON.stringify(request), signal: AbortSignal.timeout(20000) })
+  const data = await r.json(); assertProtocolValue(data); responseEnvelopeSchema.parse(data); assert.equal(data.code, r.status)
+  if (r.ok) officeResultSchema(request.type, Boolean(request.teamId)).parse(data.data)
+  report.messages.push({ at: new Date().toISOString(), request, http: r.status, response: data })
+  return data
+}
+function provider() {
+  return createServer(async (req, res) => {
+    try {
+      let body = ''; for await (const b of req) { body += b; if (body.length > 4 * 1024 * 1024) throw new Error('fixture input too large') }
+      const data = JSON.parse(body)
+      assert.equal(req.url, '/v1/chat/completions'); assert.equal(data.model, 'office-product-fixture')
+      assert.equal(req.headers.authorization, 'Bearer deterministic-provider-key')
+      report.modelRequests.push({ at: new Date().toISOString(), path: req.url, model: data.model, messages: data.messages, tools: data.tools.map(t => t.function.name), authorizationMatched: true })
+      const lastUser = data.messages.findLastIndex(m => m.role === 'user')
+      const prompt = data.messages[lastUser]?.content ?? ''
+      const results = data.messages.slice(lastUser + 1).filter(m => m.role === 'tool')
+      if (prompt==='今天是几号') {
+        assert.equal(data.messages[lastUser-1]?.role,'system')
+        const current=data.messages[lastUser-1].content.match(/Host local time: ([^\n]+)/)?.[1]
+        assert.ok(current&&!Number.isNaN(Date.parse(current)))
+        finish({content:'HOST-DATE: '+current});return
+      }
+      if (prompt==='旧能力会话'||(prompt==='长沙天气'&&!data.tools.some(t=>t.function.name==='web_fetch'))) {
+        assert.ok(!data.tools.some(t=>['web_search','web_fetch'].includes(t.function.name)))
+        assert.equal(data.messages[lastUser-1]?.role,'system')
+        assert.ok(data.messages[lastUser-1].content.includes('本轮未启用联网工具'))
+        finish({content:'这一轮我没有联网工具，也没有系统时钟。'});return
+      }
+      const legacyFollowUp=prompt==='长沙天气'&&data.messages.some(m=>m.role==='assistant'&&m.content?.includes('这一轮我没有联网工具'))
+      if (prompt.includes('WEB-')||legacyFollowUp) {
+        assert.ok(data.tools.some(t=>t.function.name==='web_search'));assert.ok(data.tools.some(t=>t.function.name==='web_fetch'))
+        assert.ok(data.messages.some(m=>m.role==='system'&&m.content.includes('Current UTC time:')&&m.content.includes('fresh=true')))
+        if(legacyFollowUp){
+          // Check actual original Provider wire, not just the leading system or echoed answer.
+          assert.equal(data.messages[lastUser-1]?.role,'system')
+          assert.ok(data.messages[lastUser-1].content.includes('历史回复不代表本轮能力')&&data.messages[lastUser-1].content.includes('本轮已启用联网工具'))
+          assert.equal(data.messages.filter(m=>m.role==='system').length,2)
+        }
+        if (!results.length) {
+          finish({content:'正在读取真实HTTP页面。',tool_calls:[{index:0,id:'actual-web-fetch',type:'function',function:{name:'web_fetch',arguments:JSON.stringify({url:webBase+(prompt.includes('WEB-SLOW')?'/slow':'/fresh'),fresh:true})}}]},'tool_calls');return
+        }
+        assert.ok(results[0].content.includes('WEB-HTTP-MARKER'))
+        finish({content:'# 网页读取结果\n\n'+results[0].content});return
+      }
+      if (prompt.includes('MODEL-ERROR')) { res.writeHead(401); res.end('controlled authentication failure'); return }
+      if (prompt.includes('慢任务')) {
+        const timer = setTimeout(() => { if (!res.destroyed) finish({ content: '慢任务完成' }) }, 60000)
+        res.once('close', () => clearTimeout(timer)); return
+      }
+      if (prompt.includes('读取') && results.length === 0) {
+        finish({ content: '我先读取这两个文件。', tool_calls: ['README.md', 'notes.txt'].map((path, i) => ({ index: i, id: 'real-read-' + i, type: 'function', function: { name: 'read_file', arguments: JSON.stringify({ path }) } })) }, 'tool_calls'); return
+      }
+      let text = '网页协议对话正常。已处理：' + prompt
+      if (results.length) text = '# 文件读取结果\n\n| 文件 | 结果 |\n| --- | --- |\n' + results.map((m,i) => '| '+['README.md','notes.txt'][i]+' | '+m.content.replaceAll('\n',' ').replaceAll('|','\\|')+' |').join('\n') + '\n\n```text\n'+results.map(m=>m.content).join('\n')+'\n```'
+      if (prompt.includes('追问')) text = '已保留历史：' + data.messages.filter(m => m.role === 'tool').map(m => m.content).join('\n')
+      finish({ content: text })
+      function finish(delta, reason = 'stop') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] }) + '\n\n')
+        res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: reason }], usage: { prompt_tokens: 100, completion_tokens: 30 } }) + '\n\n')
+        res.end('data: [DONE]\n\n')
+      }
+    } catch (e) { report.modelError = e.stack; res.writeHead(500); res.end('fixture failure') }
+  })
+}
+try {
+  const office = join(output, 'office')
+  await run('git', ['clone', '--no-hardlinks', '--no-checkout', '--', resolve(source), office], root, childEnv, 'office-clone')
+  await run('git', ['checkout', '--detach', manifest.office.commit], office, childEnv, 'office-checkout')
+  for (const item of manifest.office.files) {
+    const bytes = await readFile(join(office, item.path)); assert.equal(createHash('sha256').update(bytes).digest('hex'), item.sha256)
+  }
+  const npm = await npmCli()
+  await run(process.execPath, [npm, 'ci', '--prefer-offline', '--ignore-scripts', '--no-audit', '--no-fund'], office, childEnv, 'office-install')
+  const officePort = await freePort(); const officeBase = 'http://127.0.0.1:' + officePort
+  // 仅隔离产品子进程放行受控环回网页；真实演示绝不设置该门控。
+  childEnv.OPENPAW_WEB_TEST_ALLOW_LOOPBACK = '1'
+  webFixtureServer = createServer((req,res)=>{
+    webFixture.requests.push({url:req.url,at:new Date().toISOString()})
+    if(req.url==='/slow'){
+      webFixture.active++;res.writeHead(200,{'content-type':'text/html'});res.write('<h1>waiting for body</h1>')
+      res.once('close',()=>{webFixture.active--;webFixture.cancelled++})
+    }else{res.writeHead(200,{'content-type':'text/html'});res.end('<h1>WEB-HTTP-MARKER</h1><p>Deterministic HTTP page, not live weather.</p>')}
+  })
+  webFixtureServer.listen(0,'127.0.0.1');await once(webFixtureServer,'listening');webBase='http://127.0.0.1:'+webFixtureServer.address().port
+  providerServer = provider(); providerServer.listen(0, '127.0.0.1'); await once(providerServer, 'listening')
+  const modelBase = 'http://127.0.0.1:' + providerServer.address().port + '/v1'
+  const workspace = join(output, 'workspace 中文'); await mkdir(workspace); await mkdir(childEnv.OPENPAW_HOME)
+  const markerA = 'README-' + randomBytes(6).toString('hex'), markerB = 'NOTES-' + randomBytes(6).toString('hex')
+  await writeFile(join(workspace, 'README.md'), markerA); await writeFile(join(workspace, 'notes.txt'), markerB)
+  const config = join(output, 'host.toml')
+  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch"]\n[roots]\nproject = ${JSON.stringify(workspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
+  if (!process.env.OPENPAW_HOST_BINARY) await run('cargo', ['build', '--locked', '-p', 'openpaw-cli', '--features', 'engine-host,sidecar'], root, childEnv, 'host-build')
+  const binary = process.env.OPENPAW_HOST_BINARY ?? join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', process.platform === 'win32' ? 'openpaw.exe' : 'openpaw')
+  let host = start(resolve(binary), ['engine-host', '--config', config, '--port', '0'], root, childEnv, 'host')
+  const hostBase = await waitFor(() => host.stdout().match(/openpaw engine host listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1])
+  report.hostBinarySha256 = createHash('sha256').update(await readFile(resolve(binary))).digest('hex')
+  const buildEnv = { ...childEnv } // chat.url由Host运行时注册，不再注入VITE配置
+  await run(process.execPath, [npm, 'run', 'build:full'], office, buildEnv, 'office-build')
+  let officeProcess = start(process.execPath, ['server/dist/index.js'], office, { ...childEnv, PORT: String(officePort), HOST: '127.0.0.1', PAWOFFICE_PUBLIC_ORIGIN: officeBase }, 'office-server')
+  await waitFor(async () => { try { return (await fetch(officeBase + '/office/')).ok } catch { return false } })
+  const { chromium } = await import(pathToFileURL(join(office, 'node_modules/playwright-core/index.mjs')))
+  browser = await chromium.launch({ headless: true, ...(process.env.OPENPAW_CHROMIUM ? { executablePath: process.env.OPENPAW_CHROMIUM } : {}), args: ['--use-angle=swiftshader', '--enable-webgl', '--enable-unsafe-swiftshader'] })
+  context = await browser.newContext({ viewport: { width: 1440, height: 1050 }, locale: 'zh-CN', permissions: ['clipboard-read', 'clipboard-write'], recordVideo: { dir: join(output, 'video') } })
+  await context.tracing.start({ screenshots: true, snapshots: true, sources: false })
+  page = await context.newPage()
+  // Passive CDP capture survives HttpChatSource reader.cancel() after done.
+  // Cloning/teeing fetch would keep a connection alive and invalidate cancellation testing.
+  const allStreams = [], captureJobs = []
+  async function observe(p, ctx) {
+    const cdp = await ctx.newCDPSession(p)
+    await cdp.send('Network.enable')
+    const streams = new Map()
+    p.on('pageerror', e => report.browserErrors.push(e.message))
+    p.on('response', async response => {
+    if(response.url()!==officeBase+'/api/pawoffice/chat') return
+    const request=response.request().postDataJSON()
+    if(!['history','cancel'].includes(request.type))return
+    const item=report.browserRequests.findLast(r=>JSON.stringify(r.request)===JSON.stringify(request))
+    if(!item)return
+    try {item.http=response.status();item.json=await response.json();responseEnvelopeSchema.parse(item.json);assertProtocolValue(item.json)
+      if(response.ok())(request.type==='history'?chatHistoryPageSchema:chatCancelResultSchema).parse(item.json.data)
+    }catch(e){report.browserErrors.push(String(e))}
+    })
+    cdp.on('Network.requestWillBeSent', event => {
+    if (event.request.url === officeBase + '/api/pawoffice/chat' && event.request.method === 'POST') {
+      const item = { at: new Date().toISOString(), url: event.request.url, method: 'POST', request: JSON.parse(event.request.postData) }
+      chatOperationSchema.parse(item.request)
+      report.browserRequests.push(item)
+      if (['send','resume'].includes(item.request.type)) { const stream = { item, chunks: [] }; streams.set(event.requestId, stream); allStreams.push(stream) }
+    }
+    })
+    cdp.on('Network.responseReceived', event => {
+    const stream = streams.get(event.requestId)
+    if (!stream) return
+    stream.item.http = event.response.status
+    captureJobs.push(cdp.send('Network.streamResourceContent', { requestId: event.requestId }).then(result => {
+      if (result.bufferedData) stream.chunks.unshift(Buffer.from(result.bufferedData, 'base64'))
+    }).catch(async error => {
+      // Small terminal/error responses can finish before streaming capture attaches.
+      // CDP reads the completed resource without cloning fetch or prolonging its lifetime.
+      try { const body=await cdp.send('Network.getResponseBody',{requestId:event.requestId});stream.chunks=[Buffer.from(body.body,body.base64Encoded?'base64':'utf8')] }
+      catch(fallback){stream.item.captureError=String(error)+'; completed resource: '+String(fallback)}
+    }))
+    })
+    cdp.on('Network.dataReceived', event => { const stream = streams.get(event.requestId); if (stream && event.data) stream.chunks.push(Buffer.from(event.data, 'base64')) })
+  }
+  await observe(page, context)
+  function capturedEvents() {
+    for (const { item, chunks } of allStreams) {
+      item.body = Buffer.concat(chunks).toString('utf8')
+      assert.ok(!item.captureError, item.captureError)
+      assert.ok(['office-1','office-2'].includes(item.request.teamId), 'browser journey must use an allowed office')
+      if(item.http!==200){item.errorEnvelope=JSON.parse(item.body);responseEnvelopeSchema.parse(item.errorEnvelope);assertProtocolValue(item.errorEnvelope);continue}
+      item.events = item.body.split('\n').filter(Boolean).map(line => { assert.ok(line.length <= 350000); const event = JSON.parse(line); chatEventSchema.parse(event); assertProtocolValue(event); return event })
+    }
+  }
+  const input = page.getByRole('textbox', { name: '给办公室发送消息' })
+  const log = page.getByRole('log', {name:'对话内容'})
+  async function chooseOffice(p=page){
+    await p.getByText(/正在加载办公室/).waitFor({state:'hidden',timeout:60000})
+    await p.getByRole('button',{name:/^团队空间，当前团队/}).click()
+    await p.getByRole('button',{name:'进入真实运行验收',exact:true}).click()
+    await p.getByRole('dialog').waitFor({state:'hidden'})
+  }
+  async function newConversation(){
+    await page.getByRole('button',{name:'新会话',exact:true}).first().click()
+    await input.waitFor();await waitFor(()=>input.isEnabled())
+  }
+  async function send(text,expected){
+    await waitFor(async()=>{if(!await input.isEnabled())return false;await input.fill(text);return await page.getByRole('button',{name:'发送消息',exact:true}).isEnabled()})
+    await page.getByRole('button',{name:'发送消息',exact:true}).click()
+    if(expected){await waitFor(async()=>(await log.innerText()).includes(expected),45000);await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000})}
+  }
+  const readOffice=()=>officePost(officeBase,{type:'office.read',teamId:'office-1'})
+  const conv=(result,id)=>result.data.snapshot.conversations.find(c=>c.id===id)
+  const latestSend=()=>report.browserRequests.findLast(r=>r.request.type==='send')
+  const terminal=e=>e.type==='done'||e.type==='snapshot'&&e.state==='complete'
+  await page.goto(officeBase + '/office/', { waitUntil: 'domcontentloaded' })
+  await chooseOffice()
+  await newConversation()
+  await page.screenshot({path:join(output,'01-connected.png'),fullPage:true})
+  await send('A读取README.md和notes.txt并总结',markerA)
+  const aRequest=structuredClone(latestSend().request), a=aRequest.conversationId
+  const transcript=await log.innerText();assert.ok(transcript.includes(markerB))
+  await log.getByRole('heading',{name:'文件读取结果',exact:true}).waitFor()
+  assert.equal(await log.locator('table').count(),1)
+  assert.ok((await log.locator('pre code').innerText()).includes(markerA))
+  await log.getByRole('button',{name:'复制回复',exact:true}).last().click()
+  await log.getByRole('button',{name:'已复制',exact:true}).waitFor()
+  report.clipboard=await page.evaluate(()=>navigator.clipboard.readText())
+  assert.ok(report.clipboard.startsWith('我先读取这两个文件。\n\n# 文件读取结果'))
+  const state=await waitFor(async()=>{const r=await readOffice();return r.code===200&&conv(r,a)?.tasks.filter(t=>t.id.startsWith('tool:')).length===2?r:false})
+  const current=conv(state,a)
+  assert.ok(current.tasks.filter(t=>t.title.includes('read_file')).every(t=>t.status==='completed'))
+  assert.ok(current.events.some(e=>e.kind==='task.assigned'));assert.ok(current.whiteboard.steps.length<=3)
+  report.correlations={conversationA:a,firstTurn:aRequest.turnId,toolTasks:current.tasks.filter(t=>t.id.startsWith('tool:')).map(t=>t.id),runTask:current.tasks[0].id}
+  await page.screenshot({path:join(output,'02-real-tools.png'),fullPage:true})
+  const downloadPromise=page.waitForEvent('download')
+  await page.getByRole('button',{name:'导出快照',exact:true}).click()
+  const download=await downloadPromise;await download.saveAs(join(output,'02-scene-export.json'))
+  // Same real request twice: original Run, terminal snapshot and no new model/tool request.
+  const modelCount=report.modelRequests.length
+  const replay=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(aRequest)})
+  assert.equal(replay.status,200)
+  const replayEvents=(await replay.text()).trim().split('\n').map(JSON.parse)
+  for(const e of replayEvents)chatEventSchema.parse(e)
+  assert.equal(replayEvents[0].type,'snapshot');assert.equal(replayEvents[0].state,'complete')
+  assert.equal(report.modelRequests.length,modelCount)
+  assert.equal(replayEvents[0].text,report.clipboard)
+  const changed=structuredClone(aRequest);changed.messages.at(-1).content='同turn不同内容'
+  const conflictTurn=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(changed)})
+  assert.equal(conflictTurn.status,200)
+  const conflictEvents=(await conflictTurn.text()).trim().split('\n').map(JSON.parse)
+  assert.deepEqual(conflictEvents,[{type:'error',message:'本轮标识已用于其他内容，请重新同步会话后重试'}])
+  assert.equal(report.modelRequests.length,modelCount)
+  report.idempotency={request:aRequest,replayEvents,conflictHttp:conflictTurn.status,conflictEvents,modelCountBefore:modelCount,modelCountAfter:report.modelRequests.length}
+  await send('追问：刚才两个文件分别包含什么？','已保留历史')
+  await send('慢任务A：保持后台运行')
+  const active=structuredClone(latestSend().request)
+  await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.status==='running')})
+  await newConversation()
+  await send('B会话你好','网页协议对话正常')
+  const b=latestSend().request.conversationId
+  assert.notEqual(a,b);assert.ok(!(await log.innerText()).includes(markerA))
+  const both=await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.status==='running')&&conv(r,b)?.tasks.some(t=>t.status==='completed')?r:false})
+  report.correlations.conversationB=b
+  await page.screenshot({path:join(output,'03-B-independent-A-running.png'),fullPage:true})
+  await page.getByRole('tab',{name:/A读取README/}).click()
+  await waitFor(async()=>(await log.innerText()).includes(markerA))
+  await page.screenshot({path:join(output,'04-A-working-before-refresh.png'),fullPage:true})
+  const runsBeforeRefresh=report.modelRequests.filter(r=>r.messages.some(m=>m.role==='user'&&m.content==='慢任务A：保持后台运行')).length
+  await page.reload({waitUntil:'domcontentloaded'})
+  await chooseOffice()
+  await input.waitFor({timeout:60000})
+  await waitFor(()=>report.browserRequests.some(r=>r.request.type==='resume'&&r.request.turnId===active.turnId),45000)
+  assert.equal(report.modelRequests.filter(r=>r.messages.some(m=>m.role==='user'&&m.content==='慢任务A：保持后台运行')).length,runsBeforeRefresh)
+  if(await page.getByRole('button',{name:'展开对话',exact:true}).isVisible())await page.getByRole('button',{name:'展开对话',exact:true}).click()
+  await page.getByRole('tab',{name:/A读取README/}).click()
+  await page.screenshot({path:join(output,'05-refresh-resume-same-run.png'),fullPage:true})
+  await page.getByRole('button',{name:'停止生成',exact:true}).click()
+  await waitFor(async()=>(await log.innerText()).includes('已停止生成'))
+  await waitFor(()=>report.browserRequests.some(r=>r.request.type==='cancel'&&r.request.turnId===active.turnId&&r.json?.data?.stopped===true))
+  await waitFor(async()=>{const r=await readOffice();return conv(r,a)?.tasks.some(t=>t.summary.includes('用户取消，清理已完成'))})
+  await page.screenshot({path:join(output,'06-explicit-cancel-confirmed.png'),fullPage:true})
+  // Fresh browser storage discovers the exact conversation IDs from the live catalogue.
+  const secondContext=await browser.newContext({viewport:{width:1440,height:1050},locale:'zh-CN'})
+  const second=await secondContext.newPage();await second.goto(officeBase+'/office/',{waitUntil:'domcontentloaded'});await chooseOffice(second)
+  await second.getByRole('button',{name:'展开对话',exact:true}).click()
+  await second.getByRole('tab',{name:/B会话你好/}).click()
+  await waitFor(async()=>(await second.getByRole('log',{name:'对话内容'}).innerText()).includes('网页协议对话正常'))
+  await second.screenshot({path:join(output,'07-new-browser-discovers-conversations.png'),fullPage:true});await secondContext.close()
+  async function control(request){
+    chatOperationSchema.parse(request)
+    const r=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)})
+    assert.equal(r.status,200);const json=await r.json();responseEnvelopeSchema.parse(json);assertProtocolValue(json);return json.data
+  }
+  const identity={version:'1.0',teamId:'office-1',conversationId:a}
+  const latestPage=await control({...identity,type:'history',limit:1});chatHistoryPageSchema.parse(latestPage);assert.equal(latestPage.turns[0].id,active.turnId);assert.equal(latestPage.turns[0].state,'stopped');assert.ok(latestPage.hasMore)
+  const olderPage=await control({...identity,type:'history',limit:1,cursor:latestPage.nextCursor});chatHistoryPageSchema.parse(olderPage);assert.notEqual(olderPage.turns[0].id,active.turnId)
+  report.historyPages=[latestPage,olderPage]
+  const originalHistory=await control({...identity,type:'history'})
+  assert.equal(originalHistory.turns.find(t=>t.id===aRequest.turnId).assistant,report.clipboard)
+  // T4.2: extend the same frozen-Office journey, never patch application responses.
+  const box=p=>p.getByRole('textbox',{name:'给办公室发送消息'})
+  const transcriptOf=p=>p.getByRole('log',{name:'对话内容'})
+  async function expand(p){const b=p.getByRole('button',{name:'展开对话',exact:true});if(await b.isVisible())await b.click()}
+  async function select(p,title){await expand(p);await p.getByRole('tab',{name:title,exact:true}).click();await waitFor(()=>box(p).isEnabled())}
+  async function fresh(p){await p.getByRole('button',{name:'新会话',exact:true}).first().click();await expand(p);await waitFor(()=>box(p).isEnabled())}
+  async function uiSend(p,text){await waitFor(async()=>{if(!await box(p).isEnabled())return false;await box(p).fill(text);return p.getByRole('button',{name:'发送消息',exact:true}).isEnabled()});await p.getByRole('button',{name:'发送消息',exact:true}).click();await waitFor(async()=>(await transcriptOf(p).innerText()).includes('已处理：'+text),45000);await p.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});return structuredClone(latestSend().request)}
+  async function archived(p){return p.evaluate(async()=>{const db=await new Promise((resolve,reject)=>{const r=indexedDB.open('pawoffice-chat',2);r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error)});return new Promise((resolve,reject)=>{const tx=db.transaction(['conversations','chat-pages'],'readonly'),a=tx.objectStore('conversations').getAll(),b=tx.objectStore('chat-pages').getAll();tx.oncomplete=()=>{db.close();resolve({directories:a.result,pages:b.result})};tx.onerror=()=>reject(tx.error)})})}
+  async function switchOffice(p,name){const c=p.getByRole('button',{name:'收起聊天',exact:true});if(await c.isVisible())await c.click();await p.getByRole('button',{name:/^团队空间，当前团队/}).click();await p.getByRole('button',{name:'进入'+name,exact:true}).click();await p.getByRole('dialog').waitFor({state:'hidden'})}
+  let restart=0
+  async function stopHost(){host.p.kill('SIGTERM');await host.close}
+  async function startHost(){host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-ui-restart-'+restart++);await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))}
+  await fresh(page)
+  const modelBeforeDraft=report.modelRequests.length
+  await box(page).fill('未发送草稿不建Run')
+  assert.equal(report.modelRequests.length,modelBeforeDraft)
+  const uiInitial=await uiSend(page,'UI-分页与草稿A')
+  const uiA=uiInitial.conversationId
+  await fresh(page);await uiSend(page,'UI-草稿B');await box(page).fill('B-DRAFT')
+  await select(page,'UI-分页与草稿A');await box(page).fill('A-DRAFT')
+  await select(page,'UI-草稿B');assert.equal(await box(page).inputValue(),'B-DRAFT')
+  await page.getByRole('button',{name:/^切换会话：/}).click()
+  await page.getByRole('textbox',{name:'搜索会话'}).fill('UI-分页')
+  const search=page.getByRole('dialog',{name:'全部会话',exact:true})
+  assert.equal(await search.locator('.office-conversation-select').count(),1)
+  await page.screenshot({path:join(output,'08-search.png'),fullPage:true})
+  await search.getByRole('button',{name:'UI-分页与草稿A',exact:true}).click()
+  assert.equal(await box(page).inputValue(),'A-DRAFT')
+  await page.getByRole('tab',{name:'UI-分页与草稿A',exact:true}).press('End');assert.equal(await box(page).inputValue(),'B-DRAFT')
+  await page.getByRole('tab',{name:'UI-草稿B',exact:true}).press('Home');assert.notEqual(await box(page).inputValue(),'B-DRAFT')
+  await select(page,'UI-分页与草稿A');await page.getByRole('tab',{name:'UI-分页与草稿A',exact:true}).press('ArrowRight');assert.equal(await box(page).inputValue(),'B-DRAFT')
+  await page.getByRole('tab',{name:'UI-草稿B',exact:true}).press('ArrowLeft');assert.equal(await box(page).inputValue(),'A-DRAFT')
+  await switchOffice(page,'独立办公室');await fresh(page);await uiSend(page,'UI-办公室C');await box(page).fill('C-DRAFT')
+  await waitFor(async()=>JSON.stringify(await archived(page)).includes('C-DRAFT'))
+  await switchOffice(page,'真实运行验收');await select(page,'UI-分页与草稿A');assert.equal(await box(page).inputValue(),'A-DRAFT')
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,'UI-分页与草稿A');assert.equal(await box(page).inputValue(),'A-DRAFT')
+  await select(page,'UI-草稿B');assert.equal(await box(page).inputValue(),'B-DRAFT')
+  await switchOffice(page,'独立办公室');await expand(page);await select(page,'UI-办公室C');assert.equal(await box(page).inputValue(),'C-DRAFT')
+  await page.screenshot({path:join(output,'09-drafts-refresh.png'),fullPage:true})
+  await switchOffice(page,'真实运行验收');await select(page,'UI-分页与草稿A')
+  for(let i=1;i<=24;i++)await uiSend(page,'UI-PAGE-'+String(i).padStart(2,'0'))
+  await waitFor(async()=>JSON.stringify(await archived(page)).includes('UI-PAGE-24'))
+  // Independent browser storage tests real server pages (20+5), not a cleared user archive.
+  const pagingContext=await browser.newContext({viewport:{width:1440,height:1050},locale:'zh-CN',recordVideo:{dir:join(output,'video')}})
+  await pagingContext.tracing.start({screenshots:true,snapshots:true,sources:false})
+  try {
+    const p=await pagingContext.newPage();await observe(p,pagingContext)
+    await p.goto(officeBase+'/office/',{waitUntil:'domcontentloaded'});await chooseOffice(p);await select(p,'UI-分页与草稿A')
+    await waitFor(()=>report.browserRequests.some(r=>r.request.type==='history'&&r.request.conversationId===uiA&&r.json?.data?.hasMore))
+    await stopHost();await transcriptOf(p).evaluate(el=>el.scrollTop=0)
+    await p.getByRole('button',{name:'加载更早消息',exact:true}).click()
+    await p.locator('.office-chat-history-page [role=alert]').waitFor()
+    await p.screenshot({path:join(output,'10-older-offline.png'),fullPage:true})
+    const failedCursor=report.browserRequests.findLast(r=>r.request.type==='history'&&r.request.cursor).request.cursor
+    await startHost();await p.getByRole('button',{name:'加载更早消息',exact:true}).click()
+    await waitFor(()=>report.browserRequests.some(r=>r.request.type==='history'&&r.request.cursor===failedCursor&&r.json?.data?.turns?.length))
+    await transcriptOf(p).evaluate(el=>el.scrollTop=0);await waitFor(async()=>(await transcriptOf(p).innerText()).includes('UI-分页与草稿A'))
+    const pages=report.browserRequests.filter(r=>r.request.type==='history'&&r.request.conversationId===uiA&&r.http===200&&r.json)
+    const turns=new Map();for(const p of pages)for(const t of p.json.data.turns)turns.set(t.id,t)
+    assert.equal(turns.size,25);assert.equal(new Set([...turns.values()].map(t=>t.user)).size,25)
+    report.uiPagination={conversationId:uiA,turnCount:turns.size,failedCursor,pages};report.drafts=await archived(p)
+    await p.screenshot({path:join(output,'11-older-restored.png'),fullPage:true})
+    // The original browser now holds an old suffix; rejection must be actionable through Office.
+    await uiSend(p,'UI-第二浏览器更新')
+    const beforeReject=report.modelRequests.length
+    await box(page).fill('UI-旧历史提交');await page.getByRole('button',{name:'发送消息',exact:true}).click()
+    await waitFor(async()=>(await transcriptOf(page).innerText()).includes('会话历史已更新，请点击重新同步后重试'))
+    assert.equal(report.modelRequests.length,beforeReject)
+    report.staleHistory=structuredClone(latestSend())
+    await page.screenshot({path:join(output,'12-actionable-history-conflict.png'),fullPage:true})
+    await page.getByRole('button',{name:'重新同步',exact:true}).click()
+    await waitFor(async()=>(await transcriptOf(page).innerText()).includes('已处理：UI-第二浏览器更新'))
+    await uiSend(page,'UI-同步后继续')
+    await page.screenshot({path:join(output,'13-history-resynced.png'),fullPage:true})
+  } finally {await pagingContext.tracing.stop({path:join(output,'trace-pagination.zip')});await pagingContext.close()}
+  await fresh(page);await box(page).fill('MODEL-ERROR-认证失败验收');await page.getByRole('button',{name:'发送消息',exact:true}).click()
+  await waitFor(async()=>(await transcriptOf(page).innerText()).includes('回复未完成'),45000)
+  await page.screenshot({path:join(output,'14-provider-auth-error.png'),fullPage:true})
+  await page.getByRole('button',{name:'重新同步',exact:true}).click();await waitFor(async()=>!await page.getByText('正在同步聊天记录…',{exact:true}).isVisible())
+  await uiSend(page,'UI-模型失败后恢复')
+  await fresh(page);await stopHost();const beforeOffline=report.modelRequests.length
+  await box(page).fill('UI-首次发送连接失败');await page.getByRole('button',{name:'发送消息',exact:true}).click()
+  await waitFor(async()=>(await transcriptOf(page).innerText()).includes('回复未完成'))
+  const offline=structuredClone(latestSend());assert.equal(offline.http,502);assert.equal(report.modelRequests.length,beforeOffline)
+  assert.ok(!(await readOffice()).data.snapshot.conversations.some(c=>c.id===offline.request.conversationId))
+  report.firstSendOffline=offline
+  await page.screenshot({path:join(output,'15-first-send-offline.png'),fullPage:true})
+  await startHost();await page.getByRole('button',{name:'重新同步',exact:true}).click();await waitFor(async()=>!await page.getByText('正在同步聊天记录…',{exact:true}).isVisible());await uiSend(page,'UI-首次失败后恢复')
+  report.assertions.push('Markdown heading/table/code and clipboard equal streamed/replayed history','Real UI search, keyboard selection, per-conversation and per-office drafts survive refresh','25 real UI turns recovered as server pages 20+5; failed older-page retry keeps cursor','Dual browsers: safe in-band history conflict creates no Run; resync then send succeeds','Real provider HTTP401 and Host-offline failures remain visible and recoverable')
+  // O11—O15: original Web tool, real browser, actual HTTP and reliable stop.
+  await fresh(page);await send('WEB-READ','WEB-HTTP-MARKER')
+  const webRequest=structuredClone(latestSend().request)
+  const webState=await waitFor(async()=>{const r=await readOffice();return conv(r,webRequest.conversationId)?.tasks.some(t=>t.title.includes('web_fetch')&&t.status==='completed')?r:false})
+  const webConversation=conv(webState,webRequest.conversationId)
+  assert.ok(webConversation.whiteboard.steps.length>0)
+  // Web currently uses the existing main assistant mapping; cross-role handoff belongs to T5.
+  const webTask=webConversation.tasks.find(t=>t.title.includes('web_fetch')&&t.status==='completed')
+  assert.equal(webTask.assigneeId,'assistant')
+  assert.ok(webConversation.employees.some(e=>e.id==='assistant'&&e.sceneActorId==='office-lead'))
+  assert.ok((await log.innerText()).includes('source_url:'));assert.ok((await log.innerText()).includes('retrieved_at_unix_ms:'))
+  await page.screenshot({path:join(output,'16-real-web-fetch.png'),fullPage:true})
+  await fresh(page);await send('WEB-SLOW')
+  const webSlow=structuredClone(latestSend().request)
+  await waitFor(()=>webFixture.active===1)
+  const beforeWebRefresh=webFixture.requests.length
+  await page.screenshot({path:join(output,'17-web-running.png'),fullPage:true})
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await expand(page)
+  await page.getByRole('tab',{name:'WEB-SLOW',exact:true}).click()
+  await waitFor(()=>report.browserRequests.some(r=>r.request.type==='resume'&&r.request.turnId===webSlow.turnId),45000)
+  assert.equal(webFixture.requests.length,beforeWebRefresh,'refresh must not replay Web request')
+  await fresh(page);await send('网络并行会话','已处理：网络并行会话')
+  assert.equal(webFixture.active,1,'other conversation must complete while Web tool is waiting')
+  await page.getByRole('tab',{name:'WEB-SLOW',exact:true}).click()
+  await page.getByRole('button',{name:'停止生成',exact:true}).click()
+  await waitFor(()=>webFixture.active===0&&webFixture.cancelled===1)
+  await waitFor(()=>report.browserRequests.some(r=>r.request.type==='cancel'&&r.request.turnId===webSlow.turnId&&r.json?.data?.stopped===true))
+  await waitFor(async()=>(await log.innerText()).includes('已停止生成'))
+  const afterWebStop=await waitFor(async()=>{const r=await readOffice();return conv(r,webSlow.conversationId)?.tasks.some(t=>t.summary.includes('用户取消，清理已完成'))?r:false})
+  report.web={request:webRequest,snapshot:webConversation,slow:webSlow,stopped:conv(afterWebStop,webSlow.conversationId),fixture:webFixture}
+  assert.equal(webFixture.requests.length,2)
+  await page.screenshot({path:join(output,'18-web-cancelled-clean.png'),fullPage:true})
+  report.assertions.push('Original web_fetch/fresh HTTP result correlated with browser, Run/call/tasks/whiteboard','Current time and explicitly enabled Web tools reach actual Provider request','Refresh detaches without repeating Web request; another conversation completes during Web wait','Explicit stop closes actual HTTP body wait before confirming cancelled')
+  // D43: update capabilities while keeping the same real browser conversation and ledger.
+  const enabledConfig=await readFile(config,'utf8')
+  assert.ok(enabledConfig.includes(', "web_search", "web_fetch"'))
+  await stopHost();await writeFile(config,enabledConfig.replace(', "web_search", "web_fetch"',''));await startHost()
+  await fresh(page)
+  for(let i=0;i<3;i++)await send('旧能力会话','这一轮我没有联网工具')
+  const oldCapabilityRequest=structuredClone(latestSend().request)
+  await page.screenshot({path:join(output,'19-existing-no-web-history.png'),fullPage:true})
+  await stopHost();await writeFile(config,enabledConfig);await startHost()
+  const beforeCapabilityFollow=webFixture.requests.length
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await expand(page)
+  await page.getByRole('tab',{name:'旧能力会话',exact:true}).click()
+  await send('长沙天气','WEB-HTTP-MARKER')
+  const currentCapabilityRequest=structuredClone(latestSend().request)
+  assert.equal(currentCapabilityRequest.conversationId,oldCapabilityRequest.conversationId)
+  assert.equal(currentCapabilityRequest.messages.filter(m=>m.role==='assistant'&&m.content.includes('这一轮我没有联网工具')).length,3)
+  assert.equal(webFixture.requests.length,beforeCapabilityFollow+1)
+  const capabilityState=await waitFor(async()=>{const r=await readOffice();return conv(r,currentCapabilityRequest.conversationId)?.tasks.every(t=>t.status==='completed')?r:false})
+  report.capabilityUpgrade={old:oldCapabilityRequest,current:currentCapabilityRequest,snapshot:conv(capabilityState,currentCapabilityRequest.conversationId)}
+  await page.screenshot({path:join(output,'20-existing-session-web-enabled.png'),fullPage:true})
+  report.assertions.push('D43: three old denials remain in the same conversation after enabling Web and restarting; ordinary short follow-up performs real HTTP without rewriting history')
+  await send('今天是几号','HOST-DATE:')
+  assert.equal(latestSend().request.conversationId,oldCapabilityRequest.conversationId)
+  assert.equal(webFixture.requests.length,beforeCapabilityFollow+1)
+  await stopHost();await writeFile(config,enabledConfig.replace(', "web_search", "web_fetch"',''));await startHost()
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await expand(page)
+  await page.getByRole('tab',{name:'旧能力会话',exact:true}).click()
+  await send('长沙天气','这一轮我没有联网工具')
+  assert.equal(latestSend().request.conversationId,oldCapabilityRequest.conversationId)
+  assert.equal(webFixture.requests.length,beforeCapabilityFollow+1)
+  report.capabilityUpgrade.disabledAgain=structuredClone(latestSend().request)
+  await page.screenshot({path:join(output,'21-existing-session-web-disabled-again.png'),fullPage:true})
+  report.assertions.push('D43: same-session date uses actual current server context without unnecessary Web; disabling Web again grants no stale capability and performs zero HTTP')
+  await stopHost();await writeFile(config,enabledConfig);await startHost()
+  const saved=structuredClone((await readOffice()).data.snapshot)
+  const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
+  const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'
+  const conflict=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:differing});assert.equal(conflict.code,409)
+  if(saved.seq>1){const old=structuredClone(saved);old.seq--;assert.equal((await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:old})).data.status,'ignored')}
+  officeProcess.p.kill('SIGTERM');await officeProcess.close
+  officeProcess=start(process.execPath,['server/dist/index.js'],office,{...childEnv,PORT:String(officePort),HOST:'127.0.0.1',PAWOFFICE_PUBLIC_ORIGIN:officeBase},'office-restarted')
+  await waitFor(async()=>{try{const r=await readOffice();return r.code===200&&conv(r,a)&&conv(r,b)}catch{return false}},45000)
+  chatHistoryPageSchema.parse(await control({...identity,type:'history'}))
+  // Verify registered chat.url after real Fastify restart through its public route.
+  const forwarded=await fetch(officeBase+'/api/pawoffice/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...identity,type:'history'})})
+  assert.equal(forwarded.status,200);chatHistoryPageSchema.parse((await forwarded.json()).data)
+  const crashId='host-crash-'+Date.now(),crashTurn='crash-turn-'+Date.now()
+  const crashRequest=fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version:'1.0',type:'send',turnId:crashTurn,teamId:'office-1',conversationId:crashId,messages:[{role:'user',content:'慢任务：模拟Host崩溃'}]})}).catch(()=>null)
+  await waitFor(()=>report.modelRequests.some(r=>r.messages.some(m=>m.role==='user'&&m.content==='慢任务：模拟Host崩溃')))
+  const requestsBeforeCrash=report.modelRequests.length
+  host.p.kill('SIGKILL');await host.close
+  host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-restarted')
+  await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
+  await waitFor(async()=>{const r=await readOffice();return conv(r,crashId)?.tasks.some(t=>t.summary.includes('Host重启中断'))},45000)
+  const crashHistory=await control({version:'1.0',type:'history',teamId:'office-1',conversationId:crashId});chatHistoryPageSchema.parse(crashHistory);assert.equal(crashHistory.turns[0].state,'error');assert.equal(crashHistory.turns[0].id,crashTurn)
+  assert.equal(report.modelRequests.length,requestsBeforeCrash);await crashRequest
+  const recovered=await readOffice()
+  await page.close();officeProcess.p.kill('SIGTERM');await officeProcess.close
+  officeProcess=start(process.execPath,['server/dist/index.js'],office,{...childEnv,PORT:String(officePort),HOST:'127.0.0.1',PAWOFFICE_PUBLIC_ORIGIN:officeBase},'office-offline-restarted')
+  await waitFor(async()=>{try{const r=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:recovered.data.snapshot});return r.code===202&&r.data.status==='cached'?r:false}catch{return false}},45000)
+  report.transcript=transcript
+  await Promise.all(captureJobs);capturedEvents()
+  assert.ok(report.browserRequests.some(r=>r.http===200&&r.events?.some(terminal)))
+  const initialStream=report.browserRequests.find(r=>r.request.type==='send'&&r.request.turnId===aRequest.turnId)
+  assert.equal(initialStream.events.filter(e=>e.type==='delta').map(e=>e.text).join(''),report.clipboard)
+  const rejected=report.browserRequests.find(r=>r.request.type==='send'&&r.request.turnId===report.staleHistory.request.turnId)
+  assert.equal(rejected.http,200);assert.deepEqual(rejected.events,[{type:'error',message:'会话历史已更新，请点击重新同步后重试'}])
+  assert.equal((await control({...identity,type:'history'})).turns.find(t=>t.id===aRequest.turnId).assistant,report.clipboard)
+  assert.equal(report.browserErrors.length,0)
+  report.assertions.push('Real browser same-origin four-operation chat through unmodified latest Office','A/B conversations independent tasks and whiteboards; A running while B completes','Original read_file outputs correlated with Run/call/scene snapshot','Same turn retry reuses Run; different content conflicts','Refresh history/resume detaches without duplicate model/tool execution','Explicit cancel waits for cleanup','New browser discovers original conversation IDs and stored history','Stable paginated history and stopped state','Same seq retry/conflict/stale and offline 202 from real service','Fastify restart re-registers chat.url','Host crash interrupted without replay; stable turn survives restart')
+  const sessionDir = join(output, 'host-data/sessions')
+  report.sessions = await readdir(sessionDir)
+  for (const file of report.sessions) {
+    const ledger = (await readFile(join(sessionDir, file), 'utf8')).trim().split('\n').map(JSON.parse)
+    assert.ok(ledger.filter(e => e.type === 'tool_call_complete').length <= 2, 'no tool replay after restart')
+    report.assertions.push('Session ' + file + ': ' + ledger.filter(e => e.type === 'run_finished').map(e => e.status).join(','))
+  }
+  report.result = 'passed'
+} catch (e) { report.result = 'failed'; report.error = e.stack; if (page) await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => {}); process.exitCode = 1 }
+finally {
+  if (context) { await context.tracing.stop({ path: join(output, 'trace.zip') }).catch(() => {}); await context.close() }
+  if (browser) await browser.close()
+  for (const item of [...processes].reverse()) {
+    if (item.p.exitCode === null && item.p.signalCode === null) { item.p.kill('SIGTERM'); await Promise.race([item.close, delay(8000)]); if (item.p.exitCode === null && item.p.signalCode === null) { item.p.kill('SIGKILL'); await item.close } }
+    await item.save()
+  }
+  if (webFixtureServer) { webFixtureServer.closeAllConnections(); await new Promise(r=>webFixtureServer.close(r)) }
+  if (providerServer) { providerServer.closeAllConnections(); await new Promise(r => providerServer.close(r)) }
+  report.finishedAt = new Date().toISOString(); await writeFile(join(output, 'report.json'), JSON.stringify(report, null, 2))
+  console.log(JSON.stringify({ result: report.result, output, error: report.error }, null, 2))
+}

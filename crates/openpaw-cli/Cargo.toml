@@ -44,3 +44,7 @@ workspace = true
 [[test]]
 name = "chat_persistence_regressions"
 path = "tests/regressions/chat_persistence.rs"
+
+[[test]]
+name = "model_env_features"
+path = "tests/features/model_env.rs"

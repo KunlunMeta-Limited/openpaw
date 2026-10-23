@@ -61,6 +61,7 @@ rusqlite = { version = "0.33", features = ["bundled", "column_decltype"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "=0.15.7"
 
 # HTTP (LLM providers + web tools; rustls to keep Windows builds self-contained;
 # gzip/brotli/deflate so advertised accept-encoding can actually be decoded)

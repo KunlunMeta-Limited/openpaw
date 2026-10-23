@@ -18,6 +18,14 @@ use std::{
 /// 稳定性：T3新增，协议无关Rust接口。
 /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
 pub struct HostConfig {
+    /// 用途：可选Office适配配置，缺省保持原健康服务。
+    /// 字段：OfficeConfig或无。
+    /// 来源去向：可信TOML到Host适配器。
+    /// 约束：不得由浏览器改变；密钥只引用变量名。
+    /// 稳定性：T4新增可选字段；Rust字面量需补None。
+    /// 关联：需求/设计REQ-OP-010/011/012；DES-OP-007。
+    #[serde(default)]
+    pub office: Option<crate::OfficeConfig>,
     /// 用途：显式Host数据根，必须与所有工作根互不包含。
     /// 字段：PathBuf，宿主类型字段。
     /// 来源去向：共享Host内部与可信Rust适配器。
@@ -164,12 +172,51 @@ impl HostConfig {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub fn load(path: &Path) -> HostResult<Self> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|_| HostError::new("invalid_input", "无法读取Host配置"))?;
-        let config: Self = toml::from_str(&text)
-            .map_err(|_| HostError::new("invalid_input", "Host配置格式或字段不合法"))?;
+        let (config, _) = Self::read_config(path)?;
         config.validate()?;
         Ok(config)
+    }
+    /// 功能：显式加载Host配置，并以共用模型环境填补未填写的模型字段。
+    /// 参数：path为可信TOML；environment为只读.env与系统环境快照。
+    /// 返回：完成原权限和路径校验的HostConfig，TOML明确值始终优先。
+    /// 错误：读取、格式、路径或权限配置错误；不回显原始文件。
+    /// 状态：不创建目录、不修改进程环境；原load入口语义保持不变。
+    /// 并发与取消：启动时同步只读，无共享可变状态。
+    /// 权限：不从.env接收工作根、工具或办公室授权。
+    /// 关联：需求/设计REQ-OP-003、REQ-OP-009；DES-OP-002、DES-OP-006。
+    pub fn load_with_model_environment(
+        path: &Path,
+        environment: &openpaw_llm::model_config::ModelEnvironment,
+    ) -> HostResult<Self> {
+        let (mut config, explicit_provider) = Self::read_config(path)?;
+        if !explicit_provider {
+            config.provider = environment.provider(None, "echo").to_owned();
+        }
+        if config.model.is_none() {
+            config.model = environment.value("OPENPAW_MODEL").map(str::to_owned);
+        }
+        if config.base_url.is_none() {
+            config.base_url = environment.value("OPENPAW_BASE_URL").map(str::to_owned);
+        }
+        if config.api_key_env.is_none() {
+            config.api_key_env =
+                openpaw_llm::model_config::ModelEnvironment::key_name(&config.provider)
+                    .map(str::to_owned);
+        }
+        config.validate()?;
+        Ok(config)
+    }
+    fn read_config(path: &Path) -> HostResult<(Self, bool)> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|_| HostError::new("invalid_input", "无法读取Host配置"))?;
+        let value: toml::Value = toml::from_str(&text)
+            .map_err(|_| HostError::new("invalid_input", "Host配置格式或字段不合法"))?;
+        // 必须在serde应用echo默认值之前记录是否明确填写，避免默认值覆盖.env。
+        let explicit_provider = value.get("provider").is_some();
+        let config: Self = value
+            .try_into()
+            .map_err(|_| HostError::new("invalid_input", "Host配置格式或字段不合法"))?;
+        Ok((config, explicit_provider))
     }
     /// 功能：校验目录、槽、预算、工具和凭据引用。
     /// 参数：self为待启动配置。
@@ -249,6 +296,9 @@ impl HostConfig {
                 ));
             }
         }
+        if let Some(office) = &self.office {
+            office.validate(self)?;
+        }
         let allowed = [
             "read_file",
             "glob",
@@ -262,6 +312,8 @@ impl HostConfig {
             "todo_add",
             "todo_update",
             "bash",
+            "web_search",
+            "web_fetch",
         ];
         if self.tools.iter().any(|t| !allowed.contains(&t.as_str())) {
             return Err(HostError::new("unsupported", "工具白名单包含未支持项"));

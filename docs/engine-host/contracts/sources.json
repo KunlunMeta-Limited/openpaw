@@ -1,7 +1,7 @@
 {
   "office": {
     "repository": "https://github.com/KunlunMeta-Limited/ai-office-react",
-    "commit": "b221a44ce22fe08956356b5002d17df59a6a4f50",
+    "commit": "02dbac4419e325efda9fa6293060037bd60da5e5",
     "files": [
       {
         "path": "integration/README.md",
@@ -10,17 +10,17 @@
       },
       {
         "path": "integration/docs/office-integration.md",
-        "sha256": "2eeb8ebfb33b8e7f0017e299f9590067ec5f75e9c37dc24274a59c37a4c1c827",
+        "sha256": "46444d605eeca7a8e164589d96ab493b137315e9805e62bec25197b74139d01b",
         "testSnapshot": false
       },
       {
         "path": "integration/docs/dashboard-integration.md",
-        "sha256": "6771828585fd51ce2d47b1ddedd0bcd6a36c6a5c9a70db152053f2cd76daf516",
+        "sha256": "84d22916e615153167f86c9a0a96d7fa023fbf83ec5478341de16fa3ff801b34",
         "testSnapshot": false
       },
       {
         "path": "integration/docs/chat-integration.md",
-        "sha256": "8fa92dba97f18c3269f5f3883b5feda0717a6aaee94574cab196eceebec3fdbc",
+        "sha256": "6cc69b2530f9716ca632f1bc52fb21fdd6dda10ea5829f8a7604a0248b555bb1",
         "testSnapshot": false
       },
       {
@@ -30,12 +30,12 @@
       },
       {
         "path": "integration/clients/client.mjs",
-        "sha256": "0ec763988631c80934259e18ae75ca32a49a762f9e4cc97d2edc7396ef1d6613",
+        "sha256": "e4636295e7cfb824786a8882397f924eb1796dda330b3f0698606cc4804eb431",
         "testSnapshot": false
       },
       {
         "path": "integration/clients/ui-client.mjs",
-        "sha256": "371e72daf2a3b9d1bba19f6d1348371f7601773b21aaea17d4a815ed29344379",
+        "sha256": "8dc8fb512c507ccbf84361ad2f45e1d21eaff58cb42803b988f7e5f9357b1b38",
         "testSnapshot": false
       },
       {
@@ -45,27 +45,27 @@
       },
       {
         "path": "packages/protocol/src/dashboard.ts",
-        "sha256": "17a210dbb875c6f2f04d3042140a95bd4fcf387a2a84938b07aea73626d7c5a3",
+        "sha256": "e66f4217b0d5fe1944651279402bff21e180ef3657291bf43bb450f72fe9fd4c",
         "testSnapshot": true
       },
       {
         "path": "packages/protocol/src/office-ui.ts",
-        "sha256": "76cb296f4653519393dcfc96e4a48359c59a78a4792316c7cac6479a03600991",
+        "sha256": "bc59c701379cfd569c7b7306cc304edfd294588235947d4e6f682606920832ba",
         "testSnapshot": true
       },
       {
         "path": "packages/protocol/src/office-integration.ts",
-        "sha256": "e8a0673b481aeeeb46fca2c0aea0d86cea2b0f4d12d58abcc63cb7486454e8c7",
+        "sha256": "a46b8710124c8f9a82176028d2e7dddda2865a1cd81cff2a61bdc65fd17b1338",
         "testSnapshot": true
       },
       {
         "path": "packages/protocol/src/chat.ts",
-        "sha256": "1fd75cd4afc340093e9d3b724ff0e4c12dafea29de995c0d17314e6fe510faf4",
+        "sha256": "896de960e05409d25a2463b4a12f0f3754b55c512a916f6662ee922cbd4bf975",
         "testSnapshot": true
       },
       {
         "path": "packages/protocol/src/relay.ts",
-        "sha256": "b9759f85ac98cb29ada43f614b591b78fec578ca6147b82f00d0da51b0fdabf5",
+        "sha256": "abd4a67fb0aadd35de484c32e059f64136cf82cc3c5e0abd87279e783c7e6b4a",
         "testSnapshot": true
       },
       {
@@ -85,7 +85,7 @@
       },
       {
         "path": "apps/web/src/chat/ChatSession.ts",
-        "sha256": "5ffc39db291342e25aaa1b4ab8b66cfb72d9b9a0018110667031c635f4a2cd7d",
+        "sha256": "67d4f46648241ed2ed0806fb94ba845b2261c2f990adead26fa8f0eeddc3119d",
         "testSnapshot": false
       },
       {

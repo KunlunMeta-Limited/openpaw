@@ -2,9 +2,11 @@
 # Windows原生：使用正斜杠路径，例如home = "C:/Users/user/openpaw-data"，root = "C:/Users/user/project"。
 # home与所有工作根互不包含；不能把项目根设成用户整个home或磁盘根。
 home = "/home/user/openpaw-data"
-provider = "echo" # 离线演示；真实模型改为openai或anthropic
+# 明确填写优先于.env。沿用统一.env模型时省略下面provider/model/base_url/api_key_env。
+# 默认.env：OPENPAW_HOME/.env或用户目录/.openpaw/.env；也可用--env-file指定。
+provider = "echo" # 保留原离线演示；希望使用.env时删除或注释这一行
 # model = "gpt-4o"
-# api_key_env = "OPENAI_API_KEY" # 只填环境变量名，不能填密钥
+# api_key_env = "OPENAI_API_KEY" # 只填变量名，值可来自系统环境或.env；省略时按Provider选标准名
 # base_url = "https://api.openai.com/v1"
 max_active_runs = 4
 run_timeout_secs = 1800
@@ -13,7 +15,11 @@ tool_timeout_secs = 300
 approval_timeout_secs = 300
 # 写入和bash需显式加入；每次调用仍必须通过Host持久审批。
 tools = ["read_file", "glob", "grep", "todo_list", "think"]
-# T7预留：必须成对配置，当前T3只开放健康接口。
+# 需要查询天气、公开资料等时，用下面一行替换上行；不改Office或模型.env。
+# tools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch"]
+# 联网工具使用原HTTP客户端/系统代理；fresh绕本地缓存不保证站点数据为当天。
+# 公开站点超时/反爬/动态页面可能无法获取有效数据，不以旧数据伪装实时结果。
+# T7预留：必须成对配置，T4启用office段后增加官方聊天接口；OpenCode认证路由尚未交付。
 # basic_username_env = "OPENPAW_HOST_USER"
 # basic_password_env = "OPENPAW_HOST_PASSWORD"
 [roots]
@@ -23,3 +29,16 @@ office-1 = "project"
 office-2 = "project"
 office-3 = "project"
 office-4 = "project"
+
+# Office接入（T4）：取消以下注释才启用；保持上方tools只读。
+# 不填模型字段即可沿用原生 ~/.openpaw/.env 的DeepSeek配置。
+# Office服务密钥是独立的系统环境 PAWOFFICE_API_KEY，不能用模型密钥替代。
+# [office]
+# base_url = "http://127.0.0.1:8765"
+# api_key_env = "PAWOFFICE_API_KEY"
+# allowed_origins = ["http://127.0.0.1:8765"]
+# [office.names]
+# office-1 = "研发办公室"
+# office-2 = "产品办公室"
+# office-3 = "资料办公室"
+# office-4 = "测试办公室"

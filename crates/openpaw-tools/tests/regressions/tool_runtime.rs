@@ -390,3 +390,91 @@ async fn t3_bounded_preview_preserves_read_file_lines_and_rejects_binary_large_e
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn d40_precancelled_web_invocation_has_no_start_or_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let observer = Arc::new(Observer {
+        calls: AtomicUsize::new(0),
+        fail: false,
+    });
+    let registry = ToolRegistry::new(dir.path()).with_execution_observer(observer.clone());
+    for (name, args) in [
+        ("web_fetch", json!({"url":"http://127.0.0.1:9/"})),
+        ("web_search", json!({"query":"cancelled before start"})),
+    ] {
+        let token = CancellationToken::new();
+        token.cancel();
+        let context = ToolCallContext::new("web-run", "web-call", name, &args, token);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            registry.call_with_context(name, args, context),
+        )
+        .await;
+        assert!(
+            matches!(result, Ok(Err(Error::Cancelled))),
+            "pre-cancelled network call must be Cancelled: {result:?}"
+        );
+    }
+    assert_eq!(observer.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn d40_inflight_web_wait_is_cancelled_before_http_timeout() {
+    if std::env::var("OPENPAW_D40_CHILD").as_deref() != Ok("1") {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "d40_inflight_web_wait_is_cancelled_before_http_timeout",
+                "--nocapture",
+            ])
+            .env("OPENPAW_D40_CHILD", "1")
+            .env("OPENPAW_WEB_TEST_ALLOW_LOOPBACK", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/slow", listener.local_addr().unwrap());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = started.send(());
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::new(dir.path());
+        let args = json!({"url":url});
+        let cancel = CancellationToken::new();
+        let context = ToolCallContext::new("run", "call", "web_fetch", &args, cancel.clone());
+        let mut call =
+            tokio::spawn(
+                async move { registry.call_with_context("web_fetch", args, context).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(3), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut call).await;
+        if result.is_err() {
+            call.abort();
+            let _ = call.await;
+        }
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Ok(Ok(Err(Error::Cancelled)))),
+            "network wait must observe call token: {result:?}"
+        );
+    });
+}

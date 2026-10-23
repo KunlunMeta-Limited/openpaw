@@ -40,7 +40,9 @@ fn main() {
     }
     let code = match cli.command {
         #[cfg(feature = "engine-host")]
-        Some(Command::EngineHost { config, port }) => openpaw_cli::host_cmd::run(&config, port),
+        Some(Command::EngineHost { config, port }) => {
+            openpaw_cli::host_cmd::run_with_env(&config, port, cli.env_file.as_deref())
+        }
         Some(Command::Hello) => hello::run(),
         Some(Command::Chat {
             model,
@@ -49,6 +51,7 @@ fn main() {
             workspace,
             home,
         }) => chat::run(chat::ChatArgs {
+            env_file: cli.env_file,
             model,
             base_url,
             provider,
@@ -109,7 +112,9 @@ fn main() {
             }
         },
         Some(Command::Config { cmd }) => match cmd {
-            config_cmd::Command::Show => config_cmd::run_show(&resolve_home(None)),
+            config_cmd::Command::Show => {
+                config_cmd::run_show_with_env(&resolve_home(None), cli.env_file.as_deref())
+            }
             config_cmd::Command::Doctor { home, workspace } => {
                 let workspace = workspace.unwrap_or_else(default_workspace);
                 config_cmd::run_doctor(&resolve_home(home), &workspace)

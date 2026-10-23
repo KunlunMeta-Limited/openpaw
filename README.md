@@ -144,10 +144,65 @@ registry token.
 Relocate the whole deployment by setting `OPENPAW_HOME`; project-scope
 knowledge goes to `<project>/.openpaw/` instead.
 
-**Provider keys.** Environment variables only — `ANTHROPIC_API_KEY` /
-`OPENAI_API_KEY`. Keys never touch disk and there is no config file to
-leak them (PowerShell: `$env:ANTHROPIC_API_KEY = "sk-..."`;
-bash: `export ANTHROPIC_API_KEY=sk-...`).
+**模型配置 / Model configuration.** OpenPaw现在原生读取用户数据目录下的`.env`：
+默认Linux为`~/.openpaw/.env`，Windows为`$HOME\.openpaw\.env`；设置了`OPENPAW_HOME`则使用该目录。
+只读加载，不向上搜索项目目录，不执行shell，也不把文件密钥加入工具进程环境。
+
+首次从仓库复制模板（已有文件请直接编辑，不覆盖）：
+
+```bash
+mkdir -p ~/.openpaw
+cp -n .env.example ~/.openpaw/.env
+chmod 600 ~/.openpaw/.env
+```
+
+Windows PowerShell（无需WSL）：
+
+```powershell
+$openpawConfigDir = if ($env:OPENPAW_HOME) { $env:OPENPAW_HOME } else { Join-Path $HOME '.openpaw' }
+New-Item -ItemType Directory -Force $openpawConfigDir | Out-Null
+$openpawEnvPath = Join-Path $openpawConfigDir '.env'
+if (-not (Test-Path $openpawEnvPath)) { Copy-Item .env.example $openpawEnvPath }
+notepad $openpawEnvPath
+```
+
+将模板中的DeepSeek密钥占位值替换为自己的密钥：
+
+```dotenv
+OPENPAW_PROVIDER=openai
+OPENPAW_MODEL=deepseek-chat
+OPENPAW_BASE_URL=https://api.deepseek.com/v1
+OPENAI_API_KEY=your_deepseek_api_key
+```
+
+此处`openai`表示OpenAI兼容协议，实际服务为DeepSeek。随后执行：
+
+```bash
+openpaw config show          # 只显示有效模型、来源和密钥有无，不发模型请求
+openpaw chat                 # 不再每次输入模型、端点和密钥
+openpaw chat --env-file /absolute/path/model.env
+```
+
+优先级为：明确CLI参数或Host TOML模型字段 → 系统环境变量 → `.env` → 原默认值。
+未配置时chat仍为离线mock，Host仍为echo；模型为空、文件格式错误或显式文件不存在会失败，不静默降级。
+`--env-file`是全局选项，也可用于`config show`和`engine-host`；`chat --home`仅改变会话存储位置。
+默认文件不存在时保持旧用法。配置只在启动时读取，修改后重启。
+`.env`支持UTF-8（含BOM）、CRLF、注释、引号及dotenvy变量引用；重复字段拒绝。
+使用`OPENPAW_HOME`时Linux复制目标也应改成该目录。系统环境中已有同名变量会覆盖文件，可用`config show`核对来源。
+
+Host继续用原TOML指定数据目录、授权工作区和工具：
+
+```bash
+openpaw engine-host --config /absolute/path/host.toml
+```
+
+希望Host沿用`.env`时，省略TOML的`provider`、`model`、`base_url`和`api_key_env`；
+明确写了`provider = "echo"`就继续离线运行。自定义`api_key_env`仍可从系统环境或选定.env读取。
+原`HostConfig::load`和`Host::start`嵌入式Rust入口保持原行为；新加载仅在CLI启动或显式调用新回退接口时启用。
+**配置模型并不代表Office聊天已接通，Office适配仍按T4计划单独验收。**
+
+原环境变量用法继续支持：`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`配合`chat --provider ... --model ... --base-url ...`。
+密钥不进Git、浏览器、日志或错误原始行；`.env.example`只含占位值。
 
 **Run as an MCP sidecar.** There is no daemon: the editor/agent client
 launches `openpaw --sidecar --sidecar-transport stdio` itself and owns the
@@ -301,3 +356,5 @@ secrets/internal-terms scrub.
 
 Apache-2.0. Contributions are subject to the Developer Certificate of
 Origin (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+
+Office 接入使用可选 `engine-host` feature。完成模型 `.env` 后，还需在 Host TOML 中启用 `[office]`，并在 Office **构建前**配置公开聊天地址；只改模型配置不会改变已有的预览构建。完整配置、启动与原生 Linux/Windows 验证命令见 [Office 交接说明](docs/engine-host/handoff.md#当前t4实施交接官方v1聊天与真实投影0005-r3) 和 [配置示例](docs/engine-host/host-config.example.toml)。Office 与模型密钥分别保留在服务端，均不得进入 `VITE_*`。

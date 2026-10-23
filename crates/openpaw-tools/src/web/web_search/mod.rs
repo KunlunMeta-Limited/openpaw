@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use openpaw_core::{Result, ToolCallOutcome, ToolCategory, ToolConcurrency, ToolSpec};
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -263,6 +264,14 @@ fn default_fetch_max_chars() -> usize {
     20_000
 }
 
+/// 功能：声明原搜索工具和有界数量参数。
+/// 参数：无。
+/// 返回：搜索工具元数据。
+/// 错误：无。
+/// 状态：无。
+/// 并发与取消：声明可共享，不发HTTP。
+/// 权限：仅公开信息检索，不执行网页指令。
+/// 关联：需求/设计REQ-OP-010；DES-OP-007。
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "web_search".into(),
@@ -274,7 +283,7 @@ pub fn spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
-                "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
+                "limit": {"type": "integer", "minimum":1,"maximum":10, "description": "Max results (default 5)", "default": 5},
                 "engine": {
                     "type": "string",
                     "enum": ["bing", "duckduckgo"],
@@ -296,7 +305,7 @@ pub fn spec() -> ToolSpec {
                     "default": true
                 },
                 "fetch_max_chars": {
-                    "type": "integer",
+                    "type": "integer", "minimum":1,"maximum":20000,
                     "description": "Max chars to fetch per page when fetch_content=true (default: 20000)",
                     "default": 20000
                 }
@@ -310,7 +319,34 @@ pub fn spec() -> ToolSpec {
     }
 }
 
-pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
+/// 功能：兼容原入口搜索公开网页。
+/// 参数：workspace为兼容工作根，args为原搜索输入。
+/// 返回：原格式标题/URL/摘要与可选正文。
+/// 错误：输入/引擎失败作为工具错误返回。
+/// 状态：复用原引擎降级与抓取缓存。
+/// 并发与取消：有取消上下文时使用run_cancellable，不分离遗留抓取任务。
+/// 权限：保持原域名过滤与网页地址校验。
+/// 关联：需求/设计REQ-OP-010；DES-OP-007。
+pub async fn run(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
+    run_cancellable(workspace, args, CancellationToken::new()).await
+}
+
+/// 功能：使用本次调用token搜索和托管正文抓取。
+/// 参数：workspace为兼容工作根，args为原输入，cancel为调用token。
+/// 返回：原格式搜索内容或工具错误。
+/// 错误：取消返回Cancelled；输入/引擎错误沿用工具错误。
+/// 状态：不创建新的存储/搜索服务。
+/// 并发与取消：取消停止引擎等待，终止并等待所有正文任务再返回。
+/// 权限：复用原搜索/域名过滤/抓取校验，不授予其他工具权限。
+/// 关联：需求/设计REQ-OP-006、REQ-OP-010；DES-OP-004、DES-OP-007。
+pub(crate) async fn run_cancellable(
+    _workspace: &Path,
+    args: serde_json::Value,
+    cancel: CancellationToken,
+) -> Result<ToolCallOutcome> {
+    if cancel.is_cancelled() {
+        return Err(openpaw_core::Error::Cancelled);
+    }
     let a: Args = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => return Ok(ToolCallOutcome::error(format!("web_search: bad args: {e}"))),
@@ -323,6 +359,11 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
         ));
     }
 
+    if !(1..=10).contains(&a.limit) || !(1..=20_000).contains(&a.fetch_max_chars) {
+        return Ok(ToolCallOutcome::error(
+            "web_search: limit must be 1..10 and fetch_max_chars 1..20000",
+        ));
+    }
     let options = SearchOptions {
         max_results: Some(a.limit),
         allowed_domains: a.allowed_domains.clone(),
@@ -332,7 +373,11 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
     // 语言感知引擎降级链
     let engines = engines_for_query(&a.query, a.engine.as_deref());
 
-    match search_with_fallback(&a.query, &options, &engines).await {
+    let search = tokio::select! { biased;
+        _ = cancel.cancelled() => return Err(openpaw_core::Error::Cancelled),
+        result = search_with_fallback(&a.query, &options, &engines) => result,
+    };
+    match search {
         Ok(results) => {
             if results.is_empty() {
                 return Ok(ToolCallOutcome::ok(format!("no results for: {}", a.query)));
@@ -352,54 +397,7 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
                 return Ok(ToolCallOutcome::ok(out));
             }
 
-            // Auto-fetch full page content for each search result (concurrently)
-            let fetch_args: Vec<(usize, SearchResult)> = results.into_iter().enumerate().collect();
-
-            let fetch_tasks: Vec<_> = fetch_args
-                .into_iter()
-                .map(|(idx, r)| {
-                    let url = r.url.clone();
-                    let title = r.title.clone();
-                    let snippet = r.snippet.clone();
-                    let max_chars = a.fetch_max_chars;
-                    tokio::spawn(async move {
-                        let fetch_input = serde_json::json!({
-                            "url": url,
-                            "max_chars": max_chars,
-                        });
-                        let content =
-                            match crate::web::web_fetch::run(Path::new("."), fetch_input).await {
-                                Ok(outcome) if !outcome.is_error => outcome.content,
-                                Ok(outcome) => format!("[fetch failed: {}]", outcome.content),
-                                Err(e) => format!("[fetch error: {e}]"),
-                            };
-                        (idx, title, url, snippet, content)
-                    })
-                })
-                .collect();
-
-            // Collect results, preserving original order
-            let mut fetched: Vec<(usize, String, String, Option<String>, String)> =
-                Vec::with_capacity(fetch_tasks.len());
-            for task in fetch_tasks {
-                if let Ok(item) = task.await {
-                    fetched.push(item);
-                }
-            }
-            fetched.sort_by_key(|(idx, _, _, _, _)| *idx);
-
-            // Format output: snippet + full page content for each result
-            let out = fetched
-                .iter()
-                .map(|(idx, title, url, snippet, content)| {
-                    let header = match snippet {
-                        Some(s) => format!("{}. {} — {}\n   摘要: {}", idx + 1, title, url, s),
-                        None => format!("{}. {} — {}", idx + 1, title, url),
-                    };
-                    format!("{}\n   正文:\n{}", header, indent_content(content, 3))
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n---\n\n");
+            let out = fetch_results(results, a.fetch_max_chars, &cancel).await?;
 
             Ok(ToolCallOutcome::ok(out))
         }
@@ -410,6 +408,62 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
     }
 }
 
+async fn fetch_results(
+    results: Vec<SearchResult>,
+    max_chars: usize,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (idx, r) in results.into_iter().enumerate() {
+        let child = cancel.child_token();
+        tasks.spawn(async move {
+            let input = serde_json::json!({"url":r.url,"max_chars":max_chars});
+            let content =
+                match crate::web::web_fetch::run_cancellable(Path::new("."), input, child).await {
+                    Ok(outcome) if !outcome.is_error => outcome.content,
+                    Ok(outcome) => format!("[fetch failed: {}]", outcome.content),
+                    Err(e) => format!("[fetch error: {e}]"),
+                };
+            (idx, r.title, r.url, r.snippet, content)
+        });
+    }
+    let mut fetched = Vec::new();
+    while !tasks.is_empty() {
+        tokio::select! { biased;
+            _ = cancel.cancelled() => {
+                // abort只发出取消；等待JoinSet排空才能允许Host释放资源并确认终态。
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(openpaw_core::Error::Cancelled);
+            }
+            result = tasks.join_next() => match result {
+                Some(Ok(item)) => fetched.push(item),
+                Some(Err(e)) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    return Err(openpaw_core::Error::ToolHost(format!("web_search page task failed: {e}")));
+                }
+                None => break,
+            }
+        }
+    }
+    if cancel.is_cancelled() {
+        return Err(openpaw_core::Error::Cancelled);
+    }
+    fetched.sort_by_key(|(idx, _, _, _, _)| *idx);
+    Ok(fetched
+        .iter()
+        .map(|(idx, title, url, snippet, content)| {
+            let header = match snippet {
+                Some(s) => format!("{}. {} — {}\n   摘要: {}", idx + 1, title, url, s),
+                None => format!("{}. {} — {}", idx + 1, title, url),
+            };
+            format!("{}\n   正文:\n{}", header, indent_content(content, 3))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n"))
+}
+
 /// Indent each line of `content` by `spaces` spaces for readable nesting.
 fn indent_content(content: &str, spaces: usize) -> String {
     let prefix = " ".repeat(spaces);
@@ -418,4 +472,94 @@ fn indent_content(content: &str, spaces: usize) -> String {
         .map(|line| format!("{prefix}{line}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn d40_auto_fetch_tasks_close_before_cancel_returns() {
+        if std::env::var("OPENPAW_D40_SEARCH_CHILD").as_deref() != Ok("1") {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "web::web_search::tests::d40_auto_fetch_tasks_close_before_cancel_returns",
+                    "--nocapture",
+                ])
+                .env("OPENPAW_D40_SEARCH_CHILD", "1")
+                .env("OPENPAW_WEB_TEST_ALLOW_LOOPBACK", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/slow", listener.local_addr().unwrap());
+            let (ready, started) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                let (headers_ready, mut headers_received) = tokio::sync::mpsc::channel(2);
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let headers_ready = headers_ready.clone();
+                    connections.spawn(async move {
+                        let mut buf = [0; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                            .await
+                            .unwrap();
+                        headers_ready.send(()).await.unwrap();
+                        // 完整响应前连接必须被取消关闭，不能等到原30秒HTTP超时。
+                        let closed = stream.read(&mut buf).await;
+                        assert!(
+                            matches!(closed, Ok(0))
+                                || closed.as_ref().err().is_some_and(|e| matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                )),
+                            "{closed:?}"
+                        );
+                    });
+                }
+                for _ in 0..2 {
+                    headers_received.recv().await.unwrap();
+                }
+                let _ = ready.send(());
+                while let Some(result) = connections.join_next().await {
+                    result.unwrap();
+                }
+            });
+            let cancel = CancellationToken::new();
+            let child = cancel.clone();
+            let results = (0..2)
+                .map(|i| SearchResult {
+                    title: format!("page{i}"),
+                    url: url.clone(),
+                    snippet: None,
+                })
+                .collect();
+            let call = tokio::spawn(async move { fetch_results(results, 100, &child).await });
+            tokio::time::timeout(std::time::Duration::from_secs(3), started)
+                .await
+                .unwrap()
+                .unwrap();
+            cancel.cancel();
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), call)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(openpaw_core::Error::Cancelled)
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+    }
 }

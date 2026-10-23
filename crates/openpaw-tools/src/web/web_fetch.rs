@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use lru::LruCache;
 use openpaw_core::{Result, ToolCallOutcome, ToolCategory, ToolConcurrency, ToolSpec};
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
 use crate::web::preapproved;
 
@@ -58,6 +59,8 @@ struct Args {
     url: String,
     #[serde(default = "default_max_chars")]
     max_chars: usize,
+    #[serde(default)]
+    fresh: bool,
 }
 
 fn default_max_chars() -> usize {
@@ -75,6 +78,14 @@ pub(crate) fn loopback_test_allowance() -> bool {
     std::env::var_os(TEST_ALLOW_LOOPBACK_ENV).is_some_and(|v| v == "1")
 }
 
+/// 功能：声明原网页读取工具及可选实时抓取参数。
+/// 参数：无。
+/// 返回：原工具元数据与JSON Schema。
+/// 错误：无。
+/// 状态：无。
+/// 并发与取消：声明可共享，不发请求。
+/// 权限：仅声明公开HTTP读取能力，不授予工作区外文件权限。
+/// 关联：需求/设计REQ-OP-010；DES-OP-007。
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "web_fetch".into(),
@@ -83,7 +94,8 @@ pub fn spec() -> ToolSpec {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "URL to fetch"},
-                "max_chars": {"type": "integer", "description": "Max characters to return (default 20000)"}
+                "max_chars": {"type": "integer", "minimum":1,"maximum":100000,"description": "Max characters to return (default 20000)"},
+                "fresh": {"type":"boolean","default":false,"description":"Bypass local cache for time-sensitive queries. Returns source URL and retrieval time; retrieval time is not the page observation/update time."}
             },
             "required": ["url"]
         }),
@@ -101,12 +113,48 @@ pub fn spec() -> ToolSpec {
     }))
 }
 
-pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
+/// 功能：兼容原入口读取公开网页。
+/// 参数：workspace为兼容工作根，args为url/max_chars及可选fresh。
+/// 返回：Markdown或明确的工具错误。
+/// 错误：HTTP与输入错误作为工具错误返回。
+/// 状态：默认保留原十五分钟缓存；fresh绕过旧缓存。
+/// 并发与取消：内部独立token；有取消上下文的调用使用run_cancellable。
+/// 权限：保留原URL和逐跳地址校验，不执行网页脚本。
+/// 关联：需求/设计REQ-OP-010；DES-OP-007。
+pub async fn run(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
+    run_cancellable(workspace, args, CancellationToken::new()).await
+}
+
+/// 功能：按调用取消上下文读取公开网页。
+/// 参数：workspace为兼容工作根，args为工具输入，cancel为本次调用token。
+/// 返回：Markdown或工具错误。
+/// 错误：取消返回Cancelled；其余沿用原工具错误。
+/// 状态：成功后更新完整缓存；不保存部分响应。
+/// 并发与取消：取消丢弃纯HTTP等待，不创建分离任务。
+/// 权限：不绕过URL/DNS预查和重定向校验。
+/// 关联：需求/设计REQ-OP-006、REQ-OP-010；DES-OP-004、DES-OP-007。
+pub(crate) async fn run_cancellable(
+    _workspace: &Path,
+    args: serde_json::Value,
+    cancel: CancellationToken,
+) -> Result<ToolCallOutcome> {
+    tokio::select! { biased;
+        _ = cancel.cancelled() => Err(openpaw_core::Error::Cancelled),
+        result = fetch(args, &cancel) => result,
+    }
+}
+
+async fn fetch(args: serde_json::Value, cancel: &CancellationToken) -> Result<ToolCallOutcome> {
     let a: Args = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => return Ok(ToolCallOutcome::error(format!("web_fetch: bad args: {e}"))),
     };
 
+    if !(1..=100_000).contains(&a.max_chars) {
+        return Ok(ToolCallOutcome::error(
+            "web_fetch: max_chars must be between 1 and 100000",
+        ));
+    }
     // Security: Validate URL to prevent SSRF (private IP, localhost, DNS rebinding, etc.)
     let mut current_url = match url::Url::parse(&a.url) {
         Ok(u) => u,
@@ -136,8 +184,10 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
     // Check cache — return cached result if within TTL.
     // key 纳入 effective_max_chars，避免不同截断精度的请求互相污染缓存。
     let cache_key = build_cache_key(&current_url, effective_max_chars);
-    if let Some(cached) = get_cached(&cache_key) {
-        return Ok(ToolCallOutcome::ok(cached));
+    if !a.fresh {
+        if let Some(cached) = get_cached(&cache_key) {
+            return Ok(ToolCallOutcome::ok(cached));
+        }
     }
 
     // DNS rebinding protection — check the actually resolved IPs for
@@ -219,21 +269,23 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
         }
     }
 
-    // Limit response body size to 5MB to prevent OOM (secondary check)
-    let body = match resp.bytes().await {
-        Ok(bytes) => {
-            if bytes.len() > 5 * 1024 * 1024 {
-                return Ok(ToolCallOutcome::error(format!(
-                    "response too large: {} bytes (max 5MB)",
-                    bytes.len()
-                )));
+    // 必须在追加前检查上限；未知长度/分块响应不能先整体读取再拒绝。
+    let mut bytes = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if chunk.len() > 5 * 1024 * 1024 - bytes.len() {
+                    return Ok(ToolCallOutcome::error(
+                        "response too large: body exceeds 5MB",
+                    ));
+                }
+                bytes.extend_from_slice(&chunk);
             }
-            String::from_utf8_lossy(&bytes).into_owned()
+            Ok(None) => break,
+            Err(e) => return Ok(ToolCallOutcome::error(format!("web_fetch body: {e}"))),
         }
-        Err(e) => {
-            return Ok(ToolCallOutcome::error(format!("web_fetch body: {e}")));
-        }
-    };
+    }
+    let body = String::from_utf8_lossy(&bytes);
 
     let text = crate::web::html_to_md::html_to_markdown(&body);
 
@@ -244,9 +296,18 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
         text
     };
 
-    // Store in cache for future fetches
+    if cancel.is_cancelled() {
+        return Err(openpaw_core::Error::Cancelled);
+    }
+    // 只缓存原正文，避免把旧抓取时间伪装成本次fresh的时间；旧调用输出不变。
     put_cached(&cache_key, &truncated);
-
+    if a.fresh {
+        let retrieved = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| openpaw_core::Error::ToolHost("system clock precedes Unix epoch".into()))?
+            .as_millis();
+        return Ok(ToolCallOutcome::ok(format!("source_url: {current_url}\nretrieved_at_unix_ms: {retrieved}\nretrieval_mode: fresh (origin/CDN data may still be old; verify page data date)\n\n{truncated}")));
+    }
     Ok(ToolCallOutcome::ok(truncated))
 }
 

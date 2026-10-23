@@ -472,3 +472,63 @@ async fn ddg_mock_server_error_maps_to_http_error() {
         .unwrap_err();
     assert!(matches!(err, SearchError::Http(_)));
 }
+
+#[test]
+fn r7_web_specs_declare_bounded_network_inputs() {
+    let spec = openpaw_tools::web::web_search::spec();
+    assert_eq!(spec.input_schema["properties"]["limit"]["minimum"], 1);
+    assert_eq!(spec.input_schema["properties"]["limit"]["maximum"], 10);
+    assert_eq!(
+        spec.input_schema["properties"]["fetch_max_chars"]["maximum"],
+        20000
+    );
+}
+
+#[tokio::test]
+async fn r7_invalid_search_counts_fail_without_network() {
+    for args in [
+        serde_json::json!({"query":"weather","limit":0}),
+        serde_json::json!({"query":"weather","limit":11}),
+        serde_json::json!({"query":"weather","fetch_max_chars":20001}),
+    ] {
+        let r = openpaw_tools::web::web_search::run(std::path::Path::new("."), args)
+            .await
+            .unwrap();
+        assert!(r.is_error && r.content.contains("must be"));
+    }
+}
+
+#[test]
+fn d42_bing_only_real_containers_count_against_limit() {
+    let html = r#"<html><script>noise("class=\"b_algo\"")</script><a href="https://navigation.example">Navigation</a>
+    <li class="b_algo"><h2><a href="https://real.example/weather">Weather</a></h2><p>Observation</p></li>
+    <footer><a href="https://footer.example">Footer</a><p>not a snippet</p></footer></html>"#;
+    let results = parse_bing_html(html, 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].url, "https://real.example/weather");
+    assert_eq!(results[0].title, "Weather");
+    assert_eq!(results[0].snippet.as_deref(), Some("Observation"));
+    assert!(
+        parse_bing_html(r#"<a href="https://navigation.example">No results</a>"#, 5).is_empty()
+    );
+}
+
+#[test]
+fn d42_bing_skips_scripts_styles_comments_and_never_borrows_neighbour_title() {
+    let html = r#"<script><li class="b_algo"><h2><a href="https://script.example">Fake</a></h2></li></script>
+    <style><li class="b_algo"><h2><a href="https://style.example">Fake</a></h2></li></style>
+    <!-- <li class="b_algo"><h2><a href="https://comment.example">Fake</a></h2></li> -->
+    <li class="b_algo"><a href="https://missing-title.example">Not a result heading</a></li>
+    <li data-index='1' class='b_algo extra'><h2 data-x='1'><a href='https://first.example?q=a&amp;x=b'>First<script>bad()</script></a></h2><p>Good<style>bad{}</style> summary</p></li>
+    <li class="extra b_algo"><h2><a href="https://second.example">Second</a></h2></li>
+    <div class="b_algo"><h2><a href="https://wrong-element.example">Wrong</a></h2></div>"#;
+    let results = parse_bing_html(html, 5);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].url, "https://first.example?q=a&x=b");
+    assert_eq!(results[0].title, "First");
+    assert_eq!(results[0].snippet.as_deref(), Some("Good summary"));
+    assert_eq!(results[1].url, "https://second.example");
+    assert_eq!(results[1].title, "Second");
+    assert!(results[1].snippet.is_none());
+    assert!(parse_bing_html(html, 0).is_empty());
+}

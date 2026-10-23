@@ -6,7 +6,7 @@ use crate::{types::*, HostError, HostResult};
 use openpaw_core::{Session, SessionEvent};
 use openpaw_sandbox::file_lock::{try_lock_exclusive, FileLockGuard};
 use openpaw_store::{SessionDb, SessionReader, SessionWriter};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -48,12 +48,12 @@ pub(crate) struct Db {
     /// 关联：需求/设计DES-OP-006。
     pub(crate) notices: broadcast::Sender<HostNotice>,
     /// 用途：活动Run的有界文本展示缓存，不作为第二份账本。
-    /// 字段：Arc<Mutex<HashMap<String, (String,bool)>>>，宿主类型字段。
+    /// 字段：Arc<Mutex<HashMap<String, RunText>>>，宿主类型字段。
     /// 来源去向：共享Host内部与可信Rust适配器。
     /// 约束：只在已授权会话及配置根内使用。
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
-    pub(crate) live: Arc<Mutex<HashMap<String, (String, bool)>>>,
+    pub(crate) live: Arc<Mutex<HashMap<String, RunText>>>,
 }
 impl Store {
     /// 功能：恢复原JSONL及宿主元数据并启动单写协调器。
@@ -68,7 +68,7 @@ impl Store {
         home: PathBuf,
         roots: BTreeMap<String, PathBuf>,
         notices: broadcast::Sender<HostNotice>,
-        live: Arc<Mutex<HashMap<String, (String, bool)>>>,
+        live: Arc<Mutex<HashMap<String, RunText>>>,
     ) -> HostResult<Self> {
         let db = tokio::task::spawn_blocking(move || Db::open(home, roots, notices, live))
             .await
@@ -143,7 +143,7 @@ impl Db {
         home: PathBuf,
         roots: BTreeMap<String, PathBuf>,
         notices: broadcast::Sender<HostNotice>,
-        live: Arc<Mutex<HashMap<String, (String, bool)>>>,
+        live: Arc<Mutex<HashMap<String, RunText>>>,
     ) -> HostResult<Self> {
         let meta = home.join("engine-host");
         std::fs::create_dir_all(&meta).map_err(HostError::storage)?;
@@ -156,19 +156,34 @@ impl Db {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(HostError::storage)?;
-        if version != 0 && version != 1 {
+        if !(0..=3).contains(&version) {
             return Err(HostError::new(
                 "unsupported",
                 "不支持的Host数据版本，拒绝写入",
             ));
         }
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS host_roots(id TEXT PRIMARY KEY,path TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS host_bindings(id TEXT PRIMARY KEY, namespace TEXT NOT NULL,slot TEXT NOT NULL,conversation TEXT NOT NULL,data TEXT NOT NULL, UNIQUE(namespace,slot,conversation));
         CREATE TABLE IF NOT EXISTS host_runs(id TEXT PRIMARY KEY,session TEXT NOT NULL,data TEXT NOT NULL,input_event_offset INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS host_approvals(id TEXT PRIMARY KEY,run TEXT NOT NULL,call TEXT NOT NULL,data TEXT NOT NULL,UNIQUE(run,call));
         CREATE TABLE IF NOT EXISTS host_events(revision INTEGER PRIMARY KEY AUTOINCREMENT,kind TEXT NOT NULL,reference TEXT NOT NULL);
-        PRAGMA user_version=1;").map_err(HostError::storage)?;
+        CREATE TABLE IF NOT EXISTS host_office_calls(id INTEGER PRIMARY KEY AUTOINCREMENT,run TEXT NOT NULL,call TEXT NOT NULL,UNIQUE(run,call));
+        CREATE TABLE IF NOT EXISTS host_context_import(session TEXT PRIMARY KEY, event_offset INTEGER NOT NULL, count INTEGER NOT NULL, fingerprint TEXT NOT NULL, complete INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS host_office_projection(team TEXT PRIMARY KEY, data TEXT NOT NULL, sync_state TEXT NOT NULL);
+        SELECT id,path FROM host_roots LIMIT 0;
+        SELECT id,namespace,slot,conversation,data FROM host_bindings LIMIT 0;
+        SELECT id,session,data,input_event_offset FROM host_runs LIMIT 0;
+        SELECT id,run,call,data FROM host_approvals LIMIT 0;
+        SELECT revision,kind,reference FROM host_events LIMIT 0;
+        SELECT session,event_offset,count,fingerprint,complete FROM host_context_import LIMIT 0;
+        SELECT id,run,call FROM host_office_calls LIMIT 0;
+        SELECT team,data,sync_state FROM host_office_projection LIMIT 0;
+        CREATE TABLE IF NOT EXISTS host_requests(session TEXT NOT NULL,key TEXT NOT NULL,request TEXT NOT NULL,run TEXT NOT NULL UNIQUE,PRIMARY KEY(session,key));
+        SELECT session,key,request,run FROM host_requests LIMIT 0;
+        PRAGMA user_version=3;
+        COMMIT;").map_err(HostError::storage)?;
         for (id, path) in roots {
             let prior = conn.query_row("SELECT path FROM host_roots WHERE id=?1", [&id], |r| {
                 r.get::<_, String>(0)
@@ -348,7 +363,7 @@ impl Db {
             .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
         let events = self.events(&run.session_id)?;
         let mut active = false;
-        let mut text = String::new();
+        let mut text = RunText::default();
         let mut tools = std::collections::BTreeMap::new();
         for e in events {
             match e {
@@ -356,9 +371,10 @@ impl Db {
                 SessionEvent::Message(m) if active && m.role == openpaw_core::Role::Assistant => {
                     for block in m.content {
                         if let openpaw_core::ContentBlock::Text { text: t } = block {
-                            text.push_str(&t);
+                            text.append(&t);
                         }
                     }
+                    text.end_message();
                 }
                 SessionEvent::ToolCallStart { call_id, tool_name } if active => {
                     tools.insert(
@@ -380,7 +396,7 @@ impl Db {
                 _ => {}
             }
         }
-        let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_started','tool_result') ORDER BY revision").map_err(HostError::storage)?;
+        let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_waiting_resource','tool_started','tool_result') ORDER BY revision").map_err(HostError::storage)?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
             .map_err(HostError::storage)?;
@@ -390,7 +406,9 @@ impl Db {
                 serde_json::from_str(&value).map_err(HostError::storage)?;
             if value["run_id"].as_str() == Some(id) {
                 if let Some(tool) = value["call_id"].as_str().and_then(|c| tools.get_mut(c)) {
-                    tool.state = if kind == "tool_started" {
+                    tool.state = if kind == "tool_waiting_resource" {
+                        "awaiting_resource"
+                    } else if kind == "tool_started" {
                         "running"
                     } else if value["success"] == true {
                         "completed"
@@ -411,17 +429,17 @@ impl Db {
         run.tools = tools.into_values().collect();
         if !run.state.is_terminal() {
             if let Some(live) = self.live.lock().unwrap_or_else(|e| e.into_inner()).get(id) {
-                if live.0.len() >= text.len() {
-                    run.text = live.0.clone();
-                    run.text_truncated = live.1;
+                if live.text().len() >= text.text().len() {
+                    run.text = live.text().to_owned();
+                    run.text_truncated = live.truncated();
                 } else {
-                    run.text = text;
+                    run.text = text.text().to_owned();
                 }
             } else {
-                run.text = text;
+                run.text = text.text().to_owned();
             }
         } else {
-            run.text = text;
+            run.text = text.text().to_owned();
         }
         Ok(run)
     }
@@ -433,7 +451,23 @@ impl Db {
     /// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
-    pub(crate) fn save_run(&mut self, mut run: RunView, offset: usize) -> HostResult<RunView> {
+    pub(crate) fn save_run(&mut self, run: RunView, offset: usize) -> HostResult<RunView> {
+        self.save_run_with_request(run, offset, None)
+    }
+    /// 功能：将请求关联与首次Run元数据在同一事务提交。
+    /// 参数：run为视图，offset为JSONL输入位置，request为可选客户端幂等键和规范请求。
+    /// 返回：持久Run视图。
+    /// 错误：唯一键冲突、序列化或SQL失败。
+    /// 状态：request仅作精确重试比较，不用于恢复模型历史。
+    /// 并发与取消：单写线程；先提交关联再允许执行副作用。
+    /// 权限：作用域由共享服务校验，键不是授权。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    pub(crate) fn save_run_with_request(
+        &mut self,
+        mut run: RunView,
+        offset: usize,
+        request: Option<(String, String)>,
+    ) -> HostResult<RunView> {
         // 取消不能被稍晚开始的执行任务逆转为running。
         if run.state == RunState::Running
             && self
@@ -455,6 +489,13 @@ impl Db {
         persisted.text.clear();
         persisted.tools.clear();
         tx.execute("INSERT INTO host_runs(id,session,data,input_event_offset) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data",params![run.run_id,run.session_id,serde_json::to_string(&persisted).map_err(HostError::storage)?,offset]).map_err(HostError::storage)?;
+        if let Some((key, canonical)) = request {
+            tx.execute(
+                "INSERT INTO host_requests(session,key,request,run) VALUES(?1,?2,?3,?4)",
+                params![run.session_id, key, canonical, run.run_id],
+            )
+            .map_err(HostError::storage)?;
+        }
         tx.commit().map_err(HostError::storage)?;
         self.publish(run.revision);
         Ok(run)
@@ -562,6 +603,314 @@ impl Db {
         }
         Ok(self.home.join("sessions").join(format!("{id}.jsonl")))
     }
+    /// 功能：在已有单写协调器中核对完整历史后缀或恢复首次导入。
+    /// 参数：id为原Session，history为仅含user/assistant文本的外部完整轮次。
+    /// 返回：历史一致并可靠保存时成功。
+    /// 错误：已完成历史后缀不符、导入冲突或原账本写入失败。
+    /// 状态：导入只记录来源元数据，消息仍追加原JSONL；不恢复授权。
+    /// 并发与取消：调用方必须先预留Session/槽，避免首次导入交错。
+    /// 权限：原JSONL已提交前缀逐条比较，校验和不作为授权或防碰撞凭证。
+    /// 关联：需求/设计REQ-OP-010；DES-OP-003/007。
+    pub(crate) fn reconcile_history(
+        &mut self,
+        id: &str,
+        history: &[openpaw_core::Message],
+    ) -> HostResult<()> {
+        use openpaw_core::{Message, Role};
+        let same = |a: &Message, b: &Message| a.role == b.role && a.text() == b.text();
+        let runs: Vec<_> = self
+            .runs()?
+            .into_iter()
+            .filter(|r| r.session_id == id)
+            .collect();
+        let events = self.events(id)?;
+        let imported:Option<(usize,usize,String,bool)>=self.conn.query_row(
+            "SELECT event_offset,count,fingerprint,complete FROM host_context_import WHERE session=?1",[id],
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(HostError::storage)?;
+        if runs.is_empty() {
+            // 校验和仅诊断同一次未完成导入；真正已保存的文本始终逐条比较。
+            let serialized = serde_json::to_vec(history).map_err(HostError::storage)?;
+            let fingerprint = format!(
+                "fnv1a64:{:016x}",
+                serialized
+                    .iter()
+                    .fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(*b))
+                        .wrapping_mul(0x100000001b3))
+            );
+            let offset = if let Some((offset, count, prior, complete)) = imported {
+                if count != history.len() || fingerprint != prior {
+                    return Err(HostError::new(
+                        "history_conflict",
+                        "首次历史导入未完成或内容不同",
+                    ));
+                }
+                if complete {
+                    return Ok(());
+                }
+                offset
+            } else {
+                self.conn.execute("INSERT INTO host_context_import(session,event_offset,count,fingerprint,complete) VALUES(?1,?2,?3,?4,0)",params![id,events.len(),history.len(),fingerprint]).map_err(HostError::storage)?;
+                events.len()
+            };
+            let mut count = 0;
+            for event in events.iter().skip(offset) {
+                if let SessionEvent::Message(m) = event {
+                    if !history.get(count).is_some_and(|h| same(m, h)) {
+                        return Err(HostError::new(
+                            "history_conflict",
+                            "已提交的导入历史与请求不一致",
+                        ));
+                    }
+                    count += 1;
+                }
+            }
+            for m in &history[count..] {
+                self.append(id, SessionEvent::Message(m.clone()))?;
+            }
+            self.conn
+                .execute(
+                    "UPDATE host_context_import SET complete=1 WHERE session=?1",
+                    [id],
+                )
+                .map_err(HostError::storage)?;
+            return Ok(());
+        }
+        let mut complete_history = Vec::new();
+        if let Some((offset, count, _, true)) = imported {
+            for e in events.iter().skip(offset).take(count) {
+                if let SessionEvent::Message(m) = e {
+                    complete_history.push(m.clone());
+                }
+            }
+        }
+        let mut ordered = Vec::new();
+        for r in runs.into_iter().filter(|r| r.state == RunState::Completed) {
+            let offset: usize = self
+                .conn
+                .query_row(
+                    "SELECT input_event_offset FROM host_runs WHERE id=?1",
+                    [&r.run_id],
+                    |row| row.get(0),
+                )
+                .map_err(HostError::storage)?;
+            ordered.push((offset, r));
+        }
+        ordered.sort_by_key(|(offset, _)| *offset);
+        for (offset, r) in ordered {
+            if let Some(SessionEvent::Message(m)) = events.get(offset) {
+                if m.role == Role::User {
+                    let view = self.get_run(&r.run_id)?;
+                    if !view.text.trim().is_empty() {
+                        complete_history.push(m.clone());
+                        complete_history.push(Message::assistant_text(view.text));
+                    }
+                }
+            }
+        }
+        if history.len() > complete_history.len()
+            || !history
+                .iter()
+                .zip(
+                    complete_history
+                        .iter()
+                        .skip(complete_history.len().saturating_sub(history.len())),
+                )
+                .all(|(a, b)| same(a, b))
+        {
+            return Err(HostError::new(
+                "history_conflict",
+                "浏览器完整历史不是已完成会话的后缀",
+            ));
+        }
+        Ok(())
+    }
+    /// 功能：将原Run/call配对映射为稳定短展示ID。
+    /// 参数：run/call为原引擎真实标识。
+    /// 返回：数据库分配的展示ID，不替代原工具ID。
+    /// 错误：SQL写入或读取失败。
+    /// 状态：同一配对复用原ID；不依赖调用排序或文本截断。
+    /// 并发与取消：Store单写序列，唯一约束防止重复。
+    /// 权限：仅展示映射，不携带执行授权。
+    /// 关联：需求/设计REQ-OP-012；DES-OP-007。
+    pub(crate) fn office_call_id(&self, run: &str, call: &str) -> HostResult<String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO host_office_calls(run,call) VALUES(?1,?2)",
+                params![run, call],
+            )
+            .map_err(HostError::storage)?;
+        let id: u64 = self
+            .conn
+            .query_row(
+                "SELECT id FROM host_office_calls WHERE run=?1 AND call=?2",
+                params![run, call],
+                |r| r.get(0),
+            )
+            .map_err(HostError::storage)?;
+        Ok(format!("tool:{id}"))
+    }
+    /// 功能：读取已保存的完整Office投影及投递状态。
+    /// 参数：team为受信办公室ID。
+    /// 返回：可选的规范化完整快照与状态。
+    /// 错误：SQL或存储内容损坏。
+    /// 状态：只读；重试不重生成时间或版本。
+    /// 并发与取消：在Store单写线程执行。
+    /// 权限：仅内部适配器，不对HTTP暴露数据库。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-009。
+    pub(crate) fn office_projection(
+        &self,
+        team: &str,
+    ) -> HostResult<Option<(serde_json::Value, String)>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT data,sync_state FROM host_office_projection WHERE team=?1",
+                [team],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        row.map(|(v, state)| Ok((serde_json::from_str(&v).map_err(HostError::storage)?, state)))
+            .transpose()
+    }
+    /// 功能：在事务中持久保存完整投影版本与投递状态。
+    /// 参数：team为办公室，snapshot为完整规范内容，state为待发送或实际回执。
+    /// 返回：可靠保存成功。
+    /// 错误：事务或序列化失败，不得外发未保存快照。
+    /// 状态：不向host_events追加刷新事件，避免投影自身触发无限版本循环。
+    /// 并发与取消：Store单写线程；保存发生在HTTP之前。
+    /// 权限：内部调用，不复制消息账本。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
+    pub(crate) fn save_office_projection(
+        &mut self,
+        team: &str,
+        snapshot: &serde_json::Value,
+        state: &str,
+    ) -> HostResult<()> {
+        let tx = self.conn.transaction().map_err(HostError::storage)?;
+        tx.execute("INSERT INTO host_office_projection(team,data,sync_state) VALUES(?1,?2,?3) ON CONFLICT(team) DO UPDATE SET data=excluded.data,sync_state=excluded.sync_state",params![team,serde_json::to_string(snapshot).map_err(HostError::storage)?,state]).map_err(HostError::storage)?;
+        tx.commit().map_err(HostError::storage)
+    }
+    /// 功能：按会话及客户端幂等键查找原始接受记录。
+    /// 参数：session为已授权会话，key为客户端轮次键。
+    /// 返回：可选的规范请求及Run ID。
+    /// 错误：SQL或元数据损坏。
+    /// 状态：只读，不创建会话或Run。
+    /// 并发与取消：Store单写序列读取。
+    /// 权限：调用方必须校验会话归属。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    pub(crate) fn request_for_key(
+        &self,
+        session: &str,
+        key: &str,
+    ) -> HostResult<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT request,run FROM host_requests WHERE session=?1 AND key=?2",
+                params![session, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(HostError::storage)
+    }
+    /// 功能：取得Run的客户端键；升级前Run使用稳定身份。
+    /// 参数：run为已授权Run ID。
+    /// 返回：客户端键或legacy前缀的Run ID。
+    /// 错误：SQL读取失败。
+    /// 状态：只读，不回放运行。
+    /// 并发与取消：Store单写序列读取。
+    /// 权限：调用方必须校验范围。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    pub(crate) fn request_key(&self, run: &str) -> HostResult<String> {
+        Ok(self
+            .conn
+            .query_row("SELECT key FROM host_requests WHERE run=?1", [run], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(HostError::storage)?
+            .unwrap_or_else(|| format!("legacy:{run}")))
+    }
+    /// 功能：按原JSONL输入位置读取Run用户输入，避免将工具结果误作新轮次。
+    /// 参数：run为授权Run视图。
+    /// 返回：输入事件位置及原始用户文本。
+    /// 错误：位置损坏或SQL/账本读取失败；接受失败未保存输入时返回空文本。
+    /// 状态：只读原账本，不复制历史。
+    /// 并发与取消：Store单写序列读取。
+    /// 权限：调用方校验会话归属。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    pub(crate) fn run_input(&self, run: &RunView) -> HostResult<(usize, String)> {
+        let offset: usize = self
+            .conn
+            .query_row(
+                "SELECT input_event_offset FROM host_runs WHERE id=?1",
+                [&run.run_id],
+                |r| r.get(0),
+            )
+            .map_err(HostError::storage)?;
+        let events = self.events(&run.session_id)?;
+        let committed:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM host_events WHERE kind='run_input_committed' AND reference=?1)",[&run.run_id],|r|r.get(0)).map_err(HostError::storage)?;
+        let started = events
+            .iter()
+            .any(|e| matches!(e,SessionEvent::RunStarted{run_id} if run_id==&run.run_id));
+        if !committed && !started {
+            // 升级前真正开始的Run有原RunStarted事实；从未接受的失败请求不得借用后来追加的User。
+            return Ok((offset, String::new()));
+        }
+        let text = match events.get(offset) {
+            Some(SessionEvent::Message(m)) if m.role == openpaw_core::Role::User => m.text(),
+            _ if matches!(
+                run.state,
+                RunState::Accepting | RunState::Failed | RunState::Interrupted
+            ) =>
+            {
+                String::new()
+            }
+            _ => {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "Run输入与原账本不一致",
+                ))
+            }
+        };
+        Ok((offset, text))
+    }
+    /// 功能：只读投影首次导入的完整文本轮次。
+    /// 参数：session为已授权原Session。
+    /// 返回：原事件位置、用户及助手文本；未完成导入不展示为成功。
+    /// 错误：导入位置/角色损坏或账本读取失败。
+    /// 状态：复用既有导入标记和JSONL，不保存第二份历史。
+    /// 并发与取消：Store单写序列读取。
+    /// 权限：外部导入仍是不可信文本，不产生工具或授权事实。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    pub(crate) fn imported_turns(&self, session: &str) -> HostResult<Vec<(usize, String, String)>> {
+        let marker:Option<(usize,usize)>=self.conn.query_row("SELECT event_offset,count FROM host_context_import WHERE session=?1 AND complete=1",[session],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(HostError::storage)?;
+        let Some((offset, count)) = marker else {
+            return Ok(Vec::new());
+        };
+        let events = self.events(session)?;
+        let Some(messages) = events.get(offset..offset + count) else {
+            return Err(HostError::new("storage_unavailable", "导入历史位置损坏"));
+        };
+        let mut turns = Vec::new();
+        for (index, pair) in messages.chunks(2).enumerate() {
+            match pair {
+                [SessionEvent::Message(u), SessionEvent::Message(a)]
+                    if u.role == openpaw_core::Role::User
+                        && a.role == openpaw_core::Role::Assistant =>
+                {
+                    turns.push((offset + index * 2, u.text(), a.text()))
+                }
+                _ => {
+                    return Err(HostError::new(
+                        "storage_unavailable",
+                        "导入历史轮次结构损坏",
+                    ))
+                }
+            }
+        }
+        Ok(turns)
+    }
     fn recover(&mut self) -> HostResult<()> {
         for b in self.bindings()? {
             let path = self.path(&b.session_id)?;
@@ -656,5 +1005,132 @@ impl Db {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .map_err(HostError::storage)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod office_regressions {
+    use super::*;
+    use crate::{ClientScope, Host, HostConfig};
+    use openpaw_core::{Message, Role};
+    use serde_json::json;
+    #[tokio::test]
+    async fn failed_acceptance_offset_does_not_claim_later_user_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "input-boundary".into(),
+        };
+        let binding = host.open_session(scope).await.unwrap();
+        host.inner
+            .store
+            .call(move |db| {
+                let offset = db.events(&binding.session_id)?.len();
+                let failed = RunView {
+                    run_id: "failed-before-input".into(),
+                    session_id: binding.session_id.clone(),
+                    state: RunState::Failed,
+                    revision: 0,
+                    text: String::new(),
+                    tools: vec![],
+                    error: Some(HostError::new("storage_unavailable", "输入未提交")),
+                    text_truncated: false,
+                };
+                db.save_run(failed.clone(), offset)?;
+                db.append(
+                    &binding.session_id,
+                    SessionEvent::Message(Message::user_text("后一个请求的输入")),
+                )?;
+                db.append(
+                    &binding.session_id,
+                    SessionEvent::RunStarted {
+                        run_id: "another-run".into(),
+                    },
+                )?;
+                assert_eq!(db.run_input(&failed)?.1, "");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn torn_import_resumes_exact_prefix_and_projection_keeps_version_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config:HostConfig=serde_json::from_value(json!({"home":tmp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config.clone()).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "repair".into(),
+        };
+        let binding = host.open_session(scope).await.unwrap();
+        let id = binding.session_id;
+        let sid = id.clone();
+        host.inner.store.call(move|db|{
+            let history=vec![Message::user_text("imported-user"),Message::assistant_text("imported-answer")];
+            let bytes=serde_json::to_vec(&history).unwrap();let fingerprint=format!("fnv1a64:{:016x}",bytes.iter().fold(0xcbf29ce484222325u64,|h,b|(h^u64::from(*b)).wrapping_mul(0x100000001b3)));
+            let offset=db.events(&sid)?.len();
+            // 模拟导入marker已保存、仅第一条JSONL完成后进程退出；不执行任何工具。
+            db.conn.execute("INSERT INTO host_context_import(session,event_offset,count,fingerprint,complete) VALUES(?1,?2,2,?3,0)",params![sid,offset,fingerprint]).unwrap();
+            db.append(&sid,SessionEvent::Message(history[0].clone()))?;
+            let snapshot=json!({"seq":17,"stableTime":"2026-10-21T00:00:00Z"});db.save_office_projection("office-1",&snapshot,"pending")?;
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+        let host = Host::start(config).await.unwrap();
+        let sid = id.clone();
+        host.inner
+            .store
+            .call(move |db| {
+                let history = vec![
+                    Message::user_text("imported-user"),
+                    Message::assistant_text("imported-answer"),
+                ];
+                db.reconcile_history(&sid, &history)?;
+                db.reconcile_history(&sid, &history)?;
+                let messages: Vec<_> = db
+                    .events(&sid)?
+                    .into_iter()
+                    .filter_map(|e| {
+                        if let SessionEvent::Message(m) = e {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(messages.len(), 2);
+                assert_eq!(messages[0].role, Role::User);
+                assert_eq!(messages[1].text(), "imported-answer");
+                let (snapshot, state) = db.office_projection("office-1")?.unwrap();
+                assert_eq!(snapshot["seq"], 17);
+                assert_eq!(snapshot["stableTime"], "2026-10-21T00:00:00Z");
+                assert_eq!(state, "pending");
+                assert!(db
+                    .reconcile_history(
+                        &sid,
+                        &[
+                            Message::user_text("different"),
+                            Message::assistant_text("history")
+                        ]
+                    )
+                    .is_err());
+                let first = db.office_call_id("run", "z-call")?;
+                let second = db.office_call_id("run", "a-call")?;
+                assert_ne!(first, second);
+                assert_eq!(db.office_call_id("run", "z-call")?, first);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
     }
 }

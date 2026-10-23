@@ -22,3 +22,8 @@ mod tool_host;
 mod types;
 #[cfg(feature = "engine-host")]
 pub use {config::HostConfig, server::HostServer, service::Host, types::*};
+
+#[cfg(feature = "engine-host")]
+mod office;
+#[cfg(feature = "engine-host")]
+pub use office::OfficeConfig;
