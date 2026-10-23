@@ -83,7 +83,7 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
 
 
 // Browser transport loss is injected only in its isolated context; Host/Provider continue their real Run.
-export async function networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,waitFor,release}) {
+export async function networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,waitFor,release,interrupt,restore}) {
   await fresh(page);await send('T6主动断网续接')
   const request=structuredClone(latestSend().request)
   const log=page.getByRole('log',{name:'对话内容'})
@@ -94,10 +94,13 @@ export async function networkProduct({page,context,report,output,readOffice,conv
   const historyBefore=report.browserRequests.filter(r=>r.request.type==='history').length
   try {
     await context.setOffline(true)
+    // Chromium离线开关不保证关闭已经建立且暂时没有流量的HTTP连接。
+    // 同时真实关闭隔离转发进程，让当前聊天链路实际断开；Host及模型仍保持运行。
+    await interrupt()
     await waitFor(async()=>(await log.innerText()).includes('回复未完成'))
     assert.equal(JSON.parse(db.prepare('SELECT data FROM host_runs WHERE id=?').get(parent).data).state,'running','浏览器断网不能取消真实Run')
     await page.screenshot({path:join(output,'t6-network-offline-detached.png'),fullPage:true})
-  } finally {await context.setOffline(false)}
+  } finally {await context.setOffline(false);await restore()}
   await page.getByRole('button',{name:'重新同步',exact:true}).click()
   await waitFor(()=>report.browserRequests.filter(r=>r.request.type==='history').length>historyBefore&&report.browserRequests.some(r=>r.request.type==='resume'&&r.request.turnId===request.turnId))
   assert.equal(db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run,parent)
@@ -111,7 +114,7 @@ export async function networkProduct({page,context,report,output,readOffice,conv
   assert.equal(report.browserRequests.filter(r=>r.request.type==='send'&&r.request.turnId===request.turnId).length,1)
   const final=await waitFor(async()=>{const c=conv(await readOffice(),request.conversationId);return c?.tasks[0].status==='completed'?c:false})
   await page.screenshot({path:join(output,'t6-network-completed-same-run.png'),fullPage:true})
-  report.network={request,parent,requestsBefore,requestsAfter:report.modelRequests.length,transcript,final}
+  report.network={request,parent,requestsBefore,requestsAfter:report.modelRequests.length,transcript,final,trigger:'Chromium offline + SIGKILL isolated Office forwarding process; Host and Provider remain alive'}
   report.assertions.push('T6 actual Chromium offline loss detaches; public manual history/resume keeps one persisted Run, one model request and nonduplicated text')
   db.close()
 }

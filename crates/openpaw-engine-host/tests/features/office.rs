@@ -422,6 +422,103 @@ async fn suite() {
     boundary_cases(tmp.path()).await;
     persistent_turn_cases(tmp.path()).await;
     web_cases(tmp.path()).await;
+    unread_http_cases(tmp.path()).await;
+}
+async fn unread_http_cases(base: &std::path::Path) {
+    // 保持真实HTTP响应存活且不消费正文，另外的控制请求仍须能完成和恢复终态。
+    // 本用例不将操作系统缓冲区中尚有空间等同于已强制触发TCP背压。
+    for cancel in [false, true] {
+        let cfg = config(&base.join(format!("unread-http-{cancel}")));
+        let provider: Arc<dyn LlmProvider> = if cancel {
+            Arc::new(Slow)
+        } else {
+            Arc::new(MockProvider::stream_text("可靠文本。".repeat(4000), 200))
+        };
+        let host = Host::with_provider(cfg.clone(), provider).await.unwrap();
+        let server = HostServer::bind(host.clone(), 0).await.unwrap();
+        let url = format!("http://{}", server.address());
+        let client = reqwest::Client::new();
+        let input = request("unread", "不读取订阅正文");
+        let response = post(&client, &url, &input).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let resume = json!({"version":"1.0","type":"resume","teamId":"office-1","conversationId":"unread","turnId":input["turnId"]});
+        let second = post(&client, &url, &resume).send().await.unwrap();
+        assert_eq!(second.status(), 200);
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "unread".into(),
+        };
+        let (before, _) = host.snapshot_and_subscribe(&scope).await.unwrap();
+        assert_eq!(before.runs.len(), 1);
+        if cancel {
+            assert!(!before.runs[0].state.is_terminal());
+            let mut stop = resume.clone();
+            stop["type"] = json!("cancel");
+            let result: Value = tokio::time::timeout(Duration::from_secs(3), async {
+                post(&client, &url, &stop)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap()
+            })
+            .await
+            .expect("未消费的HTTP订阅不得阻塞取消控制请求");
+            assert_eq!(result["data"]["stopped"], true);
+        }
+        let expected = if cancel {
+            RunState::Cancelled
+        } else {
+            RunState::Completed
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let run = host.get_run(&scope, &before.runs[0].run_id).await.unwrap();
+                if run.state == expected {
+                    if !cancel {
+                        assert_eq!(run.text, "可靠文本。".repeat(4000));
+                    }
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("终态持久化不得等待HTTP消费者读取正文");
+        // 两个正文仍未读取时，新HTTP查询必须读到可靠终态。
+        let history =
+            json!({"version":"1.0","type":"history","teamId":"office-1","conversationId":"unread"});
+        let page: Value = post(&client, &url, &history)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["data"]["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            page["data"]["turns"][0]["state"],
+            if cancel { "stopped" } else { "complete" }
+        );
+        drop(response);
+        drop(second);
+        server.shutdown().await.unwrap();
+        drop(host);
+        let reopened = Host::with_provider(cfg, Arc::new(MockProvider::fixed("不得重放")))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_run(&scope, &before.runs[0].run_id)
+                .await
+                .unwrap()
+                .state,
+            expected
+        );
+        reopened.shutdown().await.unwrap();
+    }
 }
 async fn boundary_cases(base: &std::path::Path) {
     let client = reqwest::Client::new();
