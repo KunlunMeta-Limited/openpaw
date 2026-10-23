@@ -328,3 +328,104 @@ async fn metadata_purge_failure_after_ledger_removal_recovers_without_revival() 
     assert!(!ledger.exists());
     host.shutdown().await.unwrap();
 }
+
+#[test]
+fn deletion_restart_recovers_each_real_durable_phase_after_process_kill() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    for phase in ["deleting", "cancelling", "purging"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "deletion_crash_fixture_child", "--nocapture"])
+            .env("OPENPAW_DELETE_CRASH_BASE", dir.path())
+            .env("OPENPAW_DELETE_CRASH_PHASE", phase)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                if let Some(value) = line.strip_prefix("DELETE-READY ") {
+                    let _ = tx.send(value.to_owned());
+                    break;
+                }
+            }
+        });
+        let ready = rx.recv_timeout(Duration::from_secs(10));
+        // 不走Host shutdown，实际杀进程，验证OS锁/writer释放和持久意图恢复。
+        child.kill().unwrap();
+        child.wait().unwrap();
+        reader.join().unwrap();
+        let ids: serde_json::Value = serde_json::from_str(&ready.unwrap()).unwrap();
+        let cfg = config(dir.path());
+        let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+        let actual: String = db
+            .query_row("SELECT phase FROM host_session_deletions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(actual, phase);
+        db.execute_batch("DROP TRIGGER interrupt_delete").unwrap();
+        drop(db);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let host = Host::start(cfg.clone()).await.unwrap();
+            assert_eq!(
+                host.delete_session(&scope("crash-target"))
+                    .await
+                    .unwrap()
+                    .phase,
+                "deleted"
+            );
+            assert!(host.open_session(scope("crash-target")).await.is_err());
+            assert_eq!(
+                host.open_session(scope("crash-other"))
+                    .await
+                    .unwrap()
+                    .session_id,
+                ids["other"].as_str().unwrap()
+            );
+            assert!(!cfg
+                .home
+                .join("sessions")
+                .join(format!("{}.jsonl", ids["target"].as_str().unwrap()))
+                .exists());
+            assert_eq!(
+                std::fs::read_to_string(cfg.roots["r"].join("keep.txt")).unwrap(),
+                "workspace survives"
+            );
+            host.shutdown().await.unwrap();
+        });
+    }
+}
+
+#[test]
+fn deletion_crash_fixture_child() {
+    use std::io::Write;
+    let Some(base) = std::env::var_os("OPENPAW_DELETE_CRASH_BASE") else {
+        return;
+    };
+    let phase = std::env::var("OPENPAW_DELETE_CRASH_PHASE").unwrap();
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let cfg = config(std::path::Path::new(&base));
+        let host = Host::start(cfg.clone()).await.unwrap();
+        let target = host.open_session(scope("crash-target")).await.unwrap();
+        let other = host.open_session(scope("crash-other")).await.unwrap();
+        host.submit_run(&scope("crash-target"), &target.session_id, "private history".into()).await.unwrap();
+        host.wait_idle().await;
+        std::fs::write(cfg.roots["r"].join("keep.txt"), "workspace survives").unwrap();
+        let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+        let sql = match phase.as_str() {
+            "deleting" => "CREATE TRIGGER interrupt_delete BEFORE UPDATE OF phase ON host_session_deletions WHEN NEW.phase='cancelling' BEGIN SELECT RAISE(FAIL,'crash boundary'); END;",
+            "cancelling" => "CREATE TRIGGER interrupt_delete BEFORE UPDATE OF phase ON host_session_deletions WHEN NEW.phase='purging' BEGIN SELECT RAISE(FAIL,'crash boundary'); END;",
+            "purging" => "CREATE TRIGGER interrupt_delete BEFORE DELETE ON host_bindings BEGIN SELECT RAISE(FAIL,'crash boundary'); END;",
+            _ => panic!("unknown phase"),
+        };
+        db.execute_batch(sql).unwrap();
+        assert!(host.delete_session(&scope("crash-target")).await.is_err());
+        let actual: String = db.query_row("SELECT phase FROM host_session_deletions", [], |r| r.get(0)).unwrap();
+        assert_eq!(actual, phase);
+        println!("DELETE-READY {}", json!({"target":target.session_id,"other":other.session_id}));
+        std::io::stdout().flush().unwrap();
+        std::future::pending::<()>().await;
+    });
+}
