@@ -531,8 +531,15 @@ try {
   const simultaneous=await readOffice();
   assert.equal(conv(simultaneous,report.t5.approveRequest.conversationId).tasks[0].status,'blocked');
   await page.screenshot({path:join(output,'28-t5-other-session-reads-during-approval.png'),fullPage:true});
-  await select(page,'T5-允许报告');await page.getByRole('button',{name:'收起聊天',exact:true}).click();
-  await page.getByRole('button',{name:'允许本次',exact:true}).click();await expand(page);
+  await switchOffice(page,'独立办公室');await fresh(page);
+  await send('后台办公室读取README.md和notes.txt并总结',markerA);
+  report.t5.readOtherOffice=structuredClone(latestSend().request);
+  assert.equal(report.t5.readOtherOffice.teamId,'office-2');
+  const notice=page.getByRole('region',{name:'真实运行验收待决定提示',exact:true});
+  await notice.getByRole('button',{name:'允许本次',exact:true}).waitFor();
+  await page.screenshot({path:join(output,'29-t5-background-office-direct-approval.png'),fullPage:true});
+  await notice.getByRole('button',{name:'允许本次',exact:true}).click();
+  await switchOffice(page,'真实运行验收');await select(page,'T5-允许报告');
   await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});
   const artifact=await readFile(join(workspace,'reports/T5报告.md'),'utf8');assert.ok(artifact.includes(markerA)&&artifact.includes(markerB));
   report.t5.artifact={path:'reports/T5报告.md',sha256:createHash('sha256').update(artifact).digest('hex'),content:artifact};

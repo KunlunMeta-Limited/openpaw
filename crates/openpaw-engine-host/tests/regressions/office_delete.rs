@@ -194,3 +194,71 @@ async fn deletion_io_failure_keeps_durable_intent_and_retries_after_problem_is_r
     assert_eq!(host.delete_session(&a).await.unwrap().phase, "deleted");
     host.shutdown().await.unwrap();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn delete_running_command_waits_for_cleanup_and_preserves_other_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.tools.push("bash".into());
+    let provider = Arc::new(MockProvider::scripted(vec![
+        MockMode::ToolUse {
+            tool_name: "bash".into(),
+            input: json!({"command":"printf ready > command-ready; sleep 2; printf bad > late-side-effect"}),
+            text: "拟执行慢命令".into(),
+        },
+        MockMode::Fixed("finished".into()),
+    ]));
+    let host = Host::with_provider(cfg.clone(), provider).await.unwrap();
+    let a = scope("running-delete");
+    let b = scope("keep-running-delete");
+    let sa = host.open_session(a.clone()).await.unwrap();
+    let sb = host.open_session(b.clone()).await.unwrap();
+    host.submit_run(&a, &sa.session_id, "run command".into())
+        .await
+        .unwrap();
+    let approval = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(v) = host.pending_approvals(&a).await.unwrap().first() {
+                break v.clone();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    host.decide_approval(
+        &a,
+        &approval.approval_id,
+        approval.revision,
+        approval.binding,
+        true,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !cfg.roots["r"].join("command-ready").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), host.delete_session(&a))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!cfg
+        .home
+        .join("sessions")
+        .join(format!("{}.jsonl", sa.session_id))
+        .exists());
+    assert!(host.get_session(&b, &sb.session_id).await.is_ok());
+    // 超过原命令的实际副作用时刻；这是检查未发生延迟写入，不用于猜清理结束。
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert!(!cfg.roots["r"].join("late-side-effect").exists());
+    assert!(host
+        .submit_run(&a, &sa.session_id, "revive".into())
+        .await
+        .is_err());
+    host.shutdown().await.unwrap();
+}
