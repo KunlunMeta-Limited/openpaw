@@ -756,6 +756,13 @@ try {
   await waitFor(()=>report.modelRequests.some(r=>r.messages.some(m=>m.role==='user'&&m.content==='慢任务：模拟Host崩溃')))
   const requestsBeforeCrash=report.modelRequests.length
   host.p.kill('SIGKILL');await host.close
+  // 比较真实工具事实，不把新增合法查询误当重放；全部T5会话同样受此保护。
+  const sessionDir = join(output, 'host-data/sessions')
+  const toolFacts = async()=>Object.fromEntries(await Promise.all((await readdir(sessionDir)).sort().map(async file=>[
+    file,(await readFile(join(sessionDir,file),'utf8')).trim().split('\n').map(JSON.parse).filter(e=>['tool_call_start','tool_call_complete'].includes(e.type)),
+  ])))
+  report.toolFactsBeforeRestart=await toolFacts()
+  assert.ok(Object.values(report.toolFactsBeforeRestart).some(events=>events.length>0),'比较必须包含真实工具事实')
   host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-restarted')
   await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
   await waitFor(async()=>{const r=await readOffice();return conv(r,crashId)?.tasks.some(t=>t.summary.includes('处理被中断'))},45000)
@@ -775,11 +782,11 @@ try {
   assert.equal((await control({...identity,type:'history'})).turns.find(t=>t.id===aRequest.turnId).assistant,report.clipboard)
   assert.equal(report.browserErrors.length,0)
   report.assertions.push('Real browser same-origin four-operation chat through unmodified latest Office','A/B conversations independent tasks and whiteboards; A running while B completes','Original read_file outputs correlated with Run/call/scene snapshot','Same turn retry reuses Run; different content conflicts','Refresh history/resume detaches without duplicate model/tool execution','Explicit cancel waits for cleanup','New browser discovers original conversation IDs and stored history','Stable paginated history and stopped state','Same seq retry/conflict/stale and offline 202 from real service','Fastify restart re-registers chat.url','Host crash interrupted without replay; stable turn survives restart')
-  const sessionDir = join(output, 'host-data/sessions')
   report.sessions = await readdir(sessionDir)
+  report.toolFactsAfterRestart=await toolFacts()
+  assert.deepEqual(report.toolFactsAfterRestart,report.toolFactsBeforeRestart,'所有会话重启后工具事实必须精确相等，不允许重放')
   for (const file of report.sessions) {
     const ledger = (await readFile(join(sessionDir, file), 'utf8')).trim().split('\n').map(JSON.parse)
-    if (!ledger.some(e=>JSON.stringify(e).includes('T5-'))) assert.ok(ledger.filter(e => e.type === 'tool_call_complete' && e.tool_name !== 'report_progress').length <= 2, 'no tool replay after restart')
     let activeRun='';const calls=new Set();for(const e of ledger){if(e.type==='run_started')activeRun=e.run_id;if(e.type==='tool_call_complete'){const key=activeRun+':'+e.call_id;assert.ok(!calls.has(key),'same Run/call executed twice');calls.add(key)}}
     report.assertions.push('Session ' + file + ': ' + ledger.filter(e => e.type === 'run_finished').map(e => e.status).join(','))
   }
