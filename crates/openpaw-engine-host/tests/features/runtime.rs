@@ -46,6 +46,117 @@ fn scope(slot: usize) -> ClientScope {
         conversation_id: "conversation".into(),
     }
 }
+
+#[tokio::test]
+async fn office_hundred_by_hundred_bindings_keep_identity_and_reject_overflow_without_side_effects()
+{
+    fn tree(path: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let name = std::path::PathBuf::from(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                entries.push((name.clone(), None));
+                entries.extend(
+                    tree(&entry.path())
+                        .into_iter()
+                        .map(|(p, bytes)| (name.join(p), bytes)),
+                );
+            } else {
+                entries.push((name, Some(std::fs::read(entry.path()).unwrap())));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = config(temp.path());
+    std::fs::write(
+        cfg.roots["project"].join("原有资料.txt"),
+        "不得因创建空会话而修改",
+    )
+    .unwrap();
+    cfg.slots = (0..100)
+        .map(|i| (format!("office-{i:03}"), "project".to_owned()))
+        .collect();
+    let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed("未调用")))
+        .await
+        .unwrap();
+    // Host启动本来就创建.openpaw资源锁目录；核对其后每个目录/文件字节，不能误当原根为空。
+    let before = tree(&cfg.roots["project"]);
+    let root = cfg.roots["project"].clone();
+    let started = std::time::Instant::now();
+    let mut first_in_each = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for office in 0..100 {
+        for conversation in 0..100 {
+            let s = ClientScope {
+                namespace: "office".into(),
+                slot_id: format!("office-{office:03}"),
+                conversation_id: format!("conversation-{conversation:03}"),
+            };
+            let binding = host.open_session(s.clone()).await.unwrap();
+            assert_eq!(binding.scope, s);
+            assert_eq!(binding.root_id, "project");
+            assert!(
+                ids.insert(binding.session_id.clone()),
+                "不同办公室同名会话不能串线"
+            );
+            if conversation == 0 {
+                first_in_each.push(binding);
+            }
+        }
+        let overflow = ClientScope {
+            namespace: "office".into(),
+            slot_id: format!("office-{office:03}"),
+            conversation_id: "overflow".into(),
+        };
+        assert_eq!(
+            host.open_session(overflow).await.unwrap_err().kind,
+            "capacity_exceeded"
+        );
+        if office % 20 == 19 {
+            eprintln!("V08空绑定进度：{}办公室，各100会话", office + 1);
+        }
+    }
+    assert_eq!(ids.len(), 10_000);
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let count = |table: &str| {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(count("host_bindings"), 10_000);
+    assert_eq!(count("host_runs"), 0, "打开空会话不能伪造Run或调用Provider");
+    assert_eq!(count("host_approvals"), 0);
+    assert_eq!(
+        tree(&root),
+        before,
+        "会话接受/超限不能改变任何工作区文件或既有资源目录"
+    );
+    drop(db);
+    host.shutdown().await.unwrap();
+    let host = Host::with_provider(cfg, Arc::new(MockProvider::fixed("仍未调用")))
+        .await
+        .unwrap();
+    for binding in first_in_each {
+        assert_eq!(
+            host.open_session(binding.scope.clone())
+                .await
+                .unwrap()
+                .session_id,
+            binding.session_id
+        );
+    }
+    host.shutdown().await.unwrap();
+    assert_eq!(
+        tree(&root),
+        before,
+        "重启和幂等查找不能新增或修改工作区内容"
+    );
+    eprintln!("V08: 100办公室×100真实空Session绑定、每间第101个拒绝、重启身份不变通过，耗时{:?}；不冒充10000个模型Run/网页任务容量验收", started.elapsed());
+}
 async fn pending(host: &Host, s: &ClientScope) -> ApprovalView {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

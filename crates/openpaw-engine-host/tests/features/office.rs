@@ -421,6 +421,7 @@ async fn suite() {
     server.shutdown().await.unwrap();
     boundary_cases(tmp.path()).await;
     persistent_turn_cases(tmp.path()).await;
+    history_encoded_byte_budget_pages_without_losing_turns(tmp.path()).await;
     web_cases(tmp.path()).await;
     unread_http_cases(tmp.path()).await;
     checkpoint_write_failure_cancels_real_stream_without_success_and_deletion_cannot_revive_it()
@@ -806,6 +807,85 @@ async fn persistent_turn_cases(base: &std::path::Path) {
         "complete"
     );
     server.shutdown().await.unwrap();
+}
+
+async fn history_encoded_byte_budget_pages_without_losing_turns(base: &std::path::Path) {
+    let cfg = config(&base.join("history-byte-budget"));
+    // 控制字符序列在JSON中占六倍字节，确保触发传输预算而非仅验证轮次数。
+    let answer = "\u{0001}".repeat(50_000);
+    let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed(answer.clone())))
+        .await
+        .unwrap();
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "byte-budget".into(),
+    };
+    let binding = host.open_session(scope.clone()).await.unwrap();
+    let mut expected = std::collections::BTreeSet::new();
+    for i in 0..50 {
+        let run = host
+            .submit_run(&scope, &binding.session_id, format!("真实轮次{i:02}"))
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        let run = host.get_run(&scope, &run.run_id).await.unwrap();
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(run.text, answer);
+        expected.insert(format!("legacy:{}", run.run_id));
+    }
+    host.shutdown().await.unwrap();
+    let host = Host::with_provider(cfg, Arc::new(MockProvider::fixed("查询不应调用")))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("http://{}", server.address());
+    let mut request = json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"byte-budget","limit":50});
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursors = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let response = post(&client, &url, &request).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = response.bytes().await.unwrap();
+        assert!(bytes.len() <= 8 * 1024 * 1024);
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let turns = body["data"]["turns"].as_array().unwrap();
+        assert!(!turns.is_empty());
+        if pages == 0 {
+            assert!(turns.len() < 50, "确实触发字节裁剪，不能仅测limit分页");
+        }
+        for turn in turns {
+            assert_eq!(turn["assistant"], answer);
+            assert_eq!(turn["state"], "complete");
+            assert!(
+                seen.insert(turn["id"].as_str().unwrap().to_owned()),
+                "翻页不得重复轮次"
+            );
+        }
+        pages += 1;
+        if body["data"]["hasMore"] == false {
+            assert_eq!(body["data"]["nextCursor"], "");
+            break;
+        }
+        let cursor = body["data"]["nextCursor"].as_str().unwrap().to_owned();
+        assert!(cursors.insert(cursor.clone()), "有后页时游标必须前进");
+        assert!(pages <= 50);
+        request["cursor"] = json!(cursor);
+    }
+    assert_eq!(seen, expected, "重启后字节预算分页保留全部50轮");
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        50
+    );
+    server.shutdown().await.unwrap();
+    eprintln!("V08: 50个真实完成Run重启后按8MiB编码字节预算分为{pages}页，内容/稳定ID完整且无重复，无新增模型Run");
 }
 
 async fn web_cases(base: &std::path::Path) {
