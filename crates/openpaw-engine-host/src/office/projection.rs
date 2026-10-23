@@ -3,13 +3,13 @@
 //! 依赖：原Store、官方client、单办公室协调任务。
 //! 禁止职责：不伪造进度、工具开始或多Agent，不复制会话账本。
 use super::{client::Client, dto, OfficeConfig};
-use crate::{Host, HostError, HostResult, RunState};
+use crate::{ClientScope, Host, HostError, HostResult, RunState};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 /// 用途：持有Office同步任务；关闭时在Store之前完成最终投影。
-/// 字段：停止token、任务和只读配置。
+/// 字段：停止token、任务、只读配置和有界会话恢复通知。
 /// 来源去向：HostServer启动到Host关闭。
 /// 约束：网络失败不改变Run结果，冲突停止自动投递。
 /// 稳定性：T4内部生命周期。
@@ -19,6 +19,7 @@ pub(crate) struct Coordinator {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     config: OfficeConfig,
     address: std::net::SocketAddr,
+    ui_refresh: tokio::sync::broadcast::Sender<ClientScope>,
 }
 impl Coordinator {
     /// 功能：为每个授权办公室启动独立投影和同步循环。
@@ -36,6 +37,7 @@ impl Coordinator {
     ) -> HostResult<Self> {
         let client = std::sync::Arc::new(Client::new(&config)?);
         let stop = CancellationToken::new();
+        let (ui_refresh, _) = tokio::sync::broadcast::channel(32);
         let mut tasks = Vec::new();
         for team in host.inner.config.slots.keys() {
             let team = team.clone();
@@ -61,7 +63,7 @@ impl Coordinator {
         tasks.push(tokio::spawn(super::approvals::run(
             host.clone(),
             client.clone(),
-            config.clone(),
+            ui_refresh.clone(),
             address,
             stop.clone(),
         )));
@@ -78,7 +80,19 @@ impl Coordinator {
             tasks,
             config,
             address,
+            ui_refresh,
         })
+    }
+    /// 功能：通知成功恢复聊天的会话需要重新展示待审批菜单。
+    /// 参数：scope为已经轮次服务校验的完整作用域。
+    /// 返回：无。
+    /// 错误：没有接收器时忽略，原审批仍由原期限管理。
+    /// 状态：不创建审批、Run或持久化事件。
+    /// 并发与取消：非阻塞广播；其他作用域的展示忽略该通知。
+    /// 权限：仅恢复展示，不改变输入、权限或审批状态。
+    /// 关联：REQ-OP-013；DES-OP-008。
+    pub(crate) fn refresh_ui(&self, scope: &ClientScope) {
+        let _ = self.ui_refresh.send(scope.clone());
     }
     /// 功能：停止网络循环，在Store关闭前保存全部最终快照。
     /// 参数：self为worker所有者，host为已完成Run清理的共享服务。

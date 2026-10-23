@@ -266,3 +266,7 @@ D37开发审查补充：原leader先wait再kill存在PGID复用窗口；Linux使
 | D46 | service::execute将非取消/预算类异常统一interrupted，turns::message通用化，用户不能知道实际Provider参数格式失败；原Run已failed但页面只有回复未完成 | 复用原RunFinished及安全分类，聊天/历史/resume解释一致；不展示原报文，不改严格JSON解析，不发假done。核心Provider是否有兼容bug尚无原SSE证明，不预判/越界修 |
 
 原读取weather_changsha.md失败是不存在；读取../README.md被授权根正确拒绝；若干公网502/连接失败是实际外部结果，不能通过扩大根/网络权限或伪造结果解决。原8765仅T4只读，不能写Markdown或领取详情；部署版本未统一属于交付缺口。真实人物详情约65秒浮窗超时已复现，T5隔离服务同动作能返回，先升级正确Host/poller，不能因此要求改Office。空白板link仍生成“查看任务拆解”是Office既有模板行为，用户要求另列R11，不误记为OpenPaw核心缺陷。证据定位0006验证记录产品复检；D45/D46仍开放，不以源码阅读关闭。
+
+### D47：浏览器续接丢失审批展示（2026-10-23，开放）
+
+真实8765/DeepSeek在c9107ab提出天气文件写入后，换浏览器只恢复聊天/快照，没有重放旧菜单。Office仍等待原decision HTTP，Host以为展示活动中，最终审批过期且无文件。证据`/home/cheng/.cache/t5-live-weather-20261023-b/report.json`。在0006原第9.2节和允许文件内修复Host：通过已校验的history/resume触发当前作用域撤旧展示/新display重开，沿用原业务绑定与期限；不把未知、408或重连当批准。补真实reload回归并重跑全量/真实模型，未验证前不关闭。不修改Office、不新增Rx。

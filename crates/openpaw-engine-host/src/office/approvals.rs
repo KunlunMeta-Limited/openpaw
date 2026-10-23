@@ -2,7 +2,7 @@
 //! 输入输出：原ApprovalView到官方decision.request和共享CAS。
 //! 依赖：共享Host、唯一Client和快照同步屏障。
 //! 禁止职责：不另建授权、不延长业务期限、不从未知结果批准。
-use super::{client::Client, dto, projection, OfficeConfig};
+use super::{client::Client, dto, projection};
 use crate::{ApprovalView, ClientScope, Host, HostResult};
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 /// 功能：管理每个业务审批最多一个活动展示任务。
-/// 参数：host/client/config/address为现有服务，stop为协调器关闭token。
+/// 参数：host/client/address为现有服务，refresh为恢复展示通知，stop为协调器关闭token。
 /// 返回：所有展示请求已结束后返回。
 /// 错误：存储或网络问题安全保留pending至到期，不批准。
 /// 状态：新display ID区别于业务approval ID。
@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 pub(super) async fn run(
     host: Host,
     client: Arc<Client>,
-    config: OfficeConfig,
+    refresh: tokio::sync::broadcast::Sender<ClientScope>,
     address: std::net::SocketAddr,
     stop: CancellationToken,
 ) {
@@ -60,15 +60,15 @@ pub(super) async fn run(
                 };
                 let id = a.approval_id.clone();
                 active.insert(id.clone());
-                let (h, c, cfg, t, s) = (
+                let (h, c, updates, t, s) = (
                     host.clone(),
                     client.clone(),
-                    config.clone(),
+                    refresh.clone(),
                     stop.clone(),
                     b.scope.clone(),
                 );
                 tasks.spawn(async move {
-                    let _ = display(&h, &c, &cfg, address, &s, &a, &t).await;
+                    let _ = display(&h, &c, &updates, address, &s, &a, &t).await;
                     id
                 });
             }
@@ -80,12 +80,17 @@ pub(super) async fn run(
 async fn display(
     host: &Host,
     client: &Client,
-    config: &OfficeConfig,
+    updates: &tokio::sync::broadcast::Sender<ClientScope>,
     address: std::net::SocketAddr,
     scope: &ClientScope,
     a: &ApprovalView,
     stop: &CancellationToken,
 ) -> HostResult<()> {
+    // 先订阅再同步展示，避免恢复通知落在读取快照与发菜单之间。
+    let mut refresh = updates.subscribe();
+    let Some(config) = host.inner.config.office.as_ref() else {
+        return Ok(());
+    };
     let remaining = a.expires_at_ms - chrono::Utc::now().timestamp_millis();
     if remaining < 1000 {
         return Ok(());
@@ -121,19 +126,27 @@ async fn display(
         .store
         .call(move |db| db.office_decision(&id, &d, &s, expiry, "active"))
         .await?;
-    let request=client.post(json!({"type":"decision.request","teamId":scope.slot_id,"conversationId":scope.conversation_id,"timeoutMs":ms,
+    let result = {
+        let request=client.post(json!({"type":"decision.request","teamId":scope.slot_id,"conversationId":scope.conversation_id,"timeoutMs":ms,
         "decision":{"id":display,"actorId":"office-lead","kind":"confirmation","title":format!("确认本次 {}",a.binding.tool_name),"description":description,"confirmLabel":"允许本次","rejectLabel":"拒绝"}}));
-    tokio::pin!(request);
-    let result = loop {
-        tokio::select! {biased;
-            _=stop.cancelled()=>break None,
-            r=&mut request=>break Some(r),
-            _=tokio::time::sleep(Duration::from_millis(50))=>{
-                let current=host.pending_approvals(scope).await?;
-                if !current.iter().any(|v|v.approval_id==a.approval_id && v.revision==a.revision) {break None;}
+        tokio::pin!(request);
+        loop {
+            tokio::select! {biased;
+                _=stop.cancelled()=>break None,
+                changed=refresh.recv()=>{
+                    match changed {
+                        Ok(s) if s != *scope => continue,
+                        _ => break None,
+                    }
+                }
+                r=&mut request=>break Some(r),
+                _=tokio::time::sleep(Duration::from_millis(50))=>{
+                    let current=host.pending_approvals(scope).await?;
+                    if !current.iter().any(|v|v.approval_id==a.approval_id && v.revision==a.revision) {break None;}
+                }
             }
         }
-    };
+    }; // 在下一次展示之前drop旧HTTP；Office据连接关闭撤销旧display，绝不重置业务期限。
     let state = match result {
         Some(Ok((_, data))) => {
             // Client已严格核对作用域/display/choice/label；共享CAS仍重新检查取消与期限。

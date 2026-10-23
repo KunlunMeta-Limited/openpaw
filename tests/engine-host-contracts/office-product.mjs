@@ -10,6 +10,7 @@ import { dirname, join, resolve, relative, delimiter } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
 import { once } from 'node:events'
+import { DatabaseSync } from 'node:sqlite'
 import { officeRequestSchema, officeResultSchema, officeSnapshotSchema } from './upstream-office/packages/protocol/src/office-integration.ts'
 import { chatEventSchema, chatOperationSchema, chatHistoryPageSchema, chatCancelResultSchema } from './upstream-office/packages/protocol/src/chat.ts'
 import { assertProtocolValue, responseEnvelopeSchema } from './upstream-office/packages/protocol/src/schema.ts'
@@ -554,6 +555,26 @@ try {
   const pending=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.t5.approveRequest.conversationId);return c?.tasks.some(t=>t.status==='blocked')?r:false});
   report.t5.pendingSnapshot=pending;
   await page.screenshot({path:join(output,'23-t5-approval-blocked.png'),fullPage:true});
+  // 实际reload应撤旧展示再重开；只读核对原业务审批、输入和期限，不能直接HTTP代批。
+  const approvalRun=conv(pending,report.t5.approveRequest.conversationId).tasks[0].id.slice('run:'.length);
+  function approvalRecord(){
+    const db=new DatabaseSync(join(output,'host-data/engine-host/host.db'),{readOnly:true});
+    try {
+      const approval=JSON.parse(db.prepare('SELECT data FROM host_approvals WHERE run=?').get(approvalRun).data);
+      const display=db.prepare('SELECT * FROM host_office_decisions WHERE approval_id=?').get(approval.approval_id);
+      return {approval,display};
+    } finally {db.close()}
+  }
+  report.t5.beforeReload=approvalRecord();
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,'T5-允许报告');
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();
+  report.t5.afterReload=await waitFor(()=>{const r=approvalRecord();return r.display.state==='active'&&r.display.display_id!==report.t5.beforeReload.display.display_id?r:false});
+  assert.deepEqual(report.t5.afterReload.approval,report.t5.beforeReload.approval,'重开不得替换业务审批/输入/期限');
+  assert.equal(report.t5.afterReload.display.expires_at,report.t5.beforeReload.display.expires_at);
+  assert.equal(await access(join(workspace,'reports/T5报告.md')).then(()=>true,()=>false),false);
+  await page.screenshot({path:join(output,'23b-t5-reloaded-approval-same-binding.png'),fullPage:true});
+  report.assertions.push('D47: real browser reload reopens a new display, preserves exact business approval/input/expiry and performs no write before browser approval');
   await fresh(page);await send('审批等待期间读取README.md和notes.txt并总结',markerA);
   report.t5.readWhilePending=structuredClone(latestSend().request);
   assert.notEqual(report.t5.readWhilePending.conversationId,report.t5.approveRequest.conversationId);

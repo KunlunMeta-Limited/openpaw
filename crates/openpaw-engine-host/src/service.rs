@@ -960,6 +960,20 @@ impl Host {
         Ok(())
     }
 
+    /// 功能：在已校验聊天恢复后请求重新展示该会话的待审批菜单。
+    /// 参数：scope为轮次服务已核对的完整作用域。
+    /// 返回：无。
+    /// 错误：无；未启用Office时无操作。
+    /// 状态：不创建运行、不延长审批期限、不批准工具。
+    /// 并发与取消：短锁内发送瞬时通知；原展示任务自行关闭HTTP。
+    /// 权限：调用者必须先完成会话及办公室范围校验。
+    /// 关联：REQ-OP-013；DES-OP-008。
+    pub(crate) async fn refresh_office_ui(&self, scope: &ClientScope) {
+        if let Some(office) = self.inner.office.lock().await.as_ref() {
+            office.refresh_ui(scope);
+        }
+    }
+
     /// 功能：读取已恢复且可继续接受运行的就绪状态。
     /// 参数：self为共享Host。
     /// 返回：未关闭、未锁存存储故障时为真。
