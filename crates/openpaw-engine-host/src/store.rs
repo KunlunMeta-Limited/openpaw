@@ -1465,7 +1465,7 @@ impl Db {
     /// 参数：run为当前运行ID。
     /// 返回：调用ID到原计划步骤下标的映射；没有计划的调用由投影归主目标。
     /// 错误：SQL或已存计划/执行绑定损坏。
-    /// 状态：只读重建，不新增另一套调用或动画账本。
+    /// 状态：只读重建；无开始步骤的委派可由后续已校验完成证据补关联，已有绑定不移动。
     /// 并发与取消：在原Store序列内按revision读取，无网络或资源锁。
     /// 权限：只使用同Run的已存计划和实际tool_started事实。
     /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
@@ -1481,6 +1481,7 @@ impl Db {
             .map_err(HostError::storage)?;
         let mut current = None;
         let mut assignments = std::collections::BTreeMap::new();
+        let mut unassigned_delegations = std::collections::BTreeSet::new();
         for row in rows {
             let (kind, raw) = row.map_err(HostError::storage)?;
             let v: serde_json::Value = serde_json::from_str(&raw).map_err(HostError::storage)?;
@@ -1488,8 +1489,23 @@ impl Db {
                 current = v["steps"]
                     .as_array()
                     .and_then(|steps| steps.iter().position(|s| s["state"] == "in_progress"));
-            } else if let (Some(index), Some(call)) = (current, v["call_id"].as_str()) {
-                assignments.insert(call.to_owned(), index);
+                // 模型可能漏报开始；仅用原校验通过的准确证据补未关联委派，不按标题猜。
+                // 普通工具及已有开始绑定保持原位，避免进度更新重播历史动画。
+                for (index, step) in v["steps"].as_array().into_iter().flatten().enumerate() {
+                    for call in step["evidenceCallIds"].as_array().into_iter().flatten() {
+                        if let Some(call) = call.as_str() {
+                            if unassigned_delegations.remove(call) {
+                                assignments.entry(call.to_owned()).or_insert(index);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(call) = v["call_id"].as_str() {
+                if let Some(index) = current {
+                    assignments.insert(call.to_owned(), index);
+                } else if v["tool_name"] == "delegate_task" {
+                    unassigned_delegations.insert(call.to_owned());
+                }
             }
         }
         Ok(assignments)

@@ -440,85 +440,106 @@ mod tests {
     #[tokio::test]
     async fn delegated_business_step_keeps_one_card_owner_and_stable_assignment() {
         use openpaw_llm::{MockMode, MockProvider};
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("root");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("README.md"), "actual project fact").unwrap();
-        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
-        let call = |name: &str, input| MockMode::ToolUse {
-            tool_name: name.into(),
-            input,
-            text: String::new(),
-        };
-        let provider = MockProvider::scripted(vec![
-            call(
+        for (mark_active, confirm) in [(true, true), (false, true), (false, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("README.md"), "actual project fact").unwrap();
+            let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+            let call = |name: &str, input| MockMode::ToolUse {
+                tool_name: name.into(),
+                input,
+                text: String::new(),
+            };
+            let mut script = vec![call(
                 "report_progress",
                 json!({"type":"create","steps":[{"id":"lookup","title":"核对项目说明"},{"id":"summary","title":"王明汇总同事的实际结果"}]}),
-            ),
-            call(
-                "report_progress",
-                json!({"type":"update","stepId":"lookup","state":"in_progress"}),
-            ),
+            )];
+            if mark_active {
+                script.push(call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"lookup","state":"in_progress"}),
+                ));
+            }
+            let delegate_call = if mark_active { "call_2" } else { "call_1" };
+            script.extend(vec![
             call(
                 "delegate_task",
                 json!({"role_id":"research","title":"李研核对项目目标","instructions":"读取README.md","acceptance":"有文件依据"}),
             ),
             call("read_file", json!({"path":"README.md"})),
             MockMode::Fixed("李研已实际读取项目说明".into()),
-            call(
-                "report_progress",
-                json!({"type":"update","stepId":"lookup","state":"completed","evidenceCallIds":["call_2"]}),
-            ),
-            call(
-                "report_progress",
-                json!({"type":"update","stepId":"summary","state":"in_progress"}),
-            ),
-            MockMode::Fixed("王明汇总：同事已读取项目说明，证据已核实".into()),
         ]);
-        let host = Host::with_provider(config, std::sync::Arc::new(provider))
-            .await
-            .unwrap();
-        let scope = ClientScope {
-            namespace: "office".into(),
-            slot_id: "office-1".into(),
-            conversation_id: "linked".into(),
-        };
-        let session = host.open_session(scope.clone()).await.unwrap();
-        host.submit_run(&scope, &session.session_id, "请安排李研核对并汇总".into())
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
-            .await
-            .unwrap();
-        let office = OfficeConfig {
-            base_url: "http://127.0.0.1:9".into(),
-            api_key_env: "PAWOFFICE_TEST_KEY".into(),
-            allowed_origins: vec!["http://127.0.0.1:8765".into()],
-            names: Default::default(),
-            creation_slots: vec![],
-        };
-        let snapshot = prepare(&host, &office, "office-1").await.unwrap();
-        let conv = &snapshot["conversations"][0];
-        assert_eq!(
-            conv["tasks"].as_array().unwrap().len(),
-            3,
-            "计划步骤和子任务不能重复卡片"
-        );
-        assert_eq!(conv["tasks"][0]["status"], "completed");
-        assert_eq!(
-            conv["tasks"][0]["progress"], 100,
-            "正常保存最终汇总后才确认交付"
-        );
-        assert_eq!(conv["tasks"][1]["assigneeId"], "command");
-        assert_eq!(conv["events"].as_array().unwrap().len(), 1);
-        assert_eq!(conv["events"][0]["taskId"], conv["tasks"][1]["id"]);
-        assert_eq!(conv["events"][0]["fromEmployeeId"], "assistant");
-        assert_eq!(
-            prepare(&host, &office, "office-1").await.unwrap(),
-            snapshot,
-            "无新事实不改变seq或重播交接"
-        );
-        host.shutdown().await.unwrap();
+            if confirm {
+                script.push(call(
+                "report_progress",
+                json!({"type":"update","stepId":"lookup","state":"completed","evidenceCallIds":[delegate_call]}),
+                ));
+            }
+            script.extend(vec![
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"summary","state":"in_progress"}),
+                ),
+                MockMode::Fixed("王明汇总：同事已读取项目说明，证据已核实".into()),
+            ]);
+            let provider = MockProvider::scripted(script);
+            let host = Host::with_provider(config, std::sync::Arc::new(provider))
+                .await
+                .unwrap();
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "linked".into(),
+            };
+            let session = host.open_session(scope.clone()).await.unwrap();
+            host.submit_run(&scope, &session.session_id, "请安排李研核对并汇总".into())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+                .await
+                .unwrap();
+            let office = OfficeConfig {
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "PAWOFFICE_TEST_KEY".into(),
+                allowed_origins: vec!["http://127.0.0.1:8765".into()],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            let conv = &snapshot["conversations"][0];
+            assert_eq!(
+                conv["tasks"].as_array().unwrap().len(),
+                if confirm { 3 } else { 4 },
+                "有准确证据才合并；不能按相似任务标题猜测关联"
+            );
+            if confirm {
+                assert_eq!(conv["tasks"][0]["status"], "completed");
+                assert_eq!(
+                    conv["tasks"][0]["progress"], 100,
+                    "正常保存最终汇总后才确认交付"
+                );
+                assert_eq!(conv["tasks"][1]["assigneeId"], "command");
+                assert_eq!(conv["events"][0]["taskId"], conv["tasks"][1]["id"]);
+            } else {
+                assert_eq!(conv["tasks"][0]["status"], "failed");
+                assert!(conv["tasks"][0]["progress"].as_u64().unwrap() < 100);
+                assert_eq!(
+                    conv["tasks"][1]["status"], "failed",
+                    "子任务成功不自动确认未报告步骤"
+                );
+                assert_eq!(conv["tasks"][3]["assigneeId"], "command");
+                assert_eq!(conv["events"][0]["taskId"], conv["tasks"][3]["id"]);
+            }
+            assert_eq!(conv["events"].as_array().unwrap().len(), 1);
+            assert_eq!(conv["events"][0]["fromEmployeeId"], "assistant");
+            assert_eq!(
+                prepare(&host, &office, "office-1").await.unwrap(),
+                snapshot,
+                "无新事实不改变seq或重播交接"
+            );
+            host.shutdown().await.unwrap();
+        }
     }
     #[tokio::test]
     async fn legacy_snapshot_upgrades_with_new_seq_and_full_catalogue_is_bounded() {
