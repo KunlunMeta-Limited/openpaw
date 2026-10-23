@@ -2061,6 +2061,45 @@ impl Db {
     }
 }
 
+// 与实时RunText使用相同消息分隔规则；这里只投影原事实，不解析第二种消息格式。
+fn committed_run_text(events: &[SessionEvent], id: &str) -> RunText {
+    let mut active = false;
+    let mut text = RunText::default();
+    for event in events {
+        match event {
+            SessionEvent::RunStarted { run_id } => active = run_id == id,
+            SessionEvent::Message(message)
+                if active && message.role == openpaw_core::Role::Assistant =>
+            {
+                for block in &message.content {
+                    if let openpaw_core::ContentBlock::Text { text: chunk } = block {
+                        text.append(chunk);
+                    }
+                }
+                text.end_message();
+            }
+            _ => {}
+        }
+    }
+    text
+}
+fn merge_run_display(run: &mut RunView, candidate: &str, truncated: bool) -> HostResult<()> {
+    if run.text.starts_with(candidate) {
+        if run.text.len() == candidate.len() {
+            run.text_truncated |= truncated;
+        }
+    } else if candidate.starts_with(&run.text) {
+        run.text = candidate.to_owned();
+        run.text_truncated = truncated;
+    } else {
+        return Err(HostError::new(
+            "storage_unavailable",
+            "展示检查点与可靠账本前缀不一致",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod office_regressions {
     use super::*;
@@ -2295,43 +2334,4 @@ mod office_regressions {
         assert!(host.open_session(scope).await.is_err());
         host.shutdown().await.unwrap();
     }
-}
-
-// 与实时RunText使用相同消息分隔规则；这里只投影原事实，不解析第二种消息格式。
-fn committed_run_text(events: &[SessionEvent], id: &str) -> RunText {
-    let mut active = false;
-    let mut text = RunText::default();
-    for event in events {
-        match event {
-            SessionEvent::RunStarted { run_id } => active = run_id == id,
-            SessionEvent::Message(message)
-                if active && message.role == openpaw_core::Role::Assistant =>
-            {
-                for block in &message.content {
-                    if let openpaw_core::ContentBlock::Text { text: chunk } = block {
-                        text.append(chunk);
-                    }
-                }
-                text.end_message();
-            }
-            _ => {}
-        }
-    }
-    text
-}
-fn merge_run_display(run: &mut RunView, candidate: &str, truncated: bool) -> HostResult<()> {
-    if run.text.starts_with(candidate) {
-        if run.text.len() == candidate.len() {
-            run.text_truncated |= truncated;
-        }
-    } else if candidate.starts_with(&run.text) {
-        run.text = candidate.to_owned();
-        run.text_truncated = truncated;
-    } else {
-        return Err(HostError::new(
-            "storage_unavailable",
-            "展示检查点与可靠账本前缀不一致",
-        ));
-    }
-    Ok(())
 }

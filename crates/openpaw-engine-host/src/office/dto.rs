@@ -423,6 +423,11 @@ pub(super) fn ui_action(value: &Value) -> bool {
         })
 }
 
+// Zod trim沿用ECMAScript WhiteSpace/LineTerminator；Rust trim对U+0085/U+FEFF的取舍不同。
+fn member_trim(value: &str) -> &str {
+    value.trim_matches(|c| matches!(c,'\u{0009}'..='\u{000d}'|'\u{0020}'|'\u{00a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}'))
+}
+
 #[cfg(test)]
 mod action_regressions {
     use super::*;
@@ -456,9 +461,4 @@ mod action_regressions {
         boundary["role"] = json!(" role ");
         assert!(ui_action(&boundary));
     }
-}
-
-// Zod trim沿用ECMAScript WhiteSpace/LineTerminator；Rust trim对U+0085/U+FEFF的取舍不同。
-fn member_trim(value: &str) -> &str {
-    value.trim_matches(|c| matches!(c,'\u{0009}'..='\u{000d}'|'\u{0020}'|'\u{00a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}'))
 }

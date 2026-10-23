@@ -1732,3 +1732,5 @@ T7仍实现固定SDK1.18.15，不复制编排/审批；T8仍做原生平台、Of
 原0007第12.1—12.3节三项均已获用户明确批准，具体对象与时间见该单第12节末尾。实现：service::run_checkpoints/execute→store::checkpoint_run/get_run复用原Run元数据恢复展示前缀；recovery原实际进程kill增加独立SQL提交屏障，复验官方history/resume同一文本、interrupted及零重放；office原HTTP验收增加检查点写失败真实取消及删除无复活。Tokio只锁定1.53.3补丁。
 
 Office当前冻结升级到fa6ae1f，来源26份及实际变化3Schema同步；DTO/action严格识别employee.create后明确不支持动态角色，固定可信六角色不变。classic/members仍共用原快照、实例布局revision与业务seq无关；原产品runner增加六成员完整档案、运行中布局切换/刷新/跨页及无重复Run/模型验证。原8765仍T5/d150b96，源码和冻结升级不代表线上演示已升级。完整准确候选、最终实际模型/部署、T6交付验收与PR仍待完成，不能进入T7。Office R11/R12/R13/R15/R16/R17继续统一台账暂缓，R14已由上游覆盖撤回；Windows暂缓不计通过。
+
+2026-10-24最新真实DeepSeek整体failed：五子Run完成及实际报告/一次审批均有证据，但主Run因原引擎预算算法在18次调用提前失败。D56最小通用修复提案见原0007第12.5节r5，尚未批准、未改两核心文件；T6仍不可交付/提PR。该提案包含前一r4的登记归并，不需要先独立决定r4。不能以子任务成功或较早模型报告代替本轮整体失败。

@@ -1543,3 +1543,53 @@ async fn p07_restart_validates_agent_versions_and_never_replays_children() {
     assert_eq!(provider.requests.lock().unwrap().len(), before);
     reopened.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn p04_long_but_bounded_group_reaches_final_answer_and_still_honors_shared_limit() {
+    for (limit, expected, expected_calls) in
+        [(24, RunState::Completed, 21), (10, RunState::Failed, 10)]
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = team_config(tmp.path());
+        let agents = cfg.agents.as_mut().unwrap();
+        agents.max_model_requests = limit;
+        agents.max_output_tokens = 262144;
+        let mut responses = vec![
+            MockMode::ToolUse {
+                tool_name: "read_file".into(),
+                input: json!({"path":"README.md"}),
+                text: String::new(),
+            };
+            20
+        ];
+        responses.push(MockMode::Fixed("逐次核对完成，提供最终答复".into()));
+        let provider = Arc::new(MockProvider::scripted(responses));
+        let host = Host::with_provider(cfg, provider.clone()).await.unwrap();
+        let scope = team_scope("long-bounded-group");
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(
+                &scope,
+                &binding.session_id,
+                "完整处理已配置额度内的逐项检查".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let result = host.get_run(&scope, &run.run_id).await.unwrap();
+        assert_eq!(
+            result.state,
+            expected,
+            "不能在已配置预算尚有额度时提前结束；实际Provider调用={}：{:?}",
+            provider.call_count(),
+            result.error
+        );
+        assert_eq!(provider.call_count(), expected_calls);
+        if expected == RunState::Completed {
+            assert!(result.text.contains("最终答复"));
+        }
+        host.shutdown().await.unwrap();
+    }
+}

@@ -331,3 +331,7 @@ Office fa6ae1f新动作含name/role/sceneActorId，dto::ui_action未知动作返
 本会话用户已分别批准0007第12.1安全补丁、第12.2展示检查点、第12.3上游兼容。D54已复用原Run元数据和单写Store实现，不新增消息库/Schema；真实SQL提交屏障后kill恢复原部分文本，官方history/resume一致为error/interrupted，独立Provider计数为零，原9种接受/终态/父子审批写入边界保留。原HTTP注入真实UPDATE ABORT，Run失败并清理、无done；原私有Store测试覆盖不变不写、错误会话无操作、前缀冲突/4MiB拒绝、账本追上清冗余及删除后无INSERT。证据t6-approved-host-20261024-f.log，非最终准确候选交付。
 
 D55已严格识别合法employee.create，经原唯一领取和作用域检查立即返回固定六角色限制，原HTTPfixture验证无新增Run/Session/审批/文件。源码按真实Zod Unicode码点/ECMAScript trim校验，不按旧假设UTF-16误拒非BMP姓名；原Schema契约13/13。Office仍未改；成员布局真实浏览器及原完整27项待新准确候选重验。Tokio锁只改1.53.3和checksum，cargo update产生的无关Windows依赖边选择变化未纳入，locked构建已验证此最小锁可用。旧失败均保留，暂不登记最终关闭。
+
+## D56：原引擎预算消费前强制扩容导致提前结束（真实复现，待r5批准）
+
+真实模型`/home/cheng/.cache/t6-real-model-20261024-approved-a/report.json`五子均完成、主Run failed，原JSONL记录18次usage后iteration budget exhausted。AgentLoop默认弹性8/25/1，run_inner将消费绑定expand成功，current_max达到25后拒绝仍未消费的额度，实际17+1次；固定new(2)亦只剩1次grace。旧engine_e1只检查消息数<12而遗漏次数。具体最小原模块修复、文件、费用/取消/回退与准确验证见0007第12.5节r5；当前未批准、核心生产/测试未改，不在Host绕过。此问题阻塞最新真实产品交付，不能标T6完成。
