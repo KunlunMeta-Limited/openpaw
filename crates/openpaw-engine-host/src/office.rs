@@ -150,12 +150,14 @@ impl MainOfficeEntry {
 pub(crate) struct MainOffice {
     /// 串行化首次绑定与聊天准入，不覆盖实际 runtime 执行锁。
     pub(crate) admission: tokio::sync::Mutex<()>,
+    // 完整目录同步与 UI 创建回包互斥，避免新 ID 被提前初始化后遭到重复拒绝。
+    directory_sync: tokio::sync::Mutex<()>,
     records: Mutex<Result<std::collections::BTreeMap<String, MainOfficeEntry>, String>>,
     path: PathBuf,
     /// 仅服务端配置的固定 main gateway 地址。
     pub(crate) url: Option<Url>,
     key: String,
-    /// 复用连接且禁止重定向的客户端；页面代理不附业务 Bearer。
+    /// 复用连接且禁止重定向的客户端；仅用于服务端 Gateway 消息。
     pub(crate) client: Client,
     started: std::sync::atomic::AtomicBool,
     // 由原版 gateway 的能力响应协商；仅控制出站协议形状。
@@ -245,6 +247,7 @@ impl MainOffice {
         let (projection_tx, projection_rx) = mpsc::channel(32);
         let this = Arc::new(Self {
             admission: tokio::sync::Mutex::new(()),
+            directory_sync: tokio::sync::Mutex::new(()),
             records: Mutex::new(records),
             path,
             url: url
@@ -466,6 +469,80 @@ impl MainOffice {
             let _ = std::fs::remove_file(temporary);
         }
         result
+    }
+
+    /// 功能：在可信工作根目录下创建真实子目录并登记办公室。
+    /// 参数：root 为服务端配置的工作根目录；name 为单层工作空间名称。
+    /// 返回：符合当前 main 协议的办公室快照。
+    /// 错误：名称非法400、重名409、容量422、目录或登记故障500。
+    /// 状态：仅建立目录和办公室，不创建会话、不启动模型或工具。
+    /// 并发与取消：admission 串行创建；登记失败只回收本次新建空目录。
+    /// 权限：调用方完成认证，输入不能选择根目录或复用已有目录。
+    /// 关联：API-HOST-OFFICE-WORKSPACE-001、CHG-2026-0047。
+    pub(crate) async fn create_workspace(
+        &self,
+        root: &Path,
+        name: &str,
+    ) -> Result<Value, (u16, &'static str)> {
+        let name = name.trim();
+        let stem = name
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.len() == 4
+                && matches!(stem.as_bytes()[3], b'1'..=b'9');
+        if name.is_empty()
+            || name.encode_utf16().count() > 40
+            || name.ends_with('.')
+            || reserved
+            || name
+                .chars()
+                .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c))
+        {
+            return Err((400, "名称需要1–40个字符，不能包含路径、非法字符或设备名"));
+        }
+        let _admission = self.admission.lock().await;
+        let offices = self.directory().map_err(|_| (500, "办公室目录无法读取"))?;
+        if offices.iter().any(|office| {
+            office["workspace"]["name"]
+                .as_str()
+                .is_some_and(|existing| existing.to_lowercase() == name.to_lowercase())
+        }) {
+            return Err((409, "这个工作空间名称已存在，请换一个名称"));
+        }
+        if offices.len() >= 100 {
+            return Err((422, "最多支持100个办公室"));
+        }
+        let root = std::fs::canonicalize(root).map_err(|_| (500, "工作空间根目录不可用"))?;
+        let path = root.join(name);
+        std::fs::create_dir(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                (409, "同名目录已存在，未覆盖任何文件")
+            } else {
+                (500, "工作空间目录创建失败")
+            }
+        })?;
+        if let Err(error) = self.register(&path) {
+            let _ = std::fs::remove_dir(&path);
+            return Err(if error == "办公室数量已达上限" {
+                (422, "办公室数量已达上限")
+            } else {
+                (500, "办公室登记失败，未创建聊天")
+            });
+        }
+        self.directory()
+            .ok()
+            .and_then(|offices| {
+                offices
+                    .into_iter()
+                    .find(|office| office["workspace"]["name"] == name)
+            })
+            .map(|snapshot| self.wire_snapshot(&snapshot))
+            .ok_or((500, "办公室登记状态无法读取"))
     }
 
     /// 功能：为实际工作目录登记稳定办公室。
@@ -1272,14 +1349,33 @@ impl MainOffice {
     /// 参数：shutdown 为 Host 关闭令牌。
     /// 返回：无。
     /// 错误：仅安全日志，离线不改变模型回合结果。
-    /// 状态：有限间隔重试目录与当前快照，不恢复执行或历史动画。
+    /// 状态：有限间隔重试目录、可选聊天地址与当前快照，不恢复执行或历史动画。
     /// 并发与取消：两个独立任务，UI 长轮询不阻塞快照；关闭时丢弃 HTTP future。
-    /// 权限：任务操作只给出未开放说明，不启动后续 PR 业务。
-    /// 关联：T1-01、T1-08、T1-10。
+    /// 权限：创建仅使用服务端根目录；聊天地址仅来自可信环境，不附浏览器凭据。
+    /// 关联：T1-01、T1-08、T1-10、CHG-2026-0047、CHG-2026-0048。
     pub(crate) fn start(self: &Arc<Self>, shutdown: tokio_util::sync::CancellationToken) {
         use std::sync::atomic::Ordering;
         if self.url.is_none() || self.started.swap(true, Ordering::AcqRel) {
             return;
+        }
+        let configured_chat = match std::env::var("OPENPAW_MAIN_CHAT_URL") {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(_) => Err(()),
+            Ok(value) if value.trim().is_empty() => Ok(None),
+            Ok(value) => Url::parse(value.trim())
+                .ok()
+                .filter(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                        && url.fragment().is_none()
+                })
+                .map(Some)
+                .ok_or(()),
+        };
+        if configured_chat.is_err() {
+            tracing::warn!("main 聊天地址配置无效，拒绝目录初始化；不影响引擎执行");
         }
         let weak = Arc::downgrade(self);
         let stop = shutdown.clone();
@@ -1290,6 +1386,8 @@ impl MainOffice {
             .take()
             .expect("single main worker");
         tokio::spawn(async move {
+            // 即使页面已经就绪，Host 首轮仍须登记本次配置；Gateway 丢失目录后再次登记。
+            let mut chat_registered = false;
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1338,6 +1436,9 @@ impl MainOffice {
                         }
                         return Ok(());
                     }
+                    let chat = configured_chat
+                        .as_ref()
+                        .map_err(|()| "main 聊天地址配置无效".to_string())?;
                     let (status, capabilities) = office
                         .message(
                             serde_json::json!({"type":"office.capabilities"}),
@@ -1354,6 +1455,7 @@ impl MainOffice {
                     }
                     // 离线恢复只发送当前状态。交接事件超过投影期限后以新版本清除，
                     // 避免 gateway 重启后把历史事件当成一次新的拜访。
+                    let _directory_sync = office.directory_sync.lock().await;
                     office.clear_transient_events()?;
                     let snapshots = office.directory()?;
                     let (_, remote) = office
@@ -1371,14 +1473,20 @@ impl MainOffice {
                             })
                         })
                     });
-                    let status = if ready {
+                    let status = if ready && (chat.is_none() || chat_registered) {
                         200
                     } else {
-                        office.message(serde_json::json!({"type":"offices.initialize","offices":snapshots}),Duration::from_secs(3)).await?.0
+                        let mut message =
+                            serde_json::json!({"type":"offices.initialize","offices":snapshots});
+                        if let Some(url) = chat {
+                            message["chat"] = serde_json::json!({"url":url.as_str()});
+                        }
+                        office.message(message, Duration::from_secs(3)).await?.0
                     };
                     if !matches!(status, 200 | 202) {
                         return Err("main 初始化被拒绝".into());
                     }
+                    chat_registered = true;
                     if status == 200 {
                         // 完整快照会按任务重算人物状态。对仍真实活动的回合重新提交
                         // 当前思考/工具状态；只恢复状态，不重播交接或重新启动执行。
@@ -1421,24 +1529,62 @@ impl MainOffice {
                             let Some(team) = action["teamId"].as_str() else {
                                 continue;
                             };
-                            let matching = office.action_record(team, action).is_ok();
-                            let content = match action["action"].as_str() {
-                                Some("actor.inspect" | "employee.inspect" | "dialog.action") => {
-                                    if matching {
-                                        office.prepare_detail(team, action).await;
-                                        office.inspect(team, action)
-                                    } else {
-                                        serde_json::json!({"template":"detail-v1","title":"归属不匹配","description":"办公室不匹配或对话不存在，请返回原对话查看员工。","fields":[],"actions":[]})
+                            let _directory_sync = if action["action"] == "office.create" {
+                                Some(office.directory_sync.lock().await)
+                            } else {
+                                None
+                            };
+                            let presentation = if action["action"] == "office.create" {
+                                // 创建发生在办公室/会话绑定前，不能走详情的归属查找。
+                                let runtime = office
+                                    .runtime
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .upgrade();
+                                let created = match (
+                                    team,
+                                    action["conversationId"].as_str(),
+                                    action["name"].as_str(),
+                                    runtime,
+                                ) {
+                                    ("", Some(""), Some(name), Some(state)) => {
+                                        office.create_workspace(&state.config.workspace, name).await
+                                    }
+                                    ("", Some(""), Some(_), None) => {
+                                        Err((500, "工作空间服务不可用"))
+                                    }
+                                    _ => Err((400, "创建工作空间的名称或归属格式错误")),
+                                };
+                                match created {
+                                    Ok(snapshot) => {
+                                        serde_json::json!({"target":"office","snapshot":snapshot})
+                                    }
+                                    Err((_, message)) => {
+                                        serde_json::json!({"target":"result","success":false,"message":message})
                                     }
                                 }
-                                _ => {
-                                    serde_json::json!({"template":"detail-v1","title":"操作说明","description":"此操作尚未开放，未启动或修改任务。","fields":[],"actions":[]})
-                                }
-                            };
-                            let presentation = if action["action"] == "conversation.delete" {
-                                serde_json::json!({"target":"result","success":false,"message":"本轮暂不支持删除主对话，历史已保留。"})
                             } else {
-                                serde_json::json!({"target":"dialog","content":content})
+                                let matching = office.action_record(team, action).is_ok();
+                                let content = match action["action"].as_str() {
+                                    Some(
+                                        "actor.inspect" | "employee.inspect" | "dialog.action",
+                                    ) => {
+                                        if matching {
+                                            office.prepare_detail(team, action).await;
+                                            office.inspect(team, action)
+                                        } else {
+                                            serde_json::json!({"template":"detail-v1","title":"归属不匹配","description":"办公室不匹配或对话不存在，请返回原对话查看员工。","fields":[],"actions":[]})
+                                        }
+                                    }
+                                    _ => {
+                                        serde_json::json!({"template":"detail-v1","title":"操作说明","description":"此操作尚未开放，未启动或修改任务。","fields":[],"actions":[]})
+                                    }
+                                };
+                                if action["action"] == "conversation.delete" {
+                                    serde_json::json!({"target":"result","success":false,"message":"本轮暂不支持删除主对话，历史已保留。"})
+                                } else {
+                                    serde_json::json!({"target":"dialog","content":content})
+                                }
                             };
                             let response = serde_json::json!({"type":"ui.respond","interactionId":id,
                                 "presentation":presentation});

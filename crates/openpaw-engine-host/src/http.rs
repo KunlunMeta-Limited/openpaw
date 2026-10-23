@@ -112,17 +112,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/pawoffice/chat",
             post(main_conversation_chat).layer(axum::extract::DefaultBodyLimit::max(524_288)),
         )
-        .route("/office", get(main_proxy))
-        .route("/office/", get(main_proxy))
-        .route("/office/{*path}", get(main_proxy))
-        .route("/assets/{*path}", get(main_proxy))
-        .route("/farm-assets/{*path}", get(main_proxy))
-        .route("/brand/{*path}", get(main_proxy))
-        .route("/characters/{*path}", get(main_proxy))
-        .route("/pawoffice-config.js", get(main_proxy))
-        .route("/api/pawoffice/events", get(main_proxy))
-        .route("/api/pawoffice/reply", post(main_proxy))
-        .route("/api/pawoffice/ui", post(main_proxy))
         .with_state(state.clone());
     router.layer(middleware::from_fn_with_state(state, auth_middleware))
 }
@@ -302,75 +291,6 @@ struct MainChatMessage {
     content: String,
 }
 
-async fn main_proxy(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
-    let Some(mut url) = state.main_office.url.clone() else {
-        return bad(StatusCode::SERVICE_UNAVAILABLE, "main gateway 未配置");
-    };
-    if request
-        .headers()
-        .get("sec-fetch-site")
-        .is_some_and(|value| value == "cross-site")
-    {
-        return bad(StatusCode::FORBIDDEN, "请使用同源入口");
-    }
-    if let Some(origin) = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-    {
-        let expected = request
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if ![format!("http://{expected}"), format!("https://{expected}")]
-            .contains(&origin.to_string())
-        {
-            return bad(StatusCode::FORBIDDEN, "请使用同源入口");
-        }
-    }
-    url.set_path(request.uri().path());
-    url.set_query(request.uri().query());
-    let mut upstream = state
-        .main_office
-        .client
-        .request(request.method().clone(), url.clone())
-        .header(header::ORIGIN, url.origin().ascii_serialization());
-    for name in [
-        header::CONTENT_TYPE,
-        header::ACCEPT,
-        header::IF_NONE_MATCH,
-        header::IF_MODIFIED_SINCE,
-    ] {
-        if let Some(value) = request.headers().get(&name) {
-            upstream = upstream.header(name, value);
-        }
-    }
-    let bytes = match axum::body::to_bytes(request.into_body(), 524_288).await {
-        Ok(bytes) => bytes,
-        Err(_) => return bad(StatusCode::PAYLOAD_TOO_LARGE, "请求体超出限制"),
-    };
-    let response =
-        match tokio::time::timeout(Duration::from_secs(65), upstream.body(bytes).send()).await {
-            Ok(Ok(response)) => response,
-            _ => return bad(StatusCode::BAD_GATEWAY, "main gateway 暂不可用"),
-        };
-    let mut result = Response::builder().status(response.status());
-    for name in [
-        header::CONTENT_TYPE,
-        header::CACHE_CONTROL,
-        header::ETAG,
-        header::LAST_MODIFIED,
-    ] {
-        if let Some(value) = response.headers().get(&name) {
-            result = result.header(name, value);
-        }
-    }
-    result
-        .body(Body::from_stream(response.bytes_stream()))
-        .expect("upstream headers")
-}
-
 fn main_history(handle: &SessionHandle) -> Vec<MainChatMessage> {
     let messages = handle
         .message_cache
@@ -425,7 +345,7 @@ fn main_history(handle: &SessionHandle) -> Vec<MainChatMessage> {
 }
 
 /// 功能：解析发布预览的工作空间创建请求。
-/// 关联：API-HOST-OFFICE-WORKSPACE-001、CHG-2026-0043。
+/// 关联：API-HOST-OFFICE-WORKSPACE-001、CHG-2026-0043、CHG-2026-0047。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MainWorkspaceRequest {
@@ -448,79 +368,16 @@ async fn main_create_workspace(
     let Ok(Json(body)) = body else {
         return bad(StatusCode::BAD_REQUEST, "工作空间请求格式错误");
     };
-    let name = body.name.trim();
-    let stem = name
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .trim_end()
-        .to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && matches!(stem.as_bytes()[3], b'1'..=b'9');
-    if name.is_empty()
-        || name.encode_utf16().count() > 40
-        || name.ends_with('.')
-        || reserved
-        || name
-            .chars()
-            .any(|c| c.is_control() || "/\\:*?\"<>|".contains(c))
+    match state
+        .main_office
+        .create_workspace(&state.config.workspace, &body.name)
+        .await
     {
-        return bad(
-            StatusCode::BAD_REQUEST,
-            "名称需要1–40个字符，不能包含路径、非法字符或设备名",
-        );
-    }
-    let _admission = state.main_office.admission.lock().await;
-    let offices = match state.main_office.directory() {
-        Ok(offices) => offices,
-        Err(_) => return bad(StatusCode::INTERNAL_SERVER_ERROR, "办公室目录无法读取"),
-    };
-    if offices.iter().any(|office| {
-        office["workspace"]["name"]
-            .as_str()
-            .is_some_and(|existing| existing.to_lowercase() == name.to_lowercase())
-    }) {
-        return bad(StatusCode::CONFLICT, "这个工作空间名称已存在，请换一个名称");
-    }
-    if offices.len() >= 100 {
-        return bad(StatusCode::UNPROCESSABLE_ENTITY, "最多支持100个办公室");
-    }
-    let root = match std::fs::canonicalize(&state.config.workspace) {
-        Ok(root) => root,
-        Err(_) => return bad(StatusCode::INTERNAL_SERVER_ERROR, "工作空间根目录不可用"),
-    };
-    let path = root.join(name);
-    if let Err(error) = std::fs::create_dir(&path) {
-        return if error.kind() == std::io::ErrorKind::AlreadyExists {
-            bad(StatusCode::CONFLICT, "同名目录已存在，未覆盖任何文件")
-        } else {
-            bad(StatusCode::INTERNAL_SERVER_ERROR, "工作空间目录创建失败")
-        };
-    }
-    if let Err(error) = state.main_office.register(&path) {
-        let _ = std::fs::remove_dir(&path);
-        return if error == "办公室数量已达上限" {
-            bad(StatusCode::UNPROCESSABLE_ENTITY, error)
-        } else {
-            bad(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "办公室登记失败，未创建聊天",
-            )
-        };
-    }
-    match state.main_office.directory().ok().and_then(|offices| {
-        offices
-            .into_iter()
-            .find(|office| office["workspace"]["name"] == name)
-    }) {
-        Some(snapshot) => (
-            StatusCode::CREATED,
-            Json(state.main_office.wire_snapshot(&snapshot)),
-        )
-            .into_response(),
-        None => bad(StatusCode::INTERNAL_SERVER_ERROR, "办公室登记状态无法读取"),
+        Ok(snapshot) => (StatusCode::CREATED, Json(snapshot)).into_response(),
+        Err((status, message)) => bad(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            message,
+        ),
     }
 }
 
@@ -2194,7 +2051,7 @@ mod tests {
             .expect("真实子员工投影已到达 gateway")
         }
 
-        async fn ui(&self, action: serde_json::Value) -> serde_json::Value {
+        async fn ui_presentation(&self, action: serde_json::Value) -> serde_json::Value {
             let id = action["id"].as_str().unwrap().to_string();
             self.ui_actions.lock().await.push_back(action);
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -2209,13 +2066,17 @@ mod tests {
                         })
                         .cloned()
                     {
-                        return response["presentation"]["content"].clone();
+                        return response["presentation"].clone();
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
             .unwrap_or_else(|_| panic!("现有 UI 桥未回复当前请求 {id}"))
+        }
+
+        async fn ui(&self, action: serde_json::Value) -> serde_json::Value {
+            self.ui_presentation(action).await["content"].clone()
         }
 
         async fn button(
@@ -2914,6 +2775,125 @@ mod tests {
         let restarted = AppState::new(fixture.state.config.clone());
         let restored = restarted.get_typed(&id).await.unwrap();
         assert_eq!(main_conversation_turns(&restored)[0]["state"], "stopped");
+    }
+
+    #[tokio::test]
+    async fn main_ui_workspace_creation_returns_real_office_without_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-conversations", "confirm").await;
+        let presentation = fixture
+            .ui_presentation(serde_json::json!({
+                "id":"create-real-office","teamId":"","conversationId":"",
+                "action":"office.create","name":"  新建研发  "
+            }))
+            .await;
+        assert_eq!(presentation["target"], "office");
+        let snapshot = &presentation["snapshot"];
+        assert_eq!(snapshot["workspace"]["name"], "新建研发");
+        assert_eq!(snapshot["conversations"], serde_json::json!([]));
+        assert!(fixture.workspace.path().join("新建研发").is_dir());
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        let response = restarted.clone().oneshot(Request::builder()
+            .method("POST").uri("/api/pawoffice/chat")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"version":"1.0","type":"history",
+                "teamId":snapshot["workspace"]["id"],"conversationId":"new-draft","limit":20,"cursor":""}).to_string()))
+            .unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = restarted
+            .oneshot(
+                Request::builder()
+                    .uri("/session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sessions: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(sessions, serde_json::json!([]));
+        assert!(fixture.model_seen.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn main_ui_workspace_creation_preserves_errors_and_rejects_invalid_scope() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("delegate-conversations", "confirm").await;
+        let create = |id: &str, name: &str, team: &str, conversation: &str| {
+            fixture.ui_presentation(serde_json::json!({"id":id,"teamId":team,
+                "conversationId":conversation,"action":"office.create","name":name}))
+        };
+        for (id, team, conversation) in [
+            ("wrong-team", fixture.team.as_str(), ""),
+            ("wrong-conversation", "", "existing"),
+        ] {
+            let result = create(id, "MustNotExist", team, conversation).await;
+            assert_eq!(result["target"], "result");
+            assert_eq!(result["success"], false);
+            assert!(!fixture.workspace.path().join("MustNotExist").exists());
+        }
+        let invalid = create("invalid-name", "../escape", "", "").await;
+        assert_eq!(invalid["success"], false);
+        assert_eq!(
+            invalid["message"],
+            "名称需要1–40个字符，不能包含路径、非法字符或设备名"
+        );
+        let missing = fixture
+            .ui_presentation(serde_json::json!({"id":"missing-name",
+            "teamId":"","conversationId":"","action":"office.create"}))
+            .await;
+        assert_eq!(missing["success"], false);
+
+        let first = create("first", "Team A", "", "").await;
+        assert_eq!(first["target"], "office");
+        let duplicate = create("duplicate", "team a", "", "").await;
+        assert_eq!(duplicate["success"], false);
+        assert_eq!(duplicate["message"], "这个工作空间名称已存在，请换一个名称");
+        std::fs::write(fixture.workspace.path().join("Team A/keep.txt"), "keep").unwrap();
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pawoffice/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"team a"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let old_error: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(old_error["error"], duplicate["message"]);
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("Team A/keep.txt")).unwrap(),
+            "keep"
+        );
+
+        let registry = fixture.home.path().join("offices/registry.json");
+        let saved = std::fs::read(&registry).unwrap();
+        std::fs::remove_file(&registry).unwrap();
+        std::fs::create_dir(&registry).unwrap();
+        let failed = create("cannot-save", "CannotSave", "", "").await;
+        assert_eq!(failed["target"], "result");
+        assert_eq!(failed["success"], false);
+        assert_eq!(failed["message"], "办公室登记失败，未创建聊天");
+        assert!(!fixture.workspace.path().join("CannotSave").exists());
+        std::fs::remove_dir(&registry).unwrap();
+        std::fs::write(&registry, saved).unwrap();
+        assert_eq!(
+            create("retry", "CannotSave", "", "").await["target"],
+            "office"
+        );
+        assert!(fixture.model_seen.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -5708,27 +5688,20 @@ Path('exclusive').rmdir()
     }
 
     #[tokio::test]
-    async fn main_gateway_proxy_preserves_stream_and_separates_credentials() {
+    async fn main_gateway_browser_routes_are_not_proxied_and_business_can_be_anonymous() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let gateway = Router::new()
-            .route(
-                "/office/",
-                get(|headers: HeaderMap| async move {
-                    assert!(headers.get(header::AUTHORIZATION).is_none());
-                    ([(header::CONTENT_TYPE, "text/html")], "original main")
-                }),
-            )
-            .route(
-                "/api/pawoffice/events",
-                get(|headers: HeaderMap| async move {
-                    assert!(headers.get(header::AUTHORIZATION).is_none());
-                    (
-                        [(header::CONTENT_TYPE, "text/event-stream")],
-                        "data: {\"type\":\"office.sync.start\"}\n\n",
-                    )
-                }),
-            );
+        let forwarded = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = forwarded.clone();
+        let gateway = Router::new().fallback(move |request: Request<Body>| {
+            let seen = seen.clone();
+            async move {
+                if request.uri().path() != "/api/pawoffice/messages" {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                StatusCode::OK
+            }
+        });
         let task = tokio::spawn(async move {
             axum::serve(listener, gateway).await.unwrap();
         });
@@ -5737,8 +5710,8 @@ Path('exclusive').rmdir()
         let config = HostConfig {
             home: home.path().into(),
             workspace: workspace.path().into(),
-            username: Some("user".into()),
-            password: Some("password".into()),
+            username: None,
+            password: None,
             ..Default::default()
         };
         let mut state = AppState::new(config.clone());
@@ -5752,31 +5725,42 @@ Path('exclusive').rmdir()
             app.clone()
                 .oneshot(
                     Request::builder()
-                        .uri("/office/")
+                        .uri("/global/health")
                         .body(Body::empty())
                         .unwrap()
                 )
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::OK
         );
-        for path in ["/office/", "/api/pawoffice/events?workspace=1"] {
+        for (method, path) in [
+            ("GET", "/office"),
+            ("GET", "/office/"),
+            ("GET", "/office/route"),
+            ("GET", "/assets/app.js"),
+            ("GET", "/farm-assets/image.png"),
+            ("GET", "/brand/logo.svg"),
+            ("GET", "/characters/actor.png"),
+            ("GET", "/pawoffice-config.js"),
+            ("GET", "/api/pawoffice/events?workspace=1"),
+            ("POST", "/api/pawoffice/reply"),
+            ("POST", "/api/pawoffice/ui"),
+        ] {
             let response = app
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .method(method)
                         .uri(path)
-                        .header(header::AUTHORIZATION, "Basic dXNlcjpwYXNzd29yZA==")
                         .body(Body::empty())
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let content = to_bytes(response.into_body(), 1000).await.unwrap();
-            assert!(!content.is_empty());
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {path}");
         }
+        assert_eq!(forwarded.load(std::sync::atomic::Ordering::SeqCst), 0);
         task.abort();
     }
 
