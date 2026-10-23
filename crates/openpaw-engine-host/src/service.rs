@@ -967,7 +967,7 @@ impl Host {
     /// 状态：不创建运行、不延长审批期限、不批准工具。
     /// 并发与取消：短锁内发送瞬时通知；原展示任务自行关闭HTTP。
     /// 权限：调用者必须先完成会话及办公室范围校验。
-    /// 关联：REQ-OP-013；DES-OP-008。
+    /// 关联：需求REQ-OP-013；设计DES-OP-008。
     pub(crate) async fn refresh_office_ui(&self, scope: &ClientScope) {
         if let Some(office) = self.inner.office.lock().await.as_ref() {
             office.refresh_ui(scope);

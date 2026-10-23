@@ -90,7 +90,7 @@ impl Coordinator {
     /// 状态：不创建审批、Run或持久化事件。
     /// 并发与取消：非阻塞广播；其他作用域的展示忽略该通知。
     /// 权限：仅恢复展示，不改变输入、权限或审批状态。
-    /// 关联：REQ-OP-013；DES-OP-008。
+    /// 关联：需求REQ-OP-013；设计DES-OP-008。
     pub(crate) fn refresh_ui(&self, scope: &ClientScope) {
         let _ = self.ui_refresh.send(scope.clone());
     }
