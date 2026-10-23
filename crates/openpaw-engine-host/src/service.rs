@@ -90,6 +90,21 @@ struct Active {
 struct Registry {
     closing: bool,
     active: HashMap<String, Active>,
+    deletions: usize,
+}
+/// 用途：让持久删除与原关闭注册表共同持有存储生命周期。
+/// 字段：共享Host所有权。
+/// 来源去向：共享删除入口到后台删除任务。
+/// 约束：HTTP取消或任务异常也必须归还预留，关闭不得抢先关闭Store。
+/// 稳定性：Host内部实现。
+/// 关联：需求/设计REQ-OP-014；DES-OP-009。
+pub(crate) struct DeletionGuard(Host);
+impl Drop for DeletionGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.deletions -= 1;
+        self.0.inner.idle.notify_waiters();
+    }
 }
 struct Observer {
     store: Store,
@@ -251,6 +266,7 @@ impl Host {
         self.inner
             .store
             .call(move |db| {
+                db.check_live_scope(&scope)?;
                 if let Some(binding) = db.bindings()?.into_iter().find(|b| b.scope == scope) {
                     return Ok(binding);
                 }
@@ -342,7 +358,7 @@ impl Host {
     /// 状态：映射与Accepting状态同事务保存，执行仍用原AgentLoop。
     /// 并发与取消：短接受锁仅覆盖查重/持久化，不占用推理、查询、取消或审批。
     /// 权限：重试同样校验固定会话归属；键不是授权。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
     pub(crate) async fn submit_idempotent(
         &self,
         scope: &ClientScope,
@@ -406,6 +422,7 @@ impl Host {
             .store
             .call(move |db| {
                 let b = db.binding(&sid)?;
+                db.check_live_scope(&s)?;
                 check_scope(&b, &s)?;
                 Ok(b)
             })
@@ -839,6 +856,7 @@ impl Host {
         self.inner
             .store
             .call(move |db| {
+                db.check_live_scope(&scope)?;
                 let mut a = db
                     .approvals()?
                     .into_iter()
@@ -868,9 +886,9 @@ impl Host {
             })
             .await
     }
-    /// 功能：等待所有预留和活动Run完成实际清理。
+    /// 功能：等待所有预留、活动Run和已接受的持久删除完成实际清理。
     /// 参数：self为共享Host。
-    /// 返回：无返回值，返回即活动注册表为空。
+    /// 返回：无返回值，返回即活动注册表与删除预留均为空。
     /// 错误：非法范围、状态冲突或存储故障明确上报；无失败分支的读取不产生错误。
     /// 状态：不取消运行；Notify与注册表检查避免丢唤醒。
     /// 并发与取消：共享状态经协调器/锁访问；取消不提前释放实际执行资源。
@@ -881,14 +899,11 @@ impl Host {
             let notified = self.inner.idle.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .active
-                .is_empty()
-            {
+            let idle = {
+                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.active.is_empty() && state.deletions == 0
+            };
+            if idle {
                 return;
             }
             notified.await;
@@ -1056,6 +1071,56 @@ fn run_system_prompt(
         prompt.push_str("本轮未启用联网工具。历史上曾联网成功也不授予本轮权限；不得声称完成实时查询。主机已提供本轮时间，不能把缺少网络工具说成没有任何时间依据。\n");
     }
     prompt
+}
+
+impl Host {
+    /// 功能：在原关闭注册表预留一次持久删除。
+    /// 参数：self为共享Host。
+    /// 返回：后台删除必须持有至完成的守卫。
+    /// 错误：关闭已开始则拒绝新删除。
+    /// 状态：复用idle通知，不建立另一套运行注册表。
+    /// 并发与取消：与shutdown的closing检查共用同一互斥锁。
+    /// 权限：仅已校验范围的共享删除入口使用。
+    /// 关联：需求/设计REQ-OP-014；DES-OP-009。
+    pub(crate) fn reserve_deletion(&self) -> HostResult<DeletionGuard> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closing {
+            return Err(HostError::new("closing", "Host正在关闭，未接受新的删除"));
+        }
+        state.deletions += 1;
+        Ok(DeletionGuard(self.clone()))
+    }
+
+    /// 功能：取消并等待目标会话的实际运行清理。
+    /// 参数：session为已登记删除意图的会话ID。
+    /// 返回：目标活动预留完全释放后结束。
+    /// 错误：无；持久删除仍由调用方负责。
+    /// 状态：不关闭或取消其他会话。
+    /// 并发与取消：不跨await持注册表锁；Notify防丢唤醒。
+    /// 权限：仅共享删除协调器调用。
+    /// 关联：REQ-OP-014；API-HOST-DELETE。 需求/设计REQ-OP-014。
+    pub(crate) async fn quiesce_session(&self, session: &str) {
+        loop {
+            let notified = self.inner.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                let active: Vec<_> = state
+                    .active
+                    .values()
+                    .filter(|a| a.session == session)
+                    .collect();
+                if active.is_empty() {
+                    return;
+                }
+                for a in active {
+                    a.control.cancel.cancel();
+                }
+            }
+            notified.await;
+        }
+    }
 }
 
 #[cfg(test)]

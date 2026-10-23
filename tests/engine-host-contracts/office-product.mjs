@@ -116,6 +116,18 @@ function provider() {
         assert.ok(results[0].content.includes('WEB-HTTP-MARKER'))
         finish({content:'# 网页读取结果\n\n'+results[0].content});return
       }
+      if (prompt.startsWith('T5-')) {
+        if (!results.length && !prompt.includes('命令')) {
+          finish({content:'读取两文件后申请写入。',tool_calls:['README.md','notes.txt'].map((path,i)=>({index:i,id:'t5-read-'+i,type:'function',function:{name:'read_file',arguments:JSON.stringify({path})}}))},'tool_calls');return
+        }
+        const writeResult=results.find(m=>m.tool_call_id==='t5-write')
+        if (!writeResult) {
+          const command=JSON.stringify(process.execPath)+' managed-parent.cjs'
+          const input=prompt.includes('命令')?{command}:{path:prompt.includes('拒绝')?'reports/refused.txt':'reports/T5报告.md',content:'# T5真实报告\n\n'+results.map(m=>m.content).join('\n')}
+          finish({content:'拟执行，等待你的确认。',tool_calls:[{index:0,id:'t5-write',type:'function',function:{name:prompt.includes('命令')?'bash':'write_file',arguments:JSON.stringify(input)}}]},'tool_calls');return
+        }
+        finish({content:'T5工具结果：'+writeResult.content});return
+      }
       if (prompt.includes('MODEL-ERROR')) { res.writeHead(401); res.end('controlled authentication failure'); return }
       if (prompt.includes('慢任务')) {
         const timer = setTimeout(() => { if (!res.destroyed) finish({ content: '慢任务完成' }) }, 60000)
@@ -162,8 +174,11 @@ try {
   const workspace = join(output, 'workspace 中文'); await mkdir(workspace); await mkdir(childEnv.OPENPAW_HOME)
   const markerA = 'README-' + randomBytes(6).toString('hex'), markerB = 'NOTES-' + randomBytes(6).toString('hex')
   await writeFile(join(workspace, 'README.md'), markerA); await writeFile(join(workspace, 'notes.txt'), markerB)
+  // 原安全策略禁止解释器内联代码；使用隔离工作区脚本，不放宽工具策略。
+  await writeFile(join(workspace,'managed-parent.cjs'),"require('fs').writeFileSync('managed-parent.pid',String(process.pid));require('child_process').spawn(process.execPath,['managed-child.cjs'],{stdio:'inherit'});setInterval(()=>console.log('parent-tick'),50)")
+  await writeFile(join(workspace,'managed-child.cjs'),"const fs=require('fs');fs.writeFileSync('managed-child.pid',String(process.pid));setInterval(()=>console.error('child-tick'),50);setTimeout(()=>fs.writeFileSync('late-side-effect','bad'),8000)")
   const config = join(output, 'host.toml')
-  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch"]\n[roots]\nproject = ${JSON.stringify(workspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
+  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash"]\n[roots]\nproject = ${JSON.stringify(workspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
   if (!process.env.OPENPAW_HOST_BINARY) await run('cargo', ['build', '--locked', '-p', 'openpaw-cli', '--features', 'engine-host,sidecar'], root, childEnv, 'host-build')
   const binary = process.env.OPENPAW_HOST_BINARY ?? join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', process.platform === 'win32' ? 'openpaw.exe' : 'openpaw')
   let host = start(resolve(binary), ['engine-host', '--config', config, '--port', '0'], root, childEnv, 'host')
@@ -430,10 +445,10 @@ try {
   const webState=await waitFor(async()=>{const r=await readOffice();return conv(r,webRequest.conversationId)?.tasks.some(t=>t.title.includes('web_fetch')&&t.status==='completed')?r:false})
   const webConversation=conv(webState,webRequest.conversationId)
   assert.ok(webConversation.whiteboard.steps.length>0)
-  // Web currently uses the existing main assistant mapping; cross-role handoff belongs to T5.
+  // T5 maps real Web calls to the existing search role; actor handoff stays in Office.
   const webTask=webConversation.tasks.find(t=>t.title.includes('web_fetch')&&t.status==='completed')
-  assert.equal(webTask.assigneeId,'assistant')
-  assert.ok(webConversation.employees.some(e=>e.id==='assistant'&&e.sceneActorId==='office-lead'))
+  assert.equal(webTask.assigneeId,'search')
+  assert.ok(webConversation.employees.some(e=>e.id==='search'&&e.sceneActorId==='data-agent'))
   assert.ok((await log.innerText()).includes('source_url:'));assert.ok((await log.innerText()).includes('retrieved_at_unix_ms:'))
   await page.screenshot({path:join(output,'16-real-web-fetch.png'),fullPage:true})
   await fresh(page);await send('WEB-SLOW')
@@ -491,6 +506,78 @@ try {
   await page.screenshot({path:join(output,'21-existing-session-web-disabled-again.png'),fullPage:true})
   report.assertions.push('D43: same-session date uses actual current server context without unnecessary Web; disabling Web again grants no stale capability and performs zero HTTP')
   await stopHost();await writeFile(config,enabledConfig);await startHost()
+  // T5: actual browser approval, original tools, official UI navigation and deletion.
+  report.t5={};
+  await fresh(page);await send('T5-拒绝报告');await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  await page.getByRole('button',{name:'拒绝',exact:true}).waitFor();
+  report.t5.rejectRequest=structuredClone(latestSend().request);
+  assert.equal(await access(join(workspace,'reports/refused.txt')).then(()=>true,()=>false),false);
+  await page.screenshot({path:join(output,'22-t5-pending-no-side-effects.png'),fullPage:true});
+  await page.getByRole('button',{name:'拒绝',exact:true}).click();await expand(page);
+  await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});
+  assert.equal(await access(join(workspace,'reports/refused.txt')).then(()=>true,()=>false),false);
+  const deniedSnapshot=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.t5.rejectRequest.conversationId);return c?.tasks[0]?.status==='completed'?c:false});
+  assert.ok(!deniedSnapshot.events.some(e=>e.summary.includes('write_file')),'拒绝写入不能触发执行交接动画');
+  await fresh(page);await send('T5-允许报告');await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();
+  report.t5.approveRequest=structuredClone(latestSend().request);
+  assert.equal(await access(join(workspace,'reports/T5报告.md')).then(()=>true,()=>false),false);
+  const pending=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.t5.approveRequest.conversationId);return c?.tasks.some(t=>t.status==='blocked')?r:false});
+  report.t5.pendingSnapshot=pending;
+  await page.screenshot({path:join(output,'23-t5-approval-blocked.png'),fullPage:true});
+  await fresh(page);await send('审批等待期间读取README.md和notes.txt并总结',markerA);
+  report.t5.readWhilePending=structuredClone(latestSend().request);
+  assert.notEqual(report.t5.readWhilePending.conversationId,report.t5.approveRequest.conversationId);
+  const simultaneous=await readOffice();
+  assert.equal(conv(simultaneous,report.t5.approveRequest.conversationId).tasks[0].status,'blocked');
+  await page.screenshot({path:join(output,'28-t5-other-session-reads-during-approval.png'),fullPage:true});
+  await select(page,'T5-允许报告');await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  await page.getByRole('button',{name:'允许本次',exact:true}).click();await expand(page);
+  await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});
+  const artifact=await readFile(join(workspace,'reports/T5报告.md'),'utf8');assert.ok(artifact.includes(markerA)&&artifact.includes(markerB));
+  report.t5.artifact={path:'reports/T5报告.md',sha256:createHash('sha256').update(artifact).digest('hex'),content:artifact};
+  await page.locator('.runtime-person').filter({hasText:'OpenPaw助手'}).click();
+  await page.getByRole('button',{name:'文件产物',exact:true}).click();
+  await page.getByRole('button',{name:'打开 reports/T5报告.md',exact:true}).click();
+  await page.getByText(/T5真实报告/).last().waitFor();
+  await page.screenshot({path:join(output,'24-t5-file-detail-from-real-disk.png'),fullPage:true});
+  await page.getByRole('button',{name:'返回目录',exact:true}).click();
+  for(const name of ['历史','工具结果 / 拟执行','Skill','Goal','Todo']) {
+    await page.getByRole('button',{name,exact:true}).click();
+    await page.screenshot({path:join(output,'t5-detail-'+name.replaceAll('/','-')+'.png'),fullPage:true});
+    await page.getByRole('button',{name:'返回目录',exact:true}).click();
+  }
+  // 等待最后一次导航真正返回目录，再用Office原关闭按钮，避免响应晚到后重开对话框。
+  await page.getByRole('dialog',{name:'OpenPaw 会话详情',exact:true}).waitFor();
+  await page.getByRole('button',{name:'关闭详情',exact:true}).click();
+  await page.locator('dialog.office-ui-dialog').waitFor({state:'hidden'});
+  await fresh(page);await send('T5-命令慢任务');await page.getByRole('button',{name:'收起聊天',exact:true}).click();await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();
+  report.t5.shellRequest=structuredClone(latestSend().request);
+  await page.getByRole('button',{name:'允许本次',exact:true}).click();
+  report.t5.shellRunning=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.t5.shellRequest.conversationId);return c?.tasks.some(t=>t.assigneeId==='command'&&t.status==='running')?r:false});
+  report.t5.processes=await waitFor(async()=>{try{return await Promise.all(['parent','child'].map(async role=>({role,pid:Number(await readFile(join(workspace,'managed-'+role+'.pid'),'utf8'))})))}catch{return false}});
+  for(const item of report.t5.processes){assert.ok(item.pid>0);if(process.platform==='linux')item.before=await readFile('/proc/'+item.pid+'/stat','utf8')}
+  await page.screenshot({path:join(output,'25-t5-real-shell-running.png'),fullPage:true});
+  await delay(800);await expand(page);await page.getByRole('button',{name:'停止生成',exact:true}).click();
+  await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:15000});
+  for(const item of report.t5.processes){
+    if(process.platform==='linux'){
+      try{item.after=await readFile('/proc/'+item.pid+'/stat','utf8');assert.ok(['Z','X','x'].includes(item.after.slice(item.after.lastIndexOf(') ')+2).split(' ')[0]),'清理返回后仍有可运行后代')}
+      catch(e){if(!['ENOENT','ESRCH'].includes(e.code))throw e;item.after='exited: '+e.code}
+    }else{let alive=false;try{process.kill(item.pid,0);alive=true}catch(e){if(e.code!=='ESRCH')throw e}assert.equal(alive,false)}
+  }
+  await delay(8500);assert.equal(await access(join(workspace,'late-side-effect')).then(()=>true,()=>false),false);
+  await page.screenshot({path:join(output,'26-t5-shell-cancelled-clean.png'),fullPage:true});
+  await select(page,'T5-允许报告');
+  await page.getByRole('button',{name:'删除会话：T5-允许报告',exact:true}).click();
+  await page.getByRole('alertdialog',{name:'删除会话'}).getByRole('button',{name:'删除',exact:true}).click();
+  await waitFor(async()=>!conv(await readOffice(),report.t5.approveRequest.conversationId));
+  await page.getByRole('tab',{name:'T5-允许报告',exact:true}).waitFor({state:'hidden',timeout:15000});
+  assert.equal(await readFile(join(workspace,'reports/T5报告.md'),'utf8'),artifact);
+  report.t5.deletedHistory=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version:'1.0',teamId:'office-1',conversationId:report.t5.approveRequest.conversationId,type:'history'})}).then(r=>({status:r.status}));
+  assert.notEqual(report.t5.deletedHistory.status,200);
+  await page.screenshot({path:join(output,'27-t5-deleted-conversation-artifact-preserved.png'),fullPage:true});
+  report.assertions.push('T5: real browser reject leaves no artifact; confirm executes exact original write_file once','T5: blocked approval snapshot and six original read-only detail categories; generated file matches actual disk hash','T5: actual bash working/assignment, explicit stop prevents delayed descendant side effect','T5: official conversation.delete removes snapshot/history and keeps workspace artifact');
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'
@@ -531,7 +618,8 @@ try {
   report.sessions = await readdir(sessionDir)
   for (const file of report.sessions) {
     const ledger = (await readFile(join(sessionDir, file), 'utf8')).trim().split('\n').map(JSON.parse)
-    assert.ok(ledger.filter(e => e.type === 'tool_call_complete').length <= 2, 'no tool replay after restart')
+    if (!ledger.some(e=>JSON.stringify(e).includes('T5-'))) assert.ok(ledger.filter(e => e.type === 'tool_call_complete').length <= 2, 'no tool replay after restart')
+    let activeRun='';const calls=new Set();for(const e of ledger){if(e.type==='run_started')activeRun=e.run_id;if(e.type==='tool_call_complete'){const key=activeRun+':'+e.call_id;assert.ok(!calls.has(key),'same Run/call executed twice');calls.add(key)}}
     report.assertions.push('Session ' + file + ': ' + ledger.filter(e => e.type === 'run_finished').map(e => e.status).join(','))
   }
   report.result = 'passed'

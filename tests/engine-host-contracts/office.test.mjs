@@ -128,3 +128,14 @@ test('product evidence validates actual Host/Office protocol values through pinn
     assert.ok(JSON.stringify(event).length < 32000)
   }
 })
+
+
+test('T5 all real UI actions and scoped new-ID responses obey frozen schemas',()=>{
+  for(const action of f.t5Actions){assertProtocolValue(action);officeUiActionSchema.parse(action)}
+  officeRequestSchema.parse(f.t5UiResponse)
+  assert.notEqual(f.t5UiResponse.interactionId,f.t5Actions.at(-1).interactionId)
+  const invalid=structuredClone(f.t5Actions[0]);invalid.runId='invented';assert.equal(officeUiActionSchema.safeParse(invalid).success,false)
+  const detail=structuredClone(f.dialog);detail.presentation.content.fields=[{label:'unicode',value:'😀'.repeat(1000)}];officeRequestSchema.parse(detail)
+  detail.presentation.content.fields[0].value='x'.repeat(2001);assert.equal(officeRequestSchema.safeParse(detail).success,false)
+  const wrongScope=structuredClone(f.sceneCommand);wrongScope.command.sceneId='other-team';assert.equal(relayMessageSchema.safeParse(wrongScope).success,false)
+})

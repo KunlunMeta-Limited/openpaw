@@ -75,6 +75,8 @@ impl ToolExecutionObserver for Started {
         if let Err(e) = self
             .store
             .call(move |db| {
+                let run = db.get_run(&binding.run_id)?;
+                db.binding(&run.session_id)?; // 最后一道开始门禁与删除意图按Store序列排序。
                 let rev = db.bump(
                     "tool_started",
                     &serde_json::to_string(&binding).map_err(HostError::storage)?,

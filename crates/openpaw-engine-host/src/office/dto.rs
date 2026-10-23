@@ -48,7 +48,7 @@ pub(super) struct ChatRequest {
     /// 来源去向：Office到Host幂等关联。
     /// 约束：同键异内容冲突，不作为授权。
     /// 稳定性：Office 02dbac4官方字段。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub turn_id: String,
 }
 #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -195,35 +195,35 @@ pub(super) fn protocol_value(value: &Value) -> bool {
 /// 来源去向：Node转发到Host协议入口。
 /// 约束：不默认为旧版send。
 /// 稳定性：固定Office 02dbac4官方协议。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) enum Operation {
     /// 用途：可靠接受用户轮次并订阅真实运行。
     /// 字段：严格校验的官方请求载荷。
     /// 来源去向：Office Node转发至Host共享服务。
     /// 约束：办公室与会话范围必须一致。
     /// 稳定性：固定Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     Send(ChatRequest),
     /// 用途：只读分页查询原会话账本。
     /// 字段：严格校验的官方请求载荷。
     /// 来源去向：Office Node转发至Host共享服务。
     /// 约束：办公室与会话范围必须一致。
     /// 稳定性：固定Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     History(HistoryRequest),
     /// 用途：恢复已有轮次快照和增量订阅。
     /// 字段：严格校验的官方请求载荷。
     /// 来源去向：Office Node转发至Host共享服务。
     /// 约束：办公室与会话范围必须一致。
     /// 稳定性：固定Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     Resume(ControlRequest),
     /// 用途：显式取消并等待真实清理结束。
     /// 字段：严格校验的官方请求载荷。
     /// 来源去向：Office Node转发至Host共享服务。
     /// 约束：办公室与会话范围必须一致。
     /// 稳定性：固定Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     Cancel(ControlRequest),
 }
 #[derive(Deserialize)]
@@ -233,28 +233,28 @@ pub(super) enum Operation {
 /// 来源去向：Node到历史投影。
 /// 约束：不创建Session；limit为1到50。
 /// 稳定性：固定Office 02dbac4官方协议。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) struct HistoryRequest {
     /// 用途：官方聊天操作字段。
     /// 字段：按字段类型承载版本、范围或分页/轮次身份。
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub version: String,
     /// 用途：官方聊天操作字段。
     /// 字段：按字段类型承载版本、范围或分页/轮次身份。
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub team_id: String,
     /// 用途：官方聊天操作字段。
     /// 字段：按字段类型承载版本、范围或分页/轮次身份。
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub conversation_id: String,
     #[serde(default)]
     /// 用途：官方聊天操作字段。
@@ -262,7 +262,7 @@ pub(super) struct HistoryRequest {
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub cursor: String,
     #[serde(default = "default_limit")]
     /// 用途：官方聊天操作字段。
@@ -270,7 +270,7 @@ pub(super) struct HistoryRequest {
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub limit: usize,
 }
 fn default_limit() -> usize {
@@ -283,35 +283,35 @@ fn default_limit() -> usize {
 /// 来源去向：Node到原Run订阅或取消服务。
 /// 约束：查找必须绑定完整范围。
 /// 稳定性：固定Office 02dbac4官方协议。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) struct ControlRequest {
     /// 用途：官方聊天操作字段。
     /// 字段：按字段类型承载版本、范围或分页/轮次身份。
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub version: String,
     /// 用途：官方聊天操作字段。
     /// 字段：按字段类型承载版本、范围或分页/轮次身份。
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub team_id: String,
     /// 用途：官方聊天操作字段。
     /// 字段：按字段类型承载版本、范围或分页/轮次身份。
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub conversation_id: String,
     /// 用途：官方聊天操作字段。
     /// 字段：按字段类型承载版本、范围或分页/轮次身份。
     /// 来源去向：Office Node到Host校验/查找入口。
     /// 约束：由Operation::scope严格校验，不作为授权。
     /// 稳定性：Office 02dbac4官方协议。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub turn_id: String,
 }
 impl Operation {
@@ -322,7 +322,7 @@ impl Operation {
     /// 状态：不创建数据。
     /// 并发与取消：纯计算。
     /// 权限：ID不是授权凭证。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+    /// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
     pub(super) fn scope(&self) -> HostResult<crate::ClientScope> {
         let (v, t, c) = match self {
             Self::Send(r) => {
@@ -354,4 +354,39 @@ impl Operation {
 }
 fn valid_turn_id(s: &str) -> bool {
     !s.is_empty() && units(s) <= 100 && !s.chars().any(char::is_control)
+}
+
+/// 功能：严格核对领取动作的字段和标识。
+/// 参数：value为Office返回的单个动作。
+/// 返回：符合冻结协议时为真。
+/// 错误：无；非法字段返回假。
+/// 状态：纯校验，不创建操作。
+/// 并发与取消：无等待。
+/// 权限：业务作用域仍由分派器校验。
+/// 关联：REQ-OP-014；CHG-2026-0006。 需求/设计REQ-OP-014。
+pub(super) fn ui_action(value: &Value) -> bool {
+    let Some(o) = value.as_object() else {
+        return false;
+    };
+    if !["id", "teamId", "conversationId"]
+        .iter()
+        .all(|k| o.get(*k).and_then(Value::as_str).is_some_and(scene_id))
+    {
+        return false;
+    }
+    let extra: &[&str] = match value["action"].as_str() {
+        Some("conversation.delete") => &[],
+        Some("actor.inspect") => &["actorId"],
+        Some("employee.inspect") => &["employeeId"],
+        Some("task.start" | "task.block" | "task.complete") => &["taskId"],
+        Some("task.assign") => &["taskId", "assigneeId"],
+        Some("dialog.action") => &["interactionId", "optionId"],
+        _ => return false,
+    };
+    o.len() == 4 + extra.len()
+        && extra.iter().all(|k| {
+            o.get(*k).and_then(Value::as_str).is_some_and(|s| {
+                !s.is_empty() && units(s) <= 100 && !s.chars().any(char::is_control)
+            })
+        })
 }

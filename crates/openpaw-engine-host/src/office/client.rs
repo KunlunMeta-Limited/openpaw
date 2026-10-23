@@ -20,6 +20,9 @@ pub(super) struct Client {
     url: String,
     authorization: reqwest::header::HeaderValue,
     capabilities: tokio::sync::Mutex<Option<Value>>,
+    gates: tokio::sync::Mutex<
+        std::collections::BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+    >,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +62,7 @@ impl Client {
             ),
             authorization,
             capabilities: tokio::sync::Mutex::new(None),
+            gates: Default::default(),
         })
     }
     /// 功能：调用官方消息并核对HTTP封套与操作返回值。
@@ -77,9 +81,21 @@ impl Client {
                 "Office请求不符合容量或值约束",
             ));
         }
+        let timeout = match request["type"].as_str() {
+            Some("ui.next") => Duration::from_secs(35),
+            Some("decision.request") => Duration::from_millis(
+                request["timeoutMs"]
+                    .as_u64()
+                    .filter(|v| (1000..=300000).contains(v))
+                    .ok_or_else(|| HostError::new("invalid_input", "审批期限无效"))?
+                    + 10000,
+            ),
+            _ => Duration::from_secs(15),
+        };
         let response = self
             .http
             .post(&self.url)
+            .timeout(timeout)
             .header(reqwest::header::AUTHORIZATION, self.authorization.clone())
             .header("content-type", "application/json")
             .body(bytes)
@@ -114,6 +130,9 @@ impl Client {
             let kind = match data["reasonCode"].as_str() {
                 Some("SEQ_CONFLICT") => "sequence_conflict",
                 Some("OFFICE_NOT_INITIALIZED") => "office_uninitialized",
+                Some("SNAPSHOT_REQUIRED") => "snapshot_required",
+                Some("UI_REQUEST_EXPIRED" | "REQUEST_CLOSED") => "ui_expired",
+                Some("REQUEST_TIMEOUT" | "DECISION_EXPIRED") => "decision_expired",
                 _ => {
                     if status == 401 || status == 403 {
                         "office_auth"
@@ -124,7 +143,14 @@ impl Client {
                     }
                 }
             };
-            return Err(HostError::new(kind, "Office拒绝业务请求，需核查同步状态"));
+            let reason = data["reasonCode"]
+                .as_str()
+                .filter(|s| s.len() <= 64 && s.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+                .unwrap_or("UNKNOWN");
+            return Err(HostError::new(
+                kind,
+                format!("Office拒绝业务请求（{reason}），需核查同步状态"),
+            ));
         }
         match request["type"].as_str() {
             Some("office.capabilities") => {
@@ -173,7 +199,52 @@ impl Client {
                     return Err(HostError::new("protocol_error", "Office快照回执不合法"));
                 }
             }
-            _ => return Err(HostError::new("unsupported", "T4客户端不支持此操作")),
+            Some("decision.request") => {
+                let confirm = data["choiceId"] == "confirm";
+                if status != 200
+                    || data["teamId"] != request["teamId"]
+                    || data["conversationId"] != request["conversationId"]
+                    || data["decisionId"] != request["decision"]["id"]
+                    || (!confirm && data["choiceId"] != "reject")
+                    || data["label"]
+                        != request["decision"][if confirm {
+                            "confirmLabel"
+                        } else {
+                            "rejectLabel"
+                        }]
+                    || data.as_object().is_none_or(|o| o.len() != 5)
+                {
+                    return Err(HostError::new("protocol_error", "审批响应绑定不匹配"));
+                }
+            }
+            Some("ui.next") => {
+                if status != 200
+                    || data.as_object().is_none_or(|o| o.len() != 1)
+                    || data["actions"]
+                        .as_array()
+                        .is_none_or(|a| a.len() > 1 || a.iter().any(|v| !dto::ui_action(v)))
+                {
+                    return Err(HostError::new("protocol_error", "UI领取结果非法"));
+                }
+            }
+            Some("ui.respond") => {
+                if status != 200
+                    || data["interactionId"] != request["interactionId"]
+                    || data["delivered"] != true
+                    || data.as_object().is_none_or(|o| o.len() != 2)
+                {
+                    return Err(HostError::new("protocol_error", "UI回执非法"));
+                }
+            }
+            None if request.get("command").is_some() => {
+                if status != 200
+                    || data["forwarded"] != true
+                    || data.as_object().is_none_or(|o| o.len() != 1)
+                {
+                    return Err(HostError::new("protocol_error", "场景回执非法"));
+                }
+            }
+            _ => return Err(HostError::new("unsupported", "不支持此Office操作")),
         }
         Ok((status, data))
     }
@@ -193,5 +264,27 @@ impl Client {
         let data = self.post(json!({"type":"office.capabilities"})).await?.1;
         *cache = Some(data.clone());
         Ok(data)
+    }
+}
+
+impl Client {
+    /// 功能：取得办公室的唯一快照外发门。
+    /// 参数：team为可信办公室ID。
+    /// 返回：可跨网络等待持有的办公室专用锁。
+    /// 错误：无。
+    /// 状态：不锁其他办公室或Run服务。
+    /// 并发与取消：统一周期同步、审批屏障和删除屏障顺序。
+    /// 权限：仅已配置办公室。
+    /// 关联：REQ-OP-011/013/014；CHG-2026-0006。 需求/设计REQ-OP-014。
+    pub(super) async fn projection_gate(
+        &self,
+        team: &str,
+    ) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.gates
+            .lock()
+            .await
+            .entry(team.to_owned())
+            .or_default()
+            .clone()
     }
 }

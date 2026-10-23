@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 /// 状态：原JSONL记录消息；元数据仅保存幂等关联。
 /// 并发与取消：Host短接受锁防并发重试重复执行；脱离HTTP不取消执行。
 /// 权限：工作根只来自Host配置，不能由请求指定。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) async fn accept(
     host: &Host,
     scope: &ClientScope,
@@ -56,7 +56,7 @@ pub(super) async fn accept(
 /// 状态：不创建Session或Run；升级旧Run仍使用原身份。
 /// 并发与取消：在Store单写序列读取；取消另走共享服务。
 /// 权限：逐项匹配namespace/team/conversation。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
 pub(super) async fn find(host: &Host, scope: &ClientScope, turn: &str) -> HostResult<RunView> {
     let scope = scope.clone();
     let turn = turn.to_owned();
@@ -88,7 +88,7 @@ pub(super) async fn find(host: &Host, scope: &ClientScope, turn: &str) -> HostRe
 /// 状态：空会话返回空页，不创建绑定或启动模型。
 /// 并发与取消：单一Store读取序列；游标绑定既存Run身份，新追加不移动边界。
 /// 权限：只读取指定且已配置的会话范围。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
 pub(super) async fn history(
     host: &Host,
     scope: &ClientScope,
@@ -96,6 +96,7 @@ pub(super) async fn history(
 ) -> HostResult<Value> {
     let scope = scope.clone();
     host.inner.store.call(move|db|{
+        db.check_live_scope(&scope)?;
         let Some(binding)=db.bindings()?.into_iter().find(|b|b.scope==scope) else {
             if !request.cursor.is_empty(){return Err(HostError::new("invalid_input","游标不属于此会话"));}
             return Ok(json!({"turns":[],"nextCursor":"","hasMore":false,"activeTurnId":""}));
@@ -135,7 +136,7 @@ pub(super) async fn history(
 /// 状态：只读，不把中断伪装恢复执行。
 /// 并发与取消：取消清理完成前保持pending。
 /// 权限：无。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) fn state(run: &RunView) -> &'static str {
     if run.text_truncated || dto::units(&run.text) > 50000 {
         return "error";
@@ -154,7 +155,7 @@ pub(super) fn state(run: &RunView) -> &'static str {
 /// 状态：不泄露Provider响应和配置密钥。
 /// 并发与取消：纯计算。
 /// 权限：无。
-/// 关联：CHG-2026-0005第9.7节；DES-OP-007。
+/// 关联：CHG-2026-0005第9.7节；DES-OP-007。 需求/设计REQ-OP-014。
 pub(super) fn message(run: &RunView) -> String {
     if state(run) != "error" {
         return String::new();

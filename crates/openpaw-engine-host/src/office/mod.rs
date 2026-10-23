@@ -2,10 +2,14 @@
 //! 输入输出：可信本机配置、浏览器协议、共享Host事实。
 //! 依赖：现有Host、reqwest与Office冻结协议。
 //! 禁止职责：不创建第二套引擎、工具、账本或审批系统。
+mod actions;
+mod approvals;
 mod chat;
 mod client;
+mod details;
 mod dto;
 mod projection;
+mod scene;
 mod turns;
 
 use crate::{HostConfig, HostError, HostResult};
@@ -56,13 +60,13 @@ pub struct OfficeConfig {
     pub names: BTreeMap<String, String>,
 }
 impl OfficeConfig {
-    /// 功能：校验Office连接和只读授权，不进行网络调用。
+    /// 功能：校验Office连接和显式工具授权，不进行网络调用。
     /// 参数：host为所属Host配置。
     /// 返回：全部约束满足时成功。
     /// 错误：地址、来源、名称、槽或写工具非法。
     /// 状态：不读取或输出密钥内容。
     /// 并发与取消：启动阶段只读，不持运行资源锁。
-    /// 权限：Office T4仅开放已审核的读取工具。
+    /// 权限：默认只读，显式写工具仍必须经过共享审批。
     /// 关联：需求/设计REQ-OP-010；DES-OP-007；CHG-2026-0005。
     pub(crate) fn validate(&self, host: &HostConfig) -> HostResult<()> {
         let url = reqwest::Url::parse(&self.base_url)
@@ -111,12 +115,23 @@ impl OfficeConfig {
         if host.tools.iter().any(|name| {
             !matches!(
                 name.as_str(),
-                "read_file" | "glob" | "grep" | "todo_list" | "think" | "web_search" | "web_fetch"
+                "read_file"
+                    | "glob"
+                    | "grep"
+                    | "todo_list"
+                    | "think"
+                    | "web_search"
+                    | "web_fetch"
+                    | "write_file"
+                    | "edit_file"
+                    | "todo_add"
+                    | "todo_update"
+                    | "bash"
             )
         }) {
             return Err(HostError::new(
                 "unsupported",
-                "Office T4不开放写入或执行工具",
+                "Office未开放此工具；写工具需逐次审批，命令须逐次审批并受托管进程清理约束",
             ));
         }
         Ok(())

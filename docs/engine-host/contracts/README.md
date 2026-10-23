@@ -95,3 +95,19 @@ always 首期与 once 等价，只批准本次调用，不建立永久规则；�
 ## R1/R2/R3 与升级
 
 R1 见 r1-chat.md，单独批准；R2/R3 本期不改。协议升级必须先更新此文档、来源锁、正反例及评审，再修改 Host。不能让 Office 无null规则污染 OpenCode DTO，不能因 SDK 类型变化改核心协议。
+
+
+## T5现有协议适配（CHG-2026-0006 r1实施中）
+
+来源仍为固定02dbac4的office-integration第3/6/7节及office-ui Schema，未修改Office。Host所有业务请求走POST /api/pawoffice/messages；浏览器内部reply/ui不是Host端点。decision.request超时按业务剩余期限封顶300秒，HTTP加10秒；ui.next为30秒、HTTP35秒，普通请求15秒。
+
+共享ApprovalView是唯一授权事实。展示前同步完整会话并读取服务端最新快照；display ID每次唯一，响应核对team/conversation/decision/choice/label，再委托Host::decide_approval。202缓存不等于网页应用，未知/过期/旧菜单/关闭均不授权；确认不代表已经执行，实际started由原工具观察器记录。
+
+唯一UI领取器先登记action，再交有界队列128/处理16。无领取ACK，领取后登记前丢连接仍可能丢操作；接收时间不证明服务器还剩60秒。响应使用本次action.id，dialog.action载荷的旧interactionId只定位同范围、10分钟且最多64项的导航；数据摘要变化则要求重新打开。detail-v1每页5字段，UTF16字段界限和64KiB整包均保留，大文本逐段展示。
+
+conversation.delete调用中性Host::delete_session：先墓碑/失效审批，等待目标Run清理，再移除JSONL、自动损尾备份、原索引及派生记录；保留工作区产物及用户备份。完成后同步更高seq完整快照并核对服务端移除，才回复success；410/断线如实未确认，不复活业务数据。v4墓碑禁止旧send/history/resume/cancel/approve重新创建会话。
+
+任务按钮不模拟执行/暂停/完成/改派。task.assigned稳定事件由Office自动拜访，Host不另发visit。scene.say仅2秒公开摘要，forwarded仅为转发；动画和场景停止不改变Run。未完成的浏览器/故障组合验收见0006验证记录，不能据本节视为通过。
+
+
+T5场景仍用官方commandSchema：expiresAt取本次观察后10秒，timeoutMs=3000，busyPolicy=reject；只接受forwarded回执，不虚构动画完成。交接事件以原tool_started为依据，审批拒绝与前置校验失败不触发工具执行交接。删除后ui.respond未确认仅留短期控制回执，不保留正文或恢复会话。

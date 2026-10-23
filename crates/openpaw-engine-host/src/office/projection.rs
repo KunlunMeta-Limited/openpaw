@@ -34,7 +34,7 @@ impl Coordinator {
         config: OfficeConfig,
         address: std::net::SocketAddr,
     ) -> HostResult<Self> {
-        let _ = Client::new(&config)?;
+        let client = std::sync::Arc::new(Client::new(&config)?);
         let stop = CancellationToken::new();
         let mut tasks = Vec::new();
         for team in host.inner.config.slots.keys() {
@@ -42,8 +42,9 @@ impl Coordinator {
             let host = host.clone();
             let config = config.clone();
             let token = stop.clone();
+            let client = client.clone();
             tasks.push(tokio::spawn(async move {
-                let client=match Client::new(&config){Ok(c)=>c,Err(_)=>return};
+
                 let mut previous_status=String::new();let mut halted=false;let mut delay=1;
                 loop {
                     if token.is_cancelled(){break;}
@@ -57,6 +58,21 @@ impl Coordinator {
                 }
             }));
         }
+        tasks.push(tokio::spawn(super::approvals::run(
+            host.clone(),
+            client.clone(),
+            config.clone(),
+            address,
+            stop.clone(),
+        )));
+        tasks.push(tokio::spawn(super::actions::run(
+            host.clone(),
+            client.clone(),
+            config.clone(),
+            address,
+            stop.clone(),
+        )));
+        tasks.push(tokio::spawn(super::scene::run(host, client, stop.clone())));
         Ok(Self {
             stop,
             tasks,
@@ -106,8 +122,9 @@ fn status(state: RunState) -> &'static str {
 }
 fn actor(tool: &str) -> (&'static str, &'static str) {
     match tool {
-        "read_file" => ("files", "file-agent"),
-        "glob" | "grep" => ("search", "data-agent"),
+        "read_file" | "write_file" | "edit_file" => ("files", "file-agent"),
+        "glob" | "grep" | "web_search" | "web_fetch" => ("search", "data-agent"),
+        "bash" => ("command", "code-agent"),
         _ => ("assistant", "office-lead"),
     }
 }
@@ -160,6 +177,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         .get(&team)
         .cloned()
         .unwrap_or_else(|| team.clone());
+    let command_enabled = host.inner.config.tools.iter().any(|name| name == "bash");
     host.inner.store.call(move|db|{
         let previous=db.office_projection(&team)?;
         let prior=previous.as_ref().map(|(v,_)|v);
@@ -185,12 +203,13 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             let (_,input)=db.run_input(&r)?;
             let main_id=format!("run:{}",r.run_id);
             let summary=match r.state {RunState::Cancelled=>"用户取消，清理已完成",RunState::Interrupted=>"Host重启中断，不自动重放",RunState::TimedOut=>"预算到期，清理已完成",RunState::Cancelling=>"正在取消，等待实际资源清理",RunState::Failed=>"运行失败；原因见会话账本",_=>"真实运行；完整历史见会话账本"};
-            let mut tasks=vec![task(main_id,dto::bounded(&input,80),"assistant",status(r.state),summary.into(),&old,&now)];
+            let main_state=if !r.state.is_terminal() && (r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let mut tasks=vec![task(main_id,dto::bounded(&input,80),"assistant",main_state,summary.into(),&old,&now)];
             let mut events=Vec::new();
             for t in r.tools.iter().take(12) {
                 let id=db.office_call_id(&r.run_id,&t.call_id)?;let (who,_)=actor(&t.tool_name);
                 let item=task(id.clone(),format!("{} · {}",t.tool_name,dto::bounded(&t.call_id,40)),who,tool_status(&r,&t.state),format!("真实调用阶段：{}；Run {}",t.state,r.run_id),&old,&now);
-                if matches!(t.state.as_str(),"running"|"completed"|"failed")&&who!="assistant" {
+                if who!="assistant" && db.office_call_started(&r.run_id,&t.call_id)? {
                     let time=item["updatedAt"].clone();
                     let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|a|a.iter().find(|e|e["id"]==format!("assign:{id}")));
                     events.push(existing.cloned().unwrap_or_else(||json!({"id":format!("assign:{id}"),"kind":"task.assigned","summary":format!("交由{}处理{}",who,t.tool_name),"occurredAt":time,"taskId":id,"employeeId":who,"fromEmployeeId":"assistant"})));
@@ -199,10 +218,12 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             }
             events.sort_by(|a,b| b["occurredAt"].as_str().cmp(&a["occurredAt"].as_str()).then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
             let selected=&tasks[0];
-            let whiteboard=json!({"template":"task-board-v1","title":selected["title"],"status":selected["status"],"tagline":"OpenPaw真实运行","description":"任务及人物状态来自真实Run和工具事实。","note":"仅显示当前Run及有界工具；完整历史由聊天历史查询。","link":{"label":"","url":""},"steps":[{"id":"run","title":"当前请求处理","progress":selected["progress"]}]});
+            let whiteboard=json!({"template":"task-board-v1","title":selected["title"],"status":selected["status"],"tagline":"OpenPaw真实运行","description":"任务及人物状态来自真实Run和工具事实。","note":"仅显示当前Run及有界工具；完整历史由聊天历史查询。","link":{"label":"","url":""},"steps":[{"id":"accepted","title":"请求已接受","progress":100},{"id":"tools","title":"真实工具操作","progress":if !r.tools.is_empty() && r.tools.iter().all(|t|t.state=="completed"){100}else{-1}},{"id":"run","title":"运行结果","progress":selected["progress"]}]});
             priorities.insert(binding.scope.conversation_id.clone(),r.revision);
+            let mut employees=json!([{"id":"assistant","name":"OpenPaw助手","sceneActorId":"office-lead","role":"真实模型对话与协调","online":true},{"id":"files","name":"文件操作","sceneActorId":"file-agent","role":"同一引擎的文件工具，写入逐次审批","online":true},{"id":"search","name":"项目检索","sceneActorId":"data-agent","role":"同一引擎的检索工具","online":true}]);
+            if command_enabled {employees.as_array_mut().unwrap().push(json!({"id":"command","name":"命令执行","sceneActorId":"code-agent","role":"同一引擎的普通本机命令，逐次审批","online":true}));}
             conversations.push(json!({"id":binding.scope.conversation_id,"title":title,
-                "employees":[{"id":"assistant","name":"OpenPaw助手","sceneActorId":"office-lead","role":"真实模型对话与协调","online":true},{"id":"files","name":"文件读取","sceneActorId":"file-agent","role":"同一引擎的只读文件工具","online":true},{"id":"search","name":"项目检索","sceneActorId":"data-agent","role":"同一引擎的检索工具","online":true}],
+                "employees":employees,
                 "tasks":tasks,"events":events,"whiteboard":whiteboard}));
         }
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
@@ -230,7 +251,15 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         Ok(snapshot)
     }).await
 }
-async fn sync_once(
+/// 功能：按办公室唯一外发门同步完整快照并核对回执。
+/// 参数：host/config/team/client为既有服务，halted为冲突锁存，address为聊天地址。
+/// 返回：真实applied、cached、ignored或halted状态。
+/// 错误：连接、认证、版本冲突及协议错误，不假定服务端回滚。
+/// 状态：先持久完整内容再外发，重复序号保持同内容。
+/// 并发与取消：办公室专用门跨HTTP等待，不阻塞共享运行注册表。
+/// 权限：只访问已配置team，服务凭据不下发浏览器。
+/// 关联：需求/设计REQ-OP-011/013/014；CHG-2026-0006。
+pub(super) async fn sync_once(
     host: &Host,
     config: &OfficeConfig,
     team: &str,
@@ -238,6 +267,8 @@ async fn sync_once(
     halted: bool,
     address: std::net::SocketAddr,
 ) -> HostResult<String> {
+    let gate = client.projection_gate(team).await;
+    let _guard = gate.lock().await;
     let snapshot = prepare(host, config, team).await?;
     let key = team.to_owned();
     let saved_halt = host
@@ -253,7 +284,11 @@ async fn sync_once(
         return Ok("halted".into());
     }
     let caps = client.capabilities().await?;
-    for actor in ["office-lead", "file-agent", "data-agent"] {
+    let mut actors = vec!["office-lead", "file-agent", "data-agent"];
+    if host.inner.config.tools.iter().any(|name| name == "bash") {
+        actors.push("code-agent");
+    }
+    for actor in actors {
         if !caps["scene"]["actors"]
             .as_array()
             .is_some_and(|a| a.iter().any(|a| a["id"] == actor))

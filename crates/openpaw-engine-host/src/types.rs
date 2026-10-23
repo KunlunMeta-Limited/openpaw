@@ -701,3 +701,27 @@ mod text_tests {
         assert!(overflow.truncated());
     }
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// 用途：协议无关的会话删除进度。
+/// 字段：原会话ID和前进阶段，无正文。
+/// 来源去向：共享删除服务到可信客户端适配器。
+/// 约束：墓碑保留，ID不能重用。
+/// 稳定性：T5新增，既有接口不变。
+/// 关联：REQ-OP-014；API-HOST-DELETE。 需求/设计REQ-OP-014。
+pub struct DeleteView {
+    /// 用途：目标原会话ID。
+    /// 字段：稳定字符串。
+    /// 来源去向：原绑定到删除结果。
+    /// 约束：不作为认证凭据。
+    /// 稳定性：T5新增。
+    /// 关联：API-HOST-DELETE。 需求/设计REQ-OP-014。
+    pub session_id: String,
+    /// 用途：实际删除阶段。
+    /// 字段：deleting、cancelling、purging或deleted。
+    /// 来源去向：持久墓碑到删除结果。
+    /// 约束：不得倒退或在清理前声称deleted。
+    /// 稳定性：T5新增。
+    /// 关联：API-HOST-DELETE。 需求/设计REQ-OP-014。
+    pub phase: String,
+}
