@@ -152,12 +152,11 @@ impl ToolExecutor for HostTools {
                     if cancel.is_cancelled() {
                         return Err(HostError::new("cancelled", "本轮正在停止"));
                     }
-                    db.report_progress(&binding, &args)
+                    db.report_progress(&binding, &args)?;
+                    crate::task_progress::accepted_plan_hint(db.progress(&binding.run_id)?)
                 })
                 .await
-                .map(|_| {
-                    ToolCallOutcome::ok("业务步骤已记录；真实操作和文件仍须通过原工具及审批执行")
-                })
+                .map(ToolCallOutcome::ok)
                 .map_err(|e| {
                     if e.kind == "storage_unavailable" {
                         self.control.fail(e.clone());
@@ -221,8 +220,16 @@ impl ToolExecutor for HostTools {
         // 必须等待原调用返回；context取消不能通过drop绕过进程树、管道及原子写入清理。
         let result = self.registry.call_with_context(name, args, context).await;
         let success = result.as_ref().is_ok_and(|r| !r.is_error);
+        let receipt_binding = binding.clone();
         if let Err(e)=self.store.call(move|db|{let rev=db.bump("tool_result",&serde_json::json!({"run_id":binding.run_id,"call_id":binding.call_id,"success":success}).to_string())?;let _=db.notices.send(crate::HostNotice::Changed{revision:rev});Ok(())}).await {self.control.fail(e);return Err(Error::Store("工具结果保存失败".into()));}
-        result
+        // 回执在原结果可靠保存后追加；不提前宣称执行成功，也不把回执当作步骤完成。
+        result.map(|outcome| {
+            crate::task_progress::with_execution_receipt(
+                outcome,
+                &receipt_binding,
+                self.progress_enabled,
+            )
+        })
     }
 }
 #[async_trait]

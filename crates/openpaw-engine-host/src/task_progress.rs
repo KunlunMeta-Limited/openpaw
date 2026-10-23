@@ -3,7 +3,7 @@
 //! 依赖：原工具声明、调用绑定和单写Store；不另建任务数据库。
 //! 禁止职责：不执行项目工具、不批准写入、不把模型自报当成真实执行。
 use crate::{HostError, HostResult, RunState, RunView};
-use openpaw_core::{ToolCallBinding, ToolSpec};
+use openpaw_core::{ToolCallBinding, ToolCallOutcome, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -83,6 +83,45 @@ pub(crate) fn spec() -> ToolSpec {
 /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
 pub(crate) fn validate(value: &Value) -> HostResult<()> {
     parse(value).map(|_| ())
+}
+
+/// 功能：在Office真实工具成功结果后补充精确执行回执，避免遗漏进度报告。
+/// 参数：outcome为原工具结果，binding为实际执行绑定，enabled为Office进度开关。
+/// 返回：保留原正文、错误及结构化结果的回执文本。
+/// 错误：无；失败结果和未启用进度的调用原样返回。
+/// 状态：调用方仅在原工具返回且执行结果可靠保存后使用，不写入或自动确认步骤。
+/// 并发与取消：纯转换，取消和实际清理仍由原执行入口负责。
+/// 权限：回执不是审批凭据，不含输入正文；取回网页不代表内容已经核验。
+/// 关联：需求REQ-OP-012；设计DES-OP-006/007；缺陷D48。
+pub(crate) fn with_execution_receipt(
+    mut outcome: ToolCallOutcome,
+    binding: &ToolCallBinding,
+    enabled: bool,
+) -> ToolCallOutcome {
+    if enabled && !outcome.is_error && binding.tool_name != NAME {
+        let receipt = json!({"callId":binding.call_id,"tool":binding.tool_name});
+        outcome.content.push_str(&format!("\n\n[Host执行回执]\n{receipt}\n以上仅确认本次工具执行成功，不代表资料内容有效或业务步骤已完成。核对结果符合对应步骤要求后，在进入下一步骤或最终回复前调用report_progress：{{\"type\":\"update\",\"stepId\":\"当前计划中对应步骤的id\",\"state\":\"completed\",\"evidenceCallIds\":[{}]}}。必须替换stepId，逐字使用此callId；若内容无效先继续检索，不得报告完成。保存步骤仍须引用对应路径的实际write_file/edit_file回执。\n[/Host执行回执]", json!(binding.call_id)));
+    }
+    outcome
+}
+
+/// 功能：回显已接受的有界计划，使模型持续看到尚未确认的步骤。
+/// 参数：value为原Store刚读取的本轮计划。
+/// 返回：步骤ID、标题和状态，不复制工具输入或结果正文。
+/// 错误：已存计划损坏时明确报错，不伪造成功清单。
+/// 状态：只读，不改变分母、证据或进度。
+/// 并发与取消：在报告原单写序列内读取，取消门禁仍由原调用方处理。
+/// 权限：仅反馈当前已授权Office Run的计划，不授予执行权限。
+/// 关联：需求REQ-OP-012；设计DES-OP-006/007；缺陷D48。
+pub(crate) fn accepted_plan_hint(value: Option<Value>) -> HostResult<String> {
+    let plan: Plan = serde_json::from_value(value.ok_or_else(|| invalid("已记录计划缺失"))?)
+        .map_err(HostError::storage)?;
+    let steps = plan
+        .steps
+        .iter()
+        .map(|s| json!({"id":s.id,"title":s.title,"state":s.state}))
+        .collect::<Vec<_>>();
+    Ok(format!("业务步骤已记录；真实操作和文件仍须通过原工具及审批执行。当前步骤：{}。in_progress尚未完成；核验真实操作结果后，用对应Host执行回执的callId报告completed，再处理下一步。最终答复前核对清单，无工具的整理答复由最终可靠结束确认。",json!(steps)))
 }
 
 /// 功能：为无效进度报告提供本轮真实成功调用的有界恢复提示。
@@ -430,6 +469,42 @@ mod tests {
         assert!(e.message.contains("type=update") && e.message.contains("evidenceCallIds"));
     }
     #[test]
+    fn execution_receipt_keeps_original_result_and_never_confirms_a_step() {
+        let binding = ToolCallBinding {
+            run_id: "r".into(),
+            call_id: "actual-call".into(),
+            tool_name: "write_file".into(),
+            input: json!({"content":"private-input"}),
+        };
+        let mut outcome = ToolCallOutcome::ok("wrote original bytes");
+        outcome.structured = Some(json!({"original":true}));
+        let result = with_execution_receipt(outcome.clone(), &binding, true);
+        assert!(result.content.starts_with(&outcome.content));
+        assert!(result.content.contains("\"callId\":\"actual-call\""));
+        assert!(result.content.contains("evidenceCallIds") && result.content.contains("不代表"));
+        assert!(!result.content.contains("private-input"));
+        assert_eq!(result.structured, outcome.structured);
+        assert!(!result.is_error);
+        assert_eq!(
+            with_execution_receipt(outcome.clone(), &binding, false).content,
+            outcome.content
+        );
+        let failed = ToolCallOutcome::error("actual failure");
+        let result = with_execution_receipt(failed, &binding, true);
+        assert!(result.is_error);
+        assert_eq!(result.content, "actual failure");
+        let r = run();
+        let p = plan(&r);
+        let hint = accepted_plan_hint(Some(p.clone())).unwrap();
+        assert!(hint.contains("\"id\":\"record\"") && hint.contains("pending"));
+        assert_eq!(
+            project(Some(p), &r).unwrap().1,
+            0,
+            "回执/清单均不能推进进度"
+        );
+        assert!(accepted_plan_hint(Some(json!({"steps":[]}))).is_err());
+    }
+    #[test]
     fn no_tool_answer_is_confirmed_only_by_reliable_normal_finish() {
         let mut r = run();
         let p = update(
@@ -524,6 +599,7 @@ mod lifecycle_tests {
             .await
             .unwrap();
         assert!(events.iter().any(|e| matches!(e, openpaw_core::SessionEvent::Message(m) if m.content.iter().any(|block| matches!(block,openpaw_core::ContentBlock::ToolResult { content, is_error: true, .. } if content.contains("\"callId\":\"call_2\"") && content.contains("evidenceCallIds"))))), "失败结果须向模型提供本轮真实证据，随后正确重试才能完成");
+        assert!(events.iter().any(|e| matches!(e, openpaw_core::SessionEvent::Message(m) if m.content.iter().any(|block| matches!(block,openpaw_core::ContentBlock::ToolResult { content, is_error: false, tool_use_id, .. } if tool_use_id=="call_2" && content.contains("真实读取标记") && content.contains("[Host执行回执]") && content.contains("\"callId\":\"call_2\""))))), "成功正文须携带本次真实回执，不能等错误才提示");
         let id = run.run_id.clone();
         let plan = host
             .inner
