@@ -133,14 +133,13 @@ fn actor(tool: &str) -> (&'static str, &'static str) {
 fn task(
     id: String,
     title: String,
-    who: &str,
     state: &str,
     summary: String,
     old: &BTreeMap<String, Value>,
     now: &str,
     progress: u64,
 ) -> Value {
-    let mut task = json!({"id":id,"title":dto::bounded(&title,160),"assigneeId":who,"status":state,"progress":progress,"summary":dto::bounded(&summary,1000),"updatedAt":now});
+    let mut task = json!({"id":id,"title":dto::bounded(&title,160),"assigneeId":"assistant","status":state,"progress":progress,"summary":dto::bounded(&summary,1000),"updatedAt":now});
     if let Some(prior) = old.get(&id) {
         let mut comparable = prior.clone();
         comparable["updatedAt"] = Value::String(now.into());
@@ -205,9 +204,9 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 _=>"正在处理你的请求".to_owned(),
             };
             let main_state=if r.state==RunState::Completed && percent<100 {"failed"} else if !r.state.is_terminal() && (r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
-            let mut tasks=vec![task(main_id,dto::bounded(&input,80),"assistant",main_state,summary.clone(),&old,&now,percent)];
+            let mut tasks=vec![task(main_id,dto::bounded(&input,80),main_state,summary.clone(),&old,&now,percent)];
             for step in steps {
-                tasks.push(task(step["id"].as_str().unwrap().into(),step["title"].as_str().unwrap().into(),"assistant",step["status"].as_str().unwrap(),step["summary"].as_str().unwrap().into(),&old,&now,step["progress"].as_u64().unwrap()));
+                tasks.push(task(step["id"].as_str().unwrap().into(),step["title"].as_str().unwrap().into(),step["status"].as_str().unwrap(),step["summary"].as_str().unwrap().into(),&old,&now,step["progress"].as_u64().unwrap()));
             }
             let mut events=Vec::new();
             let assignments=db.office_task_assignments(&r.run_id)?;

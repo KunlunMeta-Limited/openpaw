@@ -5,7 +5,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createServer as tcpServer } from 'node:net'
-import { mkdir, readFile, writeFile, access, readdir, realpath } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, access, readdir, realpath, copyFile } from 'node:fs/promises'
 import { dirname, join, resolve, relative, delimiter } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
@@ -149,6 +149,13 @@ function provider() {
         finish({content:'T5工具结果：'+writeResult.content});return
       }
       if (prompt.includes('MODEL-ERROR')) { res.writeHead(401); res.end('controlled authentication failure'); return }
+      if (prompt==='长连接180秒验收') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        const chunk=text=>res.write('data: '+JSON.stringify({choices:[{index:0,delta:{content:text},finish_reason:null}]})+'\n\n');
+        chunk('长连接开始。');const pulse=setInterval(()=>chunk('继续接收。'),30000);
+        const ending=setTimeout(()=>{clearInterval(pulse);chunk('长连接真实完成。');res.write('data: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\n');res.end('data: [DONE]\n\n');},190000);
+        res.once('close',()=>{clearInterval(pulse);clearTimeout(ending)});return;
+      }
       if (prompt.includes('慢任务')) {
         const timer = setTimeout(() => { if (!res.destroyed) finish({ content: '慢任务完成' }) }, 60000)
         res.once('close', () => clearTimeout(timer)); return
@@ -200,7 +207,9 @@ try {
   const config = join(output, 'host.toml')
   await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash"]\n[roots]\nproject = ${JSON.stringify(workspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project"\noffice-reserved = "project"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\ncreation_slots = ["office-reserved"]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
   if (!process.env.OPENPAW_HOST_BINARY) await run('cargo', ['build', '--locked', '-p', 'openpaw-cli', '--features', 'engine-host,sidecar'], root, childEnv, 'host-build')
-  const binary = process.env.OPENPAW_HOST_BINARY ?? join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', process.platform === 'win32' ? 'openpaw.exe' : 'openpaw')
+  const buildBinary = process.env.OPENPAW_HOST_BINARY ?? join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', process.platform === 'win32' ? 'openpaw.exe' : 'openpaw')
+  // 每轮固定自己的已构建可执行文件；后续其他feature构建不能改变重启所用程序。
+  const binary=join(output,process.platform==='win32'?'openpaw-product.exe':'openpaw-product');await copyFile(resolve(buildBinary),binary)
   let host = start(resolve(binary), ['engine-host', '--config', config, '--port', '0'], root, childEnv, 'host')
   const hostBase = await waitFor(() => host.stdout().match(/openpaw engine host listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1])
   report.hostBinarySha256 = createHash('sha256').update(await readFile(resolve(binary))).digest('hex')
@@ -657,6 +666,15 @@ try {
   await page.screenshot({path:join(output,'32-real-browser-created-office-chat.png'),fullPage:true});
   await switchOffice(page,'真实运行验收');
   report.assertions.push('r2: browser goal + three business steps; 25% before approval, 100% only after exact real file write and reliable answer; stable refresh/events','r3: official office.create creates configured real workspace slot and conversation through untouched latest Office UI');
+  await fresh(page);const longStarted=Date.now();await send('长连接180秒验收');
+  await waitFor(async()=>(await log.innerText()).includes('长连接开始。'));
+  const longRequest=structuredClone(latestSend().request);
+  await waitFor(async()=>(await log.innerText()).includes('长连接真实完成。'),210000);
+  await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:20000});
+  report.t5.longConnection={request:longRequest,milliseconds:Date.now()-longStarted};assert.ok(report.t5.longConnection.milliseconds>180000);
+  assert.equal(report.browserRequests.filter(r=>r.request.type==='send'&&r.request.turnId===longRequest.turnId).length,1);
+  await page.screenshot({path:join(output,'33-official-chat-over-180-seconds.png'),fullPage:true});
+  report.assertions.push('r3: untouched latest Office browser receives one original stream over 180 seconds; Host idle and Run budgets stay enabled');
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'

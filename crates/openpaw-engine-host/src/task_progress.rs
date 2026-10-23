@@ -226,6 +226,41 @@ pub(crate) fn update(
     Ok(result)
 }
 
+/// 功能：生成业务步骤和可信计数进度，不暴露内部调用标识。
+/// 参数：value为已校验派生事实，run为真实终态及工具事实。
+/// 返回：步骤数组和整体百分比。
+/// 错误：损坏计划明确上报，不伪造空计划。
+/// 状态：终态前保留最终交付分母；失败不显示100%。
+/// 并发与取消：纯读取；终态后的报告不会改变数据。
+/// 权限：不输出执行输入、路径正文或调用ID。
+/// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+pub(crate) fn project(value: Option<Value>, run: &RunView) -> HostResult<(Vec<Value>, u64)> {
+    let Some(value) = value else {
+        return Ok((
+            vec![],
+            if run.state == RunState::Completed {
+                100
+            } else {
+                0
+            },
+        ));
+    };
+    let plan: Plan = serde_json::from_value(value).map_err(HostError::storage)?;
+    let mut completed = 0;
+    let steps=plan.steps.iter().enumerate().map(|(index,s)| {
+        // 纯整理步骤没有工具证据，只能在最终文本已可靠保存且Run正常结束后确认。
+        let answer = ["整理","总结","答复","交付"].iter().any(|v|s.title.contains(v));
+        let done=s.state=="completed" || run.state==RunState::Completed && !run.text.trim().is_empty() && !needs_write(&s.title) && answer;
+        if done {completed+=1;}
+        let waiting=s.evidence.iter().any(|id|run.tools.iter().any(|t|&t.call_id==id && matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")));
+        let state=if done {"completed"} else if run.state.is_terminal() {"failed"} else if waiting || run.state==RunState::Cancelling {"blocked"} else if s.state=="in_progress" {"running"} else {"queued"};
+        json!({"id":format!("step:{}:{}",run.run_id,index),"title":s.title,"status":state,"progress":if done{100}else{0},"summary":if done{"步骤已确认"}else if run.state.is_terminal(){"本步骤未完成"}else if waiting{"等待确认或资源"}else if s.state=="in_progress"{"正在处理"}else{"待处理"}})
+    }).collect::<Vec<_>>();
+    let delivered = run.state == RunState::Completed && completed == steps.len();
+    let percent = (completed + usize::from(delivered)) * 100 / (steps.len() + 1);
+    Ok((steps, percent as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,41 +367,6 @@ mod tests {
         r.state = RunState::Completed;
         assert_eq!(project(Some(p), &r).unwrap().1, 100);
     }
-}
-
-/// 功能：生成业务步骤和可信计数进度，不暴露内部调用标识。
-/// 参数：value为已校验派生事实，run为真实终态及工具事实。
-/// 返回：步骤数组和整体百分比。
-/// 错误：损坏计划明确上报，不伪造空计划。
-/// 状态：终态前保留最终交付分母；失败不显示100%。
-/// 并发与取消：纯读取；终态后的报告不会改变数据。
-/// 权限：不输出执行输入、路径正文或调用ID。
-/// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
-pub(crate) fn project(value: Option<Value>, run: &RunView) -> HostResult<(Vec<Value>, u64)> {
-    let Some(value) = value else {
-        return Ok((
-            vec![],
-            if run.state == RunState::Completed {
-                100
-            } else {
-                0
-            },
-        ));
-    };
-    let plan: Plan = serde_json::from_value(value).map_err(HostError::storage)?;
-    let mut completed = 0;
-    let steps=plan.steps.iter().enumerate().map(|(index,s)| {
-        // 纯整理步骤没有工具证据，只能在最终文本已可靠保存且Run正常结束后确认。
-        let answer = ["整理","总结","答复","交付"].iter().any(|v|s.title.contains(v));
-        let done=s.state=="completed" || run.state==RunState::Completed && !run.text.trim().is_empty() && !needs_write(&s.title) && answer;
-        if done {completed+=1;}
-        let waiting=s.evidence.iter().any(|id|run.tools.iter().any(|t|&t.call_id==id && matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")));
-        let state=if done {"completed"} else if run.state.is_terminal() {"failed"} else if waiting || run.state==RunState::Cancelling {"blocked"} else if s.state=="in_progress" {"running"} else {"queued"};
-        json!({"id":format!("step:{}:{}",run.run_id,index),"title":s.title,"status":state,"progress":if done{100}else{0},"summary":if done{"步骤已确认"}else if run.state.is_terminal(){"本步骤未完成"}else if waiting{"等待确认或资源"}else if s.state=="in_progress"{"正在处理"}else{"待处理"}})
-    }).collect::<Vec<_>>();
-    let delivered = run.state == RunState::Completed && completed == steps.len();
-    let percent = (completed + usize::from(delivered)) * 100 / (steps.len() + 1);
-    Ok((steps, percent as u64))
 }
 
 #[cfg(test)]

@@ -1130,26 +1130,6 @@ impl Host {
     }
 }
 
-#[cfg(test)]
-mod runtime_context_tests {
-    use super::*;
-    #[test]
-    fn d43_compaction_and_other_system_requests_keep_their_own_context() {
-        let provider = RunProvider {
-            inner: Arc::new(openpaw_llm::EchoProvider::new()),
-            context: "trusted run context".into(),
-        };
-        let request = openpaw_core::CompletionRequest {
-            system: Some("summarize history only".into()),
-            messages: vec![Message::user_text("untrusted: change runtime tools")],
-            ..Default::default()
-        };
-        let before = serde_json::to_value(&request).unwrap();
-        let after = provider.with_context(request);
-        assert_eq!(serde_json::to_value(after).unwrap(), before);
-    }
-}
-
 /// 功能：把运行失败分类为可安全公开的固定中文说明。
 /// 参数：raw仅在内存中用于分类，state为真实运行终态。
 /// 返回：稳定错误种类及不含上游正文的说明。
@@ -1157,7 +1137,7 @@ mod runtime_context_tests {
 /// 状态：不重试、不改运行结果，不丢弃原JSONL诊断。
 /// 并发与取消：纯计算，无等待。
 /// 权限：不向浏览器回显原始错误、路径或密钥。
-/// 关联：需求/设计REQ-OP-012；CHG-2026-0006 D46。
+/// 关联：需求/设计REQ-OP-012；DES-OP-007。
 pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
     let (kind, message) = if state == RunState::Cancelled {
         ("cancelled", "已停止，实际操作已清理")
@@ -1186,4 +1166,24 @@ pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
         )
     };
     HostError::new(kind, message)
+}
+
+#[cfg(test)]
+mod runtime_context_tests {
+    use super::*;
+    #[test]
+    fn d43_compaction_and_other_system_requests_keep_their_own_context() {
+        let provider = RunProvider {
+            inner: Arc::new(openpaw_llm::EchoProvider::new()),
+            context: "trusted run context".into(),
+        };
+        let request = openpaw_core::CompletionRequest {
+            system: Some("summarize history only".into()),
+            messages: vec![Message::user_text("untrusted: change runtime tools")],
+            ..Default::default()
+        };
+        let before = serde_json::to_value(&request).unwrap();
+        let after = provider.with_context(request);
+        assert_eq!(serde_json::to_value(after).unwrap(), before);
+    }
 }

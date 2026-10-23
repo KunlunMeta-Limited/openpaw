@@ -471,16 +471,9 @@ impl Db {
                     run_id,
                     error: Some(error),
                     ..
-                } if run_id == id => {
-                    // 历史通用错误可从账本细分；原宿主已锁存的存储等确定分类不能被通用错误覆盖。
-                    if run.error.as_ref().is_none_or(|e| {
-                        matches!(
-                            e.kind.as_str(),
-                            "interrupted" | "run_failed" | "timeout" | "cancelled"
-                        )
-                    }) {
-                        run.error = Some(crate::service::safe_run_error(&error, run.state));
-                    }
+                // 历史通用错误可从账本细分；宿主已锁存的存储等确定分类不能被通用错误覆盖。
+                } if run_id == id && run.error.as_ref().is_none_or(|e| matches!(e.kind.as_str(), "interrupted" | "run_failed" | "timeout" | "cancelled")) => {
+                    run.error = Some(crate::service::safe_run_error(&error, run.state));
                 }
                 _ => {}
             }
