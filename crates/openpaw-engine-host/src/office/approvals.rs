@@ -51,11 +51,23 @@ pub(super) async fn run(
                 let Ok(r) = host.inner.store.call(move |db| db.get_run(&run)).await else {
                     continue;
                 };
-                let Some(b) = bindings.iter().find(|b| {
-                    b.session_id == r.session_id
-                        && b.scope.namespace == "office"
-                        && host.inner.config.slots.contains_key(&b.scope.slot_id)
-                }) else {
+                let display_scope = if let Some(b) = bindings
+                    .iter()
+                    .find(|b| b.session_id == r.session_id && b.scope.namespace == "office")
+                {
+                    Some(b.scope.clone())
+                } else {
+                    let run = r.run_id.clone();
+                    host.inner
+                        .store
+                        .call(move |db| Ok(db.delegation_for_child(&run)?.map(|d| d.parent_scope)))
+                        .await
+                        .ok()
+                        .flatten()
+                };
+                let Some(display_scope) =
+                    display_scope.filter(|s| host.inner.config.slots.contains_key(&s.slot_id))
+                else {
                     continue;
                 };
                 let id = a.approval_id.clone();
@@ -65,7 +77,7 @@ pub(super) async fn run(
                     client.clone(),
                     refresh.clone(),
                     stop.clone(),
-                    b.scope.clone(),
+                    display_scope,
                 );
                 tasks.spawn(async move {
                     let _ = display(&h, &c, &updates, address, &s, &a, &t).await;
@@ -95,7 +107,22 @@ async fn display(
     if remaining < 1000 {
         return Ok(());
     }
-    let description = description(a);
+    let run = a.binding.run_id.clone();
+    let owner = host
+        .inner
+        .store
+        .call(move |db| db.delegation_for_child(&run))
+        .await?;
+    let role = owner.as_ref().and_then(|d| crate::agents::role(&d.role_id));
+    let title = role
+        .map(|r| format!("{}：确认本次 {}", r.name, a.binding.tool_name))
+        .unwrap_or_else(|| format!("确认本次 {}", a.binding.tool_name));
+    let actor = role.map(|r| r.actor).unwrap_or("office-lead");
+    let description = if let Some(d) = &owner {
+        format!("子任务：{}\n{}", d.title, description(a))
+    } else {
+        description(a)
+    };
     if dto::units(&description) > 2000 {
         host.decide_approval(scope, &a.approval_id, a.revision, a.binding.clone(), false)
             .await?;
@@ -128,7 +155,7 @@ async fn display(
         .await?;
     let result = {
         let request=client.post(json!({"type":"decision.request","teamId":scope.slot_id,"conversationId":scope.conversation_id,"timeoutMs":ms,
-        "decision":{"id":display,"actorId":"office-lead","kind":"confirmation","title":format!("确认本次 {}",a.binding.tool_name),"description":description,"confirmLabel":"允许本次","rejectLabel":"拒绝"}}));
+        "decision":{"id":display,"actorId":actor,"kind":"confirmation","title":title,"description":description,"confirmLabel":"允许本次","rejectLabel":"拒绝"}}));
         tokio::pin!(request);
         loop {
             tokio::select! {biased;

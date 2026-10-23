@@ -213,7 +213,11 @@ async fn dispatch(
             {
                 return Err(HostError::new("scope_denied", "该人物未绑定此会话成员"));
             }
-            json!({"kind":"menu"})
+            let member = conv["employees"]
+                .as_array()
+                .and_then(|v| v.iter().find(|v| v["sceneActorId"] == action["actorId"]))
+                .unwrap();
+            json!({"kind":"member","employeeId":member["id"],"actorId":member["sceneActorId"]})
         }
         "employee.inspect" => {
             if conv["employees"]
@@ -222,7 +226,11 @@ async fn dispatch(
             {
                 return Err(HostError::new("scope_denied", "成员不属于当前会话"));
             }
-            json!({"kind":"menu"})
+            let member = conv["employees"]
+                .as_array()
+                .and_then(|v| v.iter().find(|v| v["id"] == action["employeeId"]))
+                .unwrap();
+            json!({"kind":"member","employeeId":member["id"],"actorId":member["sceneActorId"]})
         }
         "dialog.action" => {
             let (s, id) = (

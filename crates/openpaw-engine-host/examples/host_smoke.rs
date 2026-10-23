@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let root = base.join("workspace");
     std::fs::create_dir_all(&root)?;
     let config = HostConfig {
+        agents: None,
         office: None,
         home: base.join("home"),
         roots: [("project".into(), root.clone())].into(),

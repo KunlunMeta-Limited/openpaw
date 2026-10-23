@@ -15,6 +15,7 @@ fn config(base: &std::path::Path) -> HostConfig {
     let root = base.join("workspace");
     std::fs::create_dir_all(&root).unwrap();
     HostConfig {
+        agents: None,
         office: None,
         home: base.join("home"),
         roots: [("project".into(), root)].into(),

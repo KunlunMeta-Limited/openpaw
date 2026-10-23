@@ -13,6 +13,7 @@ fn config(base: &std::path::Path) -> HostConfig {
     let root = base.join("项目 workspace");
     std::fs::create_dir_all(&root).unwrap();
     HostConfig {
+        agents: None,
         office: None,
         home: base.join("home"),
         roots: [("project".into(), root)].into(),
@@ -1000,4 +1001,365 @@ async fn d43_reopened_session_uses_current_capabilities_without_rewriting_histor
         host.shutdown().await.unwrap();
         drop(host);
     }
+}
+
+// 确定性Provider只决定模型输出，子Session、工具、锁、审批和JSONL全部走真实Host。
+struct TeamProvider {
+    requests: std::sync::Mutex<Vec<CompletionRequest>>,
+    hold_children: bool,
+    write_child: bool,
+    entered: tokio::sync::Notify,
+}
+impl TeamProvider {
+    fn new(hold_children: bool, write_child: bool) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            hold_children,
+            write_child,
+            entered: tokio::sync::Notify::new(),
+        }
+    }
+}
+#[async_trait]
+impl LlmProvider for TeamProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> openpaw_core::Result<CompletionResponse> {
+        use openpaw_core::{ContentBlock, StopReason, Usage};
+        self.requests.lock().unwrap().push(request.clone());
+        let system = request.system.as_deref().unwrap_or("");
+        let lead = system.contains("（lead）");
+        let calls: Vec<_> = request
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let content = if lead {
+            let roles = ["research", "organize", "draft", "review", "audit"];
+            let n = calls.iter().filter(|c| c.starts_with("delegate-")).count();
+            if n < roles.len() {
+                let role = roles[n];
+                vec![ContentBlock::ToolUse {
+                    id: format!("delegate-{role}"),
+                    name: "delegate_task".into(),
+                    input: json!({"role_id":role,"title":format!("{role}核对项目说明"),"instructions":"读取README.md并核对项目背景，明确真实证据和限制","acceptance":"有实际文件读取和角色独立结果"}),
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: "五位同事已分别实际核对项目说明；主角色汇总完成".into(),
+                }]
+            }
+        } else {
+            self.entered.notify_one();
+            if self.hold_children {
+                std::future::pending::<()>().await;
+            }
+            let write = self.write_child && system.contains("（draft）");
+            if calls.is_empty() {
+                vec![ContentBlock::ToolUse {
+                    id: "child-work".into(),
+                    name: if write { "write_file" } else { "read_file" }.into(),
+                    input: if write {
+                        json!({"path":"team-report.txt","content":"独立子角色真实审批产物"})
+                    } else {
+                        json!({"path":"README.md"})
+                    },
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: format!(
+                        "已完成本角色核查。证据是本子会话的真实{}结果。",
+                        if write { "write_file" } else { "read_file" }
+                    ),
+                }]
+            }
+        };
+        let stop_reason = if content
+            .iter()
+            .any(|c| matches!(c, ContentBlock::ToolUse { .. }))
+        {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        };
+        Ok(CompletionResponse {
+            content,
+            stop_reason,
+            usage: Usage {
+                input_tokens: 30,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        })
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn default_model(&self) -> &str {
+        "team-deterministic"
+    }
+    fn name(&self) -> &str {
+        "team-fixture"
+    }
+}
+fn team_scope(conversation: &str) -> ClientScope {
+    ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: conversation.into(),
+    }
+}
+fn team_config(base: &std::path::Path) -> HostConfig {
+    let mut cfg = config(base);
+    cfg.tools = vec!["read_file".into(), "write_file".into()];
+    cfg.agents = Some(AgentsConfig {
+        enabled: true,
+        ..Default::default()
+    });
+    std::fs::write(
+        cfg.roots["project"].join("README.md"),
+        "可信项目说明：复用原引擎与会话账本",
+    )
+    .unwrap();
+    cfg
+}
+fn delegated(home: &std::path::Path, parent: &str) -> Vec<serde_json::Value> {
+    let db = rusqlite::Connection::open(home.join("engine-host/host.db")).unwrap();
+    let mut q=db.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").unwrap();
+    q.query_map([parent], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect()
+}
+#[tokio::test]
+async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_original_ledgers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = team_config(tmp.path());
+    let provider = Arc::new(TeamProvider::new(false, false));
+    let host = Host::with_provider(cfg.clone(), provider.clone())
+        .await
+        .unwrap();
+    let scope = team_scope("five");
+    let b = host.open_session(scope.clone()).await.unwrap();
+    let run = host
+        .submit_run(&scope, &b.session_id, "王明，请安排五位同事实际协作".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    let final_run = host.get_run(&scope, &run.run_id).await.unwrap();
+    assert_eq!(
+        final_run.state,
+        RunState::Completed,
+        "{:?}",
+        final_run.error
+    );
+    let children = delegated(&cfg.home, &run.run_id);
+    assert_eq!(children.len(), 5);
+    let mut sessions = std::collections::BTreeSet::new();
+    let mut runs = std::collections::BTreeSet::new();
+    for child in &children {
+        let child_scope: ClientScope =
+            serde_json::from_value(child["child_scope"].clone()).unwrap();
+        let id = child["child_run"].as_str().unwrap();
+        let sid = child["child_session"].as_str().unwrap();
+        assert!(sessions.insert(sid.to_owned()));
+        assert!(runs.insert(id.to_owned()));
+        assert_ne!(sid, b.session_id);
+        let r = host.get_run(&child_scope, id).await.unwrap();
+        assert_eq!(r.state, RunState::Completed);
+        assert!(r
+            .tools
+            .iter()
+            .any(|t| t.tool_name == "read_file" && t.state == "completed"));
+        let s = host.get_session(&child_scope, sid).await.unwrap();
+        assert!(!s.messages.is_empty());
+        assert_eq!(
+            host.get_run(&scope, id).await.unwrap_err().kind,
+            "scope_denied"
+        );
+    }
+    assert_eq!(
+        provider.requests.lock().unwrap().len(),
+        16,
+        "主6次+五子各2次，不能用单模型角色对白替代"
+    );
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        1,
+        "子会话不污染Office会话历史"
+    );
+    host.delete_session(&scope).await.unwrap();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let left: u64 = db
+        .query_row("SELECT COUNT(*) FROM host_bindings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0, "父删除必须清掉所有子账本/绑定");
+    let left: u64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM host_events WHERE kind='agent_delegation'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0);
+    assert!(cfg.roots["project"].join("README.md").is_file());
+    host.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn p06_child_write_uses_exact_parent_visible_approval_and_other_conversation_cannot_approve()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = team_config(tmp.path());
+    cfg.agents
+        .as_mut()
+        .unwrap()
+        .tools
+        .insert("draft".into(), vec!["write_file".into()]);
+    let host = Host::with_provider(cfg.clone(), Arc::new(TeamProvider::new(false, true)))
+        .await
+        .unwrap();
+    let scope = team_scope("approval");
+    let b = host.open_session(scope.clone()).await.unwrap();
+    let parent = host
+        .submit_run(&scope, &b.session_id, "真实协作并保存子任务产物".into())
+        .await
+        .unwrap();
+    let approval = pending(&host, &scope).await;
+    let path = cfg.roots["project"].join("team-report.txt");
+    assert!(!path.exists());
+    assert_ne!(
+        approval.binding.run_id, parent.run_id,
+        "审批保留准确子Run绑定"
+    );
+    let other = team_scope("other");
+    host.open_session(other.clone()).await.unwrap();
+    assert_eq!(
+        host.decide_approval(
+            &other,
+            &approval.approval_id,
+            approval.revision,
+            approval.binding.clone(),
+            true
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        "scope_denied"
+    );
+    host.decide_approval(
+        &scope,
+        &approval.approval_id,
+        approval.revision,
+        approval.binding,
+        true,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "独立子角色真实审批产物"
+    );
+    assert_eq!(
+        host.get_run(&scope, &parent.run_id).await.unwrap().state,
+        RunState::Completed
+    );
+    host.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn p07_cancel_and_capacity_reservations_do_not_orphan_real_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = team_config(tmp.path());
+    let provider = Arc::new(TeamProvider::new(true, false));
+    let host = Host::with_provider(cfg, provider.clone()).await.unwrap();
+    let a = team_scope("a");
+    let b = team_scope("b");
+    let c = team_scope("c");
+    let ab = host.open_session(a.clone()).await.unwrap();
+    let bb = host.open_session(b.clone()).await.unwrap();
+    let cb = host.open_session(c.clone()).await.unwrap();
+    let ar = host
+        .submit_run(&a, &ab.session_id, "协作A".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.entered.notified())
+        .await
+        .unwrap();
+    let br = host
+        .submit_run(&b, &bb.session_id, "协作B".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        host.submit_run(&c, &cb.session_id, "协作C".into())
+            .await
+            .unwrap_err()
+            .kind,
+        "capacity_exceeded"
+    );
+    host.cancel_run(&a, &ar.run_id).await.unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let v = host.get_run(&a, &ar.run_id).await.unwrap();
+            if v.state.is_terminal() {
+                break v;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(terminal.state, RunState::Cancelled);
+    assert!(
+        !host
+            .get_run(&b, &br.run_id)
+            .await
+            .unwrap()
+            .state
+            .is_terminal(),
+        "取消A不应取消B"
+    );
+    host.shutdown().await.unwrap();
+    let rows = delegated(&host_config_home(tmp.path()), &br.run_id);
+    assert_eq!(rows.len(), 1);
+}
+fn host_config_home(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("home")
+}
+#[test]
+fn p04_agent_configuration_rejects_overrides_and_preserves_old_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = team_config(tmp.path());
+    cfg.validate().unwrap();
+    cfg.max_active_runs = 1;
+    assert!(cfg.validate().is_err());
+    cfg.max_active_runs = 4;
+    for role in ["unknown", "draft"] {
+        cfg.agents
+            .as_mut()
+            .unwrap()
+            .tools
+            .insert(role.into(), vec!["bash".into()]);
+        assert!(cfg.validate().is_err());
+        cfg.agents.as_mut().unwrap().tools.clear();
+    }
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    value["agents"]["provider"] = json!("override");
+    assert!(serde_json::from_value::<HostConfig>(value).is_err());
 }

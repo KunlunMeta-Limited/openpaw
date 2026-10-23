@@ -21,6 +21,27 @@ use std::sync::Arc;
 /// 稳定性：T3新增，协议无关Rust接口。
 /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
 pub(crate) struct HostTools {
+    /// 用途：共享Host句柄，执行仍经原运行注册表。
+    /// 字段：crate::Host，共享Host句柄，执行仍经原运行注册表。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub(crate) host: crate::Host,
+    /// 用途：可信角色及主子协作上下文。
+    /// 字段：Option<crate::orchestration::Execution>，可信角色及主子协作上下文。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub(crate) execution: Option<crate::orchestration::Execution>,
+    /// 用途：协作主角色普通工具执行预算，委派使用父期限。
+    /// 字段：Option<std::time::Duration>，协作主角色普通工具执行预算，委派使用父期限。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub(crate) ordinary_timeout: Option<std::time::Duration>,
     /// 用途：仅当前Office绑定运行暴露进度元数据工具。
     /// 字段：bool，非权限凭据。
     /// 来源去向：可信Session绑定到原工具装配。
@@ -117,6 +138,9 @@ impl ToolExecutor for HostTools {
             .into_iter()
             .filter(|s| self.allowed.contains(&s.name))
             .collect();
+        if self.execution.as_ref().is_some_and(|e| e.role == "lead") {
+            specs.push(crate::orchestration::spec());
+        }
         if self.progress_enabled {
             specs.push(crate::task_progress::spec());
         }
@@ -126,6 +150,51 @@ impl ToolExecutor for HostTools {
         Err(Error::ToolHost("Host工具必须携带Run上下文".into()))
     }
     async fn call_with_context(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        context: ToolCallContext,
+    ) -> Result<ToolCallOutcome> {
+        let cancel = context.cancel();
+        let call = self.invoke(name, args, context);
+        tokio::pin!(call);
+        if let Some(timeout) = self.ordinary_timeout.filter(|_| name != "delegate_task") {
+            tokio::select! { biased;
+                result=&mut call=>result,
+                _=tokio::time::sleep(timeout)=> {
+                    cancel.cancel();
+                    let _=call.await;
+                    self.control.fail(HostError::new("tool_timeout","操作执行时间超过预算，已等待实际清理"));
+                    Err(Error::ToolHost("tool execution budget exceeded".into()))
+                }
+            }
+        } else {
+            call.await
+        }
+    }
+}
+#[async_trait]
+impl ToolHostValidator for HostTools {
+    async fn validate_input(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> std::result::Result<(), String> {
+        if name == "delegate_task" && self.execution.as_ref().is_some_and(|e| e.role == "lead") {
+            return crate::orchestration::validate(input).map_err(|e| e.message);
+        }
+        if self.progress_enabled && name == "report_progress" {
+            return crate::task_progress::validate(input).map_err(|e| e.message);
+        }
+        if !self.allowed.iter().any(|s| s == name) {
+            return Err("工具未在Host授权清单".into());
+        }
+        self.registry.validate_input(name, input).await
+    }
+}
+
+impl HostTools {
+    async fn invoke(
         &self,
         name: &str,
         args: serde_json::Value,
@@ -165,6 +234,37 @@ impl ToolExecutor for HostTools {
                         Error::ToolHost(e.to_string())
                     }
                 });
+        }
+        if name == "delegate_task" {
+            let execution = self
+                .execution
+                .as_ref()
+                .filter(|e| e.role == "lead")
+                .ok_or_else(|| Error::ToolHost("子角色不能委派".into()))?;
+            let result = self
+                .host
+                .delegate(execution, context.binding().clone(), context.cancel())
+                .await
+                .map_err(|e| {
+                    if e.kind == "storage_unavailable" {
+                        self.control.fail(e.clone());
+                        Error::Store(e.message)
+                    } else if e.kind == "cancelled" {
+                        Error::Cancelled
+                    } else {
+                        Error::ToolHost(e.to_string())
+                    }
+                })?;
+            let completed = serde_json::from_str::<serde_json::Value>(&result)
+                .ok()
+                .is_some_and(|v| v["state"] == "completed");
+            let mut outcome = ToolCallOutcome::ok(result);
+            outcome.is_error = !completed;
+            return Ok(crate::task_progress::with_execution_receipt(
+                outcome,
+                context.binding(),
+                self.progress_enabled,
+            ));
         }
         let write = writing(name);
         if write {
@@ -230,21 +330,5 @@ impl ToolExecutor for HostTools {
                 self.progress_enabled,
             )
         })
-    }
-}
-#[async_trait]
-impl ToolHostValidator for HostTools {
-    async fn validate_input(
-        &self,
-        name: &str,
-        input: &serde_json::Value,
-    ) -> std::result::Result<(), String> {
-        if self.progress_enabled && name == "report_progress" {
-            return crate::task_progress::validate(input).map_err(|e| e.message);
-        }
-        if !self.allowed.iter().any(|s| s == name) {
-            return Err("工具未在Host授权清单".into());
-        }
-        self.registry.validate_input(name, input).await
     }
 }

@@ -146,7 +146,7 @@ impl Db {
     /// 状态：只读，不为旧Run补造计划。
     /// 并发与取消：由原单写Store串行调用，无资源锁。
     /// 权限：校验Run和Session删除门禁。
-    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn progress(&self, run: &str) -> HostResult<Option<serde_json::Value>> {
         let view = self.get_run(run)?;
         self.binding(&view.session_id)?;
@@ -162,7 +162,7 @@ impl Db {
     /// 状态：每Run最多256次有效报告，原host_events保留固定分母和证据。
     /// 并发与取消：状态检查和追加处于原Store单写命令，不等待审批或工作区锁。
     /// 权限：仅Office绑定的同Run report_progress，不批准其他工具。
-    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn report_progress(
         &mut self,
         binding: &openpaw_core::ToolCallBinding,
@@ -1133,7 +1133,7 @@ impl Db {
     /// 状态：只读墓碑，禁止旧ID重新创建。
     /// 并发与取消：单写序列，与接受和删除原子排序。
     /// 权限：不将ID当认证凭据。
-    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
     pub(crate) fn check_live_scope(&self, scope: &ClientScope) -> HostResult<()> {
         if self.deletion(scope)?.is_some() {
             return Err(HostError::new(
@@ -1150,7 +1150,7 @@ impl Db {
     /// 状态：不包含正文、输入或输出。
     /// 并发与取消：单写线程只读。
     /// 权限：精确范围查找。
-    /// 关联：REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn deletion(&self, scope: &ClientScope) -> HostResult<Option<DeleteView>> {
         let key = serde_json::to_string(scope).map_err(HostError::storage)?;
         self.conn
@@ -1174,7 +1174,7 @@ impl Db {
     /// 状态：先保存墓碑再取消；重复调用不新建会话。
     /// 并发与取消：单写排序；不等待网络或运行清理。
     /// 权限：仅目标范围，不修改工作区文件。
-    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
     pub(crate) fn begin_delete(&mut self, scope: &ClientScope) -> HostResult<DeleteView> {
         if let Some(v) = self.deletion(scope)? {
             return Ok(v);
@@ -1195,6 +1195,9 @@ impl Db {
                 ],
             )
             .map_err(HostError::storage)?;
+        for child in self.owned_child_sessions(&binding.session_id)? {
+            self.begin_delete(&child.scope)?;
+        }
         for mut a in self.approvals()? {
             if self
                 .runs()?
@@ -1230,7 +1233,7 @@ impl Db {
     /// 状态：先移除账本和派生正文，最后保留最小墓碑；不回滚副作用。
     /// 并发与取消：只在目标Run完成清理后调用；恢复时先于writer打开。
     /// 权限：只删除本会话及自动损尾备份，保留项目和用户备份。
-    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
     pub(crate) fn purge_session(&mut self, scope: &str, session: &str) -> HostResult<()> {
         let phase: String = self
             .conn
@@ -1244,6 +1247,13 @@ impl Db {
             return Ok(());
         }
         self.conn.execute("UPDATE host_session_deletions SET phase='purging' WHERE scope=?1 AND phase!='deleted'",[scope]).map_err(HostError::storage)?;
+        for child in self.owned_child_sessions(session)? {
+            let deletion = self.begin_delete(&child.scope)?;
+            if deletion.phase != "deleted" {
+                let key = serde_json::to_string(&child.scope).map_err(HostError::storage)?;
+                self.purge_session(&key, &child.session_id)?;
+            }
+        }
         self.writers.remove(session);
         let path = self.path(session)?;
         let remove = |path: &std::path::Path| match std::fs::remove_file(path) {
@@ -1472,7 +1482,7 @@ impl Db {
     /// 状态：清除过期元数据，每会话最多64个导航。
     /// 并发与取消：单写序列提交后才分派。
     /// 权限：上下文不保存消息正文或凭据。
-    /// 关联：REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn office_action(
         &self,
         id: &str,
@@ -1516,7 +1526,7 @@ impl Db {
     /// 状态：不重置期限。
     /// 并发与取消：只读单写队列。
     /// 权限：跨会话不可复用按钮。
-    /// 关联：REQ-OP-014；API-OFFICE-UI。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；API-OFFICE-UI。 需求/设计REQ-OP-014。
     pub(crate) fn office_navigation(
         &self,
         id: &str,
@@ -1537,7 +1547,7 @@ impl Db {
     /// 状态：新尝试覆盖旧展示ID，期限不延长。
     /// 并发与取消：单写序列。
     /// 权限：不保存另一份批准或输入正文。
-    /// 关联：REQ-OP-013；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-013；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn office_decision(
         &self,
         approval: &str,
@@ -1573,7 +1583,7 @@ impl Db {
     /// 状态：不保存正文，不在重启时重投。
     /// 并发与取消：单写序列，无网络等待。
     /// 权限：仅Office适配器内部。
-    /// 关联：REQ-OP-015；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-015；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn office_scene(
         &self,
         event: &str,
@@ -1627,6 +1637,176 @@ impl Db {
             params![id,key,if status=="delivered" {"deleted_ui_confirmed"} else {"deleted_ui_unconfirmed"},chrono::Utc::now().timestamp_millis()+600000],
         ).map_err(HostError::storage)?;
         Ok(())
+    }
+}
+
+impl Db {
+    /// 功能：从原控制事件读取并验证一个父Run的持久委派引用。
+    /// 参数：parent为真实父Run ID。
+    /// 返回：按派发顺序的版本1引用；正文仍从JSONL查询。
+    /// 错误：未知版本、父子范围/根不一致或数据库错误。
+    /// 状态：只读，不从意图恢复执行。
+    /// 并发与取消：在原单写Store序列内读取。
+    /// 权限：必须先由调用方验证父scope；子绑定逐字段核对。
+    /// 关联：需求/设计REQ-OP-022/023；DES-OP-012。
+    pub(crate) fn delegations(
+        &self,
+        parent: &str,
+    ) -> HostResult<Vec<crate::orchestration::Delegation>> {
+        let mut stmt = self.conn.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([parent], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let mut result = Vec::new();
+        for row in rows {
+            let d: crate::orchestration::Delegation =
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+            let owner = self.binding(&d.parent_session)?;
+            let child = self.binding(&d.child_session)?;
+            if d.version != 1
+                || d.run_id != parent
+                || owner.scope != d.parent_scope
+                || owner.scope.namespace != "office"
+                || self.get_run(parent)?.session_id != d.parent_session
+                || child.scope != d.child_scope
+                || child.scope.namespace != "host-agent"
+                || child.scope.slot_id != owner.scope.slot_id
+                || child.root_id != owner.root_id
+                || crate::agents::role(&d.role_id).is_none()
+                || d.role_id == "lead"
+            {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "持久委派版本或所属关系不合法",
+                ));
+            }
+            result.push(d);
+        }
+        Ok(result)
+    }
+    /// 功能：可靠保存新的委派控制意图，通知现有投影订阅者。
+    /// 参数：d为原Store序列内生成的可信父子引用。
+    /// 返回：保存成功。
+    /// 错误：数据库或序列化错误。
+    /// 状态：先于子Run接受保存，不复制子消息或工具结果。
+    /// 并发与取消：原Store串行，不另建任务数据库。
+    /// 权限：仅共享编排入口可调用，客户端不能提交引用。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn save_delegation(&self, d: &crate::orchestration::Delegation) -> HostResult<()> {
+        let rev = self.bump(
+            "agent_delegation",
+            &serde_json::to_string(d).map_err(HostError::storage)?,
+        )?;
+        self.publish(rev);
+        Ok(())
+    }
+    /// 功能：将一个真实子Run解析回唯一且仍有效的Office父会话。
+    /// 参数：child为实际子Run ID。
+    /// 返回：可信所属引用，普通Run返回无。
+    /// 错误：关联损坏、范围失效或存储错误。
+    /// 状态：只读，不创建绑定或改变原审批ID。
+    /// 并发与取消：原单写序列内校验，删除后不能再解析。
+    /// 权限：核对完整父子namespace/team/conversation/root，不按字符串前缀授权。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn delegation_for_child(
+        &self,
+        child: &str,
+    ) -> HostResult<Option<crate::orchestration::Delegation>> {
+        let parent:Option<String> = self.conn.query_row("SELECT json_extract(reference,'$.run_id') FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.child_run')=?1",[child],|r|r.get(0)).optional().map_err(HostError::storage)?;
+        match parent {
+            None => Ok(None),
+            Some(parent) => {
+                let d = self
+                    .delegations(&parent)?
+                    .into_iter()
+                    .find(|d| d.child_run == child)
+                    .ok_or_else(|| HostError::new("scope_denied", "子运行不属于当前主任务"))?;
+                self.check_live_scope(&d.parent_scope)?;
+                let run = self.get_run(child)?;
+                if run.session_id != d.child_session {
+                    return Err(HostError::new("scope_denied", "子运行与所属会话不符"));
+                }
+                Ok(Some(d))
+            }
+        }
+    }
+}
+
+impl Db {
+    /// 功能：将准确待审Run解析为原范围或已验证后代的准确子范围。
+    /// 参数：scope为请求方完整范围，run为审批真实Run ID。
+    /// 返回：最后原check_scope应使用的准确范围。
+    /// 错误：未知、跨父会话或篡改所属一律scope_denied。
+    /// 状态：不修改审批、版本、期限或输入绑定。
+    /// 并发与取消：原Store串行，父删除先检查墓碑。
+    /// 权限：父授权仅覆盖其持久登记后代，不按team或runId猜授权。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn approval_scope(&self, scope: &ClientScope, run: &str) -> HostResult<ClientScope> {
+        self.check_live_scope(scope)?;
+        let current = self.get_run(run)?;
+        let binding = self.binding(&current.session_id)?;
+        if binding.scope == *scope {
+            return Ok(scope.clone());
+        }
+        let d = self
+            .delegation_for_child(run)?
+            .filter(|d| d.parent_scope == *scope)
+            .ok_or_else(|| HostError::new("scope_denied", "审批不属于此会话或其真实子任务"))?;
+        crate::service::check_scope(&binding, &d.child_scope)?;
+        Ok(d.child_scope)
+    }
+}
+
+impl Db {
+    /// 功能：在删除及恢复阶段解析父会话仍残留的子账本引用。
+    /// 参数：session为已有删除墓碑的父会话或当前删除目标。
+    /// 返回：尚有绑定的可信子会话；已经清除的子项不再重复删除。
+    /// 错误：版本、父子范围和根不一致拒绝继续清除。
+    /// 状态：只读控制引用；允许读取墓碑中的父身份但不授予查询权限。
+    /// 并发与取消：仅原Store删除序列，活动工具清理由Host先等待。
+    /// 权限：逐字段校验父子绑定，绝不按任意路径删除工作区。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    fn owned_child_sessions(&self, session: &str) -> HostResult<Vec<SessionBinding>> {
+        let bindings = self.bindings()?;
+        let Some(parent) = bindings.iter().find(|b| b.session_id == session) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt=self.conn.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.parent_session')=?1").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([session], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let mut children = Vec::new();
+        for row in rows {
+            let d: crate::orchestration::Delegation =
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+            if d.version != 1
+                || parent.scope != d.parent_scope
+                || d.child_scope.namespace != "host-agent"
+                || d.child_scope.slot_id != parent.scope.slot_id
+            {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "删除阶段的父子引用不合法",
+                ));
+            }
+            if let Some(child) = bindings.iter().find(|b| b.session_id == d.child_session) {
+                if child.scope != d.child_scope || child.root_id != parent.root_id {
+                    return Err(HostError::new("scope_denied", "子会话范围或根不一致"));
+                }
+                children.push(child.clone());
+            } else if self
+                .deletion(&d.child_scope)?
+                .is_none_or(|v| v.phase != "deleted")
+            {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "子账本引用丢失，拒绝猜测删除",
+                ));
+            }
+        }
+        Ok(children)
     }
 }
 

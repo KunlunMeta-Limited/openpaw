@@ -18,6 +18,14 @@ use std::{
 /// 稳定性：T3新增，协议无关Rust接口。
 /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
 pub struct HostConfig {
+    /// 用途：可信本机协作配置，缺省不启用独立子Agent。
+    /// 字段：可选AgentsConfig，原TOML可省略。
+    /// 来源去向：可信配置到共享运行装配。
+    /// 约束：不接受浏览器、模型或.env授权角色能力。
+    /// 稳定性：T6新增可选字段。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    #[serde(default)]
+    pub agents: Option<AgentsConfig>,
     /// 用途：可选Office适配配置，缺省保持原健康服务。
     /// 字段：OfficeConfig或无。
     /// 来源去向：可信TOML到Host适配器。
@@ -318,6 +326,9 @@ impl HostConfig {
         if self.tools.iter().any(|t| !allowed.contains(&t.as_str())) {
             return Err(HostError::new("unsupported", "工具白名单包含未支持项"));
         }
+        if let Some(agents) = &self.agents {
+            agents.validate(self)?;
+        }
         let user = self
             .basic_username_env
             .as_ref()
@@ -353,5 +364,137 @@ pub(crate) fn valid_id(id: &str) -> HostResult<()> {
         Err(HostError::new("invalid_input", "标识为空、过长或含控制符"))
     } else {
         Ok(())
+    }
+}
+
+/// 用途：一层主子协作的显式本机限额与角色工具配置。
+/// 字段：启用开关、子运行/委派/模型总预算及各角色缩小后的工具清单。
+/// 来源去向：可信TOML到Host；不包含密钥、模型或根覆盖。
+/// 约束：默认关闭，角色工具为Host白名单子集，写工具仍逐次审批。
+/// 稳定性：T6可选配置，旧配置无需迁移。
+/// 关联：需求/设计REQ-OP-022；CHG-2026-0007第9.7.1节。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentsConfig {
+    /// 用途：显式启用独立主子协作。
+    /// 字段：bool，显式启用独立主子协作。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub enabled: bool,
+    /// 用途：每组最多1至2个活动子运行。
+    /// 字段：usize，每组最多1至2个活动子运行。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub max_active_children: usize,
+    /// 用途：每主Run最多1至12次委派。
+    /// 字段：usize，每主Run最多1至12次委派。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub max_delegations: usize,
+    /// 用途：共享Provider调用次数预算。
+    /// 字段：u64，共享Provider调用次数预算。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub max_model_requests: u64,
+    /// 用途：共享输出token预留预算。
+    /// 字段：u64，共享输出token预留预算。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub max_output_tokens: u64,
+    /// 用途：按固定角色缩小的工具白名单。
+    /// 字段：BTreeMap<String, Vec<String>>，按固定角色缩小的工具白名单。
+    /// 来源去向：可信Host装配、原Store与本次运行。
+    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
+    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
+    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
+    pub tools: BTreeMap<String, Vec<String>>,
+}
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_active_children: 2,
+            max_delegations: 12,
+            max_model_requests: 64,
+            max_output_tokens: 65536,
+            tools: BTreeMap::new(),
+        }
+    }
+}
+impl AgentsConfig {
+    /// 功能：校验协作容量、固定角色和缩小后的工具权限。
+    /// 参数：host为原Host配置，不从模型输入补权限。
+    /// 返回：合法返回成功。
+    /// 错误：非法限额、未知角色/工具或重复工具返回invalid_input。
+    /// 状态：只读，不改变原配置或全局容量。
+    /// 并发与取消：启动同步校验，无等待。
+    /// 权限：所有角色工具必须是Host白名单子集。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    fn validate(&self, host: &HostConfig) -> HostResult<()> {
+        if !(1..=2).contains(&self.max_active_children)
+            || !(1..=12).contains(&self.max_delegations)
+            || self.max_model_requests == 0
+            || self.max_output_tokens == 0
+            || (self.enabled && host.max_active_runs < 2)
+        {
+            return Err(HostError::new(
+                "invalid_input",
+                "协作需要至少2个全局运行槽及合法正数限额",
+            ));
+        }
+        for (id, tools) in &self.tools {
+            if crate::agents::role(id).is_none()
+                || tools.iter().any(|t| !host.tools.contains(t))
+                || tools
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != tools.len()
+            {
+                return Err(HostError::new(
+                    "invalid_input",
+                    "角色未知、工具重复或超出Host白名单",
+                ));
+            }
+        }
+        Ok(())
+    }
+    /// 功能：取得固定角色本轮真正允许的工具。
+    /// 参数：role为可信目录ID，host为全局白名单。
+    /// 返回：显式缩小清单或Host中的只读子集。
+    /// 错误：无；未知角色在配置/委派校验处拒绝。
+    /// 状态：返回副本，不修改注册表。
+    /// 并发与取消：纯计算，无等待。
+    /// 权限：主角色默认使用原Host清单；子角色默认不含写入或命令。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn allowed(&self, role: &str, host: &[String]) -> Vec<String> {
+        self.tools.get(role).cloned().unwrap_or_else(|| {
+            host.iter()
+                .filter(|t| {
+                    role == "lead"
+                        || matches!(
+                            t.as_str(),
+                            "read_file"
+                                | "glob"
+                                | "grep"
+                                | "todo_list"
+                                | "think"
+                                | "web_search"
+                                | "web_fetch"
+                        )
+                })
+                .cloned()
+                .collect()
+        })
     }
 }

@@ -281,6 +281,68 @@ async fn interaction_scenario() {
         .await
         .unwrap()
     }
+    let mut inspected = std::collections::BTreeMap::new();
+    for (employee, actor, name) in [
+        ("assistant", "office-lead", "王明"),
+        ("command", "code-agent", "李研"),
+        ("files", "file-agent", "周理"),
+        ("draft", "app-agent", "陈书"),
+        ("review", "review-agent", "刘市"),
+        ("search", "data-agent", "赵审"),
+    ] {
+        let actor_reply = action(
+            &shared,
+            &format!("actor-{actor}"),
+            "actor.inspect",
+            json!({"actorId":actor}),
+        )
+        .await;
+        let member_reply = action(
+            &shared,
+            &format!("member-{employee}"),
+            "employee.inspect",
+            json!({"employeeId":employee}),
+        )
+        .await;
+        let a = &actor_reply["presentation"]["content"];
+        let b = &member_reply["presentation"]["content"];
+        assert_eq!(a, b, "同一人物和左侧成员必须对应相同目标");
+        assert_eq!(a["title"], format!("{name} · 成员详情"));
+        assert!(!a["fields"].as_array().unwrap().is_empty());
+        inspected.insert(employee, a.clone());
+        let list = action(
+            &shared,
+            &format!("history-{actor}"),
+            "dialog.action",
+            json!({"interactionId":format!("actor-{actor}"),"optionId":"history"}),
+        )
+        .await;
+        assert_eq!(list["presentation"]["content"]["title"], "历史");
+        let back = action(
+            &shared,
+            &format!("back-{actor}"),
+            "dialog.action",
+            json!({"interactionId":format!("history-{actor}"),"optionId":"back"}),
+        )
+        .await;
+        assert_eq!(
+            back["presentation"]["content"]["title"],
+            format!("{name} · 成员详情"),
+            "返回不能丢失目标身份"
+        );
+    }
+    assert_ne!(
+        inspected["assistant"]["fields"],
+        inspected["draft"]["fields"]
+    );
+    let unknown = action(
+        &shared,
+        "unknown-actor",
+        "actor.inspect",
+        json!({"actorId":"not-a-real-person"}),
+    )
+    .await;
+    assert_eq!(unknown["presentation"]["success"], false);
     let menu = action(
         &shared,
         "inspect-1",
