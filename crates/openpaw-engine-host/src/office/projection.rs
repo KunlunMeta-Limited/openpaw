@@ -143,7 +143,7 @@ fn status(state: RunState) -> &'static str {
 /// 状态：纯只读映射，不创建任务或Run。
 /// 并发与取消：无锁、无等待、不可取消。
 /// 权限：返回值仅用于有界展示，不能作为授权依据。
-/// 关联：需求/设计REQ-OP-021；D50/P02/P03；REQ-OP-021/023。
+/// 关联：需求/设计REQ-OP-021/023；DES-OP-011。
 pub(super) fn actor(tool: &str) -> (&'static str, &'static str) {
     match tool {
         "read_file" | "write_file" | "edit_file" => ("files", "file-agent"),
@@ -186,8 +186,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         .get(&team)
         .cloned()
         .unwrap_or_else(|| team.clone());
-    let command_enabled = host.inner.config.tools.iter().any(|name| name == "bash");
-    let agents_enabled = host.inner.config.agents.as_ref().is_some_and(|a| a.enabled);
+    let employees:Vec<_>=crate::agents::ROLES.iter().map(|role|json!({"id":role.employee,"name":role.name,"sceneActorId":role.actor,"role":role.duty,"online":crate::agents::enabled(role,&host.inner.config)})).collect();
     host.inner.store.call(move|db|{
         let name = db.office_creations()?.iter().find(|v|v["slot_id"]==team)
             .and_then(|v|v["name"].as_str()).map(str::to_owned).unwrap_or(name);
@@ -298,10 +297,6 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             let whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,500),"note":"","link":{"label":"","url":""},"steps":board_steps});
             priorities.insert(binding.scope.conversation_id.clone(),r.revision);
             // 常驻人物和成员来自同一可信目录，未启用角色也能说明真实状态。
-            let employees:Vec<_>=crate::agents::ROLES.iter().map(|role| {
-                let enabled=agents_enabled || matches!(role.employee,"assistant"|"files"|"search") || (role.employee=="command" && command_enabled);
-                json!({"id":role.employee,"name":role.name,"sceneActorId":role.actor,"role":role.duty,"online":enabled})
-            }).collect();
             conversations.push(json!({"id":binding.scope.conversation_id,"title":title,
                 "employees":employees,
                 "tasks":tasks,"events":events,"whiteboard":whiteboard}));

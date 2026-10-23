@@ -157,7 +157,7 @@ pub(super) async fn render(
                 "正在处理已关联的会话操作"
             } else if agents_enabled {
                 "尚无此成员的独立任务"
-            } else if matches!(role.employee, "assistant" | "files" | "search") {
+            } else if crate::agents::enabled(role, &host.inner.config) {
                 "空闲，尚无分配给此成员的活动任务"
             } else {
                 "当前会话未启用此功能角色，无活动任务"

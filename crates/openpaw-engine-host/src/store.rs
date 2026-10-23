@@ -190,17 +190,23 @@ impl Db {
                     .map_err(HostError::storage)?,
             );
         }
-        let next = crate::task_progress::update(previous.clone(), value, &run, &started).map_err(
-            |mut error| {
-                if error.kind == "invalid_progress" {
-                    // 拒绝仍是拒绝；仅提供可恢复的本轮证据标识，不替模型选择或确认完成。
-                    error
-                        .message
-                        .push_str(&crate::task_progress::recovery_hint(&run, &started));
-                }
+        let delegated = self.delegated_writes(&run.run_id)?;
+        let next = crate::task_progress::update_with_delegations(
+            previous.clone(),
+            value,
+            &run,
+            &started,
+            &delegated,
+        )
+        .map_err(|mut error| {
+            if error.kind == "invalid_progress" {
+                // 拒绝仍是拒绝；仅提供可恢复的本轮证据标识，不替模型选择或确认完成。
                 error
-            },
-        )?;
+                    .message
+                    .push_str(&crate::task_progress::recovery_hint(&run, &started));
+            }
+            error
+        })?;
         if previous.as_ref() == Some(&next) {
             return Ok(());
         }
@@ -1023,6 +1029,7 @@ impl Db {
         for (scope, session) in pending {
             self.purge_session(&scope, &session)?;
         }
+        self.validate_agent_metadata()?;
         self.conn
             .execute(
                 "UPDATE host_office_decisions SET state='expired' WHERE state='active'",
@@ -1807,6 +1814,172 @@ impl Db {
             }
         }
         Ok(children)
+    }
+}
+
+impl Db {
+    /// 功能：启动时拒绝未知版本或所属损坏的协作控制引用。
+    /// 参数：self为已先恢复删除墓碑的原数据库。
+    /// 返回：全部协作引用可被当前版本准确解释。
+    /// 错误：未知版本、丢失主组、伪造父子绑定或SQL故障。
+    /// 状态：不重放意图，不恢复执行，不复制模型消息。
+    /// 并发与取消：启动单写阶段执行，尚未接受客户端请求。
+    /// 权限：以原绑定/Run逐字段验证，不以模型角色或ID前缀授权。
+    /// 关联：需求/设计REQ-OP-009/022；DES-OP-012。
+    fn validate_agent_metadata(&self) -> HostResult<()> {
+        let mut query = self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('agent_group','agent_delegation','agent_budget') ORDER BY revision").map_err(HostError::storage)?;
+        let rows = query
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(HostError::storage)?;
+        let mut groups = std::collections::BTreeSet::new();
+        let mut delegated = std::collections::BTreeSet::new();
+        for row in rows {
+            let (kind, raw) = row.map_err(HostError::storage)?;
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).map_err(HostError::storage)?;
+            let parent = value["run_id"]
+                .as_str()
+                .ok_or_else(|| HostError::new("storage_unavailable", "协作元数据缺少父Run"))?;
+            if value["version"] != 1 {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "不支持的协作元数据版本",
+                ));
+            }
+            let run = self.get_run(parent)?;
+            let owner = self.binding(&run.session_id)?;
+            if owner.scope.namespace != "office" {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "协作主Run不属于Office绑定",
+                ));
+            }
+            if kind == "agent_group" {
+                let scope: ClientScope =
+                    serde_json::from_value(value["scope"].clone()).map_err(HostError::storage)?;
+                let config: crate::AgentsConfig =
+                    serde_json::from_value(value["config"].clone()).map_err(HostError::storage)?;
+                if scope != owner.scope || !config.enabled || !groups.insert(parent.to_owned()) {
+                    return Err(HostError::new(
+                        "storage_unavailable",
+                        "协作主组绑定损坏或重复",
+                    ));
+                }
+            } else {
+                if !groups.contains(parent) {
+                    return Err(HostError::new(
+                        "storage_unavailable",
+                        "协作引用缺少先前可靠主组",
+                    ));
+                }
+                if kind == "agent_delegation" {
+                    delegated.insert(parent.to_owned());
+                }
+            }
+        }
+        for parent in delegated {
+            let mut calls = std::collections::BTreeSet::new();
+            let mut sessions = std::collections::BTreeSet::new();
+            let mut runs = std::collections::BTreeSet::new();
+            for d in self.delegations(&parent)? {
+                if !calls.insert(d.call_id)
+                    || !sessions.insert(d.child_session.clone())
+                    || !runs.insert(d.child_run.clone())
+                {
+                    return Err(HostError::new("storage_unavailable", "协作子引用重复"));
+                }
+                match self.get_run(&d.child_run) {
+                    Ok(run) if run.session_id == d.child_session => {}
+                    Err(e) if e.kind == "not_found" => {} // 已保存意图但未接受，不自动重放。
+                    _ => {
+                        return Err(HostError::new(
+                            "storage_unavailable",
+                            "协作子Run与会话不匹配",
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// 功能：校验重试委派与原持久最终输入完全一致。
+    /// 参数：binding为当前可信工具上下文。
+    /// 返回：原绑定相同才允许读取原子任务结果。
+    /// 错误：缺失绑定、损坏记录或输入冲突。
+    /// 状态：只读，不创建第二个子Run。
+    /// 并发与取消：在原Store单写序列执行，不等待模型。
+    /// 权限：逐字段比较Run、call、工具及完整输入，不以摘要代替。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn check_delegation_input(
+        &self,
+        binding: &openpaw_core::ToolCallBinding,
+    ) -> HostResult<()> {
+        let original: String = self.conn.query_row("SELECT reference FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.call_id')=?2 ORDER BY revision LIMIT 1", params![&binding.run_id,&binding.call_id], |r|r.get(0)).map_err(HostError::storage)?;
+        let original: openpaw_core::ToolCallBinding =
+            serde_json::from_str(&original).map_err(HostError::storage)?;
+        if original != *binding {
+            return Err(HostError::new(
+                "request_conflict",
+                "同一委派调用不能替换原最终输入",
+            ));
+        }
+        Ok(())
+    }
+    /// 功能：从父委派的真实成功子Run提取有范围的文件写入证据。
+    /// 参数：parent为已校验Office主Run ID。
+    /// 返回：准确父call到其已成功子写路径，不返回正文或伪造父工具记录。
+    /// 错误：损坏所属、子Run查询和存储错误。
+    /// 状态：只读原Run及原tool_started，失败/未接受子不提供成功证据。
+    /// 并发与取消：原Store单写序列读取，与进度提交一致。
+    /// 权限：先验证父子完整绑定；只有同子Run成功且实际开始的写工具可用。
+    /// 关联：需求/设计REQ-OP-022/023；DES-OP-012。
+    fn delegated_writes(
+        &self,
+        parent: &str,
+    ) -> HostResult<Vec<crate::task_progress::DelegatedWrite>> {
+        let mut result = Vec::new();
+        for d in self.delegations(parent)? {
+            let child = match self.get_run(&d.child_run) {
+                Ok(r) => r,
+                Err(e) if e.kind == "not_found" => continue,
+                Err(e) => return Err(e),
+            };
+            if child.state != RunState::Completed {
+                continue;
+            }
+            let mut query=self.conn.prepare("SELECT reference FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1").map_err(HostError::storage)?;
+            let rows = query
+                .query_map([&d.child_run], |r| r.get::<_, String>(0))
+                .map_err(HostError::storage)?;
+            let mut paths = Vec::new();
+            for row in rows {
+                let b: openpaw_core::ToolCallBinding =
+                    serde_json::from_str(&row.map_err(HostError::storage)?)
+                        .map_err(HostError::storage)?;
+                if b.run_id == d.child_run
+                    && matches!(b.tool_name.as_str(), "write_file" | "edit_file")
+                    && child.tools.iter().any(|t| {
+                        t.call_id == b.call_id
+                            && t.tool_name == b.tool_name
+                            && t.state == "completed"
+                    })
+                {
+                    if let Some(path) = b
+                        .input
+                        .get("path")
+                        .or_else(|| b.input.get("file_path"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        paths.push(path.to_owned());
+                    }
+                }
+            }
+            result.push(crate::task_progress::DelegatedWrite {
+                call_id: d.call_id,
+                paths,
+            });
+        }
+        Ok(result)
     }
 }
 

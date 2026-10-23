@@ -357,7 +357,10 @@ impl Host {
             let actual = db.events(&parent.session_id)?.into_iter().any(|e| matches!(e,openpaw_core::SessionEvent::Message(m) if m.content.iter().any(|c| matches!(c,openpaw_core::ContentBlock::ToolUse {id,name,input} if id==&b.call_id && name=="delegate_task" && input==&b.input))));
             if !actual { return Err(HostError::new("request_conflict", "委派与原账本最终工具输入不一致")); }
             let prior = db.delegations(&b.run_id)?;
-            if let Some(d) = prior.iter().find(|d| d.call_id == b.call_id) { return Ok((d.clone(), false)); }
+            if let Some(d) = prior.iter().find(|d| d.call_id == b.call_id) {
+                db.check_delegation_input(&b)?;
+                return Ok((d.clone(), false));
+            }
             if prior.len() >= limit { return Err(HostError::new("capacity_exceeded", "本轮委派次数已满")); }
             let child_scope = ClientScope { namespace:"host-agent".into(), slot_id:owner.scope.slot_id.clone(), conversation_id:uuid::Uuid::new_v4().simple().to_string() };
             let meta = db.session(&parent.session_id)?.meta;

@@ -52,7 +52,7 @@ pub(crate) struct Role {
 /// 来源去向：原Office名册审查到共享Host。
 /// 约束：常驻人物可查询不代表已启用独立Agent。
 /// 稳定性：Host内部常量。
-/// 关联：需求/设计REQ-OP-021/022；D50/D51。
+/// 关联：需求/设计REQ-OP-021/022；DES-OP-011。
 pub(crate) const ROLES: [Role; 6] = [
     Role {
         id: "lead",
@@ -108,4 +108,31 @@ pub(crate) const ROLES: [Role; 6] = [
 /// 关联：需求/设计REQ-OP-021/022；DES-OP-011/012。
 pub(crate) fn role(id: &str) -> Option<&'static Role> {
     ROLES.iter().find(|role| role.id == id)
+}
+
+/// 功能：从本机实际配置判断角色是否具有当前可用能力。
+/// 参数：role为可信固定目录项，config为原Host配置。
+/// 返回：独立协作显式启用或对应功能工具存在时为真。
+/// 错误：无；未知角色不隐式启用。
+/// 状态：只读，不调用模型、不新建任务。
+/// 并发与取消：纯计算，无锁及等待。
+/// 权限：只用于状态说明，真实工具入口仍二次校验白名单和审批。
+/// 关联：需求/设计REQ-OP-021/022；DES-OP-011/012。
+pub(crate) fn enabled(role: &Role, config: &crate::HostConfig) -> bool {
+    if config.agents.as_ref().is_some_and(|a| a.enabled) {
+        return true;
+    }
+    match role.id {
+        "lead" => true,
+        "organize" => config
+            .tools
+            .iter()
+            .any(|t| matches!(t.as_str(), "read_file" | "write_file" | "edit_file")),
+        "audit" => config
+            .tools
+            .iter()
+            .any(|t| matches!(t.as_str(), "glob" | "grep" | "web_search" | "web_fetch")),
+        "research" => config.tools.iter().any(|t| t == "bash"),
+        _ => false,
+    }
 }

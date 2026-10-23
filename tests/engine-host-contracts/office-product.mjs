@@ -762,7 +762,7 @@ try {
   await writeFile(config,(await readFile(config,'utf8'))+'\n[agents]\nenabled = true\n')
   host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-team')
   await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
-  await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,waitFor,release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
+  await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,waitFor,release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'

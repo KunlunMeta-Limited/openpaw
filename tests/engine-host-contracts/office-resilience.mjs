@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,waitFor,release}) {
+export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,waitFor,release}) {
   const roles=[['research','command','code-agent','李研'],['organize','files','file-agent','周理'],['draft','draft','app-agent','陈书'],['review','review','review-agent','刘市'],['audit','search','data-agent','赵审']]
   let exportIndex=0
   async function scene(label) {
@@ -13,6 +13,9 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     await (await pending).saveAs(path)
     return JSON.parse(await readFile(path,'utf8'))
   }
+  // Use the existing user control to keep this walkthrough free of idle coffee traffic.
+  // The preceding unmodified full product journey keeps default idle behavior; its traffic failure is retained separately.
+  await page.reload();await page.getByRole('button',{name:'关闭空闲闲聊',exact:true}).click()
   await fresh(page);await send('T6真实五人协作')
   const request=structuredClone(latestSend().request)
   await page.getByRole('button',{name:'收起聊天',exact:true}).click()
@@ -37,11 +40,13 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     handoffs.push({role,employee,actor,task,event,command:visit.command,record:finished.records.find(r=>r.command.commandId===visit.command.commandId)})
     release(role)
   }
+  await expand(page)
   await waitFor(async()=>(await page.getByRole('log',{name:'对话内容'}).innerText()).includes('T6五个独立角色核查完成'),45000)
   await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:15000})
   const final=await waitFor(async()=>{const c=conv(await readOffice(),request.conversationId);return c?.tasks[0].status==='completed'&&c.tasks[0].progress===100?c:false})
   assert.equal(final.tasks.length,6);assert.equal(final.events.filter(e=>e.kind==='task.assigned').length,5)
   assert.ok(final.whiteboard.steps.length<=3);assert.ok(final.whiteboard.description.includes('5/5'))
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click()
   const snapshot=await scene('complete')
   assert.equal(snapshot.records.filter(r=>r.command.capability==='office.visit').length,5,'每个真实派发只播放一次交接')
   const db=new DatabaseSync(join(output,'host-data/engine-host/host.db'),{readOnly:true})

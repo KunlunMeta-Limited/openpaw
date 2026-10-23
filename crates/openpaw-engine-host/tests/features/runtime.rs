@@ -1008,6 +1008,7 @@ struct TeamProvider {
     requests: std::sync::Mutex<Vec<CompletionRequest>>,
     hold_children: bool,
     write_child: bool,
+    replay_first: Option<bool>,
     entered: tokio::sync::Notify,
 }
 impl TeamProvider {
@@ -1016,6 +1017,7 @@ impl TeamProvider {
             requests: std::sync::Mutex::new(Vec::new()),
             hold_children,
             write_child,
+            replay_first: None,
             entered: tokio::sync::Notify::new(),
         }
     }
@@ -1041,13 +1043,32 @@ impl LlmProvider for TeamProvider {
             .collect();
         let content = if lead {
             let roles = ["research", "organize", "draft", "review", "audit"];
-            let n = calls.iter().filter(|c| c.starts_with("delegate-")).count();
-            if n < roles.len() {
-                let role = roles[n];
+            let raw = calls.iter().filter(|c| c.starts_with("delegate-")).count();
+            let n = raw - usize::from(self.replay_first.is_some() && raw > 1);
+            if self.write_child && !calls.contains(&"team-plan") {
+                vec![ContentBlock::ToolUse {
+                    id: "team-plan".into(),
+                    name: "report_progress".into(),
+                    input: json!({"type":"create","steps":[{"id":"save","title":"保存 team-report.txt"}]}),
+                }]
+            } else if self.write_child && n == roles.len() && !calls.contains(&"team-confirm") {
+                vec![ContentBlock::ToolUse {
+                    id: "team-confirm".into(),
+                    name: "report_progress".into(),
+                    input: json!({"type":"update","stepId":"save","state":"completed","evidenceCallIds":["delegate-draft"]}),
+                }]
+            } else if n < roles.len() {
+                let repeat = self.replay_first.is_some() && raw == 1;
+                let role = roles[if repeat { 0 } else { n }];
+                let title = if repeat && self.replay_first == Some(true) {
+                    "不同的委派目标".into()
+                } else {
+                    format!("{role}核对项目说明")
+                };
                 vec![ContentBlock::ToolUse {
                     id: format!("delegate-{role}"),
                     name: "delegate_task".into(),
-                    input: json!({"role_id":role,"title":format!("{role}核对项目说明"),"instructions":"读取README.md并核对项目背景，明确真实证据和限制","acceptance":"有实际文件读取和角色独立结果"}),
+                    input: json!({"role_id":role,"title":title,"instructions":"读取README.md并核对项目背景，明确真实证据和限制","acceptance":"有实际文件读取和角色独立结果"}),
                 }]
             } else {
                 vec![ContentBlock::Text {
@@ -1278,6 +1299,13 @@ async fn p06_child_write_uses_exact_parent_visible_approval_and_other_conversati
         host.get_run(&scope, &parent.run_id).await.unwrap().state,
         RunState::Completed
     );
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let plan:String=db.query_row("SELECT reference FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[&parent.run_id],|r|r.get(0)).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    assert_eq!(
+        plan["steps"][0]["state"], "completed",
+        "父步骤只能凭准确委派及真实子文件成功确认"
+    );
     host.shutdown().await.unwrap();
 }
 #[tokio::test]
@@ -1362,4 +1390,156 @@ fn p04_agent_configuration_rejects_overrides_and_preserves_old_defaults() {
     let mut value = serde_json::to_value(&cfg).unwrap();
     value["agents"]["provider"] = json!("override");
     assert!(serde_json::from_value::<HostConfig>(value).is_err());
+}
+
+#[tokio::test]
+async fn p04_repeated_delegate_reuses_child_and_changed_input_is_rejected() {
+    for changed in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = team_config(tmp.path());
+        let mut provider = TeamProvider::new(false, false);
+        provider.replay_first = Some(changed);
+        let provider = Arc::new(provider);
+        let host = Host::with_provider(cfg.clone(), provider.clone())
+            .await
+            .unwrap();
+        let scope = team_scope("repeated");
+        let session = host.open_session(scope.clone()).await.unwrap();
+        let parent = host
+            .submit_run(&scope, &session.session_id, "测试真实委派重试".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let children = delegated(&cfg.home, &parent.run_id);
+        assert_eq!(children.len(), 5, "同call不得再建子Session/Run");
+        let requests = provider.requests.lock().unwrap().clone();
+        let errors: Vec<_> = requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                openpaw_core::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } if tool_use_id == "delegate-research" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 2);
+        assert!(!errors[0].1);
+        assert_eq!(errors[1].1, changed);
+        if changed {
+            assert!(errors[1].0.contains("不能替换"));
+        }
+        drop(requests);
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn p04_group_limits_and_deadline_are_shared_by_real_children() {
+    for mode in ["limit", "budget", "deadline"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = team_config(tmp.path());
+        let agents = cfg.agents.as_mut().unwrap();
+        match mode {
+            "limit" => agents.max_delegations = 2,
+            "budget" => agents.max_model_requests = 1,
+            "deadline" => cfg.run_timeout_secs = 1,
+            _ => unreachable!(),
+        }
+        let host = Host::with_provider(
+            cfg.clone(),
+            Arc::new(TeamProvider::new(mode == "deadline", false)),
+        )
+        .await
+        .unwrap();
+        let scope = team_scope(mode);
+        let session = host.open_session(scope.clone()).await.unwrap();
+        let parent = host
+            .submit_run(&scope, &session.session_id, "实际协作限制".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let final_run = host.get_run(&scope, &parent.run_id).await.unwrap();
+        let children = delegated(&cfg.home, &parent.run_id);
+        assert_eq!(children.len(), if mode == "limit" { 2 } else { 1 });
+        for child in &children {
+            let scope: ClientScope = serde_json::from_value(child["child_scope"].clone()).unwrap();
+            let run = host
+                .get_run(&scope, child["child_run"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert!(run.state.is_terminal());
+            if mode != "limit" {
+                assert_ne!(run.state, RunState::Completed);
+            }
+        }
+        if mode == "deadline" {
+            assert_eq!(final_run.state, RunState::TimedOut);
+        }
+        if mode == "budget" {
+            assert_eq!(final_run.state, RunState::Failed);
+        }
+        if mode == "limit" {
+            assert!(final_run
+                .tools
+                .iter()
+                .any(|t| t.tool_name == "delegate_task" && t.state == "failed"));
+        }
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn p07_restart_validates_agent_versions_and_never_replays_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = team_config(tmp.path());
+    let provider = Arc::new(TeamProvider::new(false, false));
+    let host = Host::with_provider(cfg.clone(), provider.clone())
+        .await
+        .unwrap();
+    let scope = team_scope("versions");
+    let session = host.open_session(scope.clone()).await.unwrap();
+    host.submit_run(&scope, &session.session_id, "真实协作恢复".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    let before = provider.requests.lock().unwrap().len();
+    host.shutdown().await.unwrap();
+    drop(host);
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    for kind in ["agent_group", "agent_delegation", "agent_budget"] {
+        db.execute(
+            "UPDATE host_events SET reference=json_set(reference,'$.version',2) WHERE kind=?1",
+            [kind],
+        )
+        .unwrap();
+        match Host::with_provider(cfg.clone(), provider.clone()).await {
+            Ok(h) => {
+                h.shutdown().await.unwrap();
+                panic!("未知{kind}版本不得静默接收");
+            }
+            Err(e) => assert_eq!(e.kind, "storage_unavailable"),
+        }
+        assert_eq!(provider.requests.lock().unwrap().len(), before);
+        db.execute(
+            "UPDATE host_events SET reference=json_set(reference,'$.version',1) WHERE kind=?1",
+            [kind],
+        )
+        .unwrap();
+    }
+    let reopened = Host::with_provider(cfg, provider.clone()).await.unwrap();
+    assert_eq!(provider.requests.lock().unwrap().len(), before);
+    reopened.shutdown().await.unwrap();
 }
