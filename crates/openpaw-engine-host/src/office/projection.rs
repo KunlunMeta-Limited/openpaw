@@ -216,7 +216,14 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             let plan=db.progress(&r.run_id)?;
             let (steps,mut percent)=crate::task_progress::project(plan.clone(),&r)?;
             let delegations=db.delegations(&r.run_id)?;
-            let assignments=db.office_task_assignments(&r.run_id)?;
+            let mut assignments=db.office_task_assignments(&r.run_id)?;
+            // 开始时多个连续委派可能暂挂同一步；主角色后来用准确证据核验不同
+            // 业务步骤时，展示引用采用唯一明确证据，不能再生一张重复委派卡。
+            // 原Store开始关联不改，assign事件ID/首次时间不改，细化taskId不重播拜访。
+            for d in &delegations {
+                let confirmed:Vec<_>=plan.as_ref().and_then(|p|p["steps"].as_array()).into_iter().flatten().enumerate().filter(|(_,step)|step["state"]=="completed"&&step["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id))).map(|(index,_)|index).collect();
+                if let [index]=confirmed.as_slice() {assignments.insert(d.call_id.clone(),*index);}
+            }
             let mut recovered=std::collections::BTreeSet::new();
             // 只合并被主角色用准确成功证据替代的失败尝试；相似标题不构成重试关系。
             // 同角色、同父、同步骤缺一不可，旧Run/JSONL/派发事件仍保留。
@@ -483,6 +490,144 @@ pub(super) async fn sync_once(
 mod tests {
     use super::*;
     use crate::{ClientScope, HostConfig};
+    #[tokio::test]
+    async fn consecutive_delegations_use_their_precise_completed_step_without_duplicate_cards() {
+        use openpaw_llm::{MockMode, MockProvider};
+        for (second_evidence, expected_cards) in [("call_2_1", 3), ("call_2_0", 4)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("brief.md"), "同一份真实简报").unwrap();
+            let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+            let call = |name: &str, input| MockMode::ToolUse {
+                tool_name: name.into(),
+                input,
+                text: String::new(),
+            };
+            let script = vec![
+                call(
+                    "report_progress",
+                    json!({"type":"create","steps":[{"id":"research","title":"李研核验目标"},{"id":"organize","title":"周理整理清单"}]}),
+                ),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"research","state":"in_progress"}),
+                ),
+                MockMode::ParallelToolUse {
+                    tools: vec![
+                        (
+                            "delegate_task".into(),
+                            json!({"role_id":"research","title":"李研读取简报","instructions":"读取brief.md核验目标","acceptance":"真实读取"}),
+                        ),
+                        (
+                            "delegate_task".into(),
+                            json!({"role_id":"organize","title":"周理读取简报","instructions":"读取brief.md整理清单","acceptance":"真实读取"}),
+                        ),
+                    ],
+                    text: String::new(),
+                },
+                call("read_file", json!({"path":"brief.md"})),
+                MockMode::Fixed("李研实际读取完成".into()),
+                call("read_file", json!({"path":"brief.md"})),
+                MockMode::Fixed("周理实际读取完成".into()),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"research","state":"completed","evidenceCallIds":["call_2_0"]}),
+                ),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"organize","state":"completed","evidenceCallIds":[second_evidence]}),
+                ),
+                MockMode::Fixed("王明核验两个子任务完成".into()),
+            ];
+            let host =
+                Host::with_provider(config, std::sync::Arc::new(MockProvider::scripted(script)))
+                    .await
+                    .unwrap();
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "consecutive".into(),
+            };
+            let binding = host.open_session(scope.clone()).await.unwrap();
+            let run = host
+                .submit_run(&scope, &binding.session_id, "核验目标并整理清单".into())
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
+                .await
+                .unwrap();
+            assert_eq!(
+                host.get_run(&scope, &run.run_id).await.unwrap().state,
+                RunState::Completed
+            );
+            let office = OfficeConfig {
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "PAWOFFICE_TEST_KEY".into(),
+                allowed_origins: vec!["http://127.0.0.1:8765".into()],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            let conv = &snapshot["conversations"][0];
+            assert_eq!(
+                conv["tasks"].as_array().unwrap().len(),
+                expected_cards,
+                "只有唯一准确证据才合并业务卡；同一call被多个步骤引用不能猜测归属"
+            );
+            assert_eq!(conv["tasks"][0]["progress"], 100);
+            if expected_cards == 3 {
+                for (index, employee) in ["command", "files"].into_iter().enumerate() {
+                    assert_eq!(conv["tasks"][index + 1]["assigneeId"], employee);
+                    assert_eq!(conv["tasks"][index + 1]["status"], "completed");
+                    for event in conv["events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e["employeeId"] == employee)
+                    {
+                        assert_eq!(event["taskId"], conv["tasks"][index + 1]["id"]);
+                    }
+                }
+            }
+            assert_eq!(
+                conv["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["kind"] == "task.assigned")
+                    .count(),
+                2
+            );
+            let run_id = run.run_id.clone();
+            host.inner
+                .store
+                .call(move |db| {
+                    let original = db.office_task_assignments(&run_id)?;
+                    assert_eq!(original.get("call_2_0"), Some(&0));
+                    assert_eq!(
+                        original.get("call_2_1"),
+                        Some(&0),
+                        "原开始关联与执行事实不被展示细化改写"
+                    );
+                    let ds = db.delegations(&run_id)?;
+                    assert_eq!(ds.len(), 2);
+                    assert_ne!(ds[0].child_session, ds[1].child_session);
+                    for d in ds {
+                        assert_eq!(db.get_run(&d.child_run)?.state, RunState::Completed);
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                prepare(&host, &office, "office-1").await.unwrap(),
+                snapshot,
+                "重复投影保持seq和派工ID，不再新增拜访"
+            );
+            host.shutdown().await.unwrap();
+        }
+    }
     #[tokio::test]
     async fn delegated_business_step_keeps_one_card_owner_and_stable_assignment() {
         use openpaw_llm::{MockMode, MockProvider};

@@ -371,3 +371,8 @@ Office fa6ae1f的memberSelectors从events.employeeId生成个人最近动态；H
 原g真实DeepSeekLIVE-TEAM-af508f0a，前两子完成、陈书精确写审批出现但snapshot无该成员blocked，未获批准、cancel成功。完整快照55KiB旧内容叠加当前计划/动态后触及64,000预算；原while先逆IDpop任意子卡，删了fc0794fa活动会话的周理/陈书委派及events。原100单卡终态测试缺组合；先扩原inline建立100旧Run后复用conv099创建真实两步骤和pending写审批，再修原projection优先旧终态缩减。准确方法、权限和证据见0007第12.17；不改Office/Store/审批，不实施r6。
 
 D62原容量inline回归确切红绿：100旧Run后conv099真实两步骤+pending写审批，原1卡/期望3卡退出101；按revision先缩最旧终态后同测试退出0，活动及取消后最新3卡、六身份/100目录/稳定seq/64,000字节/101超限拒绝全部保留。Host全lib及新准确全27/真实DeepSeek尚待结果，不提前关闭。r6工作区迁移已获用户准确批准（b8fd7c4），本条D62不承担迁移实现结论。
+
+
+## D63：同一回复连续委派后准确完成证据未消除重复卡
+
+原8765真实DeepSeek h父Run876ee8bb84354cbf83b85aae712598b6，五子Run和一次审批报告成功，但业务计划7步应8卡却10卡；整体验收failed，原报告/trace/JSONL保留。根因和私有最小修方案见0007第12.19节；不按标题关联，不改审批/账本/Office。原inline新增连续delegate两角色后逐项报告准确证据，修前4卡/应3卡真实退出101；修后28条Host lib通过，歧义call证据不猜、原未核验/失败重试/容量/不重播断言全部保留。定向证据`/home/cheng/.cache/t6-live-followup-20261024/d63-{red,green-lib2}.log`；准确完整复验与原页面/新模型结果未形成前不关闭本缺陷。
