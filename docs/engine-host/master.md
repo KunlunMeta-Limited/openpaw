@@ -1,7 +1,9 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-2026-10-24 本轮当前入口：Office远端main、主目录及8765部署均fa6ae1f，无新上游提交。Host原717ff615已实际部署，D58/D51/D59/D60完整27/27、真实浏览器68条及真实DeepSeek五子/一次审批/报告/100%证据见`/home/cheng/.cache/t6-live-final-20261024-c/review.json`；旧失败保留。本轮新增D61只补原批准范围内的成员开始/等待/完成动态投影，正在准确候选完整复验，尚未部署，不能用c报告代替。工作区独立物理根r6仍待准确审核；Office仍不改，Windows原生仍暂缓且未通过。最新Demo逐项对照和后续工作见master第16.7节及0007第12.15—12.16节；下面历史段落仅代表当时时点。
+2026-10-24 当前入口：Office远端main、主目录和原8765构建均为fa6ae1f，无新上游可拉取，Office本轮零修改。原T6 PR #12已合入e6a20bd，本轮在主目录fix/engine-host-t6-followup补修，未向旧PR推送。候选编制前运行的是717ff615，原c/review.json只证明该版本；D61新增成员开始/等待/完成动态，准确当前候选的完整验证、原页面和真实DeepSeek结果统一以`/home/cheng/.cache/t6-live-final-20261024-g/review.json`及`/media/cheng/新加卷/workSpace/Office/artifacts/live-office-20261024-t6/runtime-t6.json`为准。报告未形成/不通过即不算本轮交付，进程commit/hash未匹配即不算已部署，不能拿旧c绿灯替代。原静态Demo实跑9项8通过/1手机视口失败（R18，两次独立重跑同失败）；原生场景六项浏览器验证通过，详情及限制见`/home/cheng/.cache/t6-demo-audit-20261024/review.json`。一团队一独立物理根r6仍待准确批准，未实施；Office所有活跃Rx继续暂缓，Windows原生未执行、不计通过。最新Demo逐项缺口及递进方案见master16.7、0007第12.15—12.16节和专用产品差距审查第11节。
 
+<details>
+<summary>历史状态记录：保留原时点，不覆盖上方当前入口</summary>
 
 状态：T0—T5已合入。2026-10-24 最新交付状态：用户已验收准确`15cc908287124a2f8dfa7c991f914e5d0e95415d`，T6 [PR #12](https://github.com/KunlunMeta-Limited/openpaw/pull/12) 已创建，目标`merge/ai-ofice-react-overagent`；OPEN、待非作者审核、未合入，T7未开始。准确交付干净原27/27通过，真实Office浏览器68条/0页面错误、五次实际交接；真实DeepSeek一主五子、一次审批后报告落盘、7张唯一任务卡及白板6/6/100%通过。验收/PR元数据登记后的准确提交另以`/home/cheng/.cache/t6-pr-20261024-m/{full/report.json,product/report.json,review.json}`完整复验，报告形成前不预填新提交通过。原失败及历史叙述保留当时语境，以本段及0007第1/12.10节为当前状态。Office冻结fa6ae1f；8765仍已部署T5/d150b96，未随PR升级；Windows原生暂缓、未执行不计通过，Office Rx全部暂缓。
 
@@ -50,6 +52,8 @@ sequenceDiagram
 任务流使用主目标及最多12个业务步骤，原call仅在账本/工具详情可查。元数据工具不执行项目工作，确认完成需本轮实际成功证据；写文件需精确获批且产物路径一致。白板显示目标、实际完成N/M与≤3个当前步骤；前端running条会视觉增长，Host快照与文字计数才是事实，不伪造blocked抑制动画。R11未批准前默认链接保留。
 
 新版send/resume没有180秒总接收时限；history/cancel控制请求仍15秒。Host流空闲、工具、Run总预算独立生效，刷新/网络断开detach，显式停止才cancel。T6继续验证真实>180秒与故障恢复，无感自动续接仍不是本期已交付承诺。choice新增allowCustom/customText按原Schema冻结，危险工具仍用confirmation且拒绝customText，不接入新澄清或永久授权。
+
+</details>
 
 ## 0. 授权、平台与阶段规则
 
