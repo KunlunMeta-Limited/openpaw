@@ -25,6 +25,7 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     const task=data.tasks.find(t=>t.assigneeId===employee&&t.status==='running')
     const event=data.events.find(e=>e.kind==='task.assigned'&&e.taskId===task.id&&e.employeeId===employee&&e.fromEmployeeId==='assistant')
     assert.ok(event);assert.ok(!/call_|web_fetch|read_file/.test(task.title));assert.ok(data.tasks[0].progress<100)
+    assert.ok(data.events.some(e=>e.kind==='task.started'&&e.taskId===task.id&&e.employeeId===employee),'真实工作态必须向成员最近动态投影开始事实')
     const started=await waitFor(async()=>{const s=await scene(role+'-active');return s.records.some(r=>r.command.capability==='office.visit'&&r.command.participants[0].entityId==='office-lead'&&r.command.participants[1].entityId===actor)?s:false},45000)
     const visit=started.records.findLast(r=>r.command.capability==='office.visit'&&r.command.participants[1].entityId===actor)
     const person=started.world.actors.find(a=>a.id===actor)
@@ -45,10 +46,28 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:15000})
   const final=await waitFor(async()=>{const c=conv(await readOffice(),request.conversationId);return c?.tasks[0].status==='completed'&&c.tasks[0].progress===100?c:false})
   assert.equal(final.tasks.length,6);assert.equal(final.events.filter(e=>e.kind==='task.assigned').length,5)
+  for(const [,employee] of roles){const personal=final.events.filter(e=>e.employeeId===employee);assert.equal(personal.filter(e=>e.kind==='task.started').length,1);assert.equal(personal.filter(e=>e.kind==='task.completed').length,1);assert.ok(personal.find(e=>e.kind==='task.completed').summary.includes('已核验'))}
   assert.ok(final.whiteboard.steps.length<=3);assert.ok(final.whiteboard.description.includes('5/5'))
   await page.getByRole('button',{name:'收起聊天',exact:true}).click()
   const snapshot=await scene('complete')
   assert.equal(snapshot.records.filter(r=>r.command.capability==='office.visit').length,5,'每个真实派发只播放一次交接')
+  // 成员布局必须实际显示投影事件，不能只在HTTP快照里通过断言。
+  await page.getByRole('button',{name:'切换页面布局',exact:true}).click()
+  await page.getByRole('button',{name:'成员布局',exact:true}).click()
+  const timelines=[]
+  for(const [role,,,name] of roles) {
+    await page.getByRole('button',{name:'查看'+name+'的资料',exact:true}).click()
+    const region=page.getByRole('region',{name:'当前任务与最近动态'})
+    await region.waitFor()
+    const text=await region.innerText()
+    assert.ok(text.includes('观察到独立执行'),name+'应显示实际观察过的开始动态')
+    assert.ok(text.includes('已核验完成'),name+'应显示已核验的完成动态')
+    await page.screenshot({path:join(output,`t6-timeline-${role}.png`),fullPage:true})
+    timelines.push({role,name,text})
+  }
+  await page.getByRole('button',{name:'切换页面布局',exact:true}).click()
+  await page.getByRole('button',{name:'经典布局',exact:true}).click()
+
   const db=new DatabaseSync(join(output,'host-data/engine-host/host.db'),{readOnly:true})
   const parent=db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run
   const children=db.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=? ORDER BY revision").all(parent).map(r=>JSON.parse(r.reference))
@@ -77,8 +96,8 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     members.push({person:person.id,text});await page.getByRole('button',{name:'关闭详情',exact:true}).click()
   }
   assert.equal(new Set(actors.map(a=>a.request.actorId)).size,6);assert.equal(members.length,6)
-  report.t6={request,parent,children,handoffs,actors,members,final,scene:snapshot,model:'deterministic real HTTP Provider; animation pacing only in test fixture; real Host execution'}
-  report.assertions.push('T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five observed office.visit completions; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards')
+  report.t6={request,parent,children,handoffs,actors,members,timelines,final,scene:snapshot,model:'deterministic real HTTP Provider; animation pacing only in test fixture; real Host execution'}
+  report.assertions.push('D61 five real member timelines preserve observed start and verified completion, without additional assignment or visit', 'T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five observed office.visit completions; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards')
 }
 
 

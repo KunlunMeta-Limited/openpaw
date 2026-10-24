@@ -359,3 +359,8 @@ D57专项修复已通过：原inline分支修前4≠3，修后27项包含漏开�
 原8765真实DeepSeek父Run19f1f60250804b80b573727f41806202完成。刘市首次provider_arguments失败，主Agent重新委派成功并以新call精确确认s4，原投影却先绑定旧失败并显示第二张成功卡，白板6/7、71%及failed。初始演示与只读对账报告均失败，保留在t6-live-followup-20261024/live-team-b和live-reconciled。按0007已批准projection职责仅通过同父/同角色/同步骤及已校验明确成功证据确认替代；不删除旧执行事实/事件，不忽略未被替代的失败。扩原inline重委派正反例，先红后绿及精确提交完整重验结果另见专用验证记录。
 
 2026-10-24 D60：原8765自然语言真实五子执行/一次审批/报告成功，但主模型误认为没有父write回执即未经审批，未确认保存步，白板75%。task_progress工具说明/执行回执与原已支持的delegate写证据规则矛盾。原r5范围内仅修task_progress/service说明，Store/Approval校验不变；a/b失败保留，完整c和真实模型未通过前不关闭。精确方案及证据见0007第12.14节。
+
+
+## 2026-10-24 D61：成员最近动态没有映射真实生命周期
+
+Office fa6ae1f的memberSelectors从events.employeeId生成个人最近动态；Host原projection.rs只发task.assigned。原独立子Run已完成，成员却只看到收到分配，缺少真实过程，不能因任务卡有终态就算Demo成员体验完成。原批准范围最小投影修复与回归见0007第12.15节。red日志d61-red退出101；最初green暴露“独立子卡”与“尚未核验关联业务步骤”不同，保留d61-green失败；扩原正反例后d61-green-b退出0。未删断言、未把独立执行当整个目标已完成；真实开始/等待/完成、无重复visit/seq由原产品入口重验。完整准确报告形成前保持待验收，Office不改、Windows暂缓。

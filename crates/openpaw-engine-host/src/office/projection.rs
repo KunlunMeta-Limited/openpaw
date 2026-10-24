@@ -261,6 +261,23 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                     }
                 }
                 let task_id=item["id"].clone();
+                if let Some(c)=&child {
+                    // 生命周期动态复用原完整快照保存首次观察时间，不伪造错过的开始时刻。
+                    // 业务核验与子Run结束分开；只有assignment能驱动交接动画。
+                    let phases=[
+                        ("started","task.started",c.state==RunState::Running,"观察到独立执行"),
+                        ("blocked","task.blocked",!c.state.is_terminal()&&state=="blocked","曾观察到等待确认、资源或清理"),
+                        ("completed","task.completed",!superseded&&item["status"]=="completed","已核验完成"),
+                        ("result","note",done&&item["status"]!="completed","独立执行已结束；业务步骤须由主角色核验"),
+                        ("incomplete","note",c.state.is_terminal()&&!done,"此尝试未完成；真实结果保留在成员历史"),
+                    ];
+                    for (phase,kind,observed,label) in phases {
+                        let id=format!("activity:{}:{phase}",d.task_id);
+                        let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|events|events.iter().find(|event|event["id"]==id));
+                        if !observed&&existing.is_none() {continue;}
+                        child_events.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
+                    }
+                }
                 if !superseded {
                     if let Some(index)=linked {child_steps.insert(index,item);} else {child_tasks.push(item);}
                 }
@@ -509,6 +526,7 @@ mod tests {
         }
         for (mark_active, confirm, retry) in [
             (true, true, false),
+            (true, false, false),
             (false, true, false),
             (false, false, false),
             (true, true, true),
@@ -597,7 +615,11 @@ mod tests {
             let conv = &snapshot["conversations"][0];
             assert_eq!(
                 conv["tasks"].as_array().unwrap().len(),
-                if confirm { 3 } else { 4 },
+                if confirm || (mark_active && !retry) {
+                    3
+                } else {
+                    4
+                },
                 "有准确证据才合并；不能按相似任务标题猜测关联"
             );
             if confirm {
@@ -615,13 +637,39 @@ mod tests {
                     conv["tasks"][1]["status"], "failed",
                     "子任务成功不自动确认未报告步骤"
                 );
-                assert_eq!(conv["tasks"][3]["assigneeId"], "command");
-                assert_eq!(conv["events"][0]["taskId"], conv["tasks"][3]["id"]);
+                let child_index = if mark_active && !retry { 1 } else { 3 };
+                assert_eq!(conv["tasks"][child_index]["assigneeId"], "command");
+                assert_eq!(
+                    conv["events"][0]["taskId"],
+                    conv["tasks"][child_index]["id"]
+                );
             }
             assert_eq!(
-                conv["events"].as_array().unwrap().len(),
+                conv["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event["kind"] == "task.assigned")
+                    .count(),
                 if retry { 2 } else { 1 }
             );
+            let completions: Vec<_> = conv["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "task.completed")
+                .collect();
+            assert_eq!(
+                completions.len(),
+                usize::from(confirm || !mark_active || retry),
+                "关联业务步骤尚未核验不能伪报完成；独立子卡则依照其真实终态"
+            );
+            if let Some(event) = completions.first() {
+                assert_eq!(event["employeeId"], "command");
+                let child_index = if confirm { 1 } else { 3 };
+                assert_eq!(event["taskId"], conv["tasks"][child_index]["id"]);
+                assert!(event["summary"].as_str().unwrap().contains("已核验"));
+            }
             if retry {
                 let session_id = session.session_id.clone();
                 host.inner
@@ -652,7 +700,29 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(conv["events"][0]["fromEmployeeId"], "assistant");
+            assert!(conv["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["kind"] == "task.assigned")
+                .all(|event| event["fromEmployeeId"] == "assistant"));
+            assert!(
+                !conv["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"] == "task.started"),
+                "首次只看到终态，不能捏造已观察开始的历史"
+            );
+            assert_eq!(
+                conv["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event["id"].as_str().unwrap().ends_with(":incomplete"))
+                    .count(),
+                usize::from(retry)
+            );
             assert_eq!(
                 prepare(&host, &office, "office-1").await.unwrap(),
                 snapshot,
