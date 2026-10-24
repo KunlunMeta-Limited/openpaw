@@ -289,3 +289,61 @@ D48继续开放：25c6426真实d轮未提交completed，因此错误恢复未触
 ## T5最新缺陷技术状态（2026-10-23，优先于前文历史开放记录）
 
 D45/D46/D47/D48/D49均为“修复已验证，待用户交付及本PR审核”，未填已合入关闭：0df3282完整27/27、浏览器产品53记录，原8765真实h-resume及correlation均passed。D45业务目标/3步骤100%且无call卡/技术note；D46原Provider错误/停止/恢复按安全分类回归，详情3015ms、65249ms无浮窗；D47原审批期限/输入相同、展示更新后只写一次；D48真实成功回执驱动查询和保存完成；D49追问位置任务100%，不强制再次写文件，混合新写仍被读证据拒绝。原c/d/e/f/g/h失败或复检否决记录均保留，外部验证器错误与生产缺陷分列，不以这些记录伪造全量一次成功。D37原验证结论保持，D36仍开放；Windows原生暂缓。最终文档SHA完整复验与hash绑定见artifacts/t5-delivery-20261023/final-review.json及0006最新验证章节；缺少该准确passed绑定时不能据本段提前交付。
+
+
+## T6本轮产品审查：D50/D51（已复现，未修复）
+
+OpenPaw审查c1e297a/当前Host0df3282。D50为成员投影与六常驻人物入口不一致：默认仅assistant/files/search三绑定，app-agent/review-agent/本现场code-agent真实actor.inspect返回scope_denied。这是用户点击常驻人物不能获知空闲/未启用信息的产品缺陷，原范围校验本身正确，禁止删除校验修复。拟以共同目录和可信成员解析补足。
+
+D51为actions::dispatch丢失目标：actor/employee校验后统一kind=menu；details::render只给空fields的通用会话目录，左侧三成员和已绑定人物都相同。拟保留目标身份/当前任务/结果与导航作用域，六类会话查询继续复用。真实修前HTTP/截图/trace在/home/cheng/.cache/office-product-audit-20261023-r2，详细见0007产品差距审查；修复/新回归待0007准确r2批准，不提前关闭。
+
+多Agent执行器、通用clarify、任务暂停/改派和模型附件是能力缺口，不为凑缺陷编号记成已存在实现的bug。新版Officefocus回归属于集中Rx R14；白板字形/原位菜单分别R12/R13，OpenPaw不能私改Office。大规模全Run/JSONL遍历只是待测性能风险，未实测不当已确诊缺陷。
+
+历史状态补登：D45—D49相关修复已随T5 PR#11合入f22cca1；前文“待本PR审核”保留原时点。D36未修、Windows原生暂缓不计通过。本轮D50/D51不受T5批准覆盖，不能因旧套件通过关闭。
+
+
+2026-10-23 D50/D51修复进展：agents.rs统一六人物与成员，actions不再丢employee/actor，details含真实字段与作用域导航，原HTTP夹具逐一验证六人物/六成员同目标、返回保留身份及陌生人物拒绝通过。独立子任务详情只经持久父子引用定位准确子账本，工作区共享分类明确标注。尚待真实浏览器逐点击证据与准确完整套件，当前不将D50/D51登记为最终关闭；原修前截图/HTTP保留。
+
+
+## T6真实模型再核查：D52/D53（已复现，实现修正待完整重验）
+
+- D52：真实DeepSeek五子Run正常结束、目标报告存在且标记/hash可核验，但计划最后一步“王明汇总五位真实结果并引用报告路径”不匹配原纯答复白名单（只有整理/总结/答复/交付），导致页面主目标failed/71%。修复只补“汇总”同义业务动作；仍要求非写入步骤、真实非空答复且Run正常终态，不将失败/取消或文件步骤自动完成。源码task_progress::project；回归delegated_business_step_keeps_one_card_owner_and_stable_assignment同时验证纯汇总和真实派发证据。
+- D53：同一真实业务步骤已通过原run_progress/tool_started准确关联委派，但projection额外添加同一子任务卡片，导致6步骤+5子卡重复、白板分母11。修复沿用原office_task_assignments，明确关联时复用原步骤卡/ID、保留真实子角色、独立task.assigned稳定ID；未关联子任务仍单独显示，不按相似标题猜所属。子执行完成但父未核验的步骤不能涂绿；协作模式的父核验read_file不再重发已委派步骤的交接动画。旧单Agent工具归属逻辑保留。
+
+修前证据/home/cheng/.cache/t6-real-model-20261023-b/report.json：执行层检查曾记passed，但最终快照tasks[0]=failed/71%，因此整体产品验收必须判未通过；保留该原报告，追加更严的UI终态/有界无重复卡片断言，不能沿用其passed做交付。原失败a为验收脚本审批locator错误，也保留。Office工程未改。
+
+
+## D54：流式当前消息仅在内存，Host硬停后部分回复丢失（已复现，修复待增量批准）
+
+原recovery子进程扩展在接受/输入、TextDelta可观察、终态三个边界真实kill。TextDelta边界重启后Run=interrupted且工具不重放，但text由“硬停前已落盘的部分文本”变为空；修前日志/home/cheng/.cache/t6-recovery-sync-20261023.log。进一步审查确认修前标记名“已落盘”是测试意图，现有get_run实际读取live，不证明持久化；测试保留这一用户可见丢失复现，不将内存读当持久屏障。当前store::save_run始终清text，get_run终态只还原完整JSONL assistant消息，尚未完成的Provider消息无检查点。
+
+拟复用原host_runs.data内已有RunView.text/text_truncated，增加有界、合并、非权威的展示检查点；消息/工具/usage仍原JSONL，检查点不进入模型上下文、不恢复执行。不得在同步delta回调阻塞磁盘。具体生命周期、失败处理、兼容/回退和文件范围在0007第12.2节；涉及持久字段语义超出原仅协作控制元数据批准，先人审，尚未修改生产。原失败断言不删除。
+
+
+## D55：新上游employee.create已领取但旧Host校验拒绝（源码确认，适配待增量批准）
+
+Office fa6ae1f新动作含name/role/sceneActorId，dto::ui_action未知动作返回false，Client::post(ui.next)将本次已消费结果判protocol_error，poller不能发送明确业务拒绝，页面最终超时。当前固定六角色满员会在浏览器禁加，故本轮没有声称从默认页面已复现添加；这是逐协议源码核对确定的新上游兼容缺口，不把它登记成Office缺陷。
+
+最小方案见0007第12.3节：严格识别合法新增动作，复用原唯一领取/持久动作/范围/期限，明确返回不支持动态角色且无副作用；不静默创建有权限Agent。新冻结/DTO/action修改尚未批准，未实施。动态添加的真实业务和权限方案另审，不拿“明确拒绝”说成完整创建成功。
+
+## 2026-10-24 D54/D55已批准实现后的专项结果
+
+本会话用户已分别批准0007第12.1安全补丁、第12.2展示检查点、第12.3上游兼容。D54已复用原Run元数据和单写Store实现，不新增消息库/Schema；真实SQL提交屏障后kill恢复原部分文本，官方history/resume一致为error/interrupted，独立Provider计数为零，原9种接受/终态/父子审批写入边界保留。原HTTP注入真实UPDATE ABORT，Run失败并清理、无done；原私有Store测试覆盖不变不写、错误会话无操作、前缀冲突/4MiB拒绝、账本追上清冗余及删除后无INSERT。证据t6-approved-host-20261024-f.log，非最终准确候选交付。
+
+D55已严格识别合法employee.create，经原唯一领取和作用域检查立即返回固定六角色限制，原HTTPfixture验证无新增Run/Session/审批/文件。源码按真实Zod Unicode码点/ECMAScript trim校验，不按旧假设UTF-16误拒非BMP姓名；原Schema契约13/13。Office仍未改；成员布局真实浏览器及原完整27项待新准确候选重验。Tokio锁只改1.53.3和checksum，cargo update产生的无关Windows依赖边选择变化未纳入，locked构建已验证此最小锁可用。旧失败均保留，暂不登记最终关闭。
+
+## D56：原引擎预算消费前强制扩容导致提前结束（r5已批准，专项修复通过）
+
+真实模型`/home/cheng/.cache/t6-real-model-20261024-approved-a/report.json`五子均完成、主Run failed，原JSONL记录18次usage后iteration budget exhausted。AgentLoop默认弹性8/25/1，run_inner将消费绑定expand成功，current_max达到25后拒绝仍未消费的额度，实际17+1次；固定new(2)亦只剩1次grace。旧engine_e1只检查消息数<12而遗漏次数。具体最小原模块修复、文件、费用/取消/回退与准确验证见0007第12.5节r5；当前未批准、核心生产/测试未改，不在Host绕过。此问题阻塞最新真实产品交付，不能标T6完成。
+
+
+2026-10-24 r5准确批准后的修复：仅原agent_loop预算条件改为先try_consume、不足才expand并consume、最后try_grace。原engine_e1保留原小于12条断言并补精确调用/消息/成功工具结果：固定2+1=3、弹性8→25+1=26、从零增长3+1=4、零且无宽限=0、零加宽限=1、固定2无宽限=2；固定2和弹性21次内最终回答成功。修前3项失败日志t6-core-budget-red-20261024-b.log，修后原13项及Host共享24/10限额回归均通过（t6-core-budget-green-20261024.log、t6-host-budget-green-20261024.log）。没有改IterationBudget类型、Host限额/权限或Office；准确提交完整与真实DeepSeek复验未完成，不标最终关闭。
+
+
+## D57：委派开始漏报但后续有准确证据时重复展示任务
+
+真实DeepSeek r5-a的organize子Run完成，父计划organize-req用准确委派call ID确认完成，但开始时未in_progress，office_task_assignments漏关联，最终8卡而非7卡。主/五子执行及审批文件成功不能代替展示验收；原失败`/home/cheng/.cache/t6-real-model-20261024-r5-a/report.json`保留。按0007原r2允许的Store/投影职责，仅对实际started且未关联的delegate从后续已校验准确evidenceCallIds补绑定；已有绑定不移动，不改变普通工具动画、不按标题猜测，不新增存储/权限。精确回归及全量/真实模型复验另记。
+
+D57专项修复已通过：原inline分支修前4≠3，修后27项包含漏开始补关联、有开始保持和无证据拒合并/拒100%的反例；真实模型a原失败保留，最终新准确模型及完整结果仍待形成。
+
+2026-10-24真实DeepSeek r5-b（准确6a6a974）已通过：D56父/五子均完成，D57最终7卡/白板6步100%，准确报告/JSONL/产物与hash见0007验证记录。最终候选原27项结果以t6-agents-20261024-l报告为准；专项/模型修复通过不代替整阶段交付/PR。

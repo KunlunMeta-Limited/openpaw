@@ -333,12 +333,20 @@ async fn metadata_purge_failure_after_ledger_removal_recovers_without_revival() 
 fn deletion_restart_recovers_each_real_durable_phase_after_process_kill() {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
-    for phase in ["deleting", "cancelling", "purging"] {
+    for (phase, team) in [
+        ("deleting", false),
+        ("cancelling", false),
+        ("purging", false),
+        ("deleting", true),
+        ("cancelling", true),
+        ("purging", true),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "deletion_crash_fixture_child", "--nocapture"])
             .env("OPENPAW_DELETE_CRASH_BASE", dir.path())
             .env("OPENPAW_DELETE_CRASH_PHASE", phase)
+            .env("OPENPAW_DELETE_CRASH_TEAM", if team { "1" } else { "0" })
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -362,9 +370,14 @@ fn deletion_restart_recovers_each_real_durable_phase_after_process_kill() {
         let cfg = config(dir.path());
         let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
         let actual: String = db
-            .query_row("SELECT phase FROM host_session_deletions", [], |r| r.get(0))
+            .query_row(
+                "SELECT phase FROM host_session_deletions WHERE session=?1",
+                [ids["target"].as_str().unwrap()],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(actual, phase);
+        assert_eq!(ids["children"].as_array().unwrap().len(), usize::from(team));
         db.execute_batch("DROP TRIGGER interrupt_delete").unwrap();
         drop(db);
         tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -389,6 +402,43 @@ fn deletion_restart_recovers_each_real_durable_phase_after_process_kill() {
                 .join("sessions")
                 .join(format!("{}.jsonl", ids["target"].as_str().unwrap()))
                 .exists());
+            for child in ids["children"].as_array().unwrap() {
+                let child_scope: ClientScope =
+                    serde_json::from_value(child["scope"].clone()).unwrap();
+                assert_eq!(
+                    host.open_session(child_scope.clone())
+                        .await
+                        .unwrap_err()
+                        .kind,
+                    "session_deleted"
+                );
+                assert!(host
+                    .get_run(&child_scope, child["run"].as_str().unwrap())
+                    .await
+                    .is_err());
+                assert!(!cfg
+                    .home
+                    .join("sessions")
+                    .join(format!("{}.jsonl", child["session"].as_str().unwrap()))
+                    .exists());
+                assert_eq!(
+                    host.delete_session(&child_scope).await.unwrap().phase,
+                    "deleted"
+                );
+            }
+            let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+            let bindings: u64 = db
+                .query_row("SELECT COUNT(*) FROM host_bindings", [], |r| r.get(0))
+                .unwrap();
+            let delegations: u64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM host_events WHERE kind='agent_delegation'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(bindings, 1, "仅保留无关会话，父子均不可复活");
+            assert_eq!(delegations, 0);
             assert_eq!(
                 std::fs::read_to_string(cfg.roots["r"].join("keep.txt")).unwrap(),
                 "workspace survives"
@@ -406,14 +456,42 @@ fn deletion_crash_fixture_child() {
     };
     let phase = std::env::var("OPENPAW_DELETE_CRASH_PHASE").unwrap();
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let cfg = config(std::path::Path::new(&base));
-        let host = Host::start(cfg.clone()).await.unwrap();
+        let mut cfg = config(std::path::Path::new(&base));
+        let team = std::env::var("OPENPAW_DELETE_CRASH_TEAM").unwrap() == "1";
+        let provider = if team {
+            cfg.agents = Some(serde_json::from_value(json!({"enabled":true})).unwrap());
+            MockProvider::scripted(vec![
+                MockMode::ToolUse { tool_name:"delegate_task".into(), input:json!({"role_id":"research","title":"核查项目说明","instructions":"读取keep.txt","acceptance":"返回文件事实"}), text:String::new() },
+                MockMode::ToolUse { tool_name:"read_file".into(), input:json!({"path":"keep.txt"}), text:String::new() },
+                MockMode::Fixed("已读取实际工作区事实".into()),
+                MockMode::Fixed("主任务汇总实际子任务结果".into()),
+            ])
+        } else {
+            MockProvider::fixed("private history")
+        };
+        std::fs::write(cfg.roots["r"].join("keep.txt"), "workspace survives").unwrap();
+        let provider = Arc::new(provider);
+        let host = Host::with_provider(cfg.clone(), provider.clone()).await.unwrap();
         let target = host.open_session(scope("crash-target")).await.unwrap();
         let other = host.open_session(scope("crash-other")).await.unwrap();
         host.submit_run(&scope("crash-target"), &target.session_id, "private history".into()).await.unwrap();
         host.wait_idle().await;
         std::fs::write(cfg.roots["r"].join("keep.txt"), "workspace survives").unwrap();
         let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+        let children: Vec<serde_json::Value> = {
+            let mut q = db.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation'").unwrap();
+            q.query_map([], |r| r.get::<_, String>(0)).unwrap().map(|r| {
+                let v:serde_json::Value=serde_json::from_str(&r.unwrap()).unwrap();
+                json!({"scope":v["child_scope"],"session":v["child_session"],"run":v["child_run"]})
+            }).collect()
+        };
+        assert_eq!(children.len(), usize::from(team));
+        assert_eq!(provider.call_count(), if team { 4 } else { 1 });
+        for child in &children {
+            let child_scope:ClientScope=serde_json::from_value(child["scope"].clone()).unwrap();
+            assert_eq!(host.get_run(&child_scope, child["run"].as_str().unwrap()).await.unwrap().state, RunState::Completed);
+            assert!(cfg.home.join("sessions").join(format!("{}.jsonl",child["session"].as_str().unwrap())).is_file());
+        }
         let sql = match phase.as_str() {
             "deleting" => "CREATE TRIGGER interrupt_delete BEFORE UPDATE OF phase ON host_session_deletions WHEN NEW.phase='cancelling' BEGIN SELECT RAISE(FAIL,'crash boundary'); END;",
             "cancelling" => "CREATE TRIGGER interrupt_delete BEFORE UPDATE OF phase ON host_session_deletions WHEN NEW.phase='purging' BEGIN SELECT RAISE(FAIL,'crash boundary'); END;",
@@ -422,9 +500,9 @@ fn deletion_crash_fixture_child() {
         };
         db.execute_batch(sql).unwrap();
         assert!(host.delete_session(&scope("crash-target")).await.is_err());
-        let actual: String = db.query_row("SELECT phase FROM host_session_deletions", [], |r| r.get(0)).unwrap();
+        let actual: String = db.query_row("SELECT phase FROM host_session_deletions WHERE session=?1", [&target.session_id], |r| r.get(0)).unwrap();
         assert_eq!(actual, phase);
-        println!("DELETE-READY {}", json!({"target":target.session_id,"other":other.session_id}));
+        println!("DELETE-READY {}", json!({"target":target.session_id,"other":other.session_id,"children":children}));
         std::io::stdout().flush().unwrap();
         std::future::pending::<()>().await;
     });

@@ -13,6 +13,7 @@ fn config(base: &std::path::Path) -> HostConfig {
     let root = base.join("项目 workspace");
     std::fs::create_dir_all(&root).unwrap();
     HostConfig {
+        agents: None,
         office: None,
         home: base.join("home"),
         roots: [("project".into(), root)].into(),
@@ -44,6 +45,117 @@ fn scope(slot: usize) -> ClientScope {
         slot_id: format!("office-{slot}"),
         conversation_id: "conversation".into(),
     }
+}
+
+#[tokio::test]
+async fn office_hundred_by_hundred_bindings_keep_identity_and_reject_overflow_without_side_effects()
+{
+    fn tree(path: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let name = std::path::PathBuf::from(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                entries.push((name.clone(), None));
+                entries.extend(
+                    tree(&entry.path())
+                        .into_iter()
+                        .map(|(p, bytes)| (name.join(p), bytes)),
+                );
+            } else {
+                entries.push((name, Some(std::fs::read(entry.path()).unwrap())));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let mut cfg = config(temp.path());
+    std::fs::write(
+        cfg.roots["project"].join("原有资料.txt"),
+        "不得因创建空会话而修改",
+    )
+    .unwrap();
+    cfg.slots = (0..100)
+        .map(|i| (format!("office-{i:03}"), "project".to_owned()))
+        .collect();
+    let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed("未调用")))
+        .await
+        .unwrap();
+    // Host启动本来就创建.openpaw资源锁目录；核对其后每个目录/文件字节，不能误当原根为空。
+    let before = tree(&cfg.roots["project"]);
+    let root = cfg.roots["project"].clone();
+    let started = std::time::Instant::now();
+    let mut first_in_each = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    for office in 0..100 {
+        for conversation in 0..100 {
+            let s = ClientScope {
+                namespace: "office".into(),
+                slot_id: format!("office-{office:03}"),
+                conversation_id: format!("conversation-{conversation:03}"),
+            };
+            let binding = host.open_session(s.clone()).await.unwrap();
+            assert_eq!(binding.scope, s);
+            assert_eq!(binding.root_id, "project");
+            assert!(
+                ids.insert(binding.session_id.clone()),
+                "不同办公室同名会话不能串线"
+            );
+            if conversation == 0 {
+                first_in_each.push(binding);
+            }
+        }
+        let overflow = ClientScope {
+            namespace: "office".into(),
+            slot_id: format!("office-{office:03}"),
+            conversation_id: "overflow".into(),
+        };
+        assert_eq!(
+            host.open_session(overflow).await.unwrap_err().kind,
+            "capacity_exceeded"
+        );
+        if office % 20 == 19 {
+            eprintln!("V08空绑定进度：{}办公室，各100会话", office + 1);
+        }
+    }
+    assert_eq!(ids.len(), 10_000);
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let count = |table: &str| {
+        db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(count("host_bindings"), 10_000);
+    assert_eq!(count("host_runs"), 0, "打开空会话不能伪造Run或调用Provider");
+    assert_eq!(count("host_approvals"), 0);
+    assert_eq!(
+        tree(&root),
+        before,
+        "会话接受/超限不能改变任何工作区文件或既有资源目录"
+    );
+    drop(db);
+    host.shutdown().await.unwrap();
+    let host = Host::with_provider(cfg, Arc::new(MockProvider::fixed("仍未调用")))
+        .await
+        .unwrap();
+    for binding in first_in_each {
+        assert_eq!(
+            host.open_session(binding.scope.clone())
+                .await
+                .unwrap()
+                .session_id,
+            binding.session_id
+        );
+    }
+    host.shutdown().await.unwrap();
+    assert_eq!(
+        tree(&root),
+        before,
+        "重启和幂等查找不能新增或修改工作区内容"
+    );
+    eprintln!("100办公室×100真实空Session绑定、每间第101个拒绝、重启身份不变通过，耗时{:?}；不冒充10000个模型Run/网页任务容量验收", started.elapsed());
 }
 async fn pending(host: &Host, s: &ClientScope) -> ApprovalView {
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -999,5 +1111,596 @@ async fn d43_reopened_session_uses_current_capabilities_without_rewriting_histor
             .any(|m| m.text().contains("历史回复不代表本轮能力")));
         host.shutdown().await.unwrap();
         drop(host);
+    }
+}
+
+// 确定性Provider只决定模型输出，子Session、工具、锁、审批和JSONL全部走真实Host。
+struct TeamProvider {
+    requests: std::sync::Mutex<Vec<CompletionRequest>>,
+    hold_children: bool,
+    write_child: bool,
+    replay_first: Option<bool>,
+    entered: tokio::sync::Notify,
+}
+impl TeamProvider {
+    fn new(hold_children: bool, write_child: bool) -> Self {
+        Self {
+            requests: std::sync::Mutex::new(Vec::new()),
+            hold_children,
+            write_child,
+            replay_first: None,
+            entered: tokio::sync::Notify::new(),
+        }
+    }
+}
+#[async_trait]
+impl LlmProvider for TeamProvider {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> openpaw_core::Result<CompletionResponse> {
+        use openpaw_core::{ContentBlock, StopReason, Usage};
+        self.requests.lock().unwrap().push(request.clone());
+        let system = request.system.as_deref().unwrap_or("");
+        let lead = system.contains("（lead）");
+        let calls: Vec<_> = request
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let content = if lead {
+            let roles = ["research", "organize", "draft", "review", "audit"];
+            let raw = calls.iter().filter(|c| c.starts_with("delegate-")).count();
+            let n = raw - usize::from(self.replay_first.is_some() && raw > 1);
+            if self.write_child && !calls.contains(&"team-plan") {
+                vec![ContentBlock::ToolUse {
+                    id: "team-plan".into(),
+                    name: "report_progress".into(),
+                    input: json!({"type":"create","steps":[{"id":"save","title":"保存 team-report.txt"}]}),
+                }]
+            } else if self.write_child && n == roles.len() && !calls.contains(&"team-confirm") {
+                vec![ContentBlock::ToolUse {
+                    id: "team-confirm".into(),
+                    name: "report_progress".into(),
+                    input: json!({"type":"update","stepId":"save","state":"completed","evidenceCallIds":["delegate-draft"]}),
+                }]
+            } else if n < roles.len() {
+                let repeat = self.replay_first.is_some() && raw == 1;
+                let role = roles[if repeat { 0 } else { n }];
+                let title = if repeat && self.replay_first == Some(true) {
+                    "不同的委派目标".into()
+                } else {
+                    format!("{role}核对项目说明")
+                };
+                vec![ContentBlock::ToolUse {
+                    id: format!("delegate-{role}"),
+                    name: "delegate_task".into(),
+                    input: json!({"role_id":role,"title":title,"instructions":"读取README.md并核对项目背景，明确真实证据和限制","acceptance":"有实际文件读取和角色独立结果"}),
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: "五位同事已分别实际核对项目说明；主角色汇总完成".into(),
+                }]
+            }
+        } else {
+            self.entered.notify_one();
+            if self.hold_children {
+                std::future::pending::<()>().await;
+            }
+            let write = self.write_child && system.contains("（draft）");
+            if calls.is_empty() {
+                vec![ContentBlock::ToolUse {
+                    id: "child-work".into(),
+                    name: if write { "write_file" } else { "read_file" }.into(),
+                    input: if write {
+                        json!({"path":"team-report.txt","content":"独立子角色真实审批产物"})
+                    } else {
+                        json!({"path":"README.md"})
+                    },
+                }]
+            } else {
+                vec![ContentBlock::Text {
+                    text: format!(
+                        "已完成本角色核查。证据是本子会话的真实{}结果。",
+                        if write { "write_file" } else { "read_file" }
+                    ),
+                }]
+            }
+        };
+        let stop_reason = if content
+            .iter()
+            .any(|c| matches!(c, ContentBlock::ToolUse { .. }))
+        {
+            StopReason::ToolUse
+        } else {
+            StopReason::EndTurn
+        };
+        Ok(CompletionResponse {
+            content,
+            stop_reason,
+            usage: Usage {
+                input_tokens: 30,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        })
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn default_model(&self) -> &str {
+        "team-deterministic"
+    }
+    fn name(&self) -> &str {
+        "team-fixture"
+    }
+}
+fn team_scope(conversation: &str) -> ClientScope {
+    ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: conversation.into(),
+    }
+}
+fn team_config(base: &std::path::Path) -> HostConfig {
+    let mut cfg = config(base);
+    cfg.tools = vec!["read_file".into(), "write_file".into()];
+    cfg.agents = Some(AgentsConfig {
+        enabled: true,
+        ..Default::default()
+    });
+    std::fs::write(
+        cfg.roots["project"].join("README.md"),
+        "可信项目说明：复用原引擎与会话账本",
+    )
+    .unwrap();
+    cfg
+}
+fn delegated(home: &std::path::Path, parent: &str) -> Vec<serde_json::Value> {
+    let db = rusqlite::Connection::open(home.join("engine-host/host.db")).unwrap();
+    let mut q=db.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").unwrap();
+    q.query_map([parent], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect()
+}
+#[tokio::test]
+async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_original_ledgers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = team_config(tmp.path());
+    let provider = Arc::new(TeamProvider::new(false, false));
+    let host = Host::with_provider(cfg.clone(), provider.clone())
+        .await
+        .unwrap();
+    let scope = team_scope("five");
+    let b = host.open_session(scope.clone()).await.unwrap();
+    let run = host
+        .submit_run(&scope, &b.session_id, "王明，请安排五位同事实际协作".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    let final_run = host.get_run(&scope, &run.run_id).await.unwrap();
+    assert_eq!(
+        final_run.state,
+        RunState::Completed,
+        "{:?}",
+        final_run.error
+    );
+    let children = delegated(&cfg.home, &run.run_id);
+    assert_eq!(children.len(), 5);
+    let mut sessions = std::collections::BTreeSet::new();
+    let mut runs = std::collections::BTreeSet::new();
+    for child in &children {
+        let child_scope: ClientScope =
+            serde_json::from_value(child["child_scope"].clone()).unwrap();
+        let id = child["child_run"].as_str().unwrap();
+        let sid = child["child_session"].as_str().unwrap();
+        assert!(sessions.insert(sid.to_owned()));
+        assert!(runs.insert(id.to_owned()));
+        assert_ne!(sid, b.session_id);
+        let r = host.get_run(&child_scope, id).await.unwrap();
+        assert_eq!(r.state, RunState::Completed);
+        assert!(r
+            .tools
+            .iter()
+            .any(|t| t.tool_name == "read_file" && t.state == "completed"));
+        let s = host.get_session(&child_scope, sid).await.unwrap();
+        assert!(!s.messages.is_empty());
+        assert_eq!(
+            host.get_run(&scope, id).await.unwrap_err().kind,
+            "scope_denied"
+        );
+    }
+    assert_eq!(
+        provider.requests.lock().unwrap().len(),
+        16,
+        "主6次+五子各2次，不能用单模型角色对白替代"
+    );
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        1,
+        "子会话不污染Office会话历史"
+    );
+    host.delete_session(&scope).await.unwrap();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let left: u64 = db
+        .query_row("SELECT COUNT(*) FROM host_bindings", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0, "父删除必须清掉所有子账本/绑定");
+    let left: u64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM host_events WHERE kind='agent_delegation'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0);
+    assert!(cfg.roots["project"].join("README.md").is_file());
+    host.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn p06_child_write_uses_exact_parent_visible_approval_and_other_conversation_cannot_approve()
+{
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = team_config(tmp.path());
+    cfg.agents
+        .as_mut()
+        .unwrap()
+        .tools
+        .insert("draft".into(), vec!["write_file".into()]);
+    let host = Host::with_provider(cfg.clone(), Arc::new(TeamProvider::new(false, true)))
+        .await
+        .unwrap();
+    let scope = team_scope("approval");
+    let b = host.open_session(scope.clone()).await.unwrap();
+    let parent = host
+        .submit_run(&scope, &b.session_id, "真实协作并保存子任务产物".into())
+        .await
+        .unwrap();
+    let approval = pending(&host, &scope).await;
+    let path = cfg.roots["project"].join("team-report.txt");
+    assert!(!path.exists());
+    assert_ne!(
+        approval.binding.run_id, parent.run_id,
+        "审批保留准确子Run绑定"
+    );
+    let other = team_scope("other");
+    host.open_session(other.clone()).await.unwrap();
+    assert_eq!(
+        host.decide_approval(
+            &other,
+            &approval.approval_id,
+            approval.revision,
+            approval.binding.clone(),
+            true
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        "scope_denied"
+    );
+    host.decide_approval(
+        &scope,
+        &approval.approval_id,
+        approval.revision,
+        approval.binding,
+        true,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        "独立子角色真实审批产物"
+    );
+    assert_eq!(
+        host.get_run(&scope, &parent.run_id).await.unwrap().state,
+        RunState::Completed
+    );
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let plan:String=db.query_row("SELECT reference FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[&parent.run_id],|r|r.get(0)).unwrap();
+    let plan: serde_json::Value = serde_json::from_str(&plan).unwrap();
+    assert_eq!(
+        plan["steps"][0]["state"], "completed",
+        "父步骤只能凭准确委派及真实子文件成功确认"
+    );
+    host.shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn p07_cancel_and_capacity_reservations_do_not_orphan_real_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = team_config(tmp.path());
+    let provider = Arc::new(TeamProvider::new(true, false));
+    let host = Host::with_provider(cfg, provider.clone()).await.unwrap();
+    let a = team_scope("a");
+    let b = team_scope("b");
+    let c = team_scope("c");
+    let ab = host.open_session(a.clone()).await.unwrap();
+    let bb = host.open_session(b.clone()).await.unwrap();
+    let cb = host.open_session(c.clone()).await.unwrap();
+    let ar = host
+        .submit_run(&a, &ab.session_id, "协作A".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.entered.notified())
+        .await
+        .unwrap();
+    let br = host
+        .submit_run(&b, &bb.session_id, "协作B".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), provider.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        host.submit_run(&c, &cb.session_id, "协作C".into())
+            .await
+            .unwrap_err()
+            .kind,
+        "capacity_exceeded"
+    );
+    host.cancel_run(&a, &ar.run_id).await.unwrap();
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let v = host.get_run(&a, &ar.run_id).await.unwrap();
+            if v.state.is_terminal() {
+                break v;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(terminal.state, RunState::Cancelled);
+    assert!(
+        !host
+            .get_run(&b, &br.run_id)
+            .await
+            .unwrap()
+            .state
+            .is_terminal(),
+        "取消A不应取消B"
+    );
+    host.shutdown().await.unwrap();
+    let rows = delegated(&host_config_home(tmp.path()), &br.run_id);
+    assert_eq!(rows.len(), 1);
+}
+fn host_config_home(base: &std::path::Path) -> std::path::PathBuf {
+    base.join("home")
+}
+#[test]
+fn p04_agent_configuration_rejects_overrides_and_preserves_old_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = team_config(tmp.path());
+    cfg.validate().unwrap();
+    cfg.max_active_runs = 1;
+    assert!(cfg.validate().is_err());
+    cfg.max_active_runs = 4;
+    for role in ["unknown", "draft"] {
+        cfg.agents
+            .as_mut()
+            .unwrap()
+            .tools
+            .insert(role.into(), vec!["bash".into()]);
+        assert!(cfg.validate().is_err());
+        cfg.agents.as_mut().unwrap().tools.clear();
+    }
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    value["agents"]["provider"] = json!("override");
+    assert!(serde_json::from_value::<HostConfig>(value).is_err());
+}
+
+#[tokio::test]
+async fn p04_repeated_delegate_reuses_child_and_changed_input_is_rejected() {
+    for changed in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = team_config(tmp.path());
+        let mut provider = TeamProvider::new(false, false);
+        provider.replay_first = Some(changed);
+        let provider = Arc::new(provider);
+        let host = Host::with_provider(cfg.clone(), provider.clone())
+            .await
+            .unwrap();
+        let scope = team_scope("repeated");
+        let session = host.open_session(scope.clone()).await.unwrap();
+        let parent = host
+            .submit_run(&scope, &session.session_id, "测试真实委派重试".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let children = delegated(&cfg.home, &parent.run_id);
+        assert_eq!(children.len(), 5, "同call不得再建子Session/Run");
+        let requests = provider.requests.lock().unwrap().clone();
+        let errors: Vec<_> = requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                openpaw_core::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } if tool_use_id == "delegate-research" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 2);
+        assert!(!errors[0].1);
+        assert_eq!(errors[1].1, changed);
+        if changed {
+            assert!(errors[1].0.contains("不能替换"));
+        }
+        drop(requests);
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn p04_group_limits_and_deadline_are_shared_by_real_children() {
+    for mode in ["limit", "budget", "deadline"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = team_config(tmp.path());
+        let agents = cfg.agents.as_mut().unwrap();
+        match mode {
+            "limit" => agents.max_delegations = 2,
+            "budget" => agents.max_model_requests = 1,
+            "deadline" => cfg.run_timeout_secs = 1,
+            _ => unreachable!(),
+        }
+        let host = Host::with_provider(
+            cfg.clone(),
+            Arc::new(TeamProvider::new(mode == "deadline", false)),
+        )
+        .await
+        .unwrap();
+        let scope = team_scope(mode);
+        let session = host.open_session(scope.clone()).await.unwrap();
+        let parent = host
+            .submit_run(&scope, &session.session_id, "实际协作限制".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let final_run = host.get_run(&scope, &parent.run_id).await.unwrap();
+        let children = delegated(&cfg.home, &parent.run_id);
+        assert_eq!(children.len(), if mode == "limit" { 2 } else { 1 });
+        for child in &children {
+            let scope: ClientScope = serde_json::from_value(child["child_scope"].clone()).unwrap();
+            let run = host
+                .get_run(&scope, child["child_run"].as_str().unwrap())
+                .await
+                .unwrap();
+            assert!(run.state.is_terminal());
+            if mode != "limit" {
+                assert_ne!(run.state, RunState::Completed);
+            }
+        }
+        if mode == "deadline" {
+            assert_eq!(final_run.state, RunState::TimedOut);
+        }
+        if mode == "budget" {
+            assert_eq!(final_run.state, RunState::Failed);
+        }
+        if mode == "limit" {
+            assert!(final_run
+                .tools
+                .iter()
+                .any(|t| t.tool_name == "delegate_task" && t.state == "failed"));
+        }
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn p07_restart_validates_agent_versions_and_never_replays_children() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = team_config(tmp.path());
+    let provider = Arc::new(TeamProvider::new(false, false));
+    let host = Host::with_provider(cfg.clone(), provider.clone())
+        .await
+        .unwrap();
+    let scope = team_scope("versions");
+    let session = host.open_session(scope.clone()).await.unwrap();
+    host.submit_run(&scope, &session.session_id, "真实协作恢复".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    let before = provider.requests.lock().unwrap().len();
+    host.shutdown().await.unwrap();
+    drop(host);
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    for kind in ["agent_group", "agent_delegation", "agent_budget"] {
+        db.execute(
+            "UPDATE host_events SET reference=json_set(reference,'$.version',2) WHERE kind=?1",
+            [kind],
+        )
+        .unwrap();
+        match Host::with_provider(cfg.clone(), provider.clone()).await {
+            Ok(h) => {
+                h.shutdown().await.unwrap();
+                panic!("未知{kind}版本不得静默接收");
+            }
+            Err(e) => assert_eq!(e.kind, "storage_unavailable"),
+        }
+        assert_eq!(provider.requests.lock().unwrap().len(), before);
+        db.execute(
+            "UPDATE host_events SET reference=json_set(reference,'$.version',1) WHERE kind=?1",
+            [kind],
+        )
+        .unwrap();
+    }
+    let reopened = Host::with_provider(cfg, provider.clone()).await.unwrap();
+    assert_eq!(provider.requests.lock().unwrap().len(), before);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn p04_long_but_bounded_group_reaches_final_answer_and_still_honors_shared_limit() {
+    for (limit, expected, expected_calls) in
+        [(24, RunState::Completed, 21), (10, RunState::Failed, 10)]
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = team_config(tmp.path());
+        let agents = cfg.agents.as_mut().unwrap();
+        agents.max_model_requests = limit;
+        agents.max_output_tokens = 262144;
+        let mut responses = vec![
+            MockMode::ToolUse {
+                tool_name: "read_file".into(),
+                input: json!({"path":"README.md"}),
+                text: String::new(),
+            };
+            20
+        ];
+        responses.push(MockMode::Fixed("逐次核对完成，提供最终答复".into()));
+        let provider = Arc::new(MockProvider::scripted(responses));
+        let host = Host::with_provider(cfg, provider.clone()).await.unwrap();
+        let scope = team_scope("long-bounded-group");
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(
+                &scope,
+                &binding.session_id,
+                "完整处理已配置额度内的逐项检查".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let result = host.get_run(&scope, &run.run_id).await.unwrap();
+        assert_eq!(
+            result.state,
+            expected,
+            "不能在已配置预算尚有额度时提前结束；实际Provider调用={}：{:?}",
+            provider.call_count(),
+            result.error
+        );
+        assert_eq!(provider.call_count(), expected_calls);
+        if expected == RunState::Completed {
+            assert!(result.text.contains("最终答复"));
+        }
+        host.shutdown().await.unwrap();
     }
 }

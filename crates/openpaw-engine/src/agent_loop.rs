@@ -362,8 +362,10 @@ impl AgentLoop {
     ) -> Result<StopReason> {
         loop {
             control.check()?;
-            // ③ budget consume (elastic; `expand` raises toward `max`)
-            if !(self.budget.expand(1) && self.budget.try_consume()) {
+            // 先消费既有额度，耗尽才扩容；固定额度不能因无法扩容而被跳过。
+            // 扩容到上限后仍可消费剩余额度，最后才使用原有宽限，不提高预算。
+            if !(self.budget.try_consume() || (self.budget.expand(1) && self.budget.try_consume()))
+            {
                 // Grace keeps one last iteration before giving up.
                 if !self.budget.try_grace() {
                     return Err(Error::BudgetExhausted("iteration budget exhausted".into()));

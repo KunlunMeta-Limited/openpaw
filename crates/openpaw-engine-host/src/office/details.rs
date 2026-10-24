@@ -37,9 +37,161 @@ pub(super) async fn render(
     let mut fields = Vec::new();
     let title;
     let description;
-    if kind == "menu" {
-        title = "OpenPaw 会话详情".to_owned();
-        description = "同一引擎的真实账本和只读数据；工具拟执行输入与实际结果分开识别。".to_owned();
+    let member = context["employeeId"]
+        .as_str()
+        .map(|employee| {
+            crate::agents::ROLES
+                .iter()
+                .find(|role| {
+                    role.employee == employee && context["actorId"].as_str() == Some(role.actor)
+                })
+                .ok_or_else(|| HostError::new("scope_denied", "成员身份与人物绑定不匹配"))
+        })
+        .transpose()?;
+    // 每次导航重新验证原会话，不能让旧按钮绕过删除或重绑定。
+    let (s, sid) = (scope.clone(), session.to_owned());
+    host.inner
+        .store
+        .call(move |db| {
+            db.check_live_scope(&s)?;
+            crate::service::check_scope(&db.binding(&sid)?, &s)
+        })
+        .await?;
+    let agents_enabled = host.inner.config.agents.as_ref().is_some_and(|a| a.enabled);
+    let member_child = if let Some(role) = member.filter(|r| r.id != "lead" && agents_enabled) {
+        let (s, role_id, wanted) = (
+            scope.clone(),
+            role.id.to_owned(),
+            context["childTaskId"].as_str().map(str::to_owned),
+        );
+        host.inner
+            .store
+            .call(move |db| {
+                let binding = db
+                    .bindings()?
+                    .into_iter()
+                    .find(|b| b.scope == s)
+                    .ok_or_else(|| HostError::new("scope_denied", "成员会话不存在"))?;
+                let parent = db
+                    .runs()?
+                    .into_iter()
+                    .filter(|r| r.session_id == binding.session_id)
+                    .max_by_key(|r| r.revision);
+                let Some(parent) = parent else {
+                    return Ok(None);
+                };
+                let choices = db.delegations(&parent.run_id)?;
+                let choice = if let Some(wanted) = wanted {
+                    Some(
+                        choices
+                            .into_iter()
+                            .find(|d| d.role_id == role_id && d.task_id == wanted)
+                            .ok_or_else(|| {
+                                HostError::new(
+                                    "snapshot_changed",
+                                    "成员任务已变化，请重新打开人物详情",
+                                )
+                            })?,
+                    )
+                } else {
+                    choices.into_iter().rev().find(|d| d.role_id == role_id)
+                };
+                match choice {
+                    None => Ok(None),
+                    Some(d) => match db.get_run(&d.child_run) {
+                        Ok(run) => Ok(Some((d, run))),
+                        Err(e) if e.kind == "not_found" => Ok(None),
+                        Err(e) => Err(e),
+                    },
+                }
+            })
+            .await?
+    } else {
+        None
+    };
+    let member_scope = member_child
+        .as_ref()
+        .map(|(d, _)| &d.child_scope)
+        .unwrap_or(scope);
+    let member_session = member_child
+        .as_ref()
+        .map(|(d, _)| d.child_session.as_str())
+        .unwrap_or(session);
+    let independent_empty =
+        agents_enabled && member.is_some_and(|r| r.id != "lead") && member_child.is_none();
+    if kind == "menu" || kind == "member" {
+        if kind == "member" {
+            let role = member.ok_or_else(|| HostError::new("scope_denied", "缺少成员身份"))?;
+            title = format!("{} · 成员详情", role.name);
+            description = format!(
+                "{}。下方历史、Skill、Goal、Todo和文件入口为当前会话范围，点击查看不会启动模型。",
+                role.duty
+            );
+            let (snapshot, _) = host.snapshot_and_subscribe(scope).await?;
+            let current = snapshot.runs.iter().max_by_key(|run| run.revision);
+            let active = current.filter(|run| !run.state.is_terminal());
+            let state = if let Some((_, run)) = &member_child {
+                match run.state {
+                    crate::RunState::Completed => "子任务已完成",
+                    crate::RunState::Cancelling => "正在清理子任务",
+                    crate::RunState::Failed
+                    | crate::RunState::TimedOut
+                    | crate::RunState::Interrupted
+                    | crate::RunState::Cancelled => "子任务未完成，实际结果可查询",
+                    _ if run.tools.iter().any(|t| t.state == "awaiting_approval") => {
+                        "子任务等待人工批准"
+                    }
+                    _ => "正在独立处理分配的任务",
+                }
+            } else if active.is_some() && role.id == "lead" {
+                "正在处理会话任务"
+            } else if active.is_some_and(|r| {
+                r.tools.iter().any(|t| {
+                    super::projection::actor(&t.tool_name).0 == role.employee
+                        && matches!(
+                            t.state.as_str(),
+                            "running" | "awaiting_approval" | "awaiting_resource"
+                        )
+                })
+            }) {
+                "正在处理已关联的会话操作"
+            } else if agents_enabled {
+                "尚无此成员的独立任务"
+            } else if crate::agents::enabled(role, &host.inner.config) {
+                "空闲，尚无分配给此成员的活动任务"
+            } else {
+                "当前会话未启用此功能角色，无活动任务"
+            };
+            fields.extend([
+                json!({"label":"姓名","value":role.name}),
+                json!({"label":"职责","value":role.duty}),
+                json!({"label":"角色标识","value":role.id}),
+                json!({"label":"运行模式","value":if agents_enabled {"已启用独立主子协作；只有真实派发才产生子运行"}else{"共享会话功能角色；当前未启用独立子Agent"}}),
+                json!({"label":"当前状态","value":state}),
+            ]);
+            if let Some((d, run)) = &member_child {
+                fields.extend([
+                    json!({"label":"当前任务","value":d.title}),
+                    json!({"label":"独立执行引用","value":format!("角色 {} · Run {} · Session {}",d.role_id,d.child_run,d.child_session)}),
+                    json!({"label":"最近结果","value":dto::bounded(if run.text.is_empty(){"尚无可靠回复正文"}else{&run.text},1800)}),
+                ]);
+            }
+            if let Some(run) = current.filter(|_| member_child.is_none()) {
+                let tools: Vec<_> = run
+                    .tools
+                    .iter()
+                    .filter(|tool| super::projection::actor(&tool.tool_name).0 == role.employee)
+                    .collect();
+                fields.push(json!({"label":"已关联操作","value":format!("最近一次会话运行中有 {} 次工具操作；这是执行记录，不代表独立Agent。",tools.len())}));
+                if role.id == "lead" {
+                    fields.push(json!({"label":"最近结果","value":dto::bounded(if run.text.is_empty() {"尚无回复正文"} else {&run.text},1800)}));
+                }
+            }
+        } else {
+            title = "OpenPaw 会话详情".to_owned();
+            description =
+                "同一引擎的真实账本和只读数据；工具拟执行输入与实际结果分开识别。".to_owned();
+        }
         for (key, label) in CATEGORIES {
             button(
                 &mut buttons,
@@ -51,7 +203,11 @@ pub(super) async fn render(
         }
     } else if kind == "files" {
         title = "真实文件产物".to_owned();
-        let files = artifacts(host, scope, session).await?;
+        let files = if independent_empty {
+            vec![]
+        } else {
+            artifacts(host, member_scope, member_session).await?
+        };
         let offset = context["offset"].as_u64().unwrap_or(0) as usize;
         let page: Vec<_> = files.iter().skip(offset).take(5).collect();
         description = format!(
@@ -111,10 +267,11 @@ pub(super) async fn render(
                 let path = context["path"]
                     .as_str()
                     .ok_or_else(|| HostError::new("scope_denied", "无效文件引用"))?;
-                if !artifacts(host, scope, session)
-                    .await?
-                    .iter()
-                    .any(|p| p == path)
+                if independent_empty
+                    || !artifacts(host, member_scope, member_session)
+                        .await?
+                        .iter()
+                        .any(|p| p == path)
                 {
                     return Err(HostError::new("scope_denied", "文件不属于本会话成功产物"));
                 }
@@ -122,18 +279,33 @@ pub(super) async fn render(
             }
             _ => return Err(HostError::new("unsupported", "未知详情类型")),
         };
-        let (page, signature) = host
-            .query_detail_page(
-                scope,
+        let private_kind = matches!(kind, "history" | "tools" | "file");
+        let (page, signature) = if independent_empty && private_kind {
+            (
+                crate::QueryPage {
+                    items: Vec::new(),
+                    next_cursor: None,
+                },
+                "no-child-task".to_owned(),
+            )
+        } else {
+            host.query_detail_page(
+                if private_kind { member_scope } else { scope },
                 QueryRequest {
-                    session_id: session.into(),
+                    session_id: if private_kind {
+                        member_session
+                    } else {
+                        session
+                    }
+                    .into(),
                     kind: query,
                     offset,
                     limit: 5,
                 },
                 cancel,
             )
-            .await?;
+            .await?
+        };
         if context["signature"]
             .as_str()
             .is_some_and(|s| s != signature)
@@ -206,6 +378,18 @@ pub(super) async fn render(
             "返回目录",
             json!({"kind":"menu"}),
         );
+    }
+    if let Some(role) = member {
+        for value in options.values_mut() {
+            value["employeeId"] = json!(role.employee);
+            value["actorId"] = json!(role.actor);
+            if let Some((d, _)) = &member_child {
+                value["childTaskId"] = json!(d.task_id);
+            }
+            if value["kind"] == "menu" {
+                value["kind"] = json!("member");
+            }
+        }
     }
     let (id, scope) = (id.to_owned(), scope.clone());
     host.inner

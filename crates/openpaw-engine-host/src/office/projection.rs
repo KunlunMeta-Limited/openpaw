@@ -136,7 +136,15 @@ fn status(state: RunState) -> &'static str {
         _ => "failed",
     }
 }
-fn actor(tool: &str) -> (&'static str, &'static str) {
+/// 功能：将真实工具名称映射到可信成员与场景人物。
+/// 参数：tool为已经由Host记录的工具名称。
+/// 返回：成员ID与Office人物ID；未知工具归属主角色。
+/// 错误：无；未知工具不会扩大权限。
+/// 状态：纯只读映射，不创建任务或Run。
+/// 并发与取消：无锁、无等待、不可取消。
+/// 权限：返回值仅用于有界展示，不能作为授权依据。
+/// 关联：需求/设计REQ-OP-021/023；DES-OP-011。
+pub(super) fn actor(tool: &str) -> (&'static str, &'static str) {
     match tool {
         "read_file" | "write_file" | "edit_file" => ("files", "file-agent"),
         "glob" | "grep" | "web_search" | "web_fetch" => ("search", "data-agent"),
@@ -178,7 +186,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         .get(&team)
         .cloned()
         .unwrap_or_else(|| team.clone());
-    let command_enabled = host.inner.config.tools.iter().any(|name| name == "bash");
+    let employees:Vec<_>=crate::agents::ROLES.iter().map(|role|json!({"id":role.employee,"name":role.name,"sceneActorId":role.actor,"role":role.duty,"online":crate::agents::enabled(role,&host.inner.config)})).collect();
     host.inner.store.call(move|db|{
         let name = db.office_creations()?.iter().find(|v|v["slot_id"]==team)
             .and_then(|v|v["name"].as_str()).map(str::to_owned).unwrap_or(name);
@@ -205,7 +213,47 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             // 每会话只投影最新Run，避免旧失败抢占最新成功的员工状态；完整历史走history。
             let (_,input)=db.run_input(&r)?;
             let main_id=format!("run:{}",r.run_id);
-            let (steps,percent)=crate::task_progress::project(db.progress(&r.run_id)?,&r)?;
+            let (steps,mut percent)=crate::task_progress::project(db.progress(&r.run_id)?,&r)?;
+            let delegations=db.delegations(&r.run_id)?;
+            let assignments=db.office_task_assignments(&r.run_id)?;
+            let mut child_steps=BTreeMap::new();
+            let mut child_tasks=Vec::new();
+            let mut child_events=Vec::new();
+            let mut completed_children=0u64;
+            for d in &delegations {
+                let role=crate::agents::role(&d.role_id).ok_or_else(||HostError::new("storage_unavailable","委派引用未知角色"))?;
+                let child=match db.get_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
+                let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
+                let done=state=="completed";
+                completed_children+=u64::from(done);
+                let summary=if let Some(c)=&child {
+                    if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {"子任务未完成，已保存真实结果".into()}
+                    else if state=="blocked" {"等待确认、资源或清理".into()} else {"正在独立处理此任务".into()}
+                } else if r.state.is_terminal() {"委派中断，未接受执行；不会自动重放".into()} else {"已登记委派，等待接受执行".into()};
+                let mut item=task(d.task_id.clone(),d.title.clone(),state,summary,&old,&now,if done{100}else{0});
+                item["assigneeId"]=json!(role.employee);
+                // 派发时已有明确进行中步骤则复用其业务卡片；不按相似标题猜测关联。
+                let linked=assignments.get(&d.call_id).copied().filter(|i|*i<steps.len()&&!child_steps.contains_key(i));
+                if let Some(index)=linked {
+                    let step=&steps[index];
+                    item["id"]=step["id"].clone();item["title"]=step["title"].clone();
+                    if done && step["status"]!="completed" {
+                        item["status"]=step["status"].clone();item["progress"]=step["progress"].clone();
+                        item["summary"]=json!("子执行已结束，业务步骤仍待主角色核验");
+                    }
+                }
+                let task_id=item["id"].clone();
+                if let Some(index)=linked {child_steps.insert(index,item);} else {child_tasks.push(item);}
+                if child.is_some() {
+                    child_events.push(json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":d.created_at,"taskId":task_id,"employeeId":role.employee,"fromEmployeeId":"assistant"}));
+                }
+            }
+            if !delegations.is_empty() {
+                let delivered=r.state==RunState::Completed && completed_children==delegations.len() as u64;
+                let child_percent=(completed_children+u64::from(delivered))*100/(delegations.len() as u64+1);
+                percent=if steps.is_empty() {child_percent}else{percent.min(child_percent)};
+            }
+            let child_blocked=child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="blocked");
             let summary=match r.state {
                 RunState::Cancelled=>"已停止，实际操作已清理".to_owned(),
                 RunState::Interrupted=>"处理被中断，已完成事项保留".to_owned(),
@@ -213,21 +261,24 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 RunState::Cancelling=>"正在停止，等待实际操作清理".to_owned(),
                 RunState::Completed if percent<100=>"回复已结束，仍有步骤未完成".to_owned(),
                 RunState::Completed=>"本次目标已完成".to_owned(),
+                _ if child_blocked=>"子任务等待确认或可用资源".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
                 _=>"正在处理你的请求".to_owned(),
             };
-            let main_state=if r.state==RunState::Completed && percent<100 {"failed"} else if !r.state.is_terminal() && (r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let main_state=if r.state==RunState::Completed && percent<100 {"failed"} else if !r.state.is_terminal() && (child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
             let mut tasks=vec![task(main_id,dto::bounded(&input,80),main_state,summary.clone(),&old,&now,percent)];
-            for step in steps {
+            for (index,step) in steps.into_iter().enumerate() {
+                if let Some(child)=child_steps.remove(&index) {tasks.push(child);continue;}
                 tasks.push(task(step["id"].as_str().unwrap().into(),step["title"].as_str().unwrap().into(),step["status"].as_str().unwrap(),step["summary"].as_str().unwrap().into(),&old,&now,step["progress"].as_u64().unwrap()));
             }
-            let mut events=Vec::new();
-            let assignments=db.office_task_assignments(&r.run_id)?;
+            tasks.extend(child_tasks);
+            let mut events=child_events;
             // 工具仍是执行事实，公开任务只引用稳定的业务步骤；重试不增加卡片或重播交接。
             for t in r.tools.iter().filter(|t|t.tool_name!="report_progress") {
                 // 保留原内部调用关联号供历史详情追踪，公开任务不再使用逐call卡片。
                 let _call_reference=db.office_call_id(&r.run_id,&t.call_id)?;
+                if !delegations.is_empty() {continue;} // 协作交接只来自真实委派，主角色核验工具不重复派发同一步。
                 let (who,_)=actor(&t.tool_name);
                 if who=="assistant" || !db.office_call_started(&r.run_id,&t.call_id)? {continue;}
                 let current=assignments.get(&t.call_id).map(|i|i+1).filter(|i|*i<tasks.len()).unwrap_or(0);
@@ -254,15 +305,14 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 let first=tasks[1..].iter().position(|t|t["status"]!="completed").unwrap_or(tasks.len().saturating_sub(4));
                 tasks[1..].iter().skip(first).take(3).map(|t| {
                     let label=match t["status"].as_str(){Some("completed")=>"已完成",Some("running")=>"处理中",Some("blocked")=>"等待确认",Some("failed")=>"未完成",_=>"待处理"};
-                    json!({"id":t["id"],"title":dto::bounded(&format!("{} · {label}",t["title"].as_str().unwrap()),80),"progress":t["progress"]})
+                    json!({"id":t["id"],"title":dto::bounded(&format!("{} · {label}",dto::bounded(t["title"].as_str().unwrap(),24)),40),"progress":t["progress"]})
                 }).collect()
             } else {vec![json!({"id":"goal","title":dto::bounded(&summary,80),"progress":percent})]};
             let completed=tasks.iter().skip(1).filter(|t|t["status"]=="completed").count();
             let description=if tasks.len()>1 {format!("已确认完成 {completed}/{} 步；{summary}",tasks.len()-1)}else{summary};
-            let whiteboard=json!({"template":"task-board-v1","title":selected["title"],"status":selected["status"],"tagline":"","description":dto::bounded(&description,500),"note":"","link":{"label":"","url":""},"steps":board_steps});
+            let whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,500),"note":"","link":{"label":"","url":""},"steps":board_steps});
             priorities.insert(binding.scope.conversation_id.clone(),r.revision);
-            let mut employees=json!([{"id":"assistant","name":"OpenPaw助手","sceneActorId":"office-lead","role":"任务处理与协调","online":true},{"id":"files","name":"文件操作","sceneActorId":"file-agent","role":"文件查看与记录，修改前确认","online":true},{"id":"search","name":"项目检索","sceneActorId":"data-agent","role":"项目检索与资料查询","online":true}]);
-            if command_enabled {employees.as_array_mut().unwrap().push(json!({"id":"command","name":"命令执行","sceneActorId":"code-agent","role":"执行操作，开始前确认","online":true}));}
+            // 常驻人物和成员来自同一可信目录，未启用角色也能说明真实状态。
             conversations.push(json!({"id":binding.scope.conversation_id,"title":title,
                 "employees":employees,
                 "tasks":tasks,"events":events,"whiteboard":whiteboard}));
@@ -387,6 +437,110 @@ pub(super) async fn sync_once(
 mod tests {
     use super::*;
     use crate::{ClientScope, HostConfig};
+    #[tokio::test]
+    async fn delegated_business_step_keeps_one_card_owner_and_stable_assignment() {
+        use openpaw_llm::{MockMode, MockProvider};
+        for (mark_active, confirm) in [(true, true), (false, true), (false, false)] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("README.md"), "actual project fact").unwrap();
+            let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+            let call = |name: &str, input| MockMode::ToolUse {
+                tool_name: name.into(),
+                input,
+                text: String::new(),
+            };
+            let mut script = vec![call(
+                "report_progress",
+                json!({"type":"create","steps":[{"id":"lookup","title":"核对项目说明"},{"id":"summary","title":"王明汇总同事的实际结果"}]}),
+            )];
+            if mark_active {
+                script.push(call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"lookup","state":"in_progress"}),
+                ));
+            }
+            let delegate_call = if mark_active { "call_2" } else { "call_1" };
+            script.extend(vec![
+            call(
+                "delegate_task",
+                json!({"role_id":"research","title":"李研核对项目目标","instructions":"读取README.md","acceptance":"有文件依据"}),
+            ),
+            call("read_file", json!({"path":"README.md"})),
+            MockMode::Fixed("李研已实际读取项目说明".into()),
+        ]);
+            if confirm {
+                script.push(call(
+                "report_progress",
+                json!({"type":"update","stepId":"lookup","state":"completed","evidenceCallIds":[delegate_call]}),
+                ));
+            }
+            script.extend(vec![
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"summary","state":"in_progress"}),
+                ),
+                MockMode::Fixed("王明汇总：同事已读取项目说明，证据已核实".into()),
+            ]);
+            let provider = MockProvider::scripted(script);
+            let host = Host::with_provider(config, std::sync::Arc::new(provider))
+                .await
+                .unwrap();
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "linked".into(),
+            };
+            let session = host.open_session(scope.clone()).await.unwrap();
+            host.submit_run(&scope, &session.session_id, "请安排李研核对并汇总".into())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+                .await
+                .unwrap();
+            let office = OfficeConfig {
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "PAWOFFICE_TEST_KEY".into(),
+                allowed_origins: vec!["http://127.0.0.1:8765".into()],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            let conv = &snapshot["conversations"][0];
+            assert_eq!(
+                conv["tasks"].as_array().unwrap().len(),
+                if confirm { 3 } else { 4 },
+                "有准确证据才合并；不能按相似任务标题猜测关联"
+            );
+            if confirm {
+                assert_eq!(conv["tasks"][0]["status"], "completed");
+                assert_eq!(
+                    conv["tasks"][0]["progress"], 100,
+                    "正常保存最终汇总后才确认交付"
+                );
+                assert_eq!(conv["tasks"][1]["assigneeId"], "command");
+                assert_eq!(conv["events"][0]["taskId"], conv["tasks"][1]["id"]);
+            } else {
+                assert_eq!(conv["tasks"][0]["status"], "failed");
+                assert!(conv["tasks"][0]["progress"].as_u64().unwrap() < 100);
+                assert_eq!(
+                    conv["tasks"][1]["status"], "failed",
+                    "子任务成功不自动确认未报告步骤"
+                );
+                assert_eq!(conv["tasks"][3]["assigneeId"], "command");
+                assert_eq!(conv["events"][0]["taskId"], conv["tasks"][3]["id"]);
+            }
+            assert_eq!(conv["events"].as_array().unwrap().len(), 1);
+            assert_eq!(conv["events"][0]["fromEmployeeId"], "assistant");
+            assert_eq!(
+                prepare(&host, &office, "office-1").await.unwrap(),
+                snapshot,
+                "无新事实不改变seq或重播交接"
+            );
+            host.shutdown().await.unwrap();
+        }
+    }
     #[tokio::test]
     async fn legacy_snapshot_upgrades_with_new_seq_and_full_catalogue_is_bounded() {
         let temp = tempfile::tempdir().unwrap();

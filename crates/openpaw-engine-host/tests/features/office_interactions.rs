@@ -153,7 +153,10 @@ async fn interaction_scenario() {
             }
             "ui.respond" => {
                 s.responses.push(r.clone());
-                if s.expire_delete_reply && r["interactionId"] == "delete-6" {
+                if s.expire_delete_reply
+                    && (r["interactionId"] == "delete-6"
+                        || r["interactionId"] == "create-member-expired")
+                {
                     return (axum::http::StatusCode::GONE,Json(json!({"code":410,"msg":"expired","data":{"reasonCode":"UI_REQUEST_EXPIRED"}}))).into_response();
                 }
                 json!({"interactionId":r["interactionId"],"delivered":true})
@@ -281,6 +284,136 @@ async fn interaction_scenario() {
         .await
         .unwrap()
     }
+    let sessions_before = host.snapshot_and_subscribe(&scope).await.unwrap().0;
+    let files_before = std::fs::read_dir(&cfg.roots["r"]).unwrap().count();
+    let member_create = action(
+        &shared,
+        "create-member-unsupported",
+        "employee.create",
+        json!({"name":"新成员","role":"","sceneActorId":"file-agent"}),
+    )
+    .await;
+    assert_eq!(member_create["presentation"]["target"], "result");
+    assert_eq!(member_create["presentation"]["success"], false);
+    assert!(member_create["presentation"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("固定六个可信角色"));
+    let sessions_after = host.snapshot_and_subscribe(&scope).await.unwrap().0;
+    assert_eq!(
+        serde_json::to_value(&sessions_before).unwrap(),
+        serde_json::to_value(&sessions_after).unwrap()
+    );
+    assert_eq!(
+        std::fs::read_dir(&cfg.roots["r"]).unwrap().count(),
+        files_before
+    );
+    let cross_scope = action(
+        &shared,
+        "create-member-cross-scope",
+        "employee.create",
+        json!({"name":"新成员","role":"","sceneActorId":"file-agent","teamId":"not-authorized"}),
+    )
+    .await;
+    assert_eq!(cross_scope["presentation"]["success"], false);
+    assert!(cross_scope["presentation"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("scope_denied"));
+    shared.lock().await.expire_delete_reply = true;
+    let expired = action(
+        &shared,
+        "create-member-expired",
+        "employee.create",
+        json!({"name":"新成员","sceneActorId":"file-agent"}),
+    )
+    .await;
+    assert_eq!(expired["presentation"]["success"], false);
+    tokio::time::timeout(Duration::from_secs(3),async {
+        loop {
+            let db=rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+            let status:String=db.query_row("SELECT status FROM host_office_actions WHERE action_id='create-member-expired'",[],|r|r.get(0)).unwrap();
+            if status=="unconfirmed"{break;}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    shared.lock().await.expire_delete_reply = false;
+    assert_eq!(
+        shared
+            .lock()
+            .await
+            .responses
+            .iter()
+            .filter(|r| r["interactionId"] == "create-member-expired")
+            .count(),
+        1
+    );
+    assert_eq!(
+        serde_json::to_value(host.snapshot_and_subscribe(&scope).await.unwrap().0).unwrap(),
+        serde_json::to_value(&sessions_before).unwrap()
+    );
+    let mut inspected = std::collections::BTreeMap::new();
+    for (employee, actor, name) in [
+        ("assistant", "office-lead", "王明"),
+        ("command", "code-agent", "李研"),
+        ("files", "file-agent", "周理"),
+        ("draft", "app-agent", "陈书"),
+        ("review", "review-agent", "刘市"),
+        ("search", "data-agent", "赵审"),
+    ] {
+        let actor_reply = action(
+            &shared,
+            &format!("actor-{actor}"),
+            "actor.inspect",
+            json!({"actorId":actor}),
+        )
+        .await;
+        let member_reply = action(
+            &shared,
+            &format!("member-{employee}"),
+            "employee.inspect",
+            json!({"employeeId":employee}),
+        )
+        .await;
+        let a = &actor_reply["presentation"]["content"];
+        let b = &member_reply["presentation"]["content"];
+        assert_eq!(a, b, "同一人物和左侧成员必须对应相同目标");
+        assert_eq!(a["title"], format!("{name} · 成员详情"));
+        assert!(!a["fields"].as_array().unwrap().is_empty());
+        inspected.insert(employee, a.clone());
+        let list = action(
+            &shared,
+            &format!("history-{actor}"),
+            "dialog.action",
+            json!({"interactionId":format!("actor-{actor}"),"optionId":"history"}),
+        )
+        .await;
+        assert_eq!(list["presentation"]["content"]["title"], "历史");
+        let back = action(
+            &shared,
+            &format!("back-{actor}"),
+            "dialog.action",
+            json!({"interactionId":format!("history-{actor}"),"optionId":"back"}),
+        )
+        .await;
+        assert_eq!(
+            back["presentation"]["content"]["title"],
+            format!("{name} · 成员详情"),
+            "返回不能丢失目标身份"
+        );
+    }
+    assert_ne!(
+        inspected["assistant"]["fields"],
+        inspected["draft"]["fields"]
+    );
+    let unknown = action(
+        &shared,
+        "unknown-actor",
+        "actor.inspect",
+        json!({"actorId":"not-a-real-person"}),
+    )
+    .await;
+    assert_eq!(unknown["presentation"]["success"], false);
     let menu = action(
         &shared,
         "inspect-1",
@@ -532,6 +665,9 @@ async fn creation_http_scenario() {
         actions: VecDeque<Value>,
         responses: Vec<Value>,
         premature: bool,
+        poll_failures: usize,
+        lost_claims: usize,
+        rejected_registrations: usize,
     }
     async fn handler(
         State(shared): State<Arc<Mutex<Created>>>,
@@ -559,7 +695,28 @@ async fn creation_http_scenario() {
                 json!({"teamId":r["teamId"],"seq":r["snapshot"]["seq"],"status":"applied"})
             }
             "ui.next" => {
+                if s.poll_failures == 0 {
+                    s.poll_failures += 1;
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"code":503,"msg":"controlled unavailable","data":{}})),
+                    )
+                        .into_response();
+                }
                 let a = s.actions.pop_front();
+                if a.as_ref().is_some_and(|a| a["id"] == "claim-lost") {
+                    s.lost_claims += 1;
+                    // 真正在HTTP响应前消费动作再断链；无ACK协议不会重投递。
+                    let body = axum::body::Body::from_stream(futures::stream::once(async {
+                        Err::<axum::body::Bytes, _>(std::io::Error::other(
+                            "controlled claimed response loss",
+                        ))
+                    }));
+                    return axum::response::Response::new(body);
+                }
+                if a.as_ref().is_some_and(|a| a["id"] == "registration-fails") {
+                    s.rejected_registrations += 1;
+                }
                 drop(s);
                 if a.is_none() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -578,6 +735,16 @@ async fn creation_http_scenario() {
                         return (axum::http::StatusCode::GONE,Json(json!({"code":410,"msg":"expired","data":{"reasonCode":"UI_REQUEST_EXPIRED"}}))).into_response();
                     }
                     s.snapshots.insert(id.to_owned(), snapshot.clone());
+                    if r["interactionId"] == "new-c" {
+                        // 服务端已使用创建快照但确认失败；业务不能回滚或换槽重试。
+                        return (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            Json(
+                                json!({"code":503,"msg":"controlled lost confirmation","data":{}}),
+                            ),
+                        )
+                            .into_response();
+                    }
                 }
                 json!({"interactionId":r["interactionId"],"delivered":true})
             }
@@ -603,8 +770,13 @@ async fn creation_http_scenario() {
     let mut cfg = config(tmp.path());
     cfg.slots.insert("reserved-a".into(), "r".into());
     cfg.slots.insert("reserved-b".into(), "r".into());
+    cfg.slots.insert("reserved-c".into(), "r".into());
     cfg.office.as_mut().unwrap().base_url = base;
-    cfg.office.as_mut().unwrap().creation_slots = vec!["reserved-a".into(), "reserved-b".into()];
+    cfg.office.as_mut().unwrap().creation_slots = vec![
+        "reserved-a".into(),
+        "reserved-b".into(),
+        "reserved-c".into(),
+    ];
     let host = Host::start(cfg.clone()).await.unwrap();
     let server = HostServer::bind(host, 0).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -637,8 +809,15 @@ async fn creation_http_scenario() {
         )
         .unwrap();
     assert_eq!(guesses, 0, "拒绝请求不能产生Session绑定");
-    drop(db);
-    for (id, name) in [("new-a", "未确认办公室"), ("new-b", "正常办公室")] {
+    db.execute_batch("CREATE TRIGGER reject_action_registration BEFORE INSERT ON host_office_actions WHEN NEW.action_id='registration-fails' BEGIN SELECT RAISE(ABORT,'controlled action registration failure'); END;").unwrap();
+    for id in ["claim-lost", "registration-fails"] {
+        shared.lock().await.actions.push_back(json!({"id":id,"teamId":"","conversationId":"","action":"office.create","name":"不得创建"}));
+    }
+    for (id, name) in [
+        ("new-a", "未确认办公室"),
+        ("new-b", "正常办公室"),
+        ("new-c", "确认丢失办公室"),
+    ] {
         shared.lock().await.actions.push_back(
             json!({"id":id,"teamId":"","conversationId":"","action":"office.create","name":name}),
         );
@@ -646,7 +825,7 @@ async fn creation_http_scenario() {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let s = shared.lock().await;
-            if s.responses.len() >= 2 && s.snapshots.len() == 3 {
+            if s.responses.len() >= 3 && s.snapshots.len() == 4 {
                 break;
             }
             drop(s);
@@ -658,6 +837,18 @@ async fn creation_http_scenario() {
     {
         let s = shared.lock().await;
         assert!(!s.premature, "后台不能先于官方创建呈现初始化该槽");
+        assert_eq!(
+            (s.poll_failures, s.lost_claims, s.rejected_registrations),
+            (1, 1, 1)
+        );
+        assert!(
+            !s.responses
+                .iter()
+                .any(|r| ["claim-lost", "registration-fails"]
+                    .iter()
+                    .any(|id| r["interactionId"] == *id)),
+            "未收到或未持久登记的动作不得执行业务"
+        );
         assert_eq!(s.responses[0]["presentation"]["target"], "office");
         assert_eq!(s.responses[1]["presentation"]["target"], "office");
         assert_ne!(
@@ -679,6 +870,22 @@ async fn creation_http_scenario() {
     .await
     .unwrap();
     server.shutdown().await.unwrap();
+    let state_of = |id: &str| {
+        db.query_row(
+            "SELECT status FROM host_office_actions WHERE action_id=?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(state_of("new-a"), "unconfirmed");
+    assert_eq!(state_of("new-b"), "delivered");
+    assert_eq!(state_of("new-c"), "unconfirmed");
+    let failed: i64 = db.query_row("SELECT count(*) FROM host_office_actions WHERE action_id IN ('claim-lost','registration-fails')", [], |r| r.get(0)).unwrap();
+    assert_eq!(failed, 0, "断链或登记失败不得留下伪造已领取/完成记录");
+    db.execute_batch("DROP TRIGGER reject_action_registration;")
+        .unwrap();
+    drop(db);
     let read_facts = || {
         let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
         let mut stmt = db
@@ -690,7 +897,7 @@ async fn creation_http_scenario() {
             .collect::<Vec<_>>()
     };
     let facts = read_facts();
-    assert_eq!(facts.len(), 2);
+    assert_eq!(facts.len(), 3);
     for fact in &facts {
         assert!(cfg
             .home
@@ -699,13 +906,19 @@ async fn creation_http_scenario() {
             .exists());
     }
     shared.lock().await.snapshots.clear();
+    let replies_before_restart = shared.lock().await.responses.len();
+    for id in ["new-a", "new-b", "new-c"] {
+        shared.lock().await.actions.push_back(json!({"id":id,"teamId":"","conversationId":"","action":"office.create","name":"重复不得换槽"}));
+    }
     let host = Host::start(cfg.clone()).await.unwrap();
     let server = HostServer::bind(host, 0).await.unwrap();
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {
-            if shared.lock().await.snapshots.len() == 3 {
+            let s = shared.lock().await;
+            if s.snapshots.len() == 4 && s.actions.is_empty() {
                 break;
             }
+            drop(s);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
@@ -719,6 +932,12 @@ async fn creation_http_scenario() {
     }
     assert_eq!(read_facts(), facts, "重启不能重复分配或重放创建");
     server.shutdown().await.unwrap();
+    assert_eq!(
+        shared.lock().await.responses.len(),
+        replies_before_restart,
+        "未知/失败确认和重复动作均不能自动重发UI或重复分配"
+    );
+    eprintln!("ui.next 503恢复、领取后真实断链、SQLite登记拒绝、410/503确认未知及重启重复投递均通过；三个槽/Session只分配一次，未执行模型");
     stop.cancel();
     serving.await.unwrap();
 }

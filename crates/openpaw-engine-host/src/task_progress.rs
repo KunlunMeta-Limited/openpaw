@@ -180,11 +180,53 @@ pub(crate) fn recovery_hint(run: &RunView, started: &[ToolCallBinding]) -> Strin
 /// 并发与取消：调用方在原Store单写命令中执行；不持工作区资源。
 /// 权限：仅Office绑定可调用，可信run_id不取模型输入。
 /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+#[cfg(test)]
 pub(crate) fn update(
     previous: Option<Value>,
     value: &Value,
     run: &RunView,
     started: &[ToolCallBinding],
+) -> HostResult<Value> {
+    update_with_delegations(previous, value, run, started, &[])
+}
+
+/// 用途：经原Store逐字段校验的子Run成功文件证据。
+/// 字段：准确父委派call ID及真实子工具成功写入路径。
+/// 来源去向：原子JSONL/host_events到父业务进度校验。
+/// 约束：不是伪造父写工具；子拒绝/失败不能产生证据。
+/// 稳定性：Host内部，不改变report_progress协议。
+/// 关联：需求/设计REQ-OP-022/023；DES-OP-012。
+pub(crate) struct DelegatedWrite {
+    /// 用途：父Run真正执行的delegate_task调用ID。
+    /// 字段：String，独立于子工具call ID。
+    /// 来源去向：可信持久委派引用到原进度校验。
+    /// 约束：调用者必须先验证子Run归属及终态。
+    /// 稳定性：Host内部证据字段。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) call_id: String,
+    /// 用途：该委派真实子Run成功写入的文件路径。
+    /// 字段：Vec<String>，只包含原started及成功ToolResult对应的路径。
+    /// 来源去向：原工具事实到父业务步骤文件匹配。
+    /// 约束：不能由模型或浏览器声明；不包含文件正文。
+    /// 稳定性：Host内部证据字段。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) paths: Vec<String>,
+}
+
+/// 功能：在原单Run进度规则中验证额外的可信委派文件证据。
+/// 参数：previous/value/run/started沿用原校验；delegated由原Store从真实子Run构造。
+/// 返回：验证后的固定计划，不替模型自动推进步骤。
+/// 错误：未执行、失败、错父/错路径或未知证据仍拒绝。
+/// 状态：纯校验，实际保存仍走原Store。
+/// 并发与取消：在原单写序列内读取一致事实。
+/// 权限：父只可引用自己的delegate call，不能借其他子Run的工具ID。
+/// 关联：需求/设计REQ-OP-022/023；DES-OP-012。
+pub(crate) fn update_with_delegations(
+    previous: Option<Value>,
+    value: &Value,
+    run: &RunView,
+    started: &[ToolCallBinding],
+    delegated: &[DelegatedWrite],
 ) -> HostResult<Value> {
     if run.state.is_terminal() || run.state == RunState::Cancelling {
         return Err(invalid("本轮已结束或正在停止，不再接受步骤报告"));
@@ -289,6 +331,13 @@ pub(crate) fn update(
                     write = true;
                 }
             }
+            write |= evidence.iter().any(|id| {
+                run.tools.iter().any(|t| {
+                    t.call_id == *id && t.tool_name == "delegate_task" && t.state == "completed"
+                }) && delegated.iter().any(|d| {
+                    d.call_id == *id && d.paths.iter().any(|path| step.title.contains(path))
+                })
+            });
             if state == "completed" && (evidence.is_empty() || needs_write(&step.title) && !write) {
                 return Err(invalid(
                     "尚无可确认的执行证据；记录文件必须先真实写入，无工具的整理步骤由最终交付确认",
@@ -336,7 +385,7 @@ pub(crate) fn project(value: Option<Value>, run: &RunView) -> HostResult<(Vec<Va
     let mut completed = 0;
     let steps=plan.steps.iter().enumerate().map(|(index,s)| {
         // 纯整理步骤没有工具证据，只能在最终文本已可靠保存且Run正常结束后确认。
-        let answer = ["整理","总结","答复","交付"].iter().any(|v|s.title.contains(v));
+        let answer = ["整理","总结","汇总","答复","交付"].iter().any(|v|s.title.contains(v));
         let done=s.state=="completed" || run.state==RunState::Completed && !run.text.trim().is_empty() && !needs_write(&s.title) && answer;
         if done {completed+=1;}
         let waiting=s.evidence.iter().any(|id|run.tools.iter().any(|t|&t.call_id==id && matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")));
@@ -402,6 +451,62 @@ mod tests {
             "失败保留真实完成度"
         );
         assert!(update(Some(confirmed), &report, &r, &[]).is_err());
+    }
+    #[test]
+    fn delegated_file_completion_requires_exact_parent_call_and_child_artifact() {
+        let mut r = run();
+        let p = plan(&r);
+        r.tools.push(ToolView {
+            call_id: "delegate-draft".into(),
+            tool_name: "delegate_task".into(),
+            state: "completed".into(),
+        });
+        let b = ToolCallBinding {
+            run_id: r.run_id.clone(),
+            call_id: "delegate-draft".into(),
+            tool_name: "delegate_task".into(),
+            input: json!({"role_id":"draft"}),
+        };
+        let report = json!({"type":"update","stepId":"record","state":"completed","evidenceCallIds":["delegate-draft"]});
+        for (call, path) in [
+            ("other-parent", "weather.md"),
+            ("delegate-draft", "other.md"),
+        ] {
+            let evidence = [DelegatedWrite {
+                call_id: call.into(),
+                paths: vec![path.into()],
+            }];
+            assert!(update_with_delegations(
+                Some(p.clone()),
+                &report,
+                &r,
+                std::slice::from_ref(&b),
+                &evidence
+            )
+            .is_err());
+        }
+        let evidence = [DelegatedWrite {
+            call_id: b.call_id.clone(),
+            paths: vec!["weather.md".into()],
+        }];
+        assert!(
+            update_with_delegations(Some(p.clone()), &report, &r, &[], &evidence).is_err(),
+            "没有真实父started不能确认"
+        );
+        r.tools[0].state = "failed".into();
+        assert!(
+            update_with_delegations(
+                Some(p.clone()),
+                &report,
+                &r,
+                std::slice::from_ref(&b),
+                &evidence
+            )
+            .is_err(),
+            "委派失败不能确认子产物"
+        );
+        r.tools[0].state = "completed".into();
+        assert!(update_with_delegations(Some(p), &report, &r, &[b], &evidence).is_ok());
     }
     #[test]
     fn fixed_plan_and_strict_boundaries_prevent_progress_inflation() {

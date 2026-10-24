@@ -111,3 +111,5 @@ conversation.delete调用中性Host::delete_session：先墓碑/失效审批，�
 
 
 T5场景仍用官方commandSchema：expiresAt取本次观察后10秒，timeoutMs=3000，busyPolicy=reject；只接受forwarded回执，不虚构动画完成。交接事件以原tool_started为依据，审批拒绝与前置校验失败不触发工具执行交接。删除后ui.respond未确认仅留短期控制回执，不保留正文或恢复会话。
+
+2026-10-24：按0007第12.3节明确授权冻结fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518，26份来源10变16不变，仅3份实际Schema快照变更。prepare-office原入口核对26份Git blob hash；office.test.mjs新增成员创建/两布局合法非法夹具，真实13项通过。Zod4.6.5字符串长度实际按Unicode码点，name/role沿用ECMAScript trim；80个非BMP字符合法、81个拒绝。Host固定六角色明确拒绝动态添加，不声明创建成功。冻结版本与原8765部署d150b96分开。

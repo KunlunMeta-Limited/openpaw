@@ -477,15 +477,112 @@ async fn budget_exhaustion_ends_turn_gracefully() {
         serde_json::json!({"text": "again"}),
         "looping",
     ));
-    let l = AgentLoop::new(p)
+    let l = AgentLoop::new(p.clone())
         .with_tool_host(echo_tool_host())
         .with_budget(IterationBudget::new(2))
         .with_parallel_tools(false);
     let mut session = Session::new("mock-1", "mock");
     session.messages.push(Message::user_text("go"));
 
-    let (stop, _) = run_simple(&l, &mut session, &[]).await;
+    let (stop, events) = run_simple(&l, &mut session, &[]).await;
     assert!(matches!(stop, Err(openpaw_core::Error::BudgetExhausted(_))));
     // A handful of iterations ran, then the budget (2 + 1 grace) ended it.
     assert!(session.messages.len() < 12, "budget must bound the loop");
+    // 固定额度不能因为无法扩容而被跳过；两次正常额度加一次宽限。
+    assert_eq!(p.call_count(), 3);
+    assert_eq!(session.messages.len(), 7);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            ))
+            .count(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn budget_exhaustion_preserves_exact_elastic_and_zero_limits() {
+    for (name, budget, expected) in [
+        ("elastic", IterationBudget::new_elastic(8, 25, 1), 26),
+        ("grow_from_zero", IterationBudget::new_elastic(0, 3, 1), 4),
+        (
+            "zero_without_grace",
+            IterationBudget::new_elastic(0, 0, 0),
+            0,
+        ),
+        ("zero_with_grace", IterationBudget::new(0), 1),
+        (
+            "fixed_without_grace",
+            IterationBudget::new_elastic(2, 2, 0),
+            2,
+        ),
+    ] {
+        let provider = Arc::new(MockProvider::tool_use(
+            "echo_tool",
+            serde_json::json!({"text": "again"}),
+            "looping",
+        ));
+        let loop_ = AgentLoop::new(provider.clone())
+            .with_tool_host(echo_tool_host())
+            .with_budget(budget)
+            .with_parallel_tools(false);
+        let mut session = Session::new("mock-1", "mock");
+        session.messages.push(Message::user_text("go"));
+
+        let (result, events) = run_simple(&loop_, &mut session, &[]).await;
+        assert!(matches!(result, Err(Error::BudgetExhausted(_))), "{name}");
+        assert_eq!(provider.call_count() as usize, expected, "{name}");
+        assert_eq!(session.messages.len(), 1 + 2 * expected, "{name}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::ToolResult {
+                        is_error: false,
+                        ..
+                    }
+                ))
+                .count(),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn budget_allows_final_reply_within_existing_or_expanded_capacity() {
+    for (name, budget, tool_rounds) in [
+        ("fixed", IterationBudget::new(2), 1),
+        ("elastic", IterationBudget::new_elastic(8, 25, 1), 20),
+    ] {
+        let mut script = vec![
+            MockMode::ToolUse {
+                tool_name: "echo_tool".into(),
+                input: serde_json::json!({"text": "again"}),
+                text: "looping".into(),
+            };
+            tool_rounds
+        ];
+        script.push(MockMode::Fixed("done".into()));
+        let provider = Arc::new(MockProvider::scripted(script));
+        let loop_ = AgentLoop::new(provider.clone())
+            .with_tool_host(echo_tool_host())
+            .with_budget(budget)
+            .with_parallel_tools(false);
+        let mut session = Session::new("mock-1", "mock");
+        session.messages.push(Message::user_text("go"));
+
+        let (result, _) = run_simple(&loop_, &mut session, &[]).await;
+        assert_eq!(result.unwrap(), StopReason::EndTurn, "{name}");
+        assert_eq!(provider.call_count() as usize, tool_rounds + 1, "{name}");
+        assert_eq!(session.messages.len(), 2 + 2 * tool_rounds, "{name}");
+        assert_eq!(session.messages.last().unwrap().text(), "done", "{name}");
+    }
 }

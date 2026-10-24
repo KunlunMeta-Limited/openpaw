@@ -421,7 +421,107 @@ async fn suite() {
     server.shutdown().await.unwrap();
     boundary_cases(tmp.path()).await;
     persistent_turn_cases(tmp.path()).await;
+    history_encoded_byte_budget_pages_without_losing_turns(tmp.path()).await;
     web_cases(tmp.path()).await;
+    unread_http_cases(tmp.path()).await;
+    checkpoint_write_failure_cancels_real_stream_without_success_and_deletion_cannot_revive_it()
+        .await;
+}
+async fn unread_http_cases(base: &std::path::Path) {
+    // 保持真实HTTP响应存活且不消费正文，另外的控制请求仍须能完成和恢复终态。
+    // 本用例不将操作系统缓冲区中尚有空间等同于已强制触发TCP背压。
+    for cancel in [false, true] {
+        let cfg = config(&base.join(format!("unread-http-{cancel}")));
+        let provider: Arc<dyn LlmProvider> = if cancel {
+            Arc::new(Slow)
+        } else {
+            Arc::new(MockProvider::stream_text("可靠文本。".repeat(4000), 200))
+        };
+        let host = Host::with_provider(cfg.clone(), provider).await.unwrap();
+        let server = HostServer::bind(host.clone(), 0).await.unwrap();
+        let url = format!("http://{}", server.address());
+        let client = reqwest::Client::new();
+        let input = request("unread", "不读取订阅正文");
+        let response = post(&client, &url, &input).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let resume = json!({"version":"1.0","type":"resume","teamId":"office-1","conversationId":"unread","turnId":input["turnId"]});
+        let second = post(&client, &url, &resume).send().await.unwrap();
+        assert_eq!(second.status(), 200);
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "unread".into(),
+        };
+        let (before, _) = host.snapshot_and_subscribe(&scope).await.unwrap();
+        assert_eq!(before.runs.len(), 1);
+        if cancel {
+            assert!(!before.runs[0].state.is_terminal());
+            let mut stop = resume.clone();
+            stop["type"] = json!("cancel");
+            let result: Value = tokio::time::timeout(Duration::from_secs(3), async {
+                post(&client, &url, &stop)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap()
+            })
+            .await
+            .expect("未消费的HTTP订阅不得阻塞取消控制请求");
+            assert_eq!(result["data"]["stopped"], true);
+        }
+        let expected = if cancel {
+            RunState::Cancelled
+        } else {
+            RunState::Completed
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let run = host.get_run(&scope, &before.runs[0].run_id).await.unwrap();
+                if run.state == expected {
+                    if !cancel {
+                        assert_eq!(run.text, "可靠文本。".repeat(4000));
+                    }
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("终态持久化不得等待HTTP消费者读取正文");
+        // 两个正文仍未读取时，新HTTP查询必须读到可靠终态。
+        let history =
+            json!({"version":"1.0","type":"history","teamId":"office-1","conversationId":"unread"});
+        let page: Value = post(&client, &url, &history)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["data"]["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            page["data"]["turns"][0]["state"],
+            if cancel { "stopped" } else { "complete" }
+        );
+        drop(response);
+        drop(second);
+        server.shutdown().await.unwrap();
+        drop(host);
+        let reopened = Host::with_provider(cfg, Arc::new(MockProvider::fixed("不得重放")))
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .get_run(&scope, &before.runs[0].run_id)
+                .await
+                .unwrap()
+                .state,
+            expected
+        );
+        reopened.shutdown().await.unwrap();
+    }
 }
 async fn boundary_cases(base: &std::path::Path) {
     let client = reqwest::Client::new();
@@ -709,6 +809,85 @@ async fn persistent_turn_cases(base: &std::path::Path) {
     server.shutdown().await.unwrap();
 }
 
+async fn history_encoded_byte_budget_pages_without_losing_turns(base: &std::path::Path) {
+    let cfg = config(&base.join("history-byte-budget"));
+    // 控制字符序列在JSON中占六倍字节，确保触发传输预算而非仅验证轮次数。
+    let answer = "\u{0001}".repeat(50_000);
+    let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::fixed(answer.clone())))
+        .await
+        .unwrap();
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "byte-budget".into(),
+    };
+    let binding = host.open_session(scope.clone()).await.unwrap();
+    let mut expected = std::collections::BTreeSet::new();
+    for i in 0..50 {
+        let run = host
+            .submit_run(&scope, &binding.session_id, format!("真实轮次{i:02}"))
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        let run = host.get_run(&scope, &run.run_id).await.unwrap();
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(run.text, answer);
+        expected.insert(format!("legacy:{}", run.run_id));
+    }
+    host.shutdown().await.unwrap();
+    let host = Host::with_provider(cfg, Arc::new(MockProvider::fixed("查询不应调用")))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("http://{}", server.address());
+    let mut request = json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"byte-budget","limit":50});
+    let mut seen = std::collections::BTreeSet::new();
+    let mut cursors = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let response = post(&client, &url, &request).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = response.bytes().await.unwrap();
+        assert!(bytes.len() <= 8 * 1024 * 1024);
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let turns = body["data"]["turns"].as_array().unwrap();
+        assert!(!turns.is_empty());
+        if pages == 0 {
+            assert!(turns.len() < 50, "确实触发字节裁剪，不能仅测limit分页");
+        }
+        for turn in turns {
+            assert_eq!(turn["assistant"], answer);
+            assert_eq!(turn["state"], "complete");
+            assert!(
+                seen.insert(turn["id"].as_str().unwrap().to_owned()),
+                "翻页不得重复轮次"
+            );
+        }
+        pages += 1;
+        if body["data"]["hasMore"] == false {
+            assert_eq!(body["data"]["nextCursor"], "");
+            break;
+        }
+        let cursor = body["data"]["nextCursor"].as_str().unwrap().to_owned();
+        assert!(cursors.insert(cursor.clone()), "有后页时游标必须前进");
+        assert!(pages <= 50);
+        request["cursor"] = json!(cursor);
+    }
+    assert_eq!(seen, expected, "重启后字节预算分页保留全部50轮");
+    assert_eq!(
+        host.snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len(),
+        50
+    );
+    server.shutdown().await.unwrap();
+    eprintln!("50个真实完成Run重启后按8MiB编码字节预算分为{pages}页，内容/稳定ID完整且无重复，无新增模型Run");
+}
+
 async fn web_cases(base: &std::path::Path) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -828,4 +1007,91 @@ async fn web_cases(base: &std::path::Path) {
         .unwrap()
         .unwrap();
     server.shutdown().await.unwrap();
+}
+
+struct PartialCheckpoint;
+#[async_trait]
+impl LlmProvider for PartialCheckpoint {
+    async fn complete(&self, req: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
+        MockProvider::fixed("不应走非流入口").complete(req).await
+    }
+    async fn stream(
+        &self,
+        _: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        Ok(futures::stream::iter([
+            Ok(StreamEvent::MessageStart),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "未完成的真实流文本".into(),
+            }),
+        ])
+        .chain(futures::stream::pending())
+        .boxed())
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn name(&self) -> &str {
+        "partial-checkpoint"
+    }
+    fn default_model(&self) -> &str {
+        "partial-checkpoint"
+    }
+}
+async fn checkpoint_write_failure_cancels_real_stream_without_success_and_deletion_cannot_revive_it(
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let host = Host::with_provider(cfg.clone(), Arc::new(PartialCheckpoint))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let client = reqwest::Client::new();
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_display_checkpoint BEFORE UPDATE ON host_runs WHEN json_extract(NEW.data,'$.text') != '' BEGIN SELECT RAISE(ABORT,'injected-checkpoint-write-failure'); END;").unwrap();
+    let response = post(
+        &client,
+        &url,
+        &request("checkpoint-failure", "测试真实流检查点故障"),
+    )
+    .send()
+    .await
+    .unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(6), response.text())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!body
+        .lines()
+        .any(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "done"));
+    assert!(body.contains("error"));
+    host.wait_idle().await;
+    let data: String = db
+        .query_row("SELECT data FROM host_runs", [], |r| r.get(0))
+        .unwrap();
+    let raw: RunView = serde_json::from_str(&data).unwrap();
+    assert_eq!(raw.state, RunState::Failed);
+    assert_eq!(raw.error.unwrap().kind, "storage_unavailable");
+    db.execute_batch("DROP TRIGGER fail_display_checkpoint;")
+        .unwrap();
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "checkpoint-failure".into(),
+    };
+    host.delete_session(&scope).await.unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM host_runs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    server.shutdown().await.unwrap();
+    let host = Host::start(cfg).await.unwrap();
+    assert_eq!(
+        host.open_session(scope).await.unwrap_err().kind,
+        "session_deleted"
+    );
+    host.shutdown().await.unwrap();
 }

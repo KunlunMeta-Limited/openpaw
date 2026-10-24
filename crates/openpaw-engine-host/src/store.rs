@@ -146,7 +146,7 @@ impl Db {
     /// 状态：只读，不为旧Run补造计划。
     /// 并发与取消：由原单写Store串行调用，无资源锁。
     /// 权限：校验Run和Session删除门禁。
-    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn progress(&self, run: &str) -> HostResult<Option<serde_json::Value>> {
         let view = self.get_run(run)?;
         self.binding(&view.session_id)?;
@@ -162,7 +162,7 @@ impl Db {
     /// 状态：每Run最多256次有效报告，原host_events保留固定分母和证据。
     /// 并发与取消：状态检查和追加处于原Store单写命令，不等待审批或工作区锁。
     /// 权限：仅Office绑定的同Run report_progress，不批准其他工具。
-    /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
+    /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn report_progress(
         &mut self,
         binding: &openpaw_core::ToolCallBinding,
@@ -190,17 +190,23 @@ impl Db {
                     .map_err(HostError::storage)?,
             );
         }
-        let next = crate::task_progress::update(previous.clone(), value, &run, &started).map_err(
-            |mut error| {
-                if error.kind == "invalid_progress" {
-                    // 拒绝仍是拒绝；仅提供可恢复的本轮证据标识，不替模型选择或确认完成。
-                    error
-                        .message
-                        .push_str(&crate::task_progress::recovery_hint(&run, &started));
-                }
+        let delegated = self.delegated_writes(&run.run_id)?;
+        let next = crate::task_progress::update_with_delegations(
+            previous.clone(),
+            value,
+            &run,
+            &started,
+            &delegated,
+        )
+        .map_err(|mut error| {
+            if error.kind == "invalid_progress" {
+                // 拒绝仍是拒绝；仅提供可恢复的本轮证据标识，不替模型选择或确认完成。
                 error
-            },
-        )?;
+                    .message
+                    .push_str(&crate::task_progress::recovery_hint(&run, &started));
+            }
+            error
+        })?;
         if previous.as_ref() == Some(&next) {
             return Ok(());
         }
@@ -447,19 +453,11 @@ impl Db {
             .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
         let events = self.events(&run.session_id)?;
         let mut active = false;
-        let mut text = RunText::default();
+        let text = committed_run_text(&events, id);
         let mut tools = std::collections::BTreeMap::new();
         for e in events {
             match e {
                 SessionEvent::RunStarted { run_id } => active = run_id == id,
-                SessionEvent::Message(m) if active && m.role == openpaw_core::Role::Assistant => {
-                    for block in m.content {
-                        if let openpaw_core::ContentBlock::Text { text: t } = block {
-                            text.append(&t);
-                        }
-                    }
-                    text.end_message();
-                }
                 SessionEvent::ToolCallStart { call_id, tool_name } if active => {
                     tools.insert(
                         call_id.clone(),
@@ -519,21 +517,91 @@ impl Db {
             }
         }
         run.tools = tools.into_values().collect();
+        // 检查点只补足与可靠账本相符的展示尾部；不将它恢复为模型消息。
+        if run.text.len() > 4 * 1024 * 1024 {
+            return Err(HostError::new(
+                "storage_unavailable",
+                "展示检查点超过原有上限",
+            ));
+        }
+        let checkpoint = std::mem::take(&mut run.text);
+        let checkpoint_truncated = run.text_truncated;
+        run.text = text.text().to_owned();
+        run.text_truncated = false;
+        merge_run_display(&mut run, &checkpoint, checkpoint_truncated)?;
         if !run.state.is_terminal() {
             if let Some(live) = self.live.lock().unwrap_or_else(|e| e.into_inner()).get(id) {
-                if live.text().len() >= text.text().len() {
-                    run.text = live.text().to_owned();
-                    run.text_truncated = live.truncated();
-                } else {
-                    run.text = text.text().to_owned();
-                }
-            } else {
-                run.text = text.text().to_owned();
+                merge_run_display(&mut run, live.text(), live.truncated())?;
             }
-        } else {
-            run.text = text.text().to_owned();
         }
         Ok(run)
+    }
+    /// 功能：将本Run的有界实时展示尾部合并保存到既有元数据。
+    /// 参数：id和session为已接受运行的精确身份。
+    /// 返回：检查点写入或无变化、已结束、已删除时成功。
+    /// 错误：SQL失败或展示前缀与可靠账本冲突时明确报错。
+    /// 状态：只UPDATE既存Run，不新增消息；完整消息已提交时清除冗余尾部。
+    /// 并发与取消：原单写线程串行执行；删除墓碑后无操作，不复活会话。
+    /// 权限：同时核对Run、Session和存活作用域，不接收客户端正文。
+    /// 关联：需求/设计REQ-OP-009、REQ-OP-016；DES-OP-006。
+    pub(crate) fn checkpoint_run(&mut self, id: &str, session: &str) -> HostResult<()> {
+        let data: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM host_runs WHERE id=?1 AND session=?2",
+                params![id, session],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        let Some(data) = data else {
+            return Ok(());
+        };
+        let mut run: RunView = serde_json::from_str(&data).map_err(HostError::storage)?;
+        match self.binding(session) {
+            Ok(_) => {}
+            Err(e) if matches!(e.kind.as_str(), "session_deleted" | "not_found") => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        if run.state.is_terminal() {
+            return Ok(());
+        }
+        let (live, truncated) = {
+            let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(live) = live.get(id) else {
+                return Ok(());
+            };
+            (live.text().to_owned(), live.truncated())
+        };
+        let ledger = committed_run_text(&self.events(session)?, id);
+        let mut display = run.clone();
+        display.text = ledger.text().to_owned();
+        display.text_truncated = false;
+        merge_run_display(&mut display, &run.text, run.text_truncated)?;
+        merge_run_display(&mut display, &live, truncated)?;
+        // 仅保留未提交的尾部展示快照；账本追上后不用重复存完整回复。
+        let next = if display.text.len() > ledger.text().len() {
+            display.text
+        } else {
+            String::new()
+        };
+        let next_truncated = truncated && !next.is_empty();
+        if next.len() > 4 * 1024 * 1024 {
+            return Err(HostError::new(
+                "storage_unavailable",
+                "展示检查点超过原有上限",
+            ));
+        }
+        if run.text == next && run.text_truncated == next_truncated {
+            return Ok(());
+        }
+        run.text = next;
+        run.text_truncated = next_truncated;
+        self.conn.execute(
+            "UPDATE host_runs SET data=?3 WHERE id=?1 AND session=?2 AND EXISTS(SELECT 1 FROM host_bindings WHERE id=?2) AND NOT EXISTS(SELECT 1 FROM host_session_deletions WHERE session=?2)",
+            params![id, session, serde_json::to_string(&run).map_err(HostError::storage)?],
+        ).map_err(HostError::storage)?;
+        Ok(())
     }
     /// 功能：原子保存Run状态与生命周期revision。
     /// 参数：run为新视图，offset为原输入事件位置。
@@ -573,6 +641,18 @@ impl Db {
         {
             run.state = RunState::Cancelling;
         }
+        let checkpoint: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM host_runs WHERE id=?1 AND session=?2",
+                params![run.run_id, run.session_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        let checkpoint: Option<RunView> = checkpoint
+            .map(|v| serde_json::from_str(&v).map_err(HostError::storage))
+            .transpose()?;
         // 状态与revision同一SQLite事务，发布永远在提交之后。
         let tx = self.conn.transaction().map_err(HostError::storage)?;
         tx.execute(
@@ -582,7 +662,11 @@ impl Db {
         .map_err(HostError::storage)?;
         run.revision = tx.last_insert_rowid() as u64;
         let mut persisted = run.clone();
-        persisted.text.clear();
+        persisted.text = checkpoint
+            .as_ref()
+            .map(|v| v.text.clone())
+            .unwrap_or_default();
+        persisted.text_truncated = checkpoint.is_some_and(|v| v.text_truncated);
         persisted.tools.clear();
         tx.execute("INSERT INTO host_runs(id,session,data,input_event_offset) VALUES(?1,?2,?3,?4) ON CONFLICT(id) DO UPDATE SET data=excluded.data",params![run.run_id,run.session_id,serde_json::to_string(&persisted).map_err(HostError::storage)?,offset]).map_err(HostError::storage)?;
         if let Some((key, canonical)) = request {
@@ -1023,6 +1107,7 @@ impl Db {
         for (scope, session) in pending {
             self.purge_session(&scope, &session)?;
         }
+        self.validate_agent_metadata()?;
         self.conn
             .execute(
                 "UPDATE host_office_decisions SET state='expired' WHERE state='active'",
@@ -1133,7 +1218,7 @@ impl Db {
     /// 状态：只读墓碑，禁止旧ID重新创建。
     /// 并发与取消：单写序列，与接受和删除原子排序。
     /// 权限：不将ID当认证凭据。
-    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
     pub(crate) fn check_live_scope(&self, scope: &ClientScope) -> HostResult<()> {
         if self.deletion(scope)?.is_some() {
             return Err(HostError::new(
@@ -1150,7 +1235,7 @@ impl Db {
     /// 状态：不包含正文、输入或输出。
     /// 并发与取消：单写线程只读。
     /// 权限：精确范围查找。
-    /// 关联：REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn deletion(&self, scope: &ClientScope) -> HostResult<Option<DeleteView>> {
         let key = serde_json::to_string(scope).map_err(HostError::storage)?;
         self.conn
@@ -1174,7 +1259,7 @@ impl Db {
     /// 状态：先保存墓碑再取消；重复调用不新建会话。
     /// 并发与取消：单写排序；不等待网络或运行清理。
     /// 权限：仅目标范围，不修改工作区文件。
-    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
     pub(crate) fn begin_delete(&mut self, scope: &ClientScope) -> HostResult<DeleteView> {
         if let Some(v) = self.deletion(scope)? {
             return Ok(v);
@@ -1195,6 +1280,9 @@ impl Db {
                 ],
             )
             .map_err(HostError::storage)?;
+        for child in self.owned_child_sessions(&binding.session_id)? {
+            self.begin_delete(&child.scope)?;
+        }
         for mut a in self.approvals()? {
             if self
                 .runs()?
@@ -1230,7 +1318,7 @@ impl Db {
     /// 状态：先移除账本和派生正文，最后保留最小墓碑；不回滚副作用。
     /// 并发与取消：只在目标Run完成清理后调用；恢复时先于writer打开。
     /// 权限：只删除本会话及自动损尾备份，保留项目和用户备份。
-    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
     pub(crate) fn purge_session(&mut self, scope: &str, session: &str) -> HostResult<()> {
         let phase: String = self
             .conn
@@ -1244,6 +1332,13 @@ impl Db {
             return Ok(());
         }
         self.conn.execute("UPDATE host_session_deletions SET phase='purging' WHERE scope=?1 AND phase!='deleted'",[scope]).map_err(HostError::storage)?;
+        for child in self.owned_child_sessions(session)? {
+            let deletion = self.begin_delete(&child.scope)?;
+            if deletion.phase != "deleted" {
+                let key = serde_json::to_string(&child.scope).map_err(HostError::storage)?;
+                self.purge_session(&key, &child.session_id)?;
+            }
+        }
         self.writers.remove(session);
         let path = self.path(session)?;
         let remove = |path: &std::path::Path| match std::fs::remove_file(path) {
@@ -1370,7 +1465,7 @@ impl Db {
     /// 参数：run为当前运行ID。
     /// 返回：调用ID到原计划步骤下标的映射；没有计划的调用由投影归主目标。
     /// 错误：SQL或已存计划/执行绑定损坏。
-    /// 状态：只读重建，不新增另一套调用或动画账本。
+    /// 状态：只读重建；无开始步骤的委派可由后续已校验完成证据补关联，已有绑定不移动。
     /// 并发与取消：在原Store序列内按revision读取，无网络或资源锁。
     /// 权限：只使用同Run的已存计划和实际tool_started事实。
     /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
@@ -1386,6 +1481,7 @@ impl Db {
             .map_err(HostError::storage)?;
         let mut current = None;
         let mut assignments = std::collections::BTreeMap::new();
+        let mut unassigned_delegations = std::collections::BTreeSet::new();
         for row in rows {
             let (kind, raw) = row.map_err(HostError::storage)?;
             let v: serde_json::Value = serde_json::from_str(&raw).map_err(HostError::storage)?;
@@ -1393,8 +1489,23 @@ impl Db {
                 current = v["steps"]
                     .as_array()
                     .and_then(|steps| steps.iter().position(|s| s["state"] == "in_progress"));
-            } else if let (Some(index), Some(call)) = (current, v["call_id"].as_str()) {
-                assignments.insert(call.to_owned(), index);
+                // 模型可能漏报开始；仅用原校验通过的准确证据补未关联委派，不按标题猜。
+                // 普通工具及已有开始绑定保持原位，避免进度更新重播历史动画。
+                for (index, step) in v["steps"].as_array().into_iter().flatten().enumerate() {
+                    for call in step["evidenceCallIds"].as_array().into_iter().flatten() {
+                        if let Some(call) = call.as_str() {
+                            if unassigned_delegations.remove(call) {
+                                assignments.entry(call.to_owned()).or_insert(index);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(call) = v["call_id"].as_str() {
+                if let Some(index) = current {
+                    assignments.insert(call.to_owned(), index);
+                } else if v["tool_name"] == "delegate_task" {
+                    unassigned_delegations.insert(call.to_owned());
+                }
             }
         }
         Ok(assignments)
@@ -1472,7 +1583,7 @@ impl Db {
     /// 状态：清除过期元数据，每会话最多64个导航。
     /// 并发与取消：单写序列提交后才分派。
     /// 权限：上下文不保存消息正文或凭据。
-    /// 关联：REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn office_action(
         &self,
         id: &str,
@@ -1516,7 +1627,7 @@ impl Db {
     /// 状态：不重置期限。
     /// 并发与取消：只读单写队列。
     /// 权限：跨会话不可复用按钮。
-    /// 关联：REQ-OP-014；API-OFFICE-UI。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-014；API-OFFICE-UI。 需求/设计REQ-OP-014。
     pub(crate) fn office_navigation(
         &self,
         id: &str,
@@ -1537,7 +1648,7 @@ impl Db {
     /// 状态：新尝试覆盖旧展示ID，期限不延长。
     /// 并发与取消：单写序列。
     /// 权限：不保存另一份批准或输入正文。
-    /// 关联：REQ-OP-013；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-013；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn office_decision(
         &self,
         approval: &str,
@@ -1573,7 +1684,7 @@ impl Db {
     /// 状态：不保存正文，不在重启时重投。
     /// 并发与取消：单写序列，无网络等待。
     /// 权限：仅Office适配器内部。
-    /// 关联：REQ-OP-015；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
+    /// 关联：需求/设计REQ-OP-015；DAT-HOST-INTERACTION。 需求/设计REQ-OP-014。
     pub(crate) fn office_scene(
         &self,
         event: &str,
@@ -1630,12 +1741,448 @@ impl Db {
     }
 }
 
+impl Db {
+    /// 功能：从原控制事件读取并验证一个父Run的持久委派引用。
+    /// 参数：parent为真实父Run ID。
+    /// 返回：按派发顺序的版本1引用；正文仍从JSONL查询。
+    /// 错误：未知版本、父子范围/根不一致或数据库错误。
+    /// 状态：只读，不从意图恢复执行。
+    /// 并发与取消：在原单写Store序列内读取。
+    /// 权限：必须先由调用方验证父scope；子绑定逐字段核对。
+    /// 关联：需求/设计REQ-OP-022/023；DES-OP-012。
+    pub(crate) fn delegations(
+        &self,
+        parent: &str,
+    ) -> HostResult<Vec<crate::orchestration::Delegation>> {
+        let mut stmt = self.conn.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([parent], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let mut result = Vec::new();
+        for row in rows {
+            let d: crate::orchestration::Delegation =
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+            let owner = self.binding(&d.parent_session)?;
+            let child = self.binding(&d.child_session)?;
+            if d.version != 1
+                || d.run_id != parent
+                || owner.scope != d.parent_scope
+                || owner.scope.namespace != "office"
+                || self.get_run(parent)?.session_id != d.parent_session
+                || child.scope != d.child_scope
+                || child.scope.namespace != "host-agent"
+                || child.scope.slot_id != owner.scope.slot_id
+                || child.root_id != owner.root_id
+                || crate::agents::role(&d.role_id).is_none()
+                || d.role_id == "lead"
+            {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "持久委派版本或所属关系不合法",
+                ));
+            }
+            result.push(d);
+        }
+        Ok(result)
+    }
+    /// 功能：可靠保存新的委派控制意图，通知现有投影订阅者。
+    /// 参数：d为原Store序列内生成的可信父子引用。
+    /// 返回：保存成功。
+    /// 错误：数据库或序列化错误。
+    /// 状态：先于子Run接受保存，不复制子消息或工具结果。
+    /// 并发与取消：原Store串行，不另建任务数据库。
+    /// 权限：仅共享编排入口可调用，客户端不能提交引用。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn save_delegation(&self, d: &crate::orchestration::Delegation) -> HostResult<()> {
+        let rev = self.bump(
+            "agent_delegation",
+            &serde_json::to_string(d).map_err(HostError::storage)?,
+        )?;
+        self.publish(rev);
+        Ok(())
+    }
+    /// 功能：将一个真实子Run解析回唯一且仍有效的Office父会话。
+    /// 参数：child为实际子Run ID。
+    /// 返回：可信所属引用，普通Run返回无。
+    /// 错误：关联损坏、范围失效或存储错误。
+    /// 状态：只读，不创建绑定或改变原审批ID。
+    /// 并发与取消：原单写序列内校验，删除后不能再解析。
+    /// 权限：核对完整父子namespace/team/conversation/root，不按字符串前缀授权。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn delegation_for_child(
+        &self,
+        child: &str,
+    ) -> HostResult<Option<crate::orchestration::Delegation>> {
+        let parent:Option<String> = self.conn.query_row("SELECT json_extract(reference,'$.run_id') FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.child_run')=?1",[child],|r|r.get(0)).optional().map_err(HostError::storage)?;
+        match parent {
+            None => Ok(None),
+            Some(parent) => {
+                let d = self
+                    .delegations(&parent)?
+                    .into_iter()
+                    .find(|d| d.child_run == child)
+                    .ok_or_else(|| HostError::new("scope_denied", "子运行不属于当前主任务"))?;
+                self.check_live_scope(&d.parent_scope)?;
+                let run = self.get_run(child)?;
+                if run.session_id != d.child_session {
+                    return Err(HostError::new("scope_denied", "子运行与所属会话不符"));
+                }
+                Ok(Some(d))
+            }
+        }
+    }
+}
+
+impl Db {
+    /// 功能：将准确待审Run解析为原范围或已验证后代的准确子范围。
+    /// 参数：scope为请求方完整范围，run为审批真实Run ID。
+    /// 返回：最后原check_scope应使用的准确范围。
+    /// 错误：未知、跨父会话或篡改所属一律scope_denied。
+    /// 状态：不修改审批、版本、期限或输入绑定。
+    /// 并发与取消：原Store串行，父删除先检查墓碑。
+    /// 权限：父授权仅覆盖其持久登记后代，不按team或runId猜授权。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn approval_scope(&self, scope: &ClientScope, run: &str) -> HostResult<ClientScope> {
+        self.check_live_scope(scope)?;
+        let current = self.get_run(run)?;
+        let binding = self.binding(&current.session_id)?;
+        if binding.scope == *scope {
+            return Ok(scope.clone());
+        }
+        let d = self
+            .delegation_for_child(run)?
+            .filter(|d| d.parent_scope == *scope)
+            .ok_or_else(|| HostError::new("scope_denied", "审批不属于此会话或其真实子任务"))?;
+        crate::service::check_scope(&binding, &d.child_scope)?;
+        Ok(d.child_scope)
+    }
+}
+
+impl Db {
+    /// 功能：在删除及恢复阶段解析父会话仍残留的子账本引用。
+    /// 参数：session为已有删除墓碑的父会话或当前删除目标。
+    /// 返回：尚有绑定的可信子会话；已经清除的子项不再重复删除。
+    /// 错误：版本、父子范围和根不一致拒绝继续清除。
+    /// 状态：只读控制引用；允许读取墓碑中的父身份但不授予查询权限。
+    /// 并发与取消：仅原Store删除序列，活动工具清理由Host先等待。
+    /// 权限：逐字段校验父子绑定，绝不按任意路径删除工作区。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    fn owned_child_sessions(&self, session: &str) -> HostResult<Vec<SessionBinding>> {
+        let bindings = self.bindings()?;
+        let Some(parent) = bindings.iter().find(|b| b.session_id == session) else {
+            return Ok(Vec::new());
+        };
+        let mut stmt=self.conn.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.parent_session')=?1").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([session], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let mut children = Vec::new();
+        for row in rows {
+            let d: crate::orchestration::Delegation =
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+            if d.version != 1
+                || parent.scope != d.parent_scope
+                || d.child_scope.namespace != "host-agent"
+                || d.child_scope.slot_id != parent.scope.slot_id
+            {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "删除阶段的父子引用不合法",
+                ));
+            }
+            if let Some(child) = bindings.iter().find(|b| b.session_id == d.child_session) {
+                if child.scope != d.child_scope || child.root_id != parent.root_id {
+                    return Err(HostError::new("scope_denied", "子会话范围或根不一致"));
+                }
+                children.push(child.clone());
+            } else if self
+                .deletion(&d.child_scope)?
+                .is_none_or(|v| v.phase != "deleted")
+            {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "子账本引用丢失，拒绝猜测删除",
+                ));
+            }
+        }
+        Ok(children)
+    }
+}
+
+impl Db {
+    /// 功能：启动时拒绝未知版本或所属损坏的协作控制引用。
+    /// 参数：self为已先恢复删除墓碑的原数据库。
+    /// 返回：全部协作引用可被当前版本准确解释。
+    /// 错误：未知版本、丢失主组、伪造父子绑定或SQL故障。
+    /// 状态：不重放意图，不恢复执行，不复制模型消息。
+    /// 并发与取消：启动单写阶段执行，尚未接受客户端请求。
+    /// 权限：以原绑定/Run逐字段验证，不以模型角色或ID前缀授权。
+    /// 关联：需求/设计REQ-OP-009/022；DES-OP-012。
+    fn validate_agent_metadata(&self) -> HostResult<()> {
+        let mut query = self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('agent_group','agent_delegation','agent_budget') ORDER BY revision").map_err(HostError::storage)?;
+        let rows = query
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(HostError::storage)?;
+        let mut groups = std::collections::BTreeSet::new();
+        let mut delegated = std::collections::BTreeSet::new();
+        for row in rows {
+            let (kind, raw) = row.map_err(HostError::storage)?;
+            let value: serde_json::Value =
+                serde_json::from_str(&raw).map_err(HostError::storage)?;
+            let parent = value["run_id"]
+                .as_str()
+                .ok_or_else(|| HostError::new("storage_unavailable", "协作元数据缺少父Run"))?;
+            if value["version"] != 1 {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "不支持的协作元数据版本",
+                ));
+            }
+            let run = self.get_run(parent)?;
+            let owner = self.binding(&run.session_id)?;
+            if owner.scope.namespace != "office" {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "协作主Run不属于Office绑定",
+                ));
+            }
+            if kind == "agent_group" {
+                let scope: ClientScope =
+                    serde_json::from_value(value["scope"].clone()).map_err(HostError::storage)?;
+                let config: crate::AgentsConfig =
+                    serde_json::from_value(value["config"].clone()).map_err(HostError::storage)?;
+                if scope != owner.scope || !config.enabled || !groups.insert(parent.to_owned()) {
+                    return Err(HostError::new(
+                        "storage_unavailable",
+                        "协作主组绑定损坏或重复",
+                    ));
+                }
+            } else {
+                if !groups.contains(parent) {
+                    return Err(HostError::new(
+                        "storage_unavailable",
+                        "协作引用缺少先前可靠主组",
+                    ));
+                }
+                if kind == "agent_delegation" {
+                    delegated.insert(parent.to_owned());
+                }
+            }
+        }
+        for parent in delegated {
+            let mut calls = std::collections::BTreeSet::new();
+            let mut sessions = std::collections::BTreeSet::new();
+            let mut runs = std::collections::BTreeSet::new();
+            for d in self.delegations(&parent)? {
+                if !calls.insert(d.call_id)
+                    || !sessions.insert(d.child_session.clone())
+                    || !runs.insert(d.child_run.clone())
+                {
+                    return Err(HostError::new("storage_unavailable", "协作子引用重复"));
+                }
+                match self.get_run(&d.child_run) {
+                    Ok(run) if run.session_id == d.child_session => {}
+                    Err(e) if e.kind == "not_found" => {} // 已保存意图但未接受，不自动重放。
+                    _ => {
+                        return Err(HostError::new(
+                            "storage_unavailable",
+                            "协作子Run与会话不匹配",
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// 功能：校验重试委派与原持久最终输入完全一致。
+    /// 参数：binding为当前可信工具上下文。
+    /// 返回：原绑定相同才允许读取原子任务结果。
+    /// 错误：缺失绑定、损坏记录或输入冲突。
+    /// 状态：只读，不创建第二个子Run。
+    /// 并发与取消：在原Store单写序列执行，不等待模型。
+    /// 权限：逐字段比较Run、call、工具及完整输入，不以摘要代替。
+    /// 关联：需求/设计REQ-OP-022；DES-OP-012。
+    pub(crate) fn check_delegation_input(
+        &self,
+        binding: &openpaw_core::ToolCallBinding,
+    ) -> HostResult<()> {
+        let original: String = self.conn.query_row("SELECT reference FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.call_id')=?2 ORDER BY revision LIMIT 1", params![&binding.run_id,&binding.call_id], |r|r.get(0)).map_err(HostError::storage)?;
+        let original: openpaw_core::ToolCallBinding =
+            serde_json::from_str(&original).map_err(HostError::storage)?;
+        if original != *binding {
+            return Err(HostError::new(
+                "request_conflict",
+                "同一委派调用不能替换原最终输入",
+            ));
+        }
+        Ok(())
+    }
+    /// 功能：从父委派的真实成功子Run提取有范围的文件写入证据。
+    /// 参数：parent为已校验Office主Run ID。
+    /// 返回：准确父call到其已成功子写路径，不返回正文或伪造父工具记录。
+    /// 错误：损坏所属、子Run查询和存储错误。
+    /// 状态：只读原Run及原tool_started，失败/未接受子不提供成功证据。
+    /// 并发与取消：原Store单写序列读取，与进度提交一致。
+    /// 权限：先验证父子完整绑定；只有同子Run成功且实际开始的写工具可用。
+    /// 关联：需求/设计REQ-OP-022/023；DES-OP-012。
+    fn delegated_writes(
+        &self,
+        parent: &str,
+    ) -> HostResult<Vec<crate::task_progress::DelegatedWrite>> {
+        let mut result = Vec::new();
+        for d in self.delegations(parent)? {
+            let child = match self.get_run(&d.child_run) {
+                Ok(r) => r,
+                Err(e) if e.kind == "not_found" => continue,
+                Err(e) => return Err(e),
+            };
+            if child.state != RunState::Completed {
+                continue;
+            }
+            let mut query=self.conn.prepare("SELECT reference FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1").map_err(HostError::storage)?;
+            let rows = query
+                .query_map([&d.child_run], |r| r.get::<_, String>(0))
+                .map_err(HostError::storage)?;
+            let mut paths = Vec::new();
+            for row in rows {
+                let b: openpaw_core::ToolCallBinding =
+                    serde_json::from_str(&row.map_err(HostError::storage)?)
+                        .map_err(HostError::storage)?;
+                if b.run_id == d.child_run
+                    && matches!(b.tool_name.as_str(), "write_file" | "edit_file")
+                    && child.tools.iter().any(|t| {
+                        t.call_id == b.call_id
+                            && t.tool_name == b.tool_name
+                            && t.state == "completed"
+                    })
+                {
+                    if let Some(path) = b
+                        .input
+                        .get("path")
+                        .or_else(|| b.input.get("file_path"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        paths.push(path.to_owned());
+                    }
+                }
+            }
+            result.push(crate::task_progress::DelegatedWrite {
+                call_id: d.call_id,
+                paths,
+            });
+        }
+        Ok(result)
+    }
+}
+
+// 与实时RunText使用相同消息分隔规则；这里只投影原事实，不解析第二种消息格式。
+fn committed_run_text(events: &[SessionEvent], id: &str) -> RunText {
+    let mut active = false;
+    let mut text = RunText::default();
+    for event in events {
+        match event {
+            SessionEvent::RunStarted { run_id } => active = run_id == id,
+            SessionEvent::Message(message)
+                if active && message.role == openpaw_core::Role::Assistant =>
+            {
+                for block in &message.content {
+                    if let openpaw_core::ContentBlock::Text { text: chunk } = block {
+                        text.append(chunk);
+                    }
+                }
+                text.end_message();
+            }
+            _ => {}
+        }
+    }
+    text
+}
+fn merge_run_display(run: &mut RunView, candidate: &str, truncated: bool) -> HostResult<()> {
+    if run.text.starts_with(candidate) {
+        if run.text.len() == candidate.len() {
+            run.text_truncated |= truncated;
+        }
+    } else if candidate.starts_with(&run.text) {
+        run.text = candidate.to_owned();
+        run.text_truncated = truncated;
+    } else {
+        return Err(HostError::new(
+            "storage_unavailable",
+            "展示检查点与可靠账本前缀不一致",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod office_regressions {
     use super::*;
     use crate::{ClientScope, Host, HostConfig};
     use openpaw_core::{Message, Role};
     use serde_json::json;
+    #[tokio::test]
+    async fn stream_checkpoint_is_bounded_scoped_prefix_only_and_never_revives_deleted_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "checkpoint".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let session = binding.session_id.clone();
+        host.inner.store.call(move |db| {
+            let offset=db.events(&session)?.len();
+            db.append(&session,SessionEvent::Message(Message::user_text("输入")))?;
+            db.append(&session,SessionEvent::RunStarted{run_id:"checkpoint-run".into()})?;
+            let run=RunView{run_id:"checkpoint-run".into(),session_id:session.clone(),state:RunState::Running,revision:0,text:String::new(),tools:vec![],error:None,text_truncated:false};
+            db.save_run(run,offset)?;
+            let mut buffer=RunText::bounded(4*1024*1024);buffer.append("可靠前缀");
+            db.live.lock().unwrap().insert("checkpoint-run".into(),buffer);
+            db.checkpoint_run("checkpoint-run","wrong-session")?;
+            assert!(db.runs()?.iter().find(|r|r.run_id=="checkpoint-run").unwrap().text.is_empty());
+            db.checkpoint_run("checkpoint-run",&session)?;
+            let raw=db.runs()?.into_iter().find(|r|r.run_id=="checkpoint-run").unwrap();
+            assert_eq!(raw.text,"可靠前缀");
+            // 相同内容不执行UPDATE：触发器证明不会每秒重写不变检查点。
+            db.conn.execute_batch("CREATE TRIGGER checkpoint_failure BEFORE UPDATE ON host_runs BEGIN SELECT RAISE(ABORT,'checkpoint-write-failure'); END;").map_err(HostError::storage)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            db.live.lock().unwrap().get_mut("checkpoint-run").unwrap().append("，尚未完成");
+            assert_eq!(db.checkpoint_run("checkpoint-run",&session).unwrap_err().kind,"storage_unavailable");
+            db.conn.execute_batch("DROP TRIGGER checkpoint_failure;").map_err(HostError::storage)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            // 已提交的assistant消息追上后清冗余，不用检查点替代JSONL。
+            db.append(&session,SessionEvent::Message(Message::assistant_text("可靠前缀，尚未完成")))?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            assert!(db.runs()?.iter().find(|r|r.run_id=="checkpoint-run").unwrap().text.is_empty());
+            assert_eq!(db.get_run("checkpoint-run")?.text,"可靠前缀，尚未完成");
+            let mut bad=RunText::bounded(4*1024*1024);bad.append("与原账本不符");
+            db.live.lock().unwrap().insert("checkpoint-run".into(),bad);
+            assert!(db.checkpoint_run("checkpoint-run",&session).is_err());
+            db.live.lock().unwrap().remove("checkpoint-run");
+            // 持久损坏也拒绝；不能因为live缺席就把任意文字当可信历史。
+            let mut corrupt=db.runs()?.into_iter().find(|r|r.run_id=="checkpoint-run").unwrap();corrupt.text="损坏".into();
+            db.conn.execute("UPDATE host_runs SET data=?1 WHERE id='checkpoint-run'",[serde_json::to_string(&corrupt).unwrap()]).map_err(HostError::storage)?;
+            assert!(db.get_run("checkpoint-run").is_err());
+            corrupt.text="x".repeat(4*1024*1024+1);
+            db.conn.execute("UPDATE host_runs SET data=?1 WHERE id='checkpoint-run'",[serde_json::to_string(&corrupt).unwrap()]).map_err(HostError::storage)?;
+            assert!(db.get_run("checkpoint-run").is_err());
+            corrupt.text.clear();corrupt.state=RunState::Interrupted;
+            db.conn.execute("UPDATE host_runs SET data=?1 WHERE id='checkpoint-run'",[serde_json::to_string(&corrupt).unwrap()]).map_err(HostError::storage)?;
+            db.begin_delete(&binding.scope)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            db.purge_session(&serde_json::to_string(&binding.scope).unwrap(),&session)?;
+            db.checkpoint_run("checkpoint-run",&session)?;
+            assert!(db.runs()?.is_empty()); assert!(db.binding(&session).is_err());
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn failed_acceptance_offset_does_not_claim_later_user_input() {
         let temp = tempfile::tempdir().unwrap();

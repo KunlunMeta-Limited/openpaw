@@ -1,6 +1,7 @@
 // Product acceptance only: real Host + frozen Office + independent Chromium.
 // The local OpenAI fixture is a deterministic Provider, never a chat bridge.
 import assert from 'node:assert/strict'
+import { teamProduct, networkProduct, storageProduct } from './office-resilience.mjs'
 import { createHash, randomBytes } from 'node:crypto'
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer } from 'node:http'
@@ -30,6 +31,8 @@ const report = { startedAt: new Date().toISOString(), platform: process.platform
 const processes = []
 let browser, context, providerServer, page, webFixtureServer, webBase
 const webFixture = { requests: [], active: 0, cancelled: 0 }
+const teamGates = new Map()
+let networkGate
 const delay = ms => new Promise(r => setTimeout(r, ms))
 async function waitFor(fn, timeout = 30000) {
   const deadline = Date.now() + timeout
@@ -89,6 +92,22 @@ function provider() {
       const lastUser = data.messages.findLastIndex(m => m.role === 'user')
       const prompt = data.messages[lastUser]?.content ?? ''
       const results = data.messages.slice(lastUser + 1).filter(m => m.role === 'tool')
+      const role=['lead','research','organize','draft','review','audit'].find(role=>data.messages.some(m=>m.role==='system'&&m.content.includes('（'+role+'）')))
+      if(role&&role!=='lead') {
+        if(!results.length) {
+          await new Promise(resolve=>teamGates.set(role,resolve))
+          finish({content:'正在核查本角色资料。',tool_calls:[{index:0,id:'team-read-'+role,type:'function',function:{name:'read_file',arguments:JSON.stringify({path:'README.md'})}}]},'tool_calls');return
+        }
+        assert.ok(results[0].content.includes('README-'))
+        finish({content:role+'：已根据真实README读取完成独立核查。'});return
+      }
+      if(prompt==='T6真实五人协作') {
+        assert.equal(role,'lead');assert.ok(data.tools.some(t=>t.function.name==='delegate_task'))
+        const roles=['research','organize','draft','review','audit'];const names=['李研','周理','陈书','刘市','赵审']
+        if(results.length<roles.length) {const n=results.length;finish({content:'',tool_calls:[{index:0,id:'delegate-'+roles[n],type:'function',function:{name:'delegate_task',arguments:JSON.stringify({role_id:roles[n],title:names[n]+'核对项目说明',instructions:'读取README.md，核对项目说明并报告本角色的真实依据和限制',acceptance:'必须有本子会话的真实读取与独立答复'})}}]},'tool_calls');return}
+        assert.ok(results.every(r=>JSON.parse(r.content.split('\n\n[Host执行回执]')[0]).state==='completed'))
+        finish({content:'T6五个独立角色核查完成，均有真实独立Run和文件读取。'});return
+      }
       if (prompt==='今天是几号') {
         assert.equal(data.messages[lastUser-1]?.role,'system')
         const current=data.messages[lastUser-1].content.match(/Host local time: ([^\n]+)/)?.[1]
@@ -183,6 +202,12 @@ function provider() {
         finish({content:'T5工具结果：'+writeResult.content});return
       }
       if (prompt.includes('MODEL-ERROR')) { res.writeHead(401); res.end('controlled authentication failure'); return }
+      if (prompt==='T6主动断网续接') {
+        res.writeHead(200,{'content-type':'text/event-stream'});
+        const chunk=text=>res.write('data: '+JSON.stringify({choices:[{index:0,delta:{content:text},finish_reason:null}]})+'\n\n');
+        chunk('断网前已保存的真实文本。');
+        networkGate=()=>{chunk('断网后继续同一个Run。');res.write('data: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\n');res.end('data: [DONE]\n\n');networkGate=undefined};return;
+      }
       if (prompt==='长连接180秒验收') {
         res.writeHead(200,{'content-type':'text/event-stream'});
         const chunk=text=>res.write('data: '+JSON.stringify({choices:[{index:0,delta:{content:text},finish_reason:null}]})+'\n\n');
@@ -627,7 +652,7 @@ try {
   await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});
   const artifact=await readFile(join(workspace,'reports/T5报告.md'),'utf8');assert.ok(artifact.includes(markerA)&&artifact.includes(markerB));
   report.t5.artifact={path:'reports/T5报告.md',sha256:createHash('sha256').update(artifact).digest('hex'),content:artifact};
-  await page.locator('.runtime-person').filter({hasText:'OpenPaw助手'}).click();
+  await page.locator('.runtime-person').filter({hasText:'王明'}).click();
   await page.getByRole('button',{name:'文件产物',exact:true}).click();
   await page.getByRole('button',{name:'打开 reports/T5报告.md',exact:true}).click();
   await page.getByText(/T5真实报告/).last().waitFor();
@@ -639,7 +664,7 @@ try {
     await page.getByRole('button',{name:'返回目录',exact:true}).click();
   }
   // 等待最后一次导航真正返回目录，再用Office原关闭按钮，避免响应晚到后重开对话框。
-  await page.getByRole('dialog',{name:'OpenPaw 会话详情',exact:true}).waitFor();
+  await page.getByRole('dialog',{name:'王明 · 成员详情',exact:true}).waitFor();
   await page.getByRole('button',{name:'关闭详情',exact:true}).click();
   await page.locator('dialog.office-ui-dialog').waitFor({state:'hidden'});
   await fresh(page);await send('T5-命令慢任务');await page.getByRole('button',{name:'收起聊天',exact:true}).click();await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();
@@ -739,6 +764,20 @@ try {
   assert.equal(report.browserRequests.filter(r=>r.request.type==='send'&&r.request.turnId===longRequest.turnId).length,1);
   await page.screenshot({path:join(output,'33-official-chat-over-180-seconds.png'),fullPage:true});
   report.assertions.push('r3: untouched latest Office browser receives one original stream over 180 seconds; Host idle and Run budgets stay enabled');
+  // Opt-in collaboration only after every original single-Agent journey has run unchanged.
+  host.p.kill('SIGTERM');await host.close
+  await writeFile(config,(await readFile(config,'utf8'))+'\n[agents]\nenabled = true\n')
+  host=start(resolve(binary),['engine-host','--config',config,'--port',new URL(hostBase).port],root,childEnv,'host-team')
+  await waitFor(()=>host.stdout().includes('openpaw engine host listening on'))
+  await teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release:role=>{assert.ok(teamGates.has(role));teamGates.get(role)();teamGates.delete(role)}})
+  await networkProduct({page,context,report,output,readOffice,conv,latestSend,fresh,send,chooseOffice,select,waitFor,post:request=>officePost(officeBase,request),
+    release:()=>{assert.ok(networkGate);networkGate()},
+    interrupt:async()=>{officeProcess.p.kill('SIGKILL');await officeProcess.close},
+    restore:async()=>{
+      officeProcess=start(process.execPath,['server/dist/index.js'],office,{...childEnv,PORT:String(officePort),HOST:'127.0.0.1',PAWOFFICE_PUBLIC_ORIGIN:officeBase},'office-network-restored')
+      await waitFor(async()=>{try{const r=await readOffice();return r.code===200&&conv(r,latestSend().request.conversationId)}catch{return false}},45000)
+    }})
+  await storageProduct({page,report,output,fresh,waitFor})
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'

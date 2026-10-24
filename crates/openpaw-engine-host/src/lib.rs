@@ -3,6 +3,8 @@
 //! 依赖：可选核心引擎、工具、原存储和执行环境。
 //! 禁止职责：不复制AgentLoop、会话账本或工具主体；外部协议留后续适配器。
 #[cfg(feature = "engine-host")]
+mod agents;
+#[cfg(feature = "engine-host")]
 mod approval;
 #[cfg(feature = "engine-host")]
 mod config;
@@ -21,7 +23,12 @@ mod tool_host;
 #[cfg(feature = "engine-host")]
 mod types;
 #[cfg(feature = "engine-host")]
-pub use {config::HostConfig, server::HostServer, service::Host, types::*};
+pub use {
+    config::{AgentsConfig, HostConfig},
+    server::HostServer,
+    service::Host,
+    types::*,
+};
 
 #[cfg(feature = "engine-host")]
 mod office;
@@ -33,3 +40,6 @@ mod session_delete;
 
 #[cfg(feature = "engine-host")]
 mod task_progress;
+
+#[cfg(feature = "engine-host")]
+mod orchestration;

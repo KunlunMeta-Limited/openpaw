@@ -1,7 +1,7 @@
 {
   "office": {
     "repository": "https://github.com/KunlunMeta-Limited/ai-office-react",
-    "commit": "d150b96ff0fff59ece869da7e3dc6067c1b066e3",
+    "commit": "fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518",
     "files": [
       {
         "path": "integration/README.md",
@@ -10,7 +10,7 @@
       },
       {
         "path": "integration/docs/office-integration.md",
-        "sha256": "9459c2603ba12d5204f208315475049249ae9305fff20874e8dc6017144bd4d4",
+        "sha256": "64f684be14ffb79188a52ad7e7f9745d0bfbfdb48e08ebe75b0548c11ea5501f",
         "testSnapshot": false
       },
       {
@@ -35,7 +35,7 @@
       },
       {
         "path": "integration/clients/ui-client.mjs",
-        "sha256": "e341d7cc6480f892666175941f6b546646c003af227e9af8ee3fd240aefd8bbd",
+        "sha256": "41e94512baa819c5b93656df6784aee767f827f6986bb7a9fed20e0134218114",
         "testSnapshot": false
       },
       {
@@ -45,17 +45,17 @@
       },
       {
         "path": "packages/protocol/src/dashboard.ts",
-        "sha256": "e66f4217b0d5fe1944651279402bff21e180ef3657291bf43bb450f72fe9fd4c",
+        "sha256": "cd662abbd45a955c0918106980a6c23bb83ec12d228a65c25a81fb2e74301abb",
         "testSnapshot": true
       },
       {
         "path": "packages/protocol/src/office-ui.ts",
-        "sha256": "7493884d1441244639cab039d0f3cd9b03f7727f804738b5117288ba2348fb84",
+        "sha256": "83b6ae5274aa347c76e2fcd78253a9e216400754b249771aa102c815469a3539",
         "testSnapshot": true
       },
       {
         "path": "packages/protocol/src/office-integration.ts",
-        "sha256": "47ae8147b42db380c8bce76e9dcb925b6c0cd18cccda734557da539f744d6a25",
+        "sha256": "73c9256d39df31cd9a09e1f24da445c3d5574869079641fd6cb1b4d0c05f7653",
         "testSnapshot": true
       },
       {
@@ -85,7 +85,7 @@
       },
       {
         "path": "apps/web/src/chat/ChatSession.ts",
-        "sha256": "3a510f0e97969ca915e6a763012b393f147a6f1f4a389b1fede471e4361918a2",
+        "sha256": "8868884ed848883fc3c009336e45cd40d4327ac8e412858510df0f7ef80a0611",
         "testSnapshot": false
       },
       {
@@ -110,7 +110,7 @@
       },
       {
         "path": "server/src/app.ts",
-        "sha256": "b302ebaab5f0a96ae1d60a917912b7288da8cb8e108a08e889cf25677b72a192",
+        "sha256": "ac0266445c8b7a6aa1f9cffbf6308da1c61464714490118b5349b04fe9fe6452",
         "testSnapshot": false
       },
       {
@@ -120,17 +120,17 @@
       },
       {
         "path": "apps/web/src/ui/ConnectedOfficeWorkspace.tsx",
-        "sha256": "27ff012079c1e763b94519bb7553578252a38ce13c792abfe3192b5a34812f2c",
+        "sha256": "8df75f0366e28744e73c30faa295b2d3af63f331d662e80f61055e4872362078",
         "testSnapshot": false
       },
       {
         "path": "apps/web/src/chat/sources.ts",
-        "sha256": "27af2082508f4cc861d51eafbfd8b38df9d9930ce886b974b80c2e779095f62f",
+        "sha256": "1c7f75e71b0d1448d3cdcce62be8d12ad877a8eebf0453e5da91d343b22c4316",
         "testSnapshot": false
       },
       {
         "path": "tests/officeIntegration.test.mjs",
-        "sha256": "f6517ac94b822968576dd068ad606e661081f05d6be50dca96ea0f338c3c7988",
+        "sha256": "5bf7457f7cbbafc351e2042e638d23bd920073514627844319683d66de530985",
         "testSnapshot": false
       }
     ]

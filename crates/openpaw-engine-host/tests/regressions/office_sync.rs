@@ -99,23 +99,29 @@ struct Fixture {
     mode: u8,
     requests: Vec<serde_json::Value>,
     snapshot: Option<serde_json::Value>,
+    drop_next_snapshot_reply: bool,
+    dropped_replies: usize,
+    snapshot_bytes: Vec<Vec<u8>>,
 }
 async fn sync_scenario() {
+    use axum::response::IntoResponse;
     use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
     use std::sync::{Arc, Mutex};
     let fixture = Arc::new(Mutex::new(Fixture::default()));
     async fn handle(
         State(shared): State<Arc<Mutex<Fixture>>>,
         headers: HeaderMap,
-        Json(request): Json<serde_json::Value>,
-    ) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+        bytes: axum::body::Bytes,
+    ) -> axum::response::Response {
+        let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(headers["authorization"], "Bearer fixture-key");
         if request["type"] == "ui.next" {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             return (
                 axum::http::StatusCode::OK,
                 Json(json!({"code":200,"msg":"fixture","data":{"actions":[]}})),
-            );
+            )
+                .into_response();
         }
         let mut s = shared.lock().unwrap();
         s.requests.push(request.clone());
@@ -137,13 +143,27 @@ async fn sync_scenario() {
                 directory(&s)
             }
             "office.snapshot" => {
+                s.snapshot_bytes.push(bytes.to_vec());
+                if s.drop_next_snapshot_reply {
+                    s.drop_next_snapshot_reply = false;
+                    s.dropped_replies += 1;
+                    s.snapshot = Some(request["snapshot"].clone());
+                    // 请求已应用后真实中断响应体，不能假定失败等同于服务端回滚。
+                    let body = axum::body::Body::from_stream(futures::stream::once(async {
+                        Err::<axum::body::Bytes, _>(std::io::Error::other(
+                            "controlled lost receipt after apply",
+                        ))
+                    }));
+                    return axum::response::Response::new(body);
+                }
                 if s.mode == 2 {
                     code = 409;
                     json!({"reasonCode":"SEQ_CONFLICT","details":{},"issues":[]})
                 } else {
                     s.snapshot = Some(request["snapshot"].clone());
                     code = if s.mode == 0 { 202 } else { 200 };
-                    json!({"teamId":request["teamId"],"seq":request["snapshot"]["seq"],"status":if s.mode==0{"cached"}else{"applied"}})
+                    let seq = request["snapshot"]["seq"].as_u64().unwrap();
+                    json!({"teamId":request["teamId"],"seq":if s.mode==4{seq-1}else{seq},"status":if s.mode==0{"cached"}else{"applied"}})
                 }
             }
             "ui.next" => json!({"actions":[]}),
@@ -153,6 +173,7 @@ async fn sync_scenario() {
             axum::http::StatusCode::from_u16(code).unwrap(),
             Json(json!({"code":code,"msg":"fixture","data":data})),
         )
+            .into_response()
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -219,6 +240,22 @@ async fn sync_scenario() {
         .unwrap_or_default()
     };
     assert_eq!(state(), "cached");
+    fixture.lock().unwrap().drop_next_snapshot_reply = true;
+    wait(|| fixture.lock().unwrap().dropped_replies == 1).await;
+    assert_ne!(state(), "applied", "确认丢失不能被视为页面应用成功");
+    wait(|| {
+        let s = fixture.lock().unwrap();
+        s.snapshot_bytes.len() >= 4
+    })
+    .await;
+    {
+        let s = fixture.lock().unwrap();
+        assert!(
+            s.snapshot_bytes.windows(2).all(|pair| pair[0] == pair[1]),
+            "丢失回执后同seq必须重发完全相同字节，不能重生成时间或内容"
+        );
+        assert_eq!(s.snapshot.as_ref().unwrap(), &original);
+    }
     fixture.lock().unwrap().mode = 1;
     wait(|| state() == "applied").await;
     server.shutdown().await.unwrap();
@@ -291,6 +328,35 @@ async fn sync_scenario() {
             .count(),
         count
     );
+    server.shutdown().await.unwrap();
+    // 独立数据目录验证旧seq回执，保留前面的真实409锁存场景。
+    *fixture.lock().unwrap() = Fixture {
+        mode: 4,
+        ..Default::default()
+    };
+    let another = tempfile::tempdir().unwrap();
+    let mut stale_cfg = config(another.path());
+    stale_cfg.office = Some(OfficeConfig {
+        base_url: format!("http://{address}"),
+        api_key_env: "PAWOFFICE_TEST_KEY".into(),
+        allowed_origins: vec!["http://127.0.0.1:8765".into()],
+        names: Default::default(),
+        creation_slots: vec![],
+    });
+    let stale_db = stale_cfg.home.join("engine-host/host.db");
+    let host = Host::start(stale_cfg).await.unwrap();
+    let server = HostServer::bind(host, 0).await.unwrap();
+    wait(|| {
+        let db = rusqlite::Connection::open(&stale_db).unwrap();
+        db.query_row(
+            "SELECT sync_state FROM host_office_projection WHERE team='office-1'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap_or_default()
+            == "halted"
+    })
+    .await;
     server.shutdown().await.unwrap();
     token.cancel();
     serving.await.unwrap();

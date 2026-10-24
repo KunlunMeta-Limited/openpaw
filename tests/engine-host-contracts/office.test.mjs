@@ -157,3 +157,19 @@ test('choice custom input is bounded and distinct from confirmation authorizatio
   officeResultSchema('decision.request').parse(result);
   for(const customText of ['', 'x'.repeat(1001)]) assert.equal(officeResultSchema('decision.request').safeParse({...result,customText}).success,false);
 });
+
+
+test('member creation and instance layout use pinned upstream schemas without a new snapshot format', () => {
+  const member = {id:'member-new',teamId:'office-1',conversationId:'conversation-1',action:'employee.create',name:' 新成员 ',sceneActorId:'file-agent'}
+  const parsed=officeUiActionSchema.parse(member)
+  assert.equal(parsed.name,'新成员'); assert.equal(parsed.role,'')
+  for(const [field,value] of [['name','  '],['name','😀'.repeat(81)],['role',null],['role','😀'.repeat(81)],['sceneActorId','../actor'],['invented',true]]) {
+    assert.equal(officeUiActionSchema.safeParse({...member,[field]:value}).success,false,field)
+  }
+  officeUiActionSchema.parse({...member,name:'😀'.repeat(80),role:''})
+  for(const layoutId of ['classic','members'])officeRequestSchema.parse({type:'office.layout.set',layoutId})
+  officeRequestSchema.parse({type:'office.layout.read'})
+  assert.equal(officeRequestSchema.safeParse({type:'office.layout.set',layoutId:'invented'}).success,false)
+  assert.equal(officeRequestSchema.safeParse({type:'office.layout.set',layoutId:'members',seq:1}).success,false)
+  officeSnapshotSchema.parse(f.snapshot)
+})
