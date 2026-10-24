@@ -43,3 +43,8 @@ mod task_progress;
 
 #[cfg(feature = "engine-host")]
 mod orchestration;
+
+#[cfg(feature = "engine-host")]
+mod workspace_migration;
+#[cfg(feature = "engine-host")]
+pub use workspace_migration::{apply_workspaces, plan_workspaces};

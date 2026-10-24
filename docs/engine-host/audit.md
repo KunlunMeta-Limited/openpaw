@@ -376,3 +376,12 @@ D62原容量inline回归确切红绿：100旧Run后conv099真实两步骤+pendin
 ## D63：同一回复连续委派后准确完成证据未消除重复卡
 
 原8765真实DeepSeek h父Run876ee8bb84354cbf83b85aae712598b6，五子Run和一次审批报告成功，但业务计划7步应8卡却10卡；整体验收failed，原报告/trace/JSONL保留。根因和私有最小修方案见0007第12.19节；不按标题关联，不改审批/账本/Office。原inline新增连续delegate两角色后逐项报告准确证据，修前4卡/应3卡真实退出101；修后28条Host lib通过，歧义call证据不猜、原未核验/失败重试/容量/不重播断言全部保留。定向证据`/home/cheng/.cache/t6-live-followup-20261024/d63-{red,green-lib2}.log`；准确完整复验与原页面/新模型结果未形成前不关闭本缺陷。
+
+
+## D64：正常回复结束而未核验的业务被标为失败
+
+原task_progress/project将所有终态未完成步骤标failed；投影也将Completed但percent<100目标标failed。原回归先红（d64-red.log），现改blocked并说明待核验/继续，真实Failed/TimedOut/Cancelled/Interrupted及未恢复子失败仍保留failed，不能补100%。扩原正反测试、原失败重试和容量约束；专项日志d64-green-lib2.log，完整/网页尚待准确候选。
+
+## D65：普通追问覆盖团队成果与成员结果
+
+原投影和成员只选同Session最新Run；无委派的普通追问清空上次任务/白板及五成员结果。原D63回归扩追问先红（d65-red.log），再从原Run/计划/委派保留有界近期成果；详情按同scope全部父Run输入顺序找本人真实委派。ID/seq不重放派工、同目标独立计数、原64KiB/100会话约束保留；绿d65-green.log，新增任务详情回归、真实网页和模型尚待完整准确候选。

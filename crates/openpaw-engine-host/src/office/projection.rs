@@ -197,6 +197,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         let now=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
         let mut conversations=Vec::new();
         let mut priorities=BTreeMap::new();
+        let mut terminal_conversations=std::collections::BTreeSet::new();
         for binding in bindings {
             let mut runs=Vec::new();
             for r in all_runs.iter().filter(|r|r.session_id==binding.session_id) {
@@ -206,11 +207,26 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             runs.sort_by_key(|(offset,_,_)|*offset);
             let Some((_,latest,_))=runs.last() else {continue;};
             let title=dto::bounded(runs[0].2.trim(),40);
-            let r=db.get_run(&latest.run_id)?;
             let prior_conv=prior.and_then(|v|v["conversations"].as_array()).and_then(|a|a.iter().find(|c|c["id"]==binding.scope.conversation_id));
             let mut old=BTreeMap::new();
             if let Some(a)=prior_conv.and_then(|v|v["tasks"].as_array()){for t in a {if let Some(id)=t["id"].as_str(){old.insert(id.to_owned(),t.clone());}}}
-            // 每会话只投影最新Run，避免旧失败抢占最新成功的员工状态；完整历史走history。
+            // 当前轮次和至多两组近期真实业务保留独立身份，普通追问不擦除团队成果。
+            // 不复制历史任务库：每次从原Run/计划/委派重建，容量不足仍按原预算裁剪。
+            let mut display_ids=vec![latest.run_id.clone()];
+            for (_,candidate,_) in runs.iter().rev() {
+                if display_ids.len()>=3 {break;}
+                if candidate.run_id==latest.run_id {continue;}
+                if db.progress(&candidate.run_id)?.is_some() || !db.delegations(&candidate.run_id)?.is_empty() {
+                    display_ids.push(candidate.run_id.clone());
+                }
+            }
+            let latest_has_work=db.progress(&latest.run_id)?.is_some() || !db.delegations(&latest.run_id)?.is_empty() || latest.tools.iter().any(|t|t.tool_name!="report_progress");
+            let board_id=if !latest.state.is_terminal() || latest_has_work {&display_ids[0]} else {display_ids.get(1).unwrap_or(&display_ids[0])};
+            let mut retained_tasks=Vec::new();
+            let mut retained_events=Vec::new();
+            let mut retained_whiteboard=Value::Null;
+            for run_id in &display_ids {
+            let r=db.get_run(run_id)?;
             let (_,input)=db.run_input(&r)?;
             let main_id=format!("run:{}",r.run_id);
             let plan=db.progress(&r.run_id)?;
@@ -299,19 +315,21 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 percent=if steps.is_empty() {child_percent}else{percent.min(child_percent)};
             }
             let child_blocked=child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="blocked");
+            let child_failed=child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="failed");
             let summary=match r.state {
                 RunState::Cancelled=>"已停止，实际操作已清理".to_owned(),
                 RunState::Interrupted=>"处理被中断，已完成事项保留".to_owned(),
                 RunState::TimedOut|RunState::Failed=>super::turns::message(&r),
                 RunState::Cancelling=>"正在停止，等待实际操作清理".to_owned(),
-                RunState::Completed if percent<100=>"回复已结束，仍有步骤未完成".to_owned(),
+                RunState::Completed if child_failed=>"回复已结束；仍有未恢复的子任务失败，已完成部分保留".to_owned(),
+                RunState::Completed if percent<100=>"回复已结束；已完成部分保留，其余待核验或继续处理".to_owned(),
                 RunState::Completed=>"本次目标已完成".to_owned(),
                 _ if child_blocked=>"子任务等待确认或可用资源".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
                 _=>"正在处理你的请求".to_owned(),
             };
-            let main_state=if r.state==RunState::Completed && percent<100 {"failed"} else if !r.state.is_terminal() && (child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
             let mut tasks=vec![task(main_id,dto::bounded(&input,80),main_state,summary.clone(),&old,&now,percent)];
             for (index,step) in steps.into_iter().enumerate() {
                 if let Some(child)=child_steps.remove(&index) {tasks.push(child);continue;}
@@ -356,18 +374,24 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             let completed=tasks.iter().skip(1).filter(|t|t["status"]=="completed").count();
             let description=if tasks.len()>1 {format!("已确认完成 {completed}/{} 步；{summary}",tasks.len()-1)}else{summary};
             let whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,500),"note":"","link":{"label":"","url":""},"steps":board_steps});
-            priorities.insert(binding.scope.conversation_id.clone(),r.revision);
+            if run_id==board_id {retained_whiteboard=whiteboard;}
+            retained_tasks.extend(tasks);
+            retained_events.extend(events);
+            }
+            retained_events.sort_by(|a,b|b["occurredAt"].as_str().cmp(&a["occurredAt"].as_str()).then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
+            priorities.insert(binding.scope.conversation_id.clone(),latest.revision);
+            if latest.state.is_terminal() {terminal_conversations.insert(binding.scope.conversation_id.clone());}
             // 常驻人物和成员来自同一可信目录，未启用角色也能说明真实状态。
             conversations.push(json!({"id":binding.scope.conversation_id,"title":title,
                 "employees":employees,
-                "tasks":tasks,"events":events,"whiteboard":whiteboard}));
+                "tasks":retained_tasks,"events":retained_events,"whiteboard":retained_whiteboard}));
         }
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
         // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
         while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>64000 {
             let convs=snapshot["conversations"].as_array_mut().unwrap();
-            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&matches!(c["tasks"][0]["status"].as_str(),Some("completed"|"failed"))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
+            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&terminal_conversations.contains(c["id"].as_str().unwrap_or(""))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
             let Some((i,_))=candidate else {return Err(HostError::new("protocol_error","Office完整会话目录超限"));};
             let c=&mut convs[i];
             // 会话ID的字典序不代表新旧；审批中的步骤不能被旧历史挤掉。
@@ -625,6 +649,45 @@ mod tests {
                 snapshot,
                 "重复投影保持seq和派工ID，不再新增拜访"
             );
+            if expected_cards == 3 {
+                // 普通追问不能擦掉此前同事的真实工作、白板和成员详情。
+                host.submit_run(&scope, &binding.session_id, "谢谢，请保留团队成果".into())
+                    .await
+                    .unwrap();
+                host.wait_idle().await;
+                let after = prepare(&host, &office, "office-1").await.unwrap();
+                let current = &after["conversations"][0];
+                for previous in conv["tasks"].as_array().unwrap() {
+                    assert!(current["tasks"].as_array().unwrap().iter().any(|t| t["id"] == previous["id"] && t["status"] == previous["status"]), "D65：后续普通问答不能移除准确已完成业务任务");
+                }
+                assert_eq!(
+                    current["whiteboard"], conv["whiteboard"],
+                    "普通追问保留最近业务目标白板"
+                );
+                let details = crate::office::details::render(
+                    &host,
+                    &scope,
+                    &binding.session_id,
+                    "after-followup",
+                    json!({"kind":"member","employeeId":"command","actorId":"code-agent"}),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    details["content"]["fields"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f["label"] == "独立执行引用"),
+                    "成员详情仍应指向其原独立Session/Run"
+                );
+                assert_eq!(
+                    prepare(&host, &office, "office-1").await.unwrap(),
+                    after,
+                    "保留历史不能造成无事实seq增长"
+                );
+            }
             host.shutdown().await.unwrap();
         }
     }
@@ -805,10 +868,14 @@ mod tests {
                 assert_eq!(conv["tasks"][1]["assigneeId"], "command");
                 assert_eq!(latest_assignment["taskId"], conv["tasks"][1]["id"]);
             } else {
-                assert_eq!(conv["tasks"][0]["status"], "failed");
+                assert_eq!(
+                    conv["tasks"][0]["status"],
+                    if retry { "failed" } else { "blocked" }
+                );
                 assert!(conv["tasks"][0]["progress"].as_u64().unwrap() < 100);
                 assert_eq!(
-                    conv["tasks"][1]["status"], "failed",
+                    conv["tasks"][1]["status"],
+                    if retry { "failed" } else { "blocked" },
                     "子任务成功不自动确认未报告步骤"
                 );
                 let child_index = if mark_active && !retry { 1 } else { 3 };

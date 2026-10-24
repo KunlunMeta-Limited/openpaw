@@ -72,15 +72,21 @@ pub(super) async fn render(
                     .into_iter()
                     .find(|b| b.scope == s)
                     .ok_or_else(|| HostError::new("scope_denied", "成员会话不存在"))?;
-                let parent = db
+                // 同一会话的新普通问答不会删除同事上次的真实委派；按接受顺序
+                // 找角色结果，不用运行结束revision把旧任务错误排到新任务前面。
+                let mut parents = Vec::new();
+                for run in db
                     .runs()?
                     .into_iter()
                     .filter(|r| r.session_id == binding.session_id)
-                    .max_by_key(|r| r.revision);
-                let Some(parent) = parent else {
-                    return Ok(None);
-                };
-                let choices = db.delegations(&parent.run_id)?;
+                {
+                    parents.push((db.run_input(&run)?.0, run));
+                }
+                parents.sort_by_key(|(offset, _)| *offset);
+                let mut choices = Vec::new();
+                for (_, parent) in parents {
+                    choices.extend(db.delegations(&parent.run_id)?);
+                }
                 let choice = if let Some(wanted) = wanted {
                     Some(
                         choices
@@ -211,6 +217,116 @@ pub(super) async fn render(
                 key,
                 label,
                 json!({"kind":key,"offset":0,"chunk":0}),
+            );
+        }
+        button(
+            &mut buttons,
+            &mut options,
+            "tasks",
+            "任务进度与结果",
+            json!({"kind":"tasks","offset":0}),
+        );
+    } else if kind == "tasks" || kind == "task" {
+        let tasks = task_views(host, scope, session, member.map(|role| role.employee)).await?;
+        if kind == "task" {
+            let (task, run, _) = tasks
+                .iter()
+                .find(|(task, _, _)| task["id"] == context["taskId"])
+                .ok_or_else(|| {
+                    HostError::new(
+                        "snapshot_changed",
+                        "任务已不在当前展示范围，请重新打开任务列表",
+                    )
+                })?;
+            title = dto::bounded(task["title"].as_str().unwrap_or("任务详情"), 160);
+            description = "业务进度来自最近已同步快照；执行状态和结果来自真实运行。结束回复不代表全部业务已核验。".into();
+            let owner = crate::agents::ROLES
+                .iter()
+                .find(|r| task["assigneeId"] == r.employee)
+                .map(|r| r.name)
+                .unwrap_or("未分配");
+            fields.extend([
+                json!({"label":"负责人","value":owner}),
+                json!({"label":"业务状态","value":task_status(task["status"].as_str().unwrap_or("queued"))}),
+                json!({"label":"已确认进度","value":format!("{}%",task["progress"].as_u64().unwrap_or(0))}),
+                json!({"label":"进度说明","value":dto::bounded(task["summary"].as_str().unwrap_or("暂无说明"),1800)}),
+                json!({"label":"实际执行状态","value":format!("{:?}",run.state)}),
+                json!({"label":"执行引用","value":format!("Run {} · Session {}",run.run_id,run.session_id)}),
+                json!({"label":"实际回复","value":dto::bounded(if run.text.is_empty(){"尚无可靠回复正文"}else{&run.text},1800)}),
+            ]);
+            button(
+                &mut buttons,
+                &mut options,
+                "back",
+                "返回任务列表",
+                json!({"kind":"tasks","offset":context["offset"].as_u64().unwrap_or(0)}),
+            );
+        } else {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for (task, run, _) in &tasks {
+                task.to_string().hash(&mut hasher);
+                run.revision.hash(&mut hasher);
+            }
+            let signature = format!("{:016x}", hasher.finish());
+            if context["signature"]
+                .as_str()
+                .is_some_and(|s| s != signature)
+            {
+                return Err(HostError::new(
+                    "snapshot_changed",
+                    "任务已变化，请重新打开列表，避免分页错读",
+                ));
+            }
+            let offset = context["offset"].as_u64().unwrap_or(0) as usize;
+            title = "任务进度与结果".into();
+            description = format!(
+                "当前展示范围共{}项，显示{}—{}；已完成项保留，完整执行历史仍可从历史入口查询。",
+                tasks.len(),
+                offset.min(tasks.len()),
+                (offset + 5).min(tasks.len())
+            );
+            for (index, (task, _, child)) in tasks.iter().skip(offset).take(5).enumerate() {
+                fields.push(json!({"label":dto::bounded(task["title"].as_str().unwrap_or("任务"),160),"value":format!("{} · 已确认{}%\n{}",task_status(task["status"].as_str().unwrap_or("queued")),task["progress"].as_u64().unwrap_or(0),dto::bounded(task["summary"].as_str().unwrap_or(""),1000))}));
+                let mut target = json!({"kind":"task","taskId":task["id"],"offset":offset});
+                if let Some(child) = child {
+                    target["childTaskId"] = json!(child);
+                }
+                button(
+                    &mut buttons,
+                    &mut options,
+                    &format!("task-{index}"),
+                    &format!(
+                        "查看 {}",
+                        dto::bounded(task["title"].as_str().unwrap_or("任务"), 80)
+                    ),
+                    target,
+                );
+            }
+            if offset > 0 {
+                button(
+                    &mut buttons,
+                    &mut options,
+                    "prev",
+                    "上一页",
+                    json!({"kind":"tasks","offset":offset.saturating_sub(5),"signature":signature}),
+                );
+            }
+            if offset + 5 < tasks.len() {
+                button(
+                    &mut buttons,
+                    &mut options,
+                    "next",
+                    "下一页",
+                    json!({"kind":"tasks","offset":offset+5,"signature":signature}),
+                );
+            }
+            button(
+                &mut buttons,
+                &mut options,
+                "back",
+                "返回目录",
+                json!({"kind":"menu"}),
             );
         }
     } else if kind == "files" {
@@ -396,7 +512,9 @@ pub(super) async fn render(
             value["employeeId"] = json!(role.employee);
             value["actorId"] = json!(role.actor);
             if let Some((d, _)) = &member_child {
-                value["childTaskId"] = json!(d.task_id);
+                if value.get("childTaskId").is_none() {
+                    value["childTaskId"] = json!(d.task_id);
+                }
             }
             if value["kind"] == "menu" {
                 value["kind"] = json!("member");
@@ -422,6 +540,92 @@ pub(super) async fn render(
     Ok(
         json!({"target":"dialog","content":{"template":"detail-v1","title":title,"description":description,"fields":fields,"actions":buttons}}),
     )
+}
+fn task_status(status: &str) -> &str {
+    match status {
+        "completed" => "已核验完成",
+        "failed" => "未完成（执行失败或中断）",
+        "blocked" => "等待确认、核验或继续处理",
+        "running" => "正在处理",
+        _ => "待处理",
+    }
+}
+/// 功能：复用已保存投影枚举可见任务，并用原父子运行重新核验所属及执行结果。
+/// 参数：host为共享服务，scope/session为当前可信父会话，employee为可选角色过滤。
+/// 返回：任务、真实Run与可选独立子任务引用，不另建任务库。
+/// 错误：存储损坏或引用失效时明确报错。
+/// 状态：只读事实与最近同步投影；不推进进度、不执行工具。
+/// 并发与取消：原Store单线程读取，删除后不能复活导航。
+/// 权限：仅同办公室和同父会话，子运行必须有原委派事实。
+/// 关联：CHG-2026-0007第12.21节；REQ-OP-014/021。
+async fn task_views(
+    host: &Host,
+    scope: &ClientScope,
+    session: &str,
+    employee: Option<&str>,
+) -> HostResult<Vec<(Value, crate::RunView, Option<String>)>> {
+    let (scope, session, employee) = (
+        scope.clone(),
+        session.to_owned(),
+        employee.map(str::to_owned),
+    );
+    host.inner
+        .store
+        .call(move |db| {
+            db.check_live_scope(&scope)?;
+            crate::service::check_scope(&db.binding(&session)?, &scope)?;
+            let Some((projection, _)) = db.office_projection(&scope.slot_id)? else {
+                return Ok(vec![]);
+            };
+            let Some(conv) = projection["conversations"]
+                .as_array()
+                .and_then(|a| a.iter().find(|c| c["id"] == scope.conversation_id))
+            else {
+                return Ok(vec![]);
+            };
+            let parents: Vec<_> = db
+                .runs()?
+                .into_iter()
+                .filter(|r| r.session_id == session)
+                .collect();
+            let mut result = Vec::new();
+            for task in conv["tasks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| employee.as_ref().is_none_or(|e| t["assigneeId"] == *e))
+            {
+                let mut selected = None;
+                for parent in &parents {
+                    let delegations = db.delegations(&parent.run_id)?;
+                    let delegated = delegations.iter().rev().find(|d| {
+                        task["id"] == d.task_id
+                            || conv["events"].as_array().into_iter().flatten().any(|e| {
+                                e["id"] == format!("assign:{}", d.task_id)
+                                    && e["taskId"] == task["id"]
+                                    && e["employeeId"] == task["assigneeId"]
+                            })
+                    });
+                    if let Some(d) = delegated {
+                        selected = Some((db.get_run(&d.child_run)?, Some(d.task_id.clone())));
+                        break;
+                    }
+                    let step_owned = task["id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(&format!("step:{}:", parent.run_id)));
+                    if task["id"] == format!("run:{}", parent.run_id) || step_owned {
+                        selected = Some((db.get_run(&parent.run_id)?, None));
+                        break;
+                    }
+                }
+                let (run, child) = selected.ok_or_else(|| {
+                    HostError::new("snapshot_changed", "任务执行引用已失效，请重新同步")
+                })?;
+                result.push((task.clone(), run, child));
+            }
+            Ok(result)
+        })
+        .await
 }
 fn button(
     buttons: &mut Vec<Value>,
@@ -497,6 +701,133 @@ mod tests {
         let parts = split(&text, 1800);
         assert_eq!(parts.concat(), text);
         assert!(parts.iter().all(|s| dto::units(s) <= 1800));
+    }
+    #[tokio::test]
+    async fn task_navigation_pages_real_facts_and_refuses_wrong_or_deleted_scope() {
+        use openpaw_llm::{MockMode, MockProvider};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config:crate::HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let steps: Vec<_> = (0..6)
+            .map(|i| json!({"id":format!("s{i}"),"title":format!("核对资料第{}项",i+1)}))
+            .collect();
+        let provider = MockProvider::scripted(vec![
+            MockMode::ToolUse {
+                tool_name: "report_progress".into(),
+                input: json!({"type":"create","steps":steps}),
+                text: String::new(),
+            },
+            MockMode::Fixed("仅给出说明，资料尚未核验".into()),
+        ]);
+        let host = Host::with_provider(config, std::sync::Arc::new(provider))
+            .await
+            .unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "tasks".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let accepted = host
+            .submit_run(&scope, &binding.session_id, "核对六项资料".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), host.wait_idle())
+            .await
+            .unwrap();
+        let office:crate::OfficeConfig=serde_json::from_value(json!({"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_TEST_KEY","allowed_origins":["http://127.0.0.1:8765"]})).unwrap();
+        super::super::projection::prepare(&host, &office, "office-1")
+            .await
+            .unwrap();
+        let stop = CancellationToken::new();
+        let first = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "task-list",
+            json!({"kind":"tasks"}),
+            &stop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["content"]["fields"].as_array().unwrap().len(), 5);
+        assert!(first["content"]["actions"].as_array().unwrap().len() <= 8);
+        let s = scope.clone();
+        let nav = host
+            .inner
+            .store
+            .call(move |db| db.office_navigation("task-list", &s))
+            .await
+            .unwrap();
+        let second = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "task-page2",
+            nav["options"]["next"].clone(),
+            &stop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["content"]["fields"].as_array().unwrap().len(), 2);
+        let detail = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "task-detail",
+            nav["options"]["task-0"].clone(),
+            &stop,
+        )
+        .await
+        .unwrap();
+        let fields = detail["content"]["fields"].as_array().unwrap();
+        assert!(fields
+            .iter()
+            .any(|f| f["label"] == "实际执行状态" && f["value"] == "Completed"));
+        assert!(fields
+            .iter()
+            .any(|f| f["label"] == "业务状态" && f["value"] == "等待确认、核验或继续处理"));
+        let actual = host.get_run(&scope, &accepted.run_id).await.unwrap();
+        assert!(actual.text.contains("仅给出说明，资料尚未核验"));
+        assert_eq!(
+            fields.iter().find(|f| f["label"] == "实际回复").unwrap()["value"],
+            dto::bounded(&actual.text, 1800)
+        );
+        let mut wrong = scope.clone();
+        wrong.conversation_id = "foreign".into();
+        assert!(render(
+            &host,
+            &wrong,
+            &binding.session_id,
+            "wrong",
+            json!({"kind":"tasks"}),
+            &stop
+        )
+        .await
+        .is_err());
+        assert!(render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "wrong-task",
+            json!({"kind":"task","taskId":"run:foreign"}),
+            &stop
+        )
+        .await
+        .is_err());
+        host.delete_session(&scope).await.unwrap();
+        assert!(render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "deleted",
+            nav["options"]["task-0"].clone(),
+            &stop
+        )
+        .await
+        .is_err());
+        host.shutdown().await.unwrap();
     }
     #[tokio::test]
     async fn later_navigation_refuses_changed_dataset_and_cross_scope_context() {

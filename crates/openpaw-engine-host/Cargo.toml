@@ -9,7 +9,7 @@ authors.workspace = true
 
 [features]
 default = []
-engine-host = ["dep:openpaw-core", "dep:openpaw-engine", "dep:openpaw-llm", "dep:openpaw-store", "dep:openpaw-tools", "dep:openpaw-memory", "dep:openpaw-goal-ledger", "dep:openpaw-sandbox", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:futures", "dep:serde", "dep:serde_json", "dep:toml", "dep:rusqlite", "dep:uuid", "dep:chrono", "dep:axum", "dep:same-file", "dep:reqwest"]
+engine-host = ["dep:openpaw-core", "dep:openpaw-engine", "dep:openpaw-llm", "dep:openpaw-store", "dep:openpaw-tools", "dep:openpaw-memory", "dep:openpaw-goal-ledger", "dep:openpaw-sandbox", "dep:tokio", "dep:tokio-util", "dep:async-trait", "dep:futures", "dep:serde", "dep:serde_json", "dep:toml", "dep:rusqlite", "dep:uuid", "dep:chrono", "dep:axum", "dep:same-file", "dep:reqwest", "dep:ring", "dep:fs4"]
 
 [dependencies]
 openpaw-core = { workspace = true, optional = true }
@@ -32,6 +32,8 @@ uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 same-file = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
+fs4 = { workspace = true, optional = true }
 
 reqwest = { workspace = true, optional = true }
 

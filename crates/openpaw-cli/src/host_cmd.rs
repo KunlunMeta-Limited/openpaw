@@ -3,6 +3,47 @@
 //! 依赖：Host自身装配和关闭，不复制Provider选择。
 //! 禁止职责：不修改全局home或工作目录，不记录凭据。
 use std::path::Path;
+/// 功能：离线调用共享Host工作区迁移服务并输出脱敏JSON。
+/// 参数：command为人工明确选择的plan或apply及本机参数。
+/// 返回：成功零，预检或应用失败二。
+/// 错误：只输出Host安全错误，不回显TOML或密钥。
+/// 状态：plan零业务写入，apply按摘要/备份/原事务执行。
+/// 并发与取消：同步等待迁移完成，不启动HTTP或异步运行器。
+/// 权限：只由本机CLI调用，不读取模型.env，不向工具提供迁移。
+/// 关联：需求/设计REQ-OP-025；DES-OP-013；CHG-2026-0007第12.12节。
+pub fn workspace(command: crate::cli::WorkspaceMigrationCommand) -> i32 {
+    use crate::cli::WorkspaceMigrationCommand;
+    let result = match command {
+        WorkspaceMigrationCommand::Plan {
+            config,
+            target_config,
+            team,
+        } => openpaw_engine_host::plan_workspaces(&config, &target_config, &team),
+        WorkspaceMigrationCommand::Apply {
+            config,
+            target_config,
+            plan,
+            confirm_sha256,
+            backup,
+        } => openpaw_engine_host::apply_workspaces(
+            &config,
+            &target_config,
+            &plan,
+            &confirm_sha256,
+            &backup,
+        ),
+    };
+    match result {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(error) => {
+            eprintln!("engine-host-workspace: {error}");
+            2
+        }
+    }
+}
 /// 功能：运行共享Host直至Ctrl-C或终止信号，等待真实清理后退出。
 /// 参数：config为本机配置路径，port为可选端口，零表示动态分配。
 /// 返回：零为正常停止，二为配置/运行失败。

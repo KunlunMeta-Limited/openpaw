@@ -260,11 +260,15 @@ try {
   const workspace = join(output, 'workspace 中文'); await mkdir(workspace); await mkdir(childEnv.OPENPAW_HOME)
   const markerA = 'README-' + randomBytes(6).toString('hex'), markerB = 'NOTES-' + randomBytes(6).toString('hex')
   await writeFile(join(workspace, 'README.md'), markerA); await writeFile(join(workspace, 'notes.txt'), markerB)
+  const workspace2=join(output,'独立团队 workspace'),reservedWorkspace=join(output,'预授权新团队 workspace');await mkdir(workspace2);await mkdir(reservedWorkspace);
+  const markerC='README-TEAM-TWO-'+randomBytes(6).toString('hex'),markerD='NOTES-TEAM-TWO-'+randomBytes(6).toString('hex');
+  await writeFile(join(workspace2,'README.md'),markerC);await writeFile(join(workspace2,'notes.txt'),markerD);
+  report.workspaceIsolation={first:workspace,second:workspace2,reserved:reservedWorkspace,firstMarker:markerA,secondMarker:markerC};
   // 原安全策略禁止解释器内联代码；使用隔离工作区脚本，不放宽工具策略。
   await writeFile(join(workspace,'managed-parent.cjs'),"require('fs').writeFileSync('managed-parent.pid',String(process.pid));require('child_process').spawn(process.execPath,['managed-child.cjs'],{stdio:'inherit'});setInterval(()=>console.log('parent-tick'),50)")
   await writeFile(join(workspace,'managed-child.cjs'),"const fs=require('fs');fs.writeFileSync('managed-child.pid',String(process.pid));setInterval(()=>console.error('child-tick'),50);setTimeout(()=>fs.writeFileSync('late-side-effect','bad'),8000)")
   const config = join(output, 'host.toml')
-  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash"]\n[roots]\nproject = ${JSON.stringify(workspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project"\noffice-reserved = "project"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\ncreation_slots = ["office-reserved"]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
+  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash"]\n[roots]\nproject = ${JSON.stringify(workspace)}\nproject-2 = ${JSON.stringify(workspace2)}\nproject-reserved = ${JSON.stringify(reservedWorkspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project-2"\noffice-reserved = "project-reserved"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\ncreation_slots = ["office-reserved"]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
   if (!process.env.OPENPAW_HOST_BINARY) await run('cargo', ['build', '--locked', '-p', 'openpaw-cli', '--features', 'engine-host,sidecar'], root, childEnv, 'host-build')
   const buildBinary = process.env.OPENPAW_HOST_BINARY ?? join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', process.platform === 'win32' ? 'openpaw.exe' : 'openpaw')
   // 每轮固定自己的已构建可执行文件；后续其他feature构建不能改变重启所用程序。
@@ -640,7 +644,10 @@ try {
   assert.equal(conv(simultaneous,report.t5.approveRequest.conversationId).tasks[0].status,'blocked');
   await page.screenshot({path:join(output,'28-t5-other-session-reads-during-approval.png'),fullPage:true});
   await switchOffice(page,'独立办公室');await fresh(page);
-  await send('后台办公室读取README.md和notes.txt并总结',markerA);
+  await send('后台办公室读取README.md和notes.txt并总结',markerC);
+  assert.ok((await log.innerText()).includes(markerD));assert.ok(!(await log.innerText()).includes(markerA),'同名文件不得串读另一团队根');
+  assert.equal(await readFile(join(workspace,'README.md'),'utf8'),markerA);
+  report.assertions.push('r6: real browser second team reads its own same-name files and cannot show first-team marker');
   report.t5.readOtherOffice=structuredClone(latestSend().request);
   assert.equal(report.t5.readOtherOffice.teamId,'office-2');
   await page.getByRole('button',{name:'收起聊天',exact:true}).click();

@@ -433,7 +433,42 @@ async fn interaction_scenario() {
             .as_array()
             .unwrap()
             .len(),
-        6
+        7
+    );
+    let tasks = action(
+        &shared,
+        "tasks-1",
+        "dialog.action",
+        json!({"interactionId":"inspect-1","optionId":"tasks"}),
+    )
+    .await;
+    assert_eq!(tasks["presentation"]["content"]["title"], "任务进度与结果");
+    assert!(!tasks["presentation"]["content"]["fields"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let detail = action(
+        &shared,
+        "task-1",
+        "dialog.action",
+        json!({"interactionId":"tasks-1","optionId":"task-0"}),
+    )
+    .await;
+    assert!(detail["presentation"]["content"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["label"] == "实际执行状态" && f["value"] == "Completed"));
+    let task_back = action(
+        &shared,
+        "task-back",
+        "dialog.action",
+        json!({"interactionId":"task-1","optionId":"back"}),
+    )
+    .await;
+    assert_eq!(
+        task_back["presentation"]["content"]["title"],
+        "任务进度与结果"
     );
     let files = action(
         &shared,

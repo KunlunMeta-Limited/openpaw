@@ -395,8 +395,9 @@ pub(crate) fn project(value: Option<Value>, run: &RunView) -> HostResult<(Vec<Va
         let done=s.state=="completed" || run.state==RunState::Completed && !run.text.trim().is_empty() && !needs_write(&s.title) && answer;
         if done {completed+=1;}
         let waiting=s.evidence.iter().any(|id|run.tools.iter().any(|t|&t.call_id==id && matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")));
-        let state=if done {"completed"} else if run.state.is_terminal() {"failed"} else if waiting || run.state==RunState::Cancelling {"blocked"} else if s.state=="in_progress" {"running"} else {"queued"};
-        json!({"id":format!("step:{}:{}",run.run_id,index),"title":s.title,"status":state,"progress":if done{100}else{0},"summary":if done{"步骤已确认"}else if run.state.is_terminal(){"本步骤未完成"}else if waiting{"等待确认或资源"}else if s.state=="in_progress"{"正在处理"}else{"待处理"}})
+        // 正常回复结束与业务核验是不同事实，不能将漏报或待继续步骤伪报为执行失败。
+        let state=if done {"completed"} else if run.state==RunState::Completed {"blocked"} else if run.state.is_terminal() {"failed"} else if waiting || run.state==RunState::Cancelling {"blocked"} else if s.state=="in_progress" {"running"} else {"queued"};
+        json!({"id":format!("step:{}:{}",run.run_id,index),"title":s.title,"status":state,"progress":if done{100}else{0},"summary":if done{"步骤已确认"}else if run.state==RunState::Completed{"回复已结束；本步骤待核验或继续处理"}else if run.state.is_terminal(){"本步骤未完成"}else if waiting{"等待确认或资源"}else if s.state=="in_progress"{"正在处理"}else{"待处理"}})
     }).collect::<Vec<_>>();
     let delivered = run.state == RunState::Completed && completed == steps.len();
     let percent = (completed + usize::from(delivered)) * 100 / (steps.len() + 1);
@@ -421,6 +422,23 @@ mod tests {
     }
     fn plan(run: &RunView) -> Value {
         update(None,&json!({"type":"create","steps":[{"id":"lookup","title":"查询当天资料"},{"id":"record","title":"保存 weather.md"},{"id":"answer","title":"整理答复"}]}),run,&[]).unwrap()
+    }
+    #[test]
+    fn normal_reply_with_unverified_work_is_blocked_without_false_failure_or_completion() {
+        let mut r = run();
+        let original = plan(&r);
+        r.state = RunState::Completed;
+        r.text = "已给出当前答复，但未执行保存".into();
+        let (steps, percent) = project(Some(original.clone()), &r).unwrap();
+        assert_eq!(steps[0]["status"], "blocked");
+        assert_eq!(steps[1]["status"], "blocked");
+        assert_eq!(steps[2]["status"], "completed");
+        assert!(percent < 100, "回复结束不能代替未执行的业务步骤");
+        r.state = RunState::Failed;
+        let (steps, percent) = project(Some(original), &r).unwrap();
+        assert_eq!(steps[0]["status"], "failed");
+        assert_eq!(steps[1]["status"], "failed");
+        assert!(percent < 100, "真实失败不能被隐藏或伪报完成");
     }
     #[test]
     fn false_file_completion_and_cross_run_evidence_are_rejected() {

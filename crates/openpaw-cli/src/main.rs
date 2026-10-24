@@ -31,7 +31,10 @@ fn main() {
     #[cfg(feature = "sidecar")]
     if cli.sidecar {
         #[cfg(feature = "engine-host")]
-        if matches!(cli.command, Some(Command::EngineHost { .. })) {
+        if matches!(
+            cli.command,
+            Some(Command::EngineHost { .. } | Command::EngineHostWorkspace { .. })
+        ) {
             eprintln!("engine-host不能与--sidecar同时启动");
             std::process::exit(2);
         }
@@ -39,6 +42,8 @@ fn main() {
         std::process::exit(code);
     }
     let code = match cli.command {
+        #[cfg(feature = "engine-host")]
+        Some(Command::EngineHostWorkspace { command }) => openpaw_cli::host_cmd::workspace(command),
         #[cfg(feature = "engine-host")]
         Some(Command::EngineHost { config, port }) => {
             openpaw_cli::host_cmd::run_with_env(&config, port, cli.env_file.as_deref())

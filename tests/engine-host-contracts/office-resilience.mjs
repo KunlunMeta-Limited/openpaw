@@ -72,6 +72,10 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   const parent=db.prepare('SELECT run FROM host_requests WHERE key=?').get(request.turnId).run
   const children=db.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=? ORDER BY revision").all(parent).map(r=>JSON.parse(r.reference))
   assert.equal(children.length,5);assert.equal(new Set(children.map(c=>c.child_session)).size,5);assert.equal(new Set(children.map(c=>c.child_run)).size,5)
+  const parentBinding=JSON.parse(db.prepare('SELECT data FROM host_bindings WHERE id=(SELECT session FROM host_runs WHERE id=?)').get(parent).data);assert.equal(parentBinding.root_id,'project');
+  for(const child of children){const binding=JSON.parse(db.prepare('SELECT data FROM host_bindings WHERE id=?').get(child.child_session).data);assert.equal(binding.root_id,parentBinding.root_id,'真实主子Agent必须共享所属团队根');assert.equal(binding.scope.slot_id,parentBinding.scope.slot_id)}
+  const secondBindings=db.prepare("SELECT data FROM host_bindings WHERE slot='office-2'").all().map(row=>JSON.parse(row.data));assert.ok(secondBindings.length>0);assert.ok(secondBindings.every(binding=>binding.root_id==='project-2'));
+  report.workspaceIsolation={...report.workspaceIsolation,firstTeamRoot:parentBinding.root_id,childRootsVerified:children.length,secondTeamRoot:'project-2',secondBindings:secondBindings.length};
   for(const child of children){const ledger=(await readFile(join(output,'host-data/sessions',child.child_session+'.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.ok(ledger.some(e=>e.type==='tool_call_complete'&&e.tool_name==='read_file'));assert.ok(ledger.some(e=>e.type==='run_finished'&&e.status==='completed'))}
   db.close()
   // Actual Pixi clicks use exported world positions and the frozen renderer transform. HTTP actorId remains authoritative.
@@ -93,11 +97,38 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     await page.locator('.runtime-person').filter({hasText:person.name}).click();await dialog.waitFor()
     const text=await dialog.innerText();assert.ok(text.includes(person.name))
     await page.screenshot({path:join(output,`t6-sidebar-${person.id}.png`),fullPage:true})
+    await page.getByRole('button',{name:'任务进度与结果',exact:true}).click()
+    const taskList=page.getByRole('dialog',{name:'任务进度与结果',exact:true});await taskList.waitFor()
+    assert.ok((await taskList.innerText()).includes('已核验完成'))
+    await page.getByRole('button',{name:/^查看 /}).first().click()
+    assert.ok((await page.getByRole('dialog').innerText()).includes('实际执行状态'))
+    assert.ok((await page.getByRole('dialog').innerText()).includes('Completed'))
+    await page.screenshot({path:join(output,`t6-task-detail-${person.id}.png`),fullPage:true})
+    await page.getByRole('button',{name:'返回任务列表',exact:true}).click();await taskList.waitFor()
+    await page.getByRole('button',{name:'返回目录',exact:true}).click();await dialog.waitFor()
     members.push({person:person.id,text});await page.getByRole('button',{name:'关闭详情',exact:true}).click()
   }
   assert.equal(new Set(actors.map(a=>a.request.actorId)).size,6);assert.equal(members.length,6)
+  // A normal follow-up must not replace the real team ledger, whiteboard or member results.
+  await expand(page);await send('谢谢，请保留团队成果','网页协议对话正常。已处理：谢谢，请保留团队成果')
+  const retained=await waitFor(async()=>{const c=conv(await readOffice(),request.conversationId);return c?.tasks.length===7?c:false})
+  for(const task of final.tasks)assert.deepEqual(retained.tasks.find(t=>t.id===task.id),task)
+  assert.deepEqual(retained.whiteboard,final.whiteboard)
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click()
+  await page.locator('.runtime-person').filter({hasText:'陈书'}).click()
+  assert.ok((await page.getByRole('dialog').innerText()).includes('子任务已完成'))
+  await page.getByRole('button',{name:'任务进度与结果',exact:true}).click()
+  assert.ok((await page.getByRole('dialog').innerText()).includes('陈书核对项目说明'))
+  await page.screenshot({path:join(output,'t6-followup-retains-team.png'),fullPage:true})
+  await page.getByRole('button',{name:'关闭详情',exact:true}).click()
+  await page.locator('.runtime-person').filter({hasText:'王明'}).click()
+  await page.getByRole('button',{name:'任务进度与结果',exact:true}).click()
+  // 王明只看本人任务，完整团队卡片仍在Office任务中心，不混算各角色进度。
+  assert.ok((await page.getByRole('dialog').innerText()).includes('已核验完成'))
+  await page.getByRole('button',{name:'关闭详情',exact:true}).click()
   report.t6={request,parent,children,handoffs,actors,members,timelines,final,scene:snapshot,model:'deterministic real HTTP Provider; animation pacing only in test fixture; real Host execution'}
-  report.assertions.push('D61 five real member timelines preserve observed start and verified completion, without additional assignment or visit', 'T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five observed office.visit completions; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards')
+  report.assertions.push('D61 five real member timelines preserve observed start and verified completion, without additional assignment or visit', 'T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five observed office.visit completions; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards','r6: real five children share their parent team root while second-team existing sessions stay on a distinct physical root')
+  report.assertions.push('r7: six members open their own real task/result details and return without losing identity','D65: ordinary follow-up retains completed team cards, original whiteboard and independent member results')
 }
 
 
