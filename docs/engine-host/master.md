@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-2026-10-24 当前入口：Office远端main、主目录和原8765构建均为fa6ae1f，无新上游可拉取，Office本轮零修改。原T6 PR #12已合入e6a20bd，本轮在主目录fix/engine-host-t6-followup补修，未向旧PR推送。候选编制前运行的是717ff615，原c/review.json只证明该版本；D61新增成员开始/等待/完成动态，准确当前候选的完整验证、原页面和真实DeepSeek结果统一以`/home/cheng/.cache/t6-live-final-20261024-g/review.json`及`/media/cheng/新加卷/workSpace/Office/artifacts/live-office-20261024-t6/runtime-t6.json`为准。报告未形成/不通过即不算本轮交付，进程commit/hash未匹配即不算已部署，不能拿旧c绿灯替代。原静态Demo实跑9项8通过/1手机视口失败（R18，两次独立重跑同失败）；原生场景六项浏览器验证通过，详情及限制见`/home/cheng/.cache/t6-demo-audit-20261024/review.json`。一团队一独立物理根r6仍待准确批准，未实施；Office所有活跃Rx继续暂缓，Windows原生未执行、不计通过。最新Demo逐项缺口及递进方案见master16.7、0007第12.15—12.16节和专用产品差距审查第11节。
+2026-10-24 当前入口：Office远端main、主目录和8765部署仍为fa6ae1f，无新上游提交，Office工程本轮零修改。原T6 #12已合入；主目录fix/engine-host-t6-followup继续补修。准确632a617的g隔离全27项/69条浏览器通过，但原8765真实DeepSeek在审批期间暴露D62：64KiB预算按会话ID删活动卡，整体验收失败，原报告保留。原projection最小修复及真实100会话审批红绿回归已完成，新准确候选完整验证/部署/真模型以随后形成的h报告为准，形成前不标通过。用户已准确批准b8fd7c4的r6工作区迁移方案，实施/验证中，尚未对真实数据迁移；摘要与空间查询最小依赖增量见0007第12.18节，待单独批准。Office活跃Rx仍全部暂缓，Windows原生未执行、不计通过；Demo差距和剩余能力详见master16.7及专用审查。
 
 <details>
 <summary>历史状态记录：保留原时点，不覆盖上方当前入口</summary>

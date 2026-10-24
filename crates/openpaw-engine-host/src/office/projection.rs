@@ -357,17 +357,19 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         }
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
-        // 整办公室64KiB预算；先缩工具，再缩旧终态详情，始终保留全部会话ID和标题。
+        // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
         while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>64000 {
             let convs=snapshot["conversations"].as_array_mut().unwrap();
-            if let Some(c)=convs.iter_mut().rev().find(|c|c["tasks"].as_array().is_some_and(|a|a.len()>1)){
+            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&matches!(c["tasks"][0]["status"].as_str(),Some("completed"|"failed"))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
+            let Some((i,_))=candidate else {return Err(HostError::new("protocol_error","Office完整会话目录超限"));};
+            let c=&mut convs[i];
+            // 会话ID的字典序不代表新旧；审批中的步骤不能被旧历史挤掉。
+            if c["tasks"].as_array().is_some_and(|a|a.len()>1){
                 let popped=c["tasks"].as_array_mut().unwrap().pop().unwrap();
                 c["events"].as_array_mut().unwrap().retain(|e|e["taskId"]!=popped["id"]);
                 continue;
             }
-            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&matches!(c["tasks"][0]["status"].as_str(),Some("completed"|"failed"))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
-            let Some((i,_))=candidate else {return Err(HostError::new("protocol_error","Office完整会话目录超限"));};
-            let c=&mut convs[i];c["tasks"]=json!([]);c["events"]=json!([]);
+            c["tasks"]=json!([]);c["events"]=json!([]);
             // 成员身份是人物点击和侧栏的范围依据，不能随旧任务展示预算一起删除。
             // 可选职责/白板按上游Schema省略；详情仍从可信目录及原账本读取完整信息。
             c.as_object_mut().unwrap().remove("whiteboard");
@@ -763,8 +765,17 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
         std::fs::create_dir(&root).unwrap();
-        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
-        let host = Host::start(config).await.unwrap();
+        use openpaw_llm::{MockMode, MockProvider};
+        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["write_file"],"approval_timeout_secs":30})).unwrap();
+        let mut script = vec![MockMode::Fixed("已完成旧任务".into()); 100];
+        script.extend([
+            MockMode::ToolUse { tool_name: "report_progress".into(), input: json!({"type":"create","steps":[{"id":"draft","title":"撰写本轮报告"},{"id":"check","title":"核验本轮报告"}]}), text: String::new() },
+            MockMode::ToolUse { tool_name: "write_file".into(), input: json!({"path":"output.txt","content":"must wait for approval"}), text: String::new() },
+            MockMode::Fixed("本轮已完成".into()),
+        ]);
+        let host = Host::with_provider(config, std::sync::Arc::new(MockProvider::scripted(script)))
+            .await
+            .unwrap();
         let office = OfficeConfig {
             base_url: "http://127.0.0.1:9".into(),
             api_key_env: "PAWOFFICE_TEST_KEY".into(),
@@ -830,6 +841,81 @@ mod tests {
             snapshot,
             "裁剪后的内容必须稳定，不能每秒改变seq"
         );
+        let active_scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "conv-099".into(),
+        };
+        let active_session = host.open_session(active_scope.clone()).await.unwrap();
+        let active_run = host
+            .submit_run(
+                &active_scope,
+                &active_session.session_id,
+                "满目录中等待确认写报告".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (view, mut events) = host.snapshot_and_subscribe(&active_scope).await.unwrap();
+                if !view.pending_approvals.is_empty() {
+                    break;
+                }
+                events.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let active_snapshot = prepare(&host, &office, "office-1").await.unwrap();
+        let current = active_snapshot["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "conv-099")
+            .unwrap();
+        assert_eq!(
+            current["tasks"].as_array().unwrap().len(),
+            3,
+            "64KiB裁剪不得删除正在审批的业务步骤"
+        );
+        assert_eq!(current["tasks"][0]["status"], "blocked");
+        assert_eq!(current["employees"].as_array().unwrap().len(), 6);
+        assert_eq!(
+            active_snapshot["conversations"].as_array().unwrap().len(),
+            100
+        );
+        assert!(
+            serde_json::to_vec(
+                &json!({"type":"office.snapshot","teamId":"office-1","snapshot":active_snapshot})
+            )
+            .unwrap()
+            .len()
+                <= 64000
+        );
+        assert_eq!(
+            prepare(&host, &office, "office-1").await.unwrap(),
+            active_snapshot
+        );
+        assert!(!root.join("output.txt").exists());
+        host.cancel_run(&active_scope, &active_run.run_id)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+            .await
+            .unwrap();
+        let terminal_snapshot = prepare(&host, &office, "office-1").await.unwrap();
+        let latest = terminal_snapshot["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "conv-099")
+            .unwrap();
+        assert_eq!(
+            latest["tasks"].as_array().unwrap().len(),
+            3,
+            "先缩旧终态，不能先清掉最新目标"
+        );
+        assert!(!root.join("output.txt").exists());
         let scope = ClientScope {
             namespace: "office".into(),
             slot_id: "office-1".into(),

@@ -364,3 +364,10 @@ D57专项修复已通过：原inline分支修前4≠3，修后27项包含漏开�
 ## 2026-10-24 D61：成员最近动态没有映射真实生命周期
 
 Office fa6ae1f的memberSelectors从events.employeeId生成个人最近动态；Host原projection.rs只发task.assigned。原独立子Run已完成，成员却只看到收到分配，缺少真实过程，不能因任务卡有终态就算Demo成员体验完成。原批准范围最小投影修复与回归见0007第12.15节。red日志d61-red退出101；最初green暴露“独立子卡”与“尚未核验关联业务步骤”不同，保留d61-green失败；扩原正反例后d61-green-b退出0。未删断言、未把独立执行当整个目标已完成；真实开始/等待/完成、无重复visit/seq由原产品入口重验。完整准确报告形成前保持待验收，Office不改、Windows暂缓。
+
+
+## D62：满目录下按ID裁剪活动步骤和审批成员动态
+
+原g真实DeepSeekLIVE-TEAM-af508f0a，前两子完成、陈书精确写审批出现但snapshot无该成员blocked，未获批准、cancel成功。完整快照55KiB旧内容叠加当前计划/动态后触及64,000预算；原while先逆IDpop任意子卡，删了fc0794fa活动会话的周理/陈书委派及events。原100单卡终态测试缺组合；先扩原inline建立100旧Run后复用conv099创建真实两步骤和pending写审批，再修原projection优先旧终态缩减。准确方法、权限和证据见0007第12.17；不改Office/Store/审批，不实施r6。
+
+D62原容量inline回归确切红绿：100旧Run后conv099真实两步骤+pending写审批，原1卡/期望3卡退出101；按revision先缩最旧终态后同测试退出0，活动及取消后最新3卡、六身份/100目录/稳定seq/64,000字节/101超限拒绝全部保留。Host全lib及新准确全27/真实DeepSeek尚待结果，不提前关闭。r6工作区迁移已获用户准确批准（b8fd7c4），本条D62不承担迁移实现结论。
