@@ -362,6 +362,28 @@ impl Host {
                 return Ok((d.clone(), false));
             }
             if prior.len() >= limit { return Err(HostError::new("capacity_exceeded", "本轮委派次数已满")); }
+            // 一个父Run内每个Office成员只能有一个活动委派。模型偶尔会把同一
+            // 角色重复派发，若直接创建子Run，白板会把同一个人物显示成两个Agent。
+            // 只有已终态失败/取消的尝试允许重试；成功或仍在执行的角色必须由
+            // 原子拒绝返回给主Agent，主Agent再改派尚未使用的角色或继续等待。
+            if let Some(existing) = prior.iter().rev().find(|d| d.role_id == input.role_id) {
+                match db.get_run(&existing.child_run) {
+                    Ok(run) if !run.state.is_terminal() || run.state == RunState::Completed => {
+                        return Err(HostError::new(
+                            "role_conflict",
+                            "该Office成员在本轮已被分配任务；每位成员只能对应一个Agent，不能重复创建子任务",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind == "not_found" => {
+                        return Err(HostError::new(
+                            "role_conflict",
+                            "该Office成员已有未恢复的委派记录，不能重复创建子任务",
+                        ));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             let child_scope = ClientScope { namespace:"host-agent".into(), slot_id:owner.scope.slot_id.clone(), conversation_id:uuid::Uuid::new_v4().simple().to_string() };
             let meta = db.session(&parent.session_id)?.meta;
             let mut session = openpaw_core::Session::new(meta.model, meta.provider);

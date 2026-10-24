@@ -784,7 +784,7 @@ mod tests {
             &scope,
             &binding.session_id,
             "member-overview",
-            json!({"kind":"member","employeeId":"assistant","actorId":"office-lead"}),
+            json!({"kind":"member","employeeId":"office-lead","actorId":"office-lead"}),
             &stop,
         )
         .await

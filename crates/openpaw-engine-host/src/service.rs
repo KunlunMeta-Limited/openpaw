@@ -724,10 +724,22 @@ impl Host {
                 context: system.clone(),
                 group: execution.as_ref().map(|e| e.group.clone()),
             });
+            // 多Agent运行的每个子Run都复用同一AgentLoop实现，但真实联网任务
+            // 通常超过默认25轮（搜索、抓取、核对和整理各占一轮）。仅扩大
+            // 协作模式的弹性轮次；普通CLI/单Run保持核心默认预算不变，主子
+            // 总调用和输出仍受AgentsConfig共享硬上限约束。
+            let agent_budget = execution.as_ref().map(|e| {
+                let ceiling = if e.role == "lead" { 96 } else { 64 };
+                openpaw_core::IterationBudget::new_elastic_with_ceiling(8, ceiling, ceiling, 1)
+            });
             let engine = AgentLoop::new(provider)
                 .with_model(&self.inner.model)
                 .with_tool_host(tools)
                 .with_approval_manager(approval)
+                .with_budget(
+                    agent_budget
+                        .unwrap_or_else(|| openpaw_core::IterationBudget::new_elastic(8, 25, 1)),
+                )
                 .with_parallel_tools(false)
                 .with_stream_timeout(Duration::from_secs(self.inner.config.stream_idle_secs));
             let context = RunContext {

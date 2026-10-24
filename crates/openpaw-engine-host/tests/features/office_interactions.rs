@@ -354,12 +354,12 @@ async fn interaction_scenario() {
     );
     let mut inspected = std::collections::BTreeMap::new();
     for (employee, actor, name) in [
-        ("assistant", "office-lead", "王明"),
-        ("command", "code-agent", "李研"),
-        ("files", "file-agent", "周理"),
-        ("draft", "app-agent", "陈书"),
-        ("review", "review-agent", "刘市"),
-        ("search", "data-agent", "赵审"),
+        ("office-lead", "office-lead", "王明"),
+        ("code-agent", "code-agent", "李研"),
+        ("file-agent", "file-agent", "周理"),
+        ("app-agent", "app-agent", "陈书"),
+        ("review-agent", "review-agent", "刘市"),
+        ("data-agent", "data-agent", "赵审"),
     ] {
         let actor_reply = action(
             &shared,
@@ -403,10 +403,10 @@ async fn interaction_scenario() {
         );
     }
     assert_ne!(
-        inspected["assistant"]["fields"],
-        inspected["draft"]["fields"]
+        inspected["office-lead"]["fields"],
+        inspected["app-agent"]["fields"]
     );
-    assert!(inspected["assistant"]["fields"]
+    assert!(inspected["office-lead"]["fields"]
         .as_array()
         .unwrap()
         .iter()
@@ -424,7 +424,7 @@ async fn interaction_scenario() {
         &shared,
         "inspect-1",
         "employee.inspect",
-        json!({"employeeId":"assistant"}),
+        json!({"employeeId":"office-lead"}),
     )
     .await;
     assert_eq!(menu["presentation"]["target"], "dialog");
@@ -500,7 +500,7 @@ async fn interaction_scenario() {
     {
         let mut extra = json!({"taskId":format!("run:{}",r.run_id)});
         if *kind == "task.assign" {
-            extra["assigneeId"] = json!("assistant");
+            extra["assigneeId"] = json!("office-lead");
         }
         let unsupported = action(&shared, &format!("task-5-{i}"), kind, extra).await;
         assert_eq!(unsupported["presentation"]["success"], false);
@@ -555,7 +555,7 @@ async fn interaction_scenario() {
     {
         let mut s = shared.lock().await;
         for i in 0..32 {
-            s.actions.push_back(json!({"id":format!("pressure-{i}"),"teamId":"office-1","conversationId":"ui-test","action":"employee.inspect","employeeId":"assistant"}));
+            s.actions.push_back(json!({"id":format!("pressure-{i}"),"teamId":"office-1","conversationId":"ui-test","action":"employee.inspect","employeeId":"office-lead"}));
         }
     }
     tokio::time::timeout(Duration::from_secs(8), async {

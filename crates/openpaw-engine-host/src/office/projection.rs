@@ -5,7 +5,10 @@
 use super::{client::Client, dto, OfficeConfig};
 use crate::{ClientScope, Host, HostError, HostResult, RunState};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 /// 用途：持有Office同步任务；关闭时在Store之前完成最终投影。
@@ -146,10 +149,10 @@ fn status(state: RunState) -> &'static str {
 /// 关联：需求/设计REQ-OP-021/023；DES-OP-011。
 pub(super) fn actor(tool: &str) -> (&'static str, &'static str) {
     match tool {
-        "read_file" | "write_file" | "edit_file" => ("files", "file-agent"),
-        "glob" | "grep" | "web_search" | "web_fetch" => ("search", "data-agent"),
-        "bash" => ("command", "code-agent"),
-        _ => ("assistant", "office-lead"),
+        "read_file" | "write_file" | "edit_file" => ("file-agent", "file-agent"),
+        "glob" | "grep" | "web_search" | "web_fetch" => ("data-agent", "data-agent"),
+        "bash" => ("code-agent", "code-agent"),
+        _ => ("office-lead", "office-lead"),
     }
 }
 fn task(
@@ -161,7 +164,7 @@ fn task(
     now: &str,
     progress: u64,
 ) -> Value {
-    let mut task = json!({"id":id,"title":dto::bounded(&title,160),"assigneeId":"assistant","status":state,"progress":progress,"summary":dto::bounded(&summary,1000),"updatedAt":now});
+    let mut task = json!({"id":id,"title":dto::bounded(&title,160),"assigneeId":"office-lead","status":state,"progress":progress,"summary":dto::bounded(&summary,1000),"updatedAt":now});
     if let Some(prior) = old.get(&id) {
         let mut comparable = prior.clone();
         comparable["updatedAt"] = Value::String(now.into());
@@ -269,8 +272,26 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             let mut child_tasks=Vec::new();
             let mut child_events=Vec::new();
             let mut completed_children=0u64;
+            // 重试记录仍保留在账本和动态事件中，但一个Office人物只能有一张
+            // 当前任务卡。优先展示该角色最近的活动或成功尝试，全部失败时
+            // 才展示最近一次失败，避免一个人物被投影成多个Agent。
+            let mut display_calls=BTreeSet::new();
+            for role_id in delegations.iter().map(|d|d.role_id.as_str()).collect::<BTreeSet<_>>() {
+                let mut chosen=None;
+                for d in delegations.iter().rev().filter(|d|d.role_id==role_id) {
+                    let state=match db.get_run(&d.child_run) {
+                        Ok(child)=>child.state,
+                        Err(e) if e.kind=="not_found"=>continue,
+                        Err(e)=>return Err(e),
+                    };
+                    if state==RunState::Completed || !state.is_terminal() { chosen=Some(d.call_id.clone()); break; }
+                    chosen.get_or_insert_with(||d.call_id.clone());
+                }
+                if let Some(call_id)=chosen { display_calls.insert(call_id); }
+            }
             for d in &delegations {
                 let role=crate::agents::role(&d.role_id).ok_or_else(||HostError::new("storage_unavailable","委派引用未知角色"))?;
+                let show_card=display_calls.contains(&d.call_id);
                 let child=match db.get_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
                 let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
                 let superseded=recovered.contains(&d.call_id);
@@ -278,7 +299,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 let verified=done && plan.as_ref().map(|p|p["steps"].as_array().into_iter().flatten().any(|s|
                     s["state"]=="completed" && s["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id))
                 )).unwrap_or(r.state==RunState::Completed);
-                completed_children+=u64::from(done);
+                if show_card { completed_children+=u64::from(done); }
                 let summary=if let Some(c)=&child {
                     if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {"子任务未完成，已保存真实结果".into()}
                     else if state=="blocked" {"等待确认、资源或清理".into()} else {"正在独立处理此任务".into()}
@@ -313,15 +334,15 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                         child_events.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
                     }
                 }
-                if !superseded {
+                if show_card && !superseded {
                     if let Some(index)=linked {child_steps.insert(index,item);} else {child_tasks.push(item);}
                 }
                 if child.is_some() {
-                    child_events.push(json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":d.created_at,"taskId":task_id,"employeeId":role.employee,"fromEmployeeId":"assistant"}));
+                child_events.push(json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":d.created_at,"taskId":task_id,"employeeId":role.employee,"fromEmployeeId":"office-lead"}));
                 }
             }
             if !delegations.is_empty() {
-                let required_children=(delegations.len()-recovered.len()) as u64;
+                let required_children=display_calls.len() as u64;
                 let delivered=r.state==RunState::Completed && completed_children==required_children;
                 let child_percent=(completed_children+u64::from(delivered))*100/(required_children+1);
                 percent=if steps.is_empty() {child_percent}else{percent.min(child_percent)};
@@ -356,7 +377,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 let _call_reference=db.office_call_id(&r.run_id,&t.call_id)?;
                 if !delegations.is_empty() {continue;} // 协作交接只来自真实委派，主角色核验工具不重复派发同一步。
                 let (who,_)=actor(&t.tool_name);
-                if who=="assistant" || !db.office_call_started(&r.run_id,&t.call_id)? {continue;}
+                if who=="office-lead" || !db.office_call_started(&r.run_id,&t.call_id)? {continue;}
                 let current=assignments.get(&t.call_id).map(|i|i+1).filter(|i|*i<tasks.len()).unwrap_or(0);
                 let id=tasks[current]["id"].as_str().unwrap().to_owned();
                 let event_id=format!("assign:{id}:{who}");
@@ -364,9 +385,9 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 if !r.state.is_terminal() && matches!(t.state.as_str(),"running"|"awaiting_resource") {
                     tasks[current]["assigneeId"]=json!(who);
                 }
-                let label=match who {"files"=>"文件操作","search"=>"资料查询",_=>"执行操作"};
+                let label=match who {"file-agent"=>"文件操作","data-agent"=>"资料查询",_=>"执行操作"};
                 let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|a|a.iter().find(|e|e["id"]==event_id));
-                events.push(existing.cloned().unwrap_or_else(||json!({"id":event_id,"kind":"task.assigned","summary":format!("开始{label}"),"occurredAt":tasks[current]["updatedAt"],"taskId":id,"employeeId":who,"fromEmployeeId":"assistant"})));
+                events.push(existing.cloned().unwrap_or_else(||json!({"id":event_id,"kind":"task.assigned","summary":format!("开始{label}"),"occurredAt":tasks[current]["updatedAt"],"taskId":id,"employeeId":who,"fromEmployeeId":"office-lead"})));
             }
             // assignee也是任务内容；完成全部映射后再比较，避免同内容每秒改变updatedAt/seq。
             for task in &mut tasks {
@@ -678,7 +699,7 @@ mod tests {
             let awaiting_tasks = awaiting_review["conversations"][0]["tasks"]
                 .as_array()
                 .unwrap();
-            for employee in ["command", "files"] {
+            for employee in ["code-agent", "file-agent"] {
                 let own = awaiting_tasks
                     .iter()
                     .find(|t| t["assigneeId"] == employee)
@@ -690,7 +711,7 @@ mod tests {
                 );
                 assert_eq!(own["progress"], 100);
             }
-            assert_eq!(awaiting_tasks[1]["assigneeId"], "assistant");
+            assert_eq!(awaiting_tasks[1]["assigneeId"], "office-lead");
             assert_ne!(
                 awaiting_tasks[1]["status"], "completed",
                 "子执行完成不代替业务验收"
@@ -723,10 +744,10 @@ mod tests {
             if expected_cards != 3 {
                 let tasks = conv["tasks"].as_array().unwrap();
                 assert_eq!(
-                    tasks[1]["assigneeId"], "assistant",
+                    tasks[1]["assigneeId"], "office-lead",
                     "共同或歧义步骤由主角色负责，不能挂在第一位同事名下"
                 );
-                for employee in ["command", "files"] {
+                for employee in ["code-agent", "file-agent"] {
                     let own: Vec<_> = tasks
                         .iter()
                         .filter(|t| t["assigneeId"] == employee)
@@ -735,7 +756,7 @@ mod tests {
                     assert!(own[0]["id"].as_str().unwrap().starts_with("delegation:"));
                     assert_eq!(
                         own[0]["status"],
-                        if second_evidence == "call_2_0" && employee == "files" {
+                        if second_evidence == "call_2_0" && employee == "file-agent" {
                             "blocked"
                         } else {
                             "completed"
@@ -752,7 +773,7 @@ mod tests {
                 }
             }
             if expected_cards == 3 {
-                for (index, employee) in ["command", "files"].into_iter().enumerate() {
+                for (index, employee) in ["code-agent", "file-agent"].into_iter().enumerate() {
                     assert_eq!(conv["tasks"][index + 1]["assigneeId"], employee);
                     assert_eq!(conv["tasks"][index + 1]["status"], "completed");
                     for event in conv["events"]
@@ -843,7 +864,7 @@ mod tests {
                     &scope,
                     &binding.session_id,
                     "after-followup",
-                    json!({"kind":"member","employeeId":"command","actorId":"code-agent"}),
+                    json!({"kind":"member","employeeId":"code-agent","actorId":"code-agent"}),
                     &CancellationToken::new(),
                 )
                 .await
@@ -1043,13 +1064,7 @@ mod tests {
             assert_eq!(latest_assignment["kind"], "task.assigned");
             assert_eq!(
                 conv["tasks"].as_array().unwrap().len(),
-                if confirm {
-                    3
-                } else if retry {
-                    5
-                } else {
-                    4
-                },
+                if confirm { 3 } else { 4 },
                 "有准确证据才合并；不能按相似任务标题猜测关联"
             );
             if confirm {
@@ -1058,13 +1073,10 @@ mod tests {
                     conv["tasks"][0]["progress"], 100,
                     "正常保存最终汇总后才确认交付"
                 );
-                assert_eq!(conv["tasks"][1]["assigneeId"], "command");
+                assert_eq!(conv["tasks"][1]["assigneeId"], "code-agent");
                 assert_eq!(latest_assignment["taskId"], conv["tasks"][1]["id"]);
             } else {
-                assert_eq!(
-                    conv["tasks"][0]["status"],
-                    if retry { "failed" } else { "blocked" }
-                );
+                assert_eq!(conv["tasks"][0]["status"], "blocked");
                 assert!(conv["tasks"][0]["progress"].as_u64().unwrap() < 100);
                 assert_eq!(
                     conv["tasks"][1]["status"], "blocked",
@@ -1075,22 +1087,26 @@ mod tests {
                         .as_array()
                         .unwrap()
                         .iter()
-                        .filter(|t| t["assigneeId"] == "command")
+                        .filter(|t| t["assigneeId"] == "code-agent")
                         .collect();
-                    assert_eq!(attempts.len(), 2, "未核验的重试关系不能合并两次真实尝试");
-                    assert!(
-                        attempts.iter().any(|t| t["status"] == "failed"),
-                        "保留真实失败"
-                    );
-                    assert!(
-                        attempts
-                            .iter()
-                            .any(|t| t["status"] == "blocked" && t["progress"] == 100),
+                    assert_eq!(attempts.len(), 1, "同一人物的重试不能投影为第二个Agent");
+                    assert_eq!(
+                        attempts[0]["status"], "blocked",
                         "后次真实执行结束仍待业务核验"
                     );
+                    assert!(
+                        conv["events"].as_array().unwrap().iter().any(|event| {
+                            event["summary"].as_str().unwrap_or("").contains("未完成")
+                        }),
+                        "历史失败仍须保留在真实动态事件中"
+                    );
                 }
-                let child_index = if retry { 4 } else { 3 };
-                assert_eq!(conv["tasks"][child_index]["assigneeId"], "command");
+                let child_index = conv["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .position(|task| task["assigneeId"] == "code-agent")
+                    .unwrap();
                 assert_eq!(
                     latest_assignment["taskId"],
                     conv["tasks"][child_index]["id"]
@@ -1117,7 +1133,7 @@ mod tests {
                 "执行结束不能伪造核验完成事件；仅确认的证据产生完成动态"
             );
             if let Some(event) = completions.first() {
-                assert_eq!(event["employeeId"], "command");
+                assert_eq!(event["employeeId"], "code-agent");
                 let child_index = if confirm { 1 } else { 3 };
                 assert_eq!(event["taskId"], conv["tasks"][child_index]["id"]);
                 assert!(event["summary"].as_str().unwrap().contains("已核验"));
@@ -1157,7 +1173,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|event| event["kind"] == "task.assigned")
-                .all(|event| event["fromEmployeeId"] == "assistant"));
+                .all(|event| event["fromEmployeeId"] == "office-lead"));
             assert!(
                 !conv["events"]
                     .as_array()

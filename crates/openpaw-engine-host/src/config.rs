@@ -397,14 +397,14 @@ pub struct AgentsConfig {
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub max_delegations: usize,
-    /// 用途：共享Provider调用次数预算。
+    /// 用途：共享Provider调用次数预算，覆盖主Run及全部独立子Run。
     /// 字段：u64，共享Provider调用次数预算。
     /// 来源去向：可信Host装配、原Store与本次运行。
     /// 约束：不得由浏览器或模型覆盖权限及所属关系。
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub max_model_requests: u64,
-    /// 用途：共享输出token预留预算。
+    /// 用途：共享输出token预留预算，覆盖主Run及全部独立子Run。
     /// 字段：u64，共享输出token预留预算。
     /// 来源去向：可信Host装配、原Store与本次运行。
     /// 约束：不得由浏览器或模型覆盖权限及所属关系。
@@ -425,8 +425,11 @@ impl Default for AgentsConfig {
             enabled: false,
             max_active_children: 2,
             max_delegations: 12,
-            max_model_requests: 64,
-            max_output_tokens: 65536,
+            // 真实联网协作会为每位成员产生多轮“搜索—抓取—核对—交付”。
+            // 64 次会在子Run交付前耗尽，导致父Run把已完成资料标为失败；
+            // 仍由配置硬上限约束，不改变单Run的AgentLoop预算或工具权限。
+            max_model_requests: 384,
+            max_output_tokens: 524288,
             tools: BTreeMap::new(),
         }
     }

@@ -7,7 +7,7 @@
 /// 字段：角色、原成员、人物标识及可公开的姓名职责。
 /// 来源去向：固定目录到Host运行装配与Office适配。
 /// 约束：仅匹配配置中已有角色，不接收任意客户端别名。
-/// 稳定性：Host内部角色定义；原assistant/files/search/command标识保留。
+/// 稳定性：Host内部角色定义；employee使用Office官方成员ID。
 /// 关联：需求/设计REQ-OP-021/022；CHG-2026-0007第9.6节。
 pub(crate) struct Role {
     /// 用途：可信角色标识。
@@ -56,42 +56,42 @@ pub(crate) struct Role {
 pub(crate) const ROLES: [Role; 6] = [
     Role {
         id: "lead",
-        employee: "assistant",
+        employee: "office-lead",
         actor: "office-lead",
         name: "王明",
         duty: "任务统筹、分工与结果汇总",
     },
     Role {
         id: "research",
-        employee: "command",
+        employee: "code-agent",
         actor: "code-agent",
         name: "李研",
         duty: "信息检索与技术背景核对",
     },
     Role {
         id: "organize",
-        employee: "files",
+        employee: "file-agent",
         actor: "file-agent",
         name: "周理",
         duty: "项目资料查看与整理",
     },
     Role {
         id: "draft",
-        employee: "draft",
+        employee: "app-agent",
         actor: "app-agent",
         name: "陈书",
         duty: "报告草稿与交付物撰写",
     },
     Role {
         id: "review",
-        employee: "review",
+        employee: "review-agent",
         actor: "review-agent",
         name: "刘市",
         duty: "需求和验收覆盖核对",
     },
     Role {
         id: "audit",
-        employee: "search",
+        employee: "data-agent",
         actor: "data-agent",
         name: "赵审",
         duty: "来源、结论与风险复核",
