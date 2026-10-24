@@ -1325,6 +1325,14 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
                 "主角色的实际Provider请求必须收到准确人物映射：{mapping}"
             );
         }
+        assert!(
+            system.contains("本轮各子角色实际工具白名单")
+                && system.contains("赵审（audit）：read_file")
+                && system.contains(
+                    "需要新建或修改文件的任务只能交给白名单含write_file或edit_file的角色"
+                ),
+            "主角色必须看到每个子角色的实际工具能力，避免把写入任务派给只读角色"
+        );
     }
     let mut sessions = std::collections::BTreeSet::new();
     let mut runs = std::collections::BTreeSet::new();

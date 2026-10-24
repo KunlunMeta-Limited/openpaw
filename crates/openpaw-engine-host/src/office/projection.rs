@@ -11,6 +11,31 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Office messages impose a smaller envelope budget than the HTTP response
+/// limit.  Every cached snapshot must pass the same check as a newly built
+/// snapshot before it can take the fast path.
+pub(super) const OFFICE_MESSAGE_LIMIT: usize = 64_000;
+
+/// Return whether a persisted snapshot is safe to send to the configured
+/// Office.  This deliberately validates the envelope and workspace scope so
+/// a stale or manually damaged cache is rebuilt from Host facts.
+pub(super) fn snapshot_fits_office_message(team: &str, snapshot: &Value) -> bool {
+    if snapshot["schemaVersion"] != "1.0"
+        || snapshot["workspace"]["id"] != team
+        || !snapshot["conversations"].is_array()
+    {
+        return false;
+    }
+    let request = json!({
+        "type": "office.snapshot",
+        "teamId": team,
+        "snapshot": snapshot,
+    });
+    serde_json::to_vec(&request)
+        .map(|bytes| bytes.len() <= OFFICE_MESSAGE_LIMIT && dto::protocol_value(&request))
+        .unwrap_or(false)
+}
+
 /// 用途：持有Office同步任务；关闭时在Store之前完成最终投影。
 /// 字段：停止token、任务、只读配置和有界会话恢复通知。
 /// 来源去向：HostServer启动到Host关闭。
@@ -51,7 +76,9 @@ impl Coordinator {
                 let mut values = Vec::new();
                 for team in teams {
                     if let Some((snapshot, _)) = db.office_projection(&team)? {
-                        values.push((team.to_owned(), snapshot));
+                        if snapshot_fits_office_message(&team, &snapshot) {
+                            values.push((team.to_owned(), snapshot));
+                        }
                     }
                 }
                 Ok(values)
@@ -84,10 +111,32 @@ impl Coordinator {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .contains_key(&team);
-                if has_cached_projection {
+                let cached_state = host
+                    .inner
+                    .store
+                    .call({
+                        let team = team.clone();
+                        move |db| {
+                            Ok(db
+                                .office_projection(&team)?
+                                .map(|(_, state)| state)
+                                .unwrap_or_default())
+                        }
+                    })
+                    .await
+                    .unwrap_or_default();
+                // A persisted halted state is a recoverable failure from an
+                // earlier process (for example a cache size error). Retry it
+                // immediately on restart so the UI is not left stale for the
+                // normal cached-refresh grace period.
+                if has_cached_projection && cached_state != "halted" {
                     tokio::select! {
                         _ = token.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                        // Keep the cached UI responsive while allowing the
+                        // first worker pass to avoid competing with startup.
+                        // One second is enough; a longer grace period leaves
+                        // a valid projection visibly stale after restart.
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                     }
                 }
 
@@ -138,10 +187,33 @@ impl Coordinator {
                     } else {
                         Ok(previous_status.clone())
                     };
-                    let status=match result {Ok(s)=>{delay=1;s},Err(e)=>{if matches!(e.kind.as_str(),"sequence_conflict"|"protocol_error"|"office_auth"){
-                        halted=true;let team=team.clone();
-                        let _=host.inner.store.call(move|db|{if let Some((snapshot,_))=db.office_projection(&team)?{db.save_office_projection(&team,&snapshot,"halted")?;}Ok(())}).await;
-                    }delay=(delay*2).min(30);e.kind}};
+                    let status = match result {
+                        Ok(s) => {
+                            if s != "halted" {
+                                halted = false;
+                            }
+                            delay = 1;
+                            s
+                        }
+                        Err(e) => {
+                            if e.kind == "sequence_conflict" {
+                                halted = true;
+                                let team = team.clone();
+                                let _ = host
+                                    .inner
+                                    .store
+                                    .call(move |db| {
+                                        if let Some((snapshot, _)) = db.office_projection(&team)? {
+                                            db.save_office_projection(&team, &snapshot, "halted")?;
+                                        }
+                                        Ok(())
+                                    })
+                                    .await;
+                            }
+                            delay = (delay * 2).min(30);
+                            e.kind
+                        }
+                    };
                     if status!=previous_status {eprintln!("engine-host Office {team}: {status}");previous_status=status;}
                     tokio::select!{_=token.cancelled()=>break,_=tokio::time::sleep(Duration::from_secs(delay))=>{}}
                 }
@@ -202,7 +274,24 @@ impl Coordinator {
         let client = Client::new(&self.config)?;
         let flush = async {
             for team in host.inner.config.slots.keys() {
-                let _ = sync_once(host, &self.config, team, &client, false, self.address).await;
+                // A persisted halted row is only authoritative for the final
+                // flush when it came from a confirmed external sequence
+                // conflict.  It prevents shutdown from immediately replaying
+                // the same rejected snapshot; restart still retries it once.
+                let halted = host
+                    .inner
+                    .store
+                    .call({
+                        let team = team.clone();
+                        move |db| {
+                            Ok(db
+                                .office_projection(&team)?
+                                .is_some_and(|(_, state)| state == "halted"))
+                        }
+                    })
+                    .await
+                    .unwrap_or(false);
+                let _ = sync_once(host, &self.config, team, &client, halted, self.address).await;
             }
         };
         if tokio::time::timeout(Duration::from_secs(3), flush)
@@ -316,6 +405,26 @@ fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value) {
 /// 权限：只读取namespace=office及team绑定。
 /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
 pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> HostResult<Value> {
+    prepare_internal(host, config, team, false).await
+}
+
+/// Prepare a projection while servicing a UI action.  The action already
+/// owns the UI-priority guard; allowing this one read keeps first-use details
+/// and office creation from returning `projection_deferred` to the browser.
+pub(super) async fn prepare_for_ui(
+    host: &Host,
+    config: &OfficeConfig,
+    team: &str,
+) -> HostResult<Value> {
+    prepare_internal(host, config, team, true).await
+}
+
+async fn prepare_internal(
+    host: &Host,
+    config: &OfficeConfig,
+    team: &str,
+    allow_ui_busy: bool,
+) -> HostResult<Value> {
     let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
     let started_at = std::time::Instant::now();
     let team = team.to_owned();
@@ -407,7 +516,9 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             && !handoff_due
         {
             if let Some((snapshot, _)) = db.office_projection(&team)? {
-                return Ok(snapshot);
+                if snapshot_fits_office_message(&team, &snapshot) {
+                    return Ok(snapshot);
+                }
             }
         }
         let name = db.office_creations()?.iter().find(|v|v["slot_id"]==team)
@@ -443,12 +554,12 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         let mut handoff_pending_any = false;
         let mut handoff_items: Vec<(String, Value, Value)> = Vec::new();
         for binding in bindings {
-            if ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            if !allow_ui_busy && ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
                 return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
             }
             let mut runs=Vec::new();
             for r in all_runs.iter().filter(|r|r.session_id==binding.session_id) {
-                if ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                if !allow_ui_busy && ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
                     return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
                 }
                 let (offset,input)=db.run_input(r)?;
@@ -757,7 +868,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
         // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
-        while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>64000 {
+        while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>OFFICE_MESSAGE_LIMIT {
             let convs=snapshot["conversations"].as_array_mut().unwrap();
             let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&terminal_conversations.contains(c["id"].as_str().unwrap_or(""))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
             let Some((i,_))=candidate else {return Err(HostError::new("protocol_error","Office完整会话目录超限"));};
@@ -777,6 +888,56 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             }
             c["title"]=json!(dto::bounded(c["title"].as_str().unwrap_or(""),24));
         }
+        // 把本次真实扫描中尚未公开的交接项预组装成逐步快照。每个变体
+        // 同时推进各会话的一项，保持“先到人物再显示下一任务”，而不让
+        // 后续窗口再次读取全部Run/JSONL。
+        if !handoff_items.is_empty() {
+            let mut by_conversation: BTreeMap<String, Vec<(Value, Value)>> = BTreeMap::new();
+            for (conversation, item, event) in handoff_items {
+                by_conversation
+                    .entry(conversation)
+                    .or_default()
+                    .push((item, event));
+            }
+            let mut remaining = by_conversation;
+            let mut current = snapshot.clone();
+            let mut variants = Vec::new();
+            let mut overflowed = false;
+            loop {
+                let mut progressed = false;
+                for (conversation, items) in remaining.iter_mut() {
+                    let Some((item, event)) = items.first().cloned() else { continue; };
+                    let Some(conv) = current["conversations"]
+                        .as_array_mut()
+                        .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
+                    else { continue; };
+                    apply_handoff_item(conv, &item, &event);
+                    items.remove(0);
+                    progressed = true;
+                }
+                if !progressed {
+                    break;
+                }
+                if !snapshot_fits_office_message(&team, &current) {
+                    // The base projection has already been clipped to the
+                    // Office envelope. A handoff event can add enough detail
+                    // to exceed it; keep the bounded base and do not enqueue
+                    // an invalid variant that would halt syncing.
+                    overflowed = true;
+                    break;
+                }
+                variants.push(current.clone());
+                if remaining.values().all(Vec::is_empty) { break; }
+            }
+            if overflowed || variants.is_empty() {
+                handoff_pending_any = false;
+                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
+            } else {
+                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).insert(team.clone(), variants);
+            }
+        } else {
+            handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
+        }
         let update_handoff_window = |db: &mut crate::store::Db| {
             let now = chrono::Utc::now();
             if handoff_pending_any {
@@ -792,44 +953,6 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 db.office_projection_handoff_until.remove(&team);
             }
         };
-        // 把本次真实扫描中尚未公开的交接项预组装成逐步快照。每个变体
-        // 同时推进各会话的一项，保持“先到人物再显示下一任务”，而不让
-        // 后续窗口再次读取全部Run/JSONL。
-        if !handoff_items.is_empty() {
-            let mut by_conversation: BTreeMap<String, Vec<(Value, Value)>> = BTreeMap::new();
-            for (conversation, item, event) in handoff_items {
-                by_conversation
-                    .entry(conversation)
-                    .or_default()
-                    .push((item, event));
-            }
-            let mut remaining = by_conversation;
-            let mut current = snapshot.clone();
-            let mut variants = Vec::new();
-            loop {
-                let mut progressed = false;
-                for (conversation, items) in remaining.iter_mut() {
-                    let Some((item, event)) = items.first().cloned() else { continue; };
-                    let Some(conv) = current["conversations"]
-                        .as_array_mut()
-                        .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
-                    else { continue; };
-                    apply_handoff_item(conv, &item, &event);
-                    items.remove(0);
-                    progressed = true;
-                }
-                if !progressed { break; }
-                variants.push(current.clone());
-                if remaining.values().all(Vec::is_empty) { break; }
-            }
-            if variants.is_empty() {
-                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
-            } else {
-                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).insert(team.clone(), variants);
-            }
-        } else {
-            handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
-        }
         if prior==Some(&snapshot) {
             update_handoff_window(db);
             db.office_projection_source.insert(team.clone(), source_revision);
@@ -877,17 +1000,10 @@ pub(super) async fn sync_once(
         return Ok("reserved".into());
     }
     let snapshot = prepare(host, config, team).await?;
-    let key = team.to_owned();
-    let saved_halt = host
-        .inner
-        .store
-        .call(move |db| {
-            Ok(db
-                .office_projection(&key)?
-                .is_some_and(|(_, s)| s == "halted"))
-        })
-        .await?;
-    if halted || saved_halt {
+    // `halted` is an in-process latch for a confirmed external sequence
+    // conflict. A persisted halted row may represent a recoverable protocol
+    // or cache failure from an older Host, so it must not block restart.
+    if halted {
         return Ok("halted".into());
     }
     let caps = client.capabilities().await?;
@@ -960,6 +1076,24 @@ pub(super) async fn sync_once(
 mod tests {
     use super::*;
     use crate::{ClientScope, HostConfig};
+
+    #[test]
+    fn cached_snapshot_validation_rejects_wrong_scope_and_oversize_envelopes() {
+        let mut snapshot = json!({
+            "schemaVersion": "1.0",
+            "seq": 7,
+            "workspace": {"id": "office-1", "name": "办公室"},
+            "conversations": [],
+            "system": {"cpuPercent": -1, "memoryPercent": -1, "networkKbps": -1}
+        });
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+        assert!(!snapshot_fits_office_message("office-2", &snapshot));
+        snapshot["conversations"] = json!([{"id":"old","title":"x".repeat(65_000)}]);
+        assert!(!snapshot_fits_office_message("office-1", &snapshot));
+        snapshot["schemaVersion"] = json!("legacy");
+        assert!(!snapshot_fits_office_message("office-1", &snapshot));
+    }
+
     #[tokio::test]
     async fn consecutive_delegations_use_their_precise_completed_step_without_duplicate_cards() {
         use openpaw_llm::{MockMode, MockProvider};

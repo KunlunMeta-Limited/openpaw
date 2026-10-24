@@ -111,7 +111,7 @@ pub(super) async fn create(
             .call(move |db| db.save_office_creation(&id, &slot, &name, &binding.session_id))
             .await?;
     }
-    let snapshot = projection::prepare(host, config, &team).await?;
+    let snapshot = projection::prepare_for_ui(host, config, &team).await?;
     Ok((json!({"target":"office","snapshot":snapshot}), guard))
 }
 

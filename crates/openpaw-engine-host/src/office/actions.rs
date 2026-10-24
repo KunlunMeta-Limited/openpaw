@@ -221,6 +221,7 @@ async fn dispatch(
             .unwrap_or_else(|e| e.into_inner())
             .get(&scope.slot_id)
             .cloned()
+            .filter(|snapshot| projection::snapshot_fits_office_message(&scope.slot_id, snapshot))
     } else {
         None
     };
@@ -244,7 +245,7 @@ async fn dispatch(
     // 首次尚未有投影时才同步生成一次，不能在详情请求中复制第二套投影逻辑。
     let snapshot = match cached_snapshot {
         Some(snapshot) => snapshot,
-        None => projection::prepare(host, config, &scope.slot_id).await?,
+        None => projection::prepare_for_ui(host, config, &scope.slot_id).await?,
     };
     if diagnostics {
         eprintln!(

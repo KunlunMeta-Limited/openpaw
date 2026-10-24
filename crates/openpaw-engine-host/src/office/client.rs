@@ -184,18 +184,22 @@ impl Client {
                 }
             }
             Some("office.snapshot") => {
-                if data["teamId"] != request["teamId"]
-                    || data["seq"] != request["snapshot"]["seq"]
-                    || !matches!(
-                        (status, data["status"].as_str()),
-                        (200, Some("applied" | "ignored")) | (202, Some("cached"))
-                    )
-                    || data.as_object().is_none_or(|o| {
-                        o.keys().any(|k| {
-                            !matches!(k.as_str(), "teamId" | "seq" | "status" | "reasonCode")
-                        })
-                    })
-                {
+                if data["teamId"] != request["teamId"] {
+                    return Err(HostError::new("protocol_error", "Office快照回执不合法"));
+                }
+                if data["seq"] != request["snapshot"]["seq"] {
+                    return Err(HostError::new(
+                        "sequence_conflict",
+                        "Office快照回执序号与请求不一致",
+                    ));
+                }
+                if !matches!(
+                    (status, data["status"].as_str()),
+                    (200, Some("applied" | "ignored")) | (202, Some("cached"))
+                ) || data.as_object().is_none_or(|o| {
+                    o.keys()
+                        .any(|k| !matches!(k.as_str(), "teamId" | "seq" | "status" | "reasonCode"))
+                }) {
                     return Err(HostError::new("protocol_error", "Office快照回执不合法"));
                 }
             }

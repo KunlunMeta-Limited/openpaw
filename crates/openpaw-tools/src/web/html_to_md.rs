@@ -47,7 +47,10 @@ fn strip_tags_block(html: &str, tag: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut rest = html;
     loop {
-        let rest_lower = rest.to_lowercase();
+        // HTML tag names are ASCII.  Keep the transformed string byte-for-byte
+        // aligned with `rest`; Unicode `to_lowercase` can expand a character
+        // and would make a match offset unsafe to apply to the original UTF-8.
+        let rest_lower = rest.to_ascii_lowercase();
         let Some(start) = rest_lower.find(&open_lower) else {
             result.push_str(rest);
             break;
@@ -67,7 +70,7 @@ fn strip_tags_block(html: &str, tag: &str) -> String {
 
 /// Extract the main content area, preferring <main>, <article>, or <body> in that order.
 fn extract_main_content(html: &str) -> String {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
 
     // Try <main> first
     if let Some(start) = lower.find("<main") {
@@ -98,7 +101,7 @@ fn extract_main_content(html: &str) -> String {
 }
 
 fn extract_body(html: &str) -> String {
-    let lower = html.to_lowercase();
+    let lower = html.to_ascii_lowercase();
     if let Some(start) = lower.find("<body") {
         // 找到 <body ...> 的结束 >
         let after_body_tag = &html[start..];
@@ -121,7 +124,7 @@ fn extract_code_blocks(html: &str) -> (String, Vec<String>) {
     let mut rest = html;
 
     loop {
-        let lower_rest = rest.to_lowercase();
+        let lower_rest = rest.to_ascii_lowercase();
         let Some(start) = lower_rest.find("<pre") else {
             result.push_str(rest);
             break;
@@ -139,7 +142,7 @@ fn extract_code_blocks(html: &str) -> (String, Vec<String>) {
 
         // 找到 </pre> (case-insensitive, may have attributes before >)
         let after_tag = &after_pre[tag_end + 1..];
-        let lower_after = after_tag.to_lowercase();
+        let lower_after = after_tag.to_ascii_lowercase();
         let Some(end_rel) = lower_after.find("</pre") else {
             result.push_str(after_pre);
             break;
@@ -178,7 +181,7 @@ fn strip_code_tags(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
     loop {
-        let lower = rest.to_lowercase();
+        let lower = rest.to_ascii_lowercase();
         let open = lower.find("<code");
         let close = lower.find("</code");
 
@@ -315,7 +318,7 @@ impl<'a> MarkdownParser<'a> {
             .split_whitespace()
             .next()
             .unwrap_or("")
-            .to_lowercase();
+            .to_ascii_lowercase();
 
         // 解析属性
         let attrs = parse_attrs(tag_content);
@@ -413,7 +416,9 @@ impl<'a> MarkdownParser<'a> {
             return;
         };
         let tag_end = tag_start + tag_end_rel;
-        let tag_name: String = self.html[tag_start + 2..tag_end].trim().to_lowercase();
+        let tag_name: String = self.html[tag_start + 2..tag_end]
+            .trim()
+            .to_ascii_lowercase();
 
         match tag_name.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -535,7 +540,7 @@ fn parse_attrs(tag_content: &str) -> std::collections::HashMap<String, String> {
             val
         };
 
-        attrs.insert(key.to_lowercase(), value);
+        attrs.insert(key.to_ascii_lowercase(), value);
     }
 
     attrs
@@ -681,5 +686,37 @@ mod tests {
         assert!(md.contains("<tag>"));
         assert!(md.contains("&"));
         assert!(md.contains("\"quote\""));
+    }
+
+    #[test]
+    fn test_unicode_content_does_not_break_source_offsets() {
+        let html = format!(
+            "<main>前缀 İΣß 中文 <pre><code>{}</code></pre><p>尾部</p></main>",
+            "路线和天气信息。".repeat(512)
+        );
+        let md = html_to_markdown(&html);
+        assert!(md.contains("路线和天气信息。"));
+        assert!(md.contains("尾部"));
+        assert!(md.contains("```"));
+    }
+
+    #[test]
+    fn test_large_unicode_page_does_not_panic() {
+        let mut html = String::with_capacity(420_000);
+        html.push_str("<html><body><header>导航</header><article>");
+        for i in 0..2_000 {
+            html.push_str("<p>第");
+            html.push_str(&i.to_string());
+            html.push_str("段：长沙天气、路线、餐饮，İΣß 中文。</p>");
+            if i % 100 == 0 {
+                html.push_str("<pre><code>curl https://example.test/天气</code></pre>");
+            }
+        }
+        html.push_str("</article></body></html>");
+
+        let md = html_to_markdown(&html);
+        assert!(!md.is_empty());
+        assert!(md.contains("长沙天气"));
+        assert!(md.contains("```"));
     }
 }
