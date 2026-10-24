@@ -33,7 +33,7 @@ impl Coordinator {
     /// 并发与取消：每办公室一个worker，不持资源锁等待网络。
     /// 权限：只读取配置授权槽，人物先验证capabilities。
     /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
-    pub(crate) fn start(
+    pub(crate) async fn start(
         host: Host,
         config: OfficeConfig,
         address: std::net::SocketAddr,
@@ -41,6 +41,32 @@ impl Coordinator {
         let client = std::sync::Arc::new(Client::new(&config)?);
         let stop = CancellationToken::new();
         let (ui_refresh, _) = tokio::sync::broadcast::channel(32);
+        // 只读取已经保存的完整投影，先让人物点击使用可信快照；昂贵的事实重建
+        // 仍由后台worker执行，避免Host重启时把首个UI请求排在投影初始化之后。
+        let teams: Vec<String> = host.inner.config.slots.keys().cloned().collect();
+        let cached = host
+            .inner
+            .store
+            .call(move |db| {
+                let mut values = Vec::new();
+                for team in teams {
+                    if let Some((snapshot, _)) = db.office_projection(&team)? {
+                        values.push((team.to_owned(), snapshot));
+                    }
+                }
+                Ok(values)
+            })
+            .await?;
+        {
+            let mut cache = host
+                .inner
+                .office_projection_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (team, snapshot) in cached {
+                cache.insert(team, snapshot);
+            }
+        }
         let mut tasks = Vec::new();
         for team in host.inner.config.slots.keys() {
             let team = team.clone();
@@ -50,11 +76,37 @@ impl Coordinator {
             let client = client.clone();
             tasks.push(tokio::spawn(async move {
 
+                // 已有完整投影时先让Office UI/聊天动作使用这份可信快照，避免Host
+                // 重启后首个点击被全量历史重建占住Store；后台仍在短窗口后刷新事实。
+                let has_cached_projection = host
+                    .inner
+                    .office_projection_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&team);
+                if has_cached_projection {
+                    tokio::select! {
+                        _ = token.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    }
+                }
+
                 let mut previous_status=String::new();let mut halted=false;let mut delay=1;
                 let mut last_revision=None;
                 let mut last_network=tokio::time::Instant::now()-Duration::from_secs(10);
                 loop {
                     if token.is_cancelled(){break;}
+                    if host
+                        .inner
+                        .office_ui_busy
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != 0
+                    {
+                        tokio::select! {
+                            _ = token.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
+                        }
+                    }
                     let team_for_due = team.clone();
                     let (revision, handoff_due) = host
                         .inner
@@ -206,6 +258,55 @@ fn task(
     }
     task
 }
+
+/// 将一项已由真实子Run产生、但尚未到展示时机的交接事实加入快照。
+/// 该函数只操作内存中的规范快照；Run状态、权限和账本仍由首次投影读取。
+fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value) {
+    if let Some(tasks) = conversation["tasks"].as_array_mut() {
+        tasks.retain(|existing| existing["id"] != item["id"]);
+        tasks.push(item.clone());
+    }
+    if let Some(events) = conversation["events"].as_array_mut() {
+        if !events.iter().any(|existing| existing["id"] == event["id"]) {
+            events.push(event.clone());
+        }
+    }
+    let Some(tasks) = conversation["tasks"].as_array() else {
+        return;
+    };
+    let main = tasks.first().cloned().unwrap_or(Value::Null);
+    let completed = tasks
+        .iter()
+        .skip(1)
+        .filter(|task| task["status"] == "completed")
+        .count();
+    let total = tasks.len().saturating_sub(1);
+    let mut steps = Vec::new();
+    for task in tasks.iter().skip(1).rev().take(3).rev() {
+        let label = match task["status"].as_str() {
+            Some("completed") => "已完成",
+            Some("running") => "处理中",
+            Some("blocked") => "等待确认",
+            Some("failed") => "未完成",
+            _ => "待处理",
+        };
+        steps.push(json!({
+            "id": task["id"],
+            "title": dto::bounded(&format!("{} · {label}", dto::bounded(task["title"].as_str().unwrap_or(""), 24)), 40),
+            "progress": task["progress"],
+        }));
+    }
+    conversation["whiteboard"] = json!({
+        "template": "task-board-v1",
+        "title": dto::bounded(main["title"].as_str().unwrap_or(""), 32),
+        "status": main["status"],
+        "tagline": "",
+        "description": dto::bounded(&format!("已确认完成 {completed}/{total} 步；{}", main["summary"].as_str().unwrap_or("正在处理你的请求")), 500),
+        "note": "",
+        "link": {"label": "", "url": ""},
+        "steps": steps,
+    });
+}
 /// 功能：读取事实、生成有界完整快照并在变更时分配持久版本。
 /// 参数：host为共享服务，config为Office配置，team为固定办公室。
 /// 返回：已保存的规范化完整快照。
@@ -215,6 +316,8 @@ fn task(
 /// 权限：只读取namespace=office及team绑定。
 /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
 pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> HostResult<Value> {
+    let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
+    let started_at = std::time::Instant::now();
     let team = team.to_owned();
     let name = config
         .names
@@ -222,11 +325,86 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         .cloned()
         .unwrap_or_else(|| team.clone());
     let employees:Vec<_>=crate::agents::ROLES.iter().map(|role|json!({"id":role.employee,"name":role.name,"sceneActorId":role.actor,"role":role.duty,"online":crate::agents::enabled(role,&host.inner.config)})).collect();
-    host.inner.store.call(move|db|{
+    let diagnostics_team = team.clone();
+    let ui_busy = host.inner.office_ui_busy.clone();
+    let terminal_runs = host.inner.office_terminal_runs.clone();
+    let handoff_queue = host.inner.office_handoff_queue.clone();
+    let result = host.inner.store.call(move|db|{
+        let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
+        let fact_started = std::time::Instant::now();
         let source_revision = db.revision()?;
-        let handoff_scheduled = db.office_projection_handoff_until.contains_key(&team);
+        let handoff_due = db
+            .office_projection_handoff_until
+            .get(&team)
+            .is_some_and(|until| *until <= chrono::Utc::now());
+        if diagnostics {
+            eprintln!(
+                "engine-host diagnostics projection-source team={} current={} cached={:?} handoff={}",
+                team,
+                source_revision,
+                db.office_projection_source.get(&team),
+                handoff_due
+            );
+        }
+        // 交接窗口只改变“哪些已确认事实可以展示”，不改变Run事实。首次
+        // 扫描时已把后续交接快照预计算到内存队列；到期后直接推进一个快照，
+        // 避免人物点击与全量账本扫描竞争同一Store队列。
+        if handoff_due
+            && db.office_projection_source.get(&team).copied() == Some(source_revision)
+        {
+            let queued = handoff_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&team)
+                .and_then(|items| items.first().cloned());
+            if let Some(next) = queued {
+                let mut remove = false;
+                let mut snapshot = next;
+                let has_more = handoff_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&team)
+                    .is_some_and(|items| items.len() > 1);
+                let prior_state = db
+                    .office_projection(&team)?
+                    .map(|(_, state)| state)
+                    .unwrap_or_else(|| "pending".into());
+                let seq = db
+                    .office_projection(&team)?
+                    .and_then(|(value, _)| value["seq"].as_u64())
+                    .ok_or_else(|| HostError::new("sequence_conflict", "交接快照缺少序号"))?;
+                let next_seq = seq
+                    .checked_add(1)
+                    .filter(|n| *n < 9007199254740991)
+                    .ok_or_else(|| HostError::new("sequence_conflict", "Office序号已达安全整数上限"))?;
+                snapshot["seq"] = json!(next_seq);
+                db.save_office_projection(&team, &snapshot, &prior_state)?;
+                if has_more {
+                    db.office_projection_handoff_until.insert(
+                        team.clone(),
+                        chrono::Utc::now() + chrono::Duration::milliseconds(2200),
+                    );
+                } else {
+                    remove = true;
+                    db.office_projection_handoff_until.remove(&team);
+                }
+                {
+                    let mut queue = handoff_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(items) = queue.get_mut(&team) {
+                        items.remove(0);
+                        if remove {
+                            queue.remove(&team);
+                        }
+                    }
+                }
+                db.office_projection_source.insert(team.clone(), source_revision);
+                return Ok(snapshot);
+            }
+        }
         if db.office_projection_source.get(&team).copied() == Some(source_revision)
-            && !handoff_scheduled
+            && !handoff_due
         {
             if let Some((snapshot, _)) = db.office_projection(&team)? {
                 return Ok(snapshot);
@@ -238,14 +416,41 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         let prior=previous.as_ref().map(|(v,_)|v);
         let bindings:Vec<_>=db.bindings()?.into_iter().filter(|b|b.scope.namespace=="office"&&b.scope.slot_id==team).collect();
         let all_runs=db.runs()?;
+        // 终态Run的账本和工具事实已封存，可在进程内复用完整视图；活动Run
+        // 每次仍从Store重建，避免把正在变化的任务投影为旧状态。
+        let read_run = |id: &str| -> HostResult<crate::RunView> {
+            if let Some(cached) = terminal_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(id)
+                .cloned()
+            {
+                return Ok(cached);
+            }
+            let loaded = db.get_run_projection(id)?;
+            if loaded.state.is_terminal() {
+                terminal_runs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id.to_owned(), loaded.clone());
+            }
+            Ok(loaded)
+        };
         let now=chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true);
         let mut conversations=Vec::new();
         let mut priorities=BTreeMap::new();
         let mut terminal_conversations=std::collections::BTreeSet::new();
         let mut handoff_pending_any = false;
+        let mut handoff_items: Vec<(String, Value, Value)> = Vec::new();
         for binding in bindings {
+            if ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
+            }
             let mut runs=Vec::new();
             for r in all_runs.iter().filter(|r|r.session_id==binding.session_id) {
+                if ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                    return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
+                }
                 let (offset,input)=db.run_input(r)?;
                 if !input.is_empty(){runs.push((offset,r,input));}
             }
@@ -273,7 +478,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             let mut retained_events=Vec::new();
             let mut retained_whiteboard=Value::Null;
             for run_id in &display_ids {
-            let r=db.get_run(run_id)?;
+            let r=read_run(run_id)?;
             let (_,input)=db.run_input(&r)?;
             let main_id=format!("run:{}",r.run_id);
             let plan=db.progress(&r.run_id)?;
@@ -295,11 +500,11 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 let Some(index)=assignments.get(&d.call_id).copied() else {continue;};
                 let Some(step)=plan.as_ref().and_then(|p|p["steps"].get(index)) else {continue;};
                 if step["state"]!="completed" {continue;}
-                let failed=match db.get_run(&d.child_run) {Ok(c)=>c.state.is_terminal()&&c.state!=RunState::Completed,Err(e) if e.kind=="not_found"=>false,Err(e)=>return Err(e)};
+                let failed=match read_run(&d.child_run) {Ok(c)=>c.state.is_terminal()&&c.state!=RunState::Completed,Err(e) if e.kind=="not_found"=>false,Err(e)=>return Err(e)};
                 if !failed {continue;}
                 for replacement in &delegations {
                     if replacement.role_id!=d.role_id || assignments.get(&replacement.call_id)!=Some(&index) || !step["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&replacement.call_id)) {continue;}
-                    if db.get_run(&replacement.child_run)?.state==RunState::Completed {
+                    if read_run(&replacement.child_run)?.state==RunState::Completed {
                         recovered.insert(d.call_id.clone());break;
                     }
                 }
@@ -321,7 +526,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             for role_id in delegations.iter().map(|d|d.role_id.as_str()).collect::<BTreeSet<_>>() {
                 let mut chosen=None;
                 for d in delegations.iter().rev().filter(|d|d.role_id==role_id) {
-                    let state=match db.get_run(&d.child_run) {
+                    let state=match read_run(&d.child_run) {
                         Ok(child)=>child.state,
                         Err(e) if e.kind=="not_found"=>continue,
                         Err(e)=>return Err(e),
@@ -376,9 +581,10 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             for d in &delegations {
                 let role=crate::agents::role(&d.role_id).ok_or_else(||HostError::new("storage_unavailable","委派引用未知角色"))?;
                 let show_card=display_calls.contains(&d.call_id);
-                let child=match db.get_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
+                let child=match read_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
                 let handoff_visible = handoff_ready.contains(&d.call_id);
-                if show_card && !handoff_visible {
+                let handoff_hidden = show_card && !handoff_visible;
+                if handoff_hidden {
                     // 保留上一版本已经发出的事件，避免等待动画时历史闪退；
                     // 但不再次公开任务卡或执行状态，直到前一交接完成展示窗口。
                     if let Some(events) = prior_conv.and_then(|v| v["events"].as_array()) {
@@ -386,7 +592,6 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                             event["taskId"] == d.task_id
                         }).cloned());
                     }
-                    continue;
                 }
                 let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
                 let superseded=recovered.contains(&d.call_id);
@@ -426,11 +631,13 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                         let id=format!("activity:{}:{phase}",d.task_id);
                         let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|events|events.iter().find(|event|event["id"]==id));
                         if !observed&&existing.is_none() {continue;}
-                        child_events.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
+                        if !show_card || handoff_visible || existing.is_some() {
+                            child_events.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
+                        }
                     }
                 }
-                if show_card && !superseded {
-                    if let Some(index)=linked {child_steps.insert(index,item);} else {child_tasks.push(item);}
+                if show_card && !superseded && handoff_visible {
+                    if let Some(index)=linked {child_steps.insert(index,item.clone());} else {child_tasks.push(item.clone());}
                 }
                 if child.is_some() {
                 let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|events|events.iter().find(|event|event["id"]==format!("assign:{}",d.task_id)));
@@ -439,7 +646,17 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 // 同一次交接，但必须指向当前稳定任务ID，不能挂回临时卡。
                 // 事件ID和首次时间保持不变，因此不会重播拜访动画。
                 assignment["taskId"]=task_id;
-                child_events.push(assignment);
+                if handoff_hidden && !superseded {
+                    // 记录完整的下一步任务与交接事件。它们仍来自真实子Run，
+                    // 这里只是延迟公开；后续快照会按角色顺序一次加入一项。
+                    handoff_items.push((
+                        binding.scope.conversation_id.clone(),
+                        item.clone(),
+                        assignment.clone(),
+                    ));
+                } else if !show_card || handoff_visible {
+                    child_events.push(assignment);
+                }
                 }
             }
             if !delegations.is_empty() {
@@ -530,6 +747,13 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 "employees":employees,
                 "tasks":retained_tasks,"events":retained_events,"whiteboard":retained_whiteboard}));
         }
+        if diagnostics {
+            eprintln!(
+                "engine-host diagnostics projection team={} facts_ms={}",
+                team,
+                fact_started.elapsed().as_millis()
+            );
+        }
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
         // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
@@ -568,6 +792,44 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 db.office_projection_handoff_until.remove(&team);
             }
         };
+        // 把本次真实扫描中尚未公开的交接项预组装成逐步快照。每个变体
+        // 同时推进各会话的一项，保持“先到人物再显示下一任务”，而不让
+        // 后续窗口再次读取全部Run/JSONL。
+        if !handoff_items.is_empty() {
+            let mut by_conversation: BTreeMap<String, Vec<(Value, Value)>> = BTreeMap::new();
+            for (conversation, item, event) in handoff_items {
+                by_conversation
+                    .entry(conversation)
+                    .or_default()
+                    .push((item, event));
+            }
+            let mut remaining = by_conversation;
+            let mut current = snapshot.clone();
+            let mut variants = Vec::new();
+            loop {
+                let mut progressed = false;
+                for (conversation, items) in remaining.iter_mut() {
+                    let Some((item, event)) = items.first().cloned() else { continue; };
+                    let Some(conv) = current["conversations"]
+                        .as_array_mut()
+                        .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
+                    else { continue; };
+                    apply_handoff_item(conv, &item, &event);
+                    items.remove(0);
+                    progressed = true;
+                }
+                if !progressed { break; }
+                variants.push(current.clone());
+                if remaining.values().all(Vec::is_empty) { break; }
+            }
+            if variants.is_empty() {
+                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
+            } else {
+                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).insert(team.clone(), variants);
+            }
+        } else {
+            handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
+        }
         if prior==Some(&snapshot) {
             update_handoff_window(db);
             db.office_projection_source.insert(team.clone(), source_revision);
@@ -582,7 +844,15 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
         update_handoff_window(db);
         db.office_projection_source.insert(team, source_revision);
         Ok(snapshot)
-    }).await
+    }).await;
+    if diagnostics {
+        eprintln!(
+            "engine-host diagnostics projection team={} prepare_ms={}",
+            diagnostics_team,
+            started_at.elapsed().as_millis()
+        );
+    }
+    result
 }
 
 /// 功能：按办公室唯一外发门同步完整快照并核对回执。
@@ -660,19 +930,29 @@ pub(super) async fn sync_once(
         ));
     }
     let team = team.to_owned();
+    let cache_team = team.clone();
+    let persisted_snapshot = snapshot.clone();
     let saved_state = state.clone();
     host.inner
         .store
         .call(move |db| {
             if db
                 .office_projection(&team)?
-                .is_some_and(|(current, _)| current == snapshot)
+                .is_some_and(|(current, _)| current == persisted_snapshot)
             {
-                db.save_office_projection(&team, &snapshot, &saved_state)?;
+                db.save_office_projection(&team, &persisted_snapshot, &saved_state)?;
             }
             Ok(())
         })
         .await?;
+    {
+        let mut cache = host
+            .inner
+            .office_projection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.insert(cache_team, snapshot.clone());
+    }
     Ok(state)
 }
 

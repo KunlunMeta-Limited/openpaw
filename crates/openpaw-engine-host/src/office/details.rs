@@ -4,6 +4,7 @@
 //! 禁止职责：不解析Skill/Goal/Todo文件、不保存正文副本、不接受任意文件路径。
 use super::dto;
 use crate::{ClientScope, Host, HostError, HostResult, QueryKind, QueryRequest};
+use crate::{store::Db, RunView};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 const CATEGORIES: [(&str, &str); 6] = [
@@ -14,6 +15,29 @@ const CATEGORIES: [(&str, &str); 6] = [
     ("todo", "Todo"),
     ("files", "文件产物"),
 ];
+
+fn read_cached_run(
+    db: &Db,
+    cache: &std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, RunView>>>,
+    id: &str,
+) -> HostResult<RunView> {
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .cloned()
+    {
+        return Ok(cached);
+    }
+    let loaded = db.get_run_projection(id)?;
+    if loaded.state.is_terminal() {
+        cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_owned(), loaded.clone());
+    }
+    Ok(loaded)
+}
 
 /// 功能：按已验证导航生成详情并登记本次按钮上下文。
 /// 参数：host/scope/session为可信绑定，id为新动作ID，context为服务端导航，cancel为操作期限。
@@ -58,6 +82,7 @@ pub(super) async fn render(
         })
         .await?;
     let agents_enabled = host.inner.config.agents.as_ref().is_some_and(|a| a.enabled);
+    let terminal_runs = host.inner.office_terminal_runs.clone();
     let member_child = if let Some(role) = member.filter(|r| r.id != "lead" && agents_enabled) {
         let (s, role_id, wanted) = (
             scope.clone(),
@@ -75,11 +100,7 @@ pub(super) async fn render(
                 // 同一会话的新普通问答不会删除同事上次的真实委派；按接受顺序
                 // 找角色结果，不用运行结束revision把旧任务错误排到新任务前面。
                 let mut parents = Vec::new();
-                for run in db
-                    .runs()?
-                    .into_iter()
-                    .filter(|r| r.session_id == binding.session_id)
-                {
+                for run in db.runs_for_session(&binding.session_id)? {
                     parents.push((db.run_input(&run)?.0, run));
                 }
                 parents.sort_by_key(|(offset, _)| *offset);
@@ -104,7 +125,7 @@ pub(super) async fn render(
                 };
                 match choice {
                     None => Ok(None),
-                    Some(d) => match db.get_run(&d.child_run) {
+                    Some(d) => match read_cached_run(db, &terminal_runs, &d.child_run) {
                         Ok(run) => Ok(Some((d, run))),
                         Err(e) if e.kind == "not_found" => Ok(None),
                         Err(e) => Err(e),
@@ -607,6 +628,7 @@ async fn task_views(
         session.to_owned(),
         employee.map(str::to_owned),
     );
+    let terminal_runs = host.inner.office_terminal_runs.clone();
     host.inner
         .store
         .call(move |db| {
@@ -621,11 +643,7 @@ async fn task_views(
             else {
                 return Ok(vec![]);
             };
-            let parents: Vec<_> = db
-                .runs()?
-                .into_iter()
-                .filter(|r| r.session_id == session)
-                .collect();
+            let parents: Vec<_> = db.runs_for_session(&session)?;
             let mut result = Vec::new();
             for task in conv["tasks"]
                 .as_array()
@@ -645,14 +663,14 @@ async fn task_views(
                             })
                     });
                     if let Some(d) = delegated {
-                        selected = Some((db.get_run(&d.child_run)?, Some(d.task_id.clone())));
+                        selected = Some((read_cached_run(db, &terminal_runs, &d.child_run)?, Some(d.task_id.clone())));
                         break;
                     }
                     let step_owned = task["id"]
                         .as_str()
                         .is_some_and(|id| id.starts_with(&format!("step:{}:", parent.run_id)));
                     if task["id"] == format!("run:{}", parent.run_id) || step_owned {
-                        selected = Some((db.get_run(&parent.run_id)?, None));
+                        selected = Some((read_cached_run(db, &terminal_runs, &parent.run_id)?, None));
                         break;
                     }
                 }

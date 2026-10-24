@@ -18,6 +18,7 @@ use openpaw_engine::{AgentEvent, AgentLoop, RunContext, RunObserver, RunStatus};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
+        atomic::AtomicUsize,
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
@@ -79,6 +80,18 @@ pub(crate) struct Inner {
     acceptance: tokio::sync::Mutex<()>,
     notices: broadcast::Sender<HostNotice>,
     live: Arc<Mutex<HashMap<String, RunText>>>,
+    /// Office只读详情的最近完整投影；事实仍以Store中的JSONL/SQLite为准。
+    /// 启动时从持久投影预热，投影保存后更新；删除会话后必须失效对应团队。
+    pub(crate) office_projection_cache: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// 当前有Office UI动作在处理时，后台投影暂缓启动新的全量Store扫描。
+    pub(crate) office_ui_busy: Arc<AtomicUsize>,
+    /// 已结束Run的只读完整视图缓存。终态账本不可再变化，避免每次人物详情
+    /// 重新解析同一份大型JSONL；活动Run始终回到Store读取最新事实。
+    pub(crate) office_terminal_runs: Arc<Mutex<HashMap<String, RunView>>>,
+    /// 同一事实版本下的交接待展示快照。首次投影从真实账本生成队列，
+    /// 后续动画只推进一个已计算快照，不再次扫描整个办公室；重启后为空，
+    /// 由持久投影和账本重新建立，不能替代事实来源。
+    pub(crate) office_handoff_queue: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
 }
 struct Active {
     execution: Option<crate::orchestration::Execution>,
@@ -200,6 +213,9 @@ impl Host {
             .map_err(HostError::storage)??;
         let (notices, _) = broadcast::channel(256);
         let live = Arc::new(Mutex::new(HashMap::new()));
+        let office_projection_cache = Arc::new(Mutex::new(HashMap::new()));
+        let office_terminal_runs = Arc::new(Mutex::new(HashMap::new()));
+        let office_handoff_queue = Arc::new(Mutex::new(HashMap::new()));
         let store = Store::open(
             home,
             roots
@@ -233,6 +249,10 @@ impl Host {
                 acceptance: tokio::sync::Mutex::new(()),
                 notices,
                 live,
+                office_projection_cache,
+                office_ui_busy: Arc::new(AtomicUsize::new(0)),
+                office_terminal_runs,
+                office_handoff_queue,
             }),
         })
     }
@@ -1171,11 +1191,10 @@ impl Host {
         let mut owner = self.inner.office.lock().await;
         if owner.is_none() {
             if let Some(config) = &self.inner.config.office {
-                *owner = Some(crate::office::Coordinator::start(
-                    self.clone(),
-                    config.clone(),
-                    address,
-                )?);
+                *owner = Some(
+                    crate::office::Coordinator::start(self.clone(), config.clone(), address)
+                        .await?,
+                );
             }
         }
         Ok(())

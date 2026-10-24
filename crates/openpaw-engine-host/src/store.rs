@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -111,14 +112,23 @@ impl Store {
         &self,
         f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
     ) -> HostResult<T> {
+        let queued_at = Instant::now();
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Job::Call(Box::new(move |db| {
+                let started_at = Instant::now();
                 let result = if db.owner.is_some() {
                     f(db)
                 } else {
                     Err(HostError::new("storage_unavailable", "Host存储已关闭"))
                 };
+                if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() {
+                    eprintln!(
+                        "engine-host diagnostics store queue_ms={} run_ms={}",
+                        started_at.duration_since(queued_at).as_millis(),
+                        started_at.elapsed().as_millis()
+                    );
+                }
                 let _ = tx.send(result);
             })))
             .await
@@ -154,8 +164,19 @@ impl Db {
     /// 权限：校验Run和Session删除门禁。
     /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn progress(&self, run: &str) -> HostResult<Option<serde_json::Value>> {
-        let view = self.get_run(run)?;
-        self.binding(&view.session_id)?;
+        // 投影会按办公室中的每个Run查询进度；这里不需要完整Run视图或JSONL正文。
+        // 旧实现调用get_run会解码整个Session账本，多个办公室启动时把数百次昂贵读取
+        // 串在同一Store队列中。只读取既有host_runs.session并完成同样的范围校验，
+        // 进度事实仍来自host_events，正文和终态语义保持不变。
+        let session: String = self
+            .conn
+            .query_row("SELECT session FROM host_runs WHERE id=?1", [run], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(HostError::storage)?
+            .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
+        self.binding(&session)?;
         let raw:Option<String>=self.conn.query_row("SELECT reference FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[run],|r|r.get(0)).optional().map_err(HostError::storage)?;
         raw.map(|v| serde_json::from_str(&v).map_err(HostError::storage))
             .transpose()
@@ -360,6 +381,23 @@ impl Db {
     pub(crate) fn runs(&self) -> HostResult<Vec<RunView>> {
         self.all("SELECT data FROM host_runs")
     }
+    /// 功能：按Session读取宿主Run元数据，避免人物详情为查一名成员解析整个办公室历史。
+    /// 参数：session为已校验的原JSONL会话ID。
+    /// 返回：该Session的Run元数据，工具与正文仍按需读取。
+    /// 状态：只读，不改变运行生命周期；跨Session仍由调用方校验。
+    pub(crate) fn runs_for_session(&self, session: &str) -> HostResult<Vec<RunView>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT data FROM host_runs WHERE session=?1")
+            .map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([session], |row| row.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(HostError::storage)?).map_err(HostError::storage)
+        })
+        .collect()
+    }
     /// 功能：读取持久审批记录。
     /// 参数：self为单写线程内Db。
     /// 返回：完整绑定及消费状态列表。
@@ -552,6 +590,21 @@ impl Db {
             }
         }
         Ok(run)
+    }
+    /// 功能：读取Office投影所需的轻量Run视图，不解析完整JSONL正文。
+    /// 参数：id为已持久化Run标识。
+    /// 返回：状态、工具阶段和错误；回复正文由详情/历史查询按需读取。
+    /// 错误：SQL、控制事实损坏或未知Run。
+    /// 状态：只读，不改变Run或工具事实；仅供投影扫描使用。
+    /// 并发与取消：单Store序列内按Run主键和Host事实精确读取，避免全会话账本扫描。
+    /// 权限：调用方仍须先校验Office绑定；不扩大工具或文件权限。
+    /// 关联：D76人物详情冷启动优化；不改变公共Run接口。
+    pub(crate) fn get_run_projection(&self, id: &str) -> HostResult<RunView> {
+        // 轻量路径不能丢失账本正文、终态事实或工具调用关联。投影缓存已经
+        // 让人物点击不再触发此方法；没有可信缓存时沿用完整读取，保证旧数据
+        // 和测试夹具与公开Run视图完全一致。后续若增加持久化摘要，必须先用
+        // JSONL golden 验证它覆盖 get_run 的全部字段，再替换这里。
+        self.get_run(id)
     }
     /// 功能：将本Run的有界实时展示尾部合并保存到既有元数据。
     /// 参数：id和session为已接受运行的精确身份。
@@ -1046,15 +1099,43 @@ impl Db {
                 |r| r.get(0),
             )
             .map_err(HostError::storage)?;
-        let events = self.events(&run.session_id)?;
         let committed:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM host_events WHERE kind='run_input_committed' AND reference=?1)",[&run.run_id],|r|r.get(0)).map_err(HostError::storage)?;
-        let started = events
-            .iter()
-            .any(|e| matches!(e,SessionEvent::RunStarted{run_id} if run_id==&run.run_id));
-        if !committed && !started {
+        if !committed {
             // 升级前真正开始的Run有原RunStarted事实；从未接受的失败请求不得借用后来追加的User。
-            return Ok((offset, String::new()));
+            let started = self
+                .events(&run.session_id)?
+                .iter()
+                .any(|e| matches!(e, SessionEvent::RunStarted { run_id } if run_id == &run.run_id));
+            if !started {
+                return Ok((offset, String::new()));
+            }
         }
+        // 正常接受的Run在host_requests中已有规范请求；直接取最后一条user消息，
+        // 避免投影为每个Run重新扫描和解析整份JSONL。请求表只是幂等输入索引，
+        // 账本仍是事实来源；缺少索引的旧/导入Run继续走下面的JSONL回退路径。
+        if let Some(raw) = self
+            .conn
+            .query_row(
+                "SELECT request FROM host_requests WHERE run=?1",
+                [&run.run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?
+        {
+            let messages: serde_json::Value =
+                serde_json::from_str(&raw).map_err(HostError::storage)?;
+            if let Some(input) = messages.as_array().and_then(|items| {
+                items.iter().rev().find_map(|item| {
+                    (item["role"] == "user")
+                        .then(|| item["content"].as_str().map(str::to_owned))
+                        .flatten()
+                })
+            }) {
+                return Ok((offset, input));
+            }
+        }
+        let events = self.events(&run.session_id)?;
         let text = match events.get(offset) {
             Some(SessionEvent::Message(m)) if m.role == openpaw_core::Role::User => m.text(),
             _ if matches!(
@@ -1771,6 +1852,17 @@ impl Db {
         &self,
         parent: &str,
     ) -> HostResult<Vec<crate::orchestration::Delegation>> {
+        let parent_session: String = self
+            .conn
+            .query_row(
+                "SELECT session FROM host_runs WHERE id=?1",
+                [parent],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?
+            .ok_or_else(|| HostError::new("not_found", "父运行不存在"))?;
+        let owner = self.binding(&parent_session)?;
         let mut stmt = self.conn.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
         let rows = stmt
             .query_map([parent], |r| r.get::<_, String>(0))
@@ -1780,13 +1872,12 @@ impl Db {
             let d: crate::orchestration::Delegation =
                 serde_json::from_str(&row.map_err(HostError::storage)?)
                     .map_err(HostError::storage)?;
-            let owner = self.binding(&d.parent_session)?;
             let child = self.binding(&d.child_session)?;
             if d.version != 1
                 || d.run_id != parent
+                || owner.session_id != d.parent_session
                 || owner.scope != d.parent_scope
                 || owner.scope.namespace != "office"
-                || self.get_run(parent)?.session_id != d.parent_session
                 || child.scope != d.child_scope
                 || child.scope.namespace != "host-agent"
                 || child.scope.slot_id != owner.scope.slot_id

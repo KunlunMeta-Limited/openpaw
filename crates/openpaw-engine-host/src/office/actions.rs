@@ -9,6 +9,13 @@ use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
+struct UiBusyGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Drop for UiBusyGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// 功能：领取后立即登记并交给最多16个处理任务。
 /// 参数：host/client/config/address为已有服务，stop为关闭token。
 /// 返回：领取和处理任务全部join后返回。
@@ -94,12 +101,19 @@ async fn handle(
     expiry: i64,
     stop: &CancellationToken,
 ) -> HostResult<()> {
+    let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
+    let received_at = std::time::Instant::now();
     if stop.is_cancelled() || chrono::Utc::now().timestamp_millis() >= expiry {
         return Err(HostError::new(
             "ui_expired",
             "领取操作在处理前已过期，未执行业务",
         ));
     }
+    let _ui_busy = {
+        let counter = host.inner.office_ui_busy.clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        UiBusyGuard(counter)
+    };
     let token = stop.child_token();
     let (deadline, t) = (expiry, token.clone());
     let timer = tokio::spawn(async move {
@@ -123,6 +137,13 @@ async fn handle(
     } else {
         dispatch(host, client, config, address, action, &token).await
     };
+    if diagnostics {
+        eprintln!(
+            "engine-host diagnostics ui action={} dispatch_ms={}",
+            action["action"].as_str().unwrap_or("unknown"),
+            received_at.elapsed().as_millis()
+        );
+    }
     let presentation = dispatched.unwrap_or_else(
         |e| json!({"target":"result","success":false,"message":format!("{}：{}",e.kind,e.message)}),
     );
@@ -163,6 +184,8 @@ async fn dispatch(
     action: &Value,
     cancel: &CancellationToken,
 ) -> HostResult<Value> {
+    let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
+    let started_at = std::time::Instant::now();
     let scope = scope(action);
     if !host.inner.config.slots.contains_key(&scope.slot_id) {
         return Err(HostError::new("scope_denied", "办公室未授权"));
@@ -188,6 +211,19 @@ async fn dispatch(
             json!({"target":"result","success":true,"message":"会话已删除；运行已清理，工作区文件保留。"}),
         );
     }
+    let memory_snapshot = if matches!(
+        action["action"].as_str(),
+        Some("actor.inspect") | Some("employee.inspect")
+    ) {
+        host.inner
+            .office_projection_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&scope.slot_id)
+            .cloned()
+    } else {
+        None
+    };
     let s = scope.clone();
     let (binding, cached_snapshot) = host
         .inner
@@ -199,10 +235,7 @@ async fn dispatch(
                 .into_iter()
                 .find(|b| b.scope == s)
                 .ok_or_else(|| HostError::new("not_found", "此会话尚未接入Host"))?;
-            let snapshot = db
-                .office_projection(&s.slot_id)?
-                .map(|(snapshot, _)| snapshot);
-            Ok((binding, snapshot))
+            Ok((binding, memory_snapshot))
         })
         .await?;
     // 人物/成员点击是只读查询，直接读取最近一次已持久化的完整投影。
@@ -213,6 +246,13 @@ async fn dispatch(
         Some(snapshot) => snapshot,
         None => projection::prepare(host, config, &scope.slot_id).await?,
     };
+    if diagnostics {
+        eprintln!(
+            "engine-host diagnostics ui action={} snapshot_ms={}",
+            action["action"].as_str().unwrap_or("unknown"),
+            started_at.elapsed().as_millis()
+        );
+    }
     let conv = snapshot["conversations"]
         .as_array()
         .and_then(|v| v.iter().find(|v| v["id"] == scope.conversation_id))
@@ -284,7 +324,7 @@ async fn dispatch(
         }
         _ => return Err(HostError::new("unsupported", "不支持此操作")),
     };
-    details::render(
+    let rendered = details::render(
         host,
         &scope,
         &binding.session_id,
@@ -292,5 +332,13 @@ async fn dispatch(
         context,
         cancel,
     )
-    .await
+    .await;
+    if diagnostics {
+        eprintln!(
+            "engine-host diagnostics ui action={} details_ms={}",
+            action["action"].as_str().unwrap_or("unknown"),
+            started_at.elapsed().as_millis()
+        );
+    }
+    rendered
 }
