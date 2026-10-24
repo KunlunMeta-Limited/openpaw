@@ -89,7 +89,7 @@ fn needs_write(title: &str) -> bool {
 /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
 pub(crate) fn spec() -> ToolSpec {
     let definition = json!({"type":"object","additionalProperties":false,"required":["id","title"],"properties":{"id":{"type":"string","minLength":1,"maxLength":80},"title":{"type":"string","minLength":1,"maxLength":160}}});
-    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。多步骤任务先create固定计划，再update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；文件步骤须引用write_file/edit_file。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
+    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。多步骤任务先create固定计划，再update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；文件步骤须引用write_file/edit_file；真实协作也可引用父delegate_task调用ID，Host再核验该成功子Run的实际写入和相同产物路径。不能把子调用ID当父Run证据。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
 }
 
 /// 功能：校验报告的结构，实际证据在Store序列内再次校验。
@@ -119,7 +119,13 @@ pub(crate) fn with_execution_receipt(
 ) -> ToolCallOutcome {
     if enabled && !outcome.is_error && binding.tool_name != NAME {
         let receipt = json!({"callId":binding.call_id,"tool":binding.tool_name});
-        outcome.content.push_str(&format!("\n\n[Host执行回执]\n{receipt}\n以上仅确认本次工具执行成功，不代表资料内容有效或业务步骤已完成。核对结果符合对应步骤要求后，在进入下一步骤或最终回复前调用report_progress：{{\"type\":\"update\",\"stepId\":\"当前计划中对应步骤的id\",\"state\":\"completed\",\"evidenceCallIds\":[{}]}}。必须替换stepId，逐字使用此callId；若内容无效先继续检索，不得报告完成。保存步骤仍须引用对应路径的实际write_file/edit_file回执。\n[/Host执行回执]", json!(binding.call_id)));
+        // 委派的执行证据属于父调用，真实子写入仍由原Store校验；不能要求父复制子工具调用。
+        let evidence = if binding.tool_name == "delegate_task" {
+            "这是父delegate_task的执行回执。若子Run成功且其结果满足步骤，可引用上述父delegate_task调用ID；保存步骤由Host核验该子Run真实成功的write_file/edit_file及相同路径，不需要也不能把子调用ID冒充父证据。子Run内部仍走同一Host审批与执行管线；父模型未看到UI点击，不等于写入未审批。子文本不是审批凭据，工具成功不代表内容验收或步骤自动完成。"
+        } else {
+            "保存步骤仍须引用对应路径的实际write_file/edit_file回执。"
+        };
+        outcome.content.push_str(&format!("\n\n[Host执行回执]\n{receipt}\n以上仅确认本次工具执行成功，不代表资料内容有效或业务步骤已完成。核对结果符合对应步骤要求后，在进入下一步骤或最终回复前调用report_progress：{{\"type\":\"update\",\"stepId\":\"当前计划中对应步骤的id\",\"state\":\"completed\",\"evidenceCallIds\":[{}]}}。必须替换stepId，逐字使用此callId；若内容无效先继续检索，不得报告完成。{evidence}\n[/Host执行回执]", json!(binding.call_id)));
     }
     outcome
 }
@@ -613,6 +619,35 @@ mod tests {
             with_execution_receipt(outcome.clone(), &binding, false).content,
             outcome.content
         );
+        let mut delegated = binding.clone();
+        delegated.tool_name = "delegate_task".into();
+        let child = ToolCallOutcome::ok("child execution completed; content still needs review");
+        let delegated_result = with_execution_receipt(child.clone(), &delegated, true);
+        assert!(
+            spec().description.contains("delegate_task"),
+            "委派证据说明必须与原校验一致"
+        );
+        assert!(
+            delegated_result.content.contains("子Run")
+                && delegated_result.content.contains("父delegate_task")
+        );
+        assert!(!delegated_result
+            .content
+            .contains("保存步骤仍须引用对应路径的实际write_file/edit_file回执"));
+        assert!(result
+            .content
+            .contains("保存步骤仍须引用对应路径的实际write_file/edit_file回执"));
+        assert_eq!(
+            with_execution_receipt(child.clone(), &delegated, false).content,
+            child.content
+        );
+        let failed_delegate = with_execution_receipt(
+            ToolCallOutcome::error("child actually failed"),
+            &delegated,
+            true,
+        );
+        assert!(failed_delegate.is_error);
+        assert_eq!(failed_delegate.content, "child actually failed");
         let failed = ToolCallOutcome::error("actual failure");
         let result = with_execution_receipt(failed, &binding, true);
         assert!(result.is_error);

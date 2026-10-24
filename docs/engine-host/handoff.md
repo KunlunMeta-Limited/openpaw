@@ -325,3 +325,5 @@ PR https://github.com/KunlunMeta-Limited/openpaw/pull/11 已创建，目标merge
 先读0007第12.11节与[产品差距最新入口](../verification/CHG-2026-0007/产品差距审查.md#current-product-audit)，不要沿用前文历史“8765仍T5/未创建PR”。实际已部署853b0a1+fa6ae1f，当前本轮D58/D51/D59补丁是否部署由runtime-t6.json与t6-live-final准确报告核对。真实原会话先失败后重试的5角色结果可从LIVE-TEAM-3eb729f6报告和同Run查询恢复，不能发新Run伪造修复。
 
 待审r6-workspace只在原0007第12.12节，无数据库迁移实施；Office R11—R17集中暂缓（R14撤回），Windows原生暂缓。T6 PR #12已合入e6a20bd；主目录补修分支fix/engine-host-t6-followup已同步该集成。实质补丁须准确交付验收，r6迁移仍待审；不向已合入PR推送，不自行合入补修。所有最新代码/文档仍仅在/Office/openpaw，运行目录/缓存不得变成开发源。
+
+2026-10-24最新补修核查：583e874完整27项/Office68条通过，原8765同一重试Run已恢复100%、18个人物/成员入口通过；自然语言b虽五子独立完成及一次真实写审批，但父Agent被旧回执说明误导为“未经审批”并漏报保存进度，整体75%仍失败，不能声明全部产品完成。D60的原r5范围最小上下文/证据说明修复见0007第12.14节；新准确c报告及真实模型形成前不预填通过。各团队独立物理根r6仍待准确审核，Office所有Rx暂缓，Windows原生未验。
