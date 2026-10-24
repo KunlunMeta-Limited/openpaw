@@ -440,11 +440,15 @@ impl Db {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub(crate) fn get_run(&self, id: &str) -> HostResult<RunView> {
-        let mut run = self
-            .runs()?
-            .into_iter()
-            .find(|r| r.run_id == id)
+        // 人物详情及周期投影会逐个查询Run；不要反复解码其他历史Run和工具事实。
+        // 仍使用同一Store序列与原账本，精确筛选不引入缓存或改变状态覆盖顺序。
+        let data: String = self
+            .conn
+            .query_row("SELECT data FROM host_runs WHERE id=?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(HostError::storage)?
             .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
+        let mut run: RunView = serde_json::from_str(&data).map_err(HostError::storage)?;
         let events = self.events(&run.session_id)?;
         let mut active = false;
         let text = committed_run_text(&events, id);
@@ -480,9 +484,11 @@ impl Db {
                 _ => {}
             }
         }
-        let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_waiting_resource','tool_started','tool_result') ORDER BY revision").map_err(HostError::storage)?;
+        let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_waiting_resource','tool_started','tool_result') AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(HostError::storage)?;
         for row in rows {
             let (kind, value) = row.map_err(HostError::storage)?;
@@ -503,7 +509,16 @@ impl Db {
                 }
             }
         }
-        for a in self.approvals()? {
+        let mut approvals = self
+            .conn
+            .prepare("SELECT data FROM host_approvals WHERE run=?1")
+            .map_err(HostError::storage)?;
+        let rows = approvals
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        for row in rows {
+            let a: ApprovalView = serde_json::from_str(&row.map_err(HostError::storage)?)
+                .map_err(HostError::storage)?;
             if a.binding.run_id == id && a.status == "pending" {
                 if let Some(t) = tools.get_mut(&a.binding.call_id) {
                     t.state = "awaiting_approval".into();
@@ -2494,6 +2509,100 @@ mod office_regressions {
     use crate::{ClientScope, Host, HostConfig};
     use openpaw_core::{Message, Role};
     use serde_json::json;
+    #[tokio::test]
+    async fn targeted_run_read_preserves_tool_order_approval_scope_and_readonly_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let binding = host
+            .open_session(ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "targeted-read".into(),
+            })
+            .await
+            .unwrap();
+        host.inner
+            .store
+            .call(move |db| {
+                let session = &binding.session_id;
+                for id in ["target", "other"] {
+                    let offset = db.events(session)?.len();
+                    db.append(session, SessionEvent::RunStarted { run_id: id.into() })?;
+                    db.append(
+                        session,
+                        SessionEvent::ToolCallStart {
+                            call_id: "same-call".into(),
+                            tool_name: "read_file".into(),
+                        },
+                    )?;
+                    db.save_run(
+                        RunView {
+                            run_id: id.into(),
+                            session_id: session.clone(),
+                            state: RunState::Running,
+                            revision: 0,
+                            text: String::new(),
+                            tools: vec![],
+                            error: None,
+                            text_truncated: false,
+                        },
+                        offset,
+                    )?;
+                }
+                for (run, kind, success) in [
+                    ("target", "tool_waiting_resource", false),
+                    ("target", "tool_started", false),
+                    ("other", "tool_result", false),
+                    ("target", "tool_result", true),
+                ] {
+                    db.bump(
+                        kind,
+                        &json!({"run_id": run, "call_id":"same-call", "tool_name":"read_file", "input":{}, "success":success}).to_string(),
+                    )?;
+                }
+                let approval = |id: &str, run: &str| ApprovalView {
+                    approval_id: id.into(),
+                    binding: openpaw_core::ToolCallBinding {
+                        run_id: run.into(),
+                        call_id: "same-call".into(),
+                        tool_name: "read_file".into(),
+                        input: json!({"path":"example"}),
+                    },
+                    status: "pending".into(),
+                    consumed: false,
+                    revision: 0,
+                    expires_at_ms: i64::MAX,
+                };
+                db.save_approval(approval("other-approval", "other"))?;
+                let revision = db.revision()?;
+                let target = db.get_run("target")?;
+                assert_eq!(target.tools.len(), 1);
+                assert_eq!(target.tools[0].state, "completed");
+                assert_eq!(db.get_run("other")?.tools[0].state, "awaiting_approval");
+                assert_eq!(db.revision()?, revision);
+                db.save_approval(approval("target-approval", "target"))?;
+                assert_eq!(db.get_run("target")?.tools[0].state, "awaiting_approval");
+                let mut resolved = approval("target-approval", "target");
+                resolved.status = "rejected".into();
+                db.save_approval(resolved)?;
+                assert_eq!(db.get_run("target")?.tools[0].state, "completed");
+                assert_eq!(db.get_run("missing").unwrap_err().kind, "not_found");
+                db.conn
+                    .execute("UPDATE host_runs SET data='broken' WHERE id='target'", [])
+                    .map_err(HostError::storage)?;
+                assert_eq!(
+                    db.get_run("target").unwrap_err().kind,
+                    "storage_unavailable"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn stream_checkpoint_is_bounded_scoped_prefix_only_and_never_revives_deleted_data() {
         let temp = tempfile::tempdir().unwrap();
