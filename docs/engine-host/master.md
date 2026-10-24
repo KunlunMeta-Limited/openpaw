@@ -1106,7 +1106,7 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 | M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；[0004第9/10节](../changes/CHG-2026-0004.md#9-影响数据流和实现)的H01—H12 | 已完成本轮批准范围并合入；Linux准确交付与合入head均完整26/26，Windows按用户明确指示暂缓、未验证 | [OpenPaw #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)，head 825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52；2026-10-21 19:16:12合入；用户会话确认、API无独立Review；[0004履历](../changes/CHG-2026-0004.md#12-验证和审批记录)保留CI未启动与门禁例外冲突 |
 | M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；[0005第12节](../changes/CHG-2026-0005.md#12-验证和审批记录)及真实M4证据 | 已完成本轮批准只读范围并合入；用户验收9831f59，最终e7ce707完整27/27/产品passed；Windows原生暂缓，不是双平台发布 | [PR #10](https://github.com/KunlunMeta-Limited/openpaw/pull/10)，head e7ce70700f06843c8bfa4112f0f6bfbc00971eb2，merge 37f0a35729fb64639f0e1a8b8a8a4799e1dca9d3，2026-10-23 09:43:00；用户会话确认，API reviews为空；D36/D37及天气输出限制保留 |
 | M5 / T5 | 常规产品闭环：审批写产物、六类详情、删除及真实动画 | [0006第9/10/12节](../changes/CHG-2026-0006.md)、[15.3六包](#office-t5-workpackages)、[M5核查](#milestone-m5) | 当前用户批准Linux交付范围完成；准确最终head完整27/27、产品53条与原8765真实模型/账本证据；Windows原生暂缓 | [PR #11](https://github.com/KunlunMeta-Limited/openpaw/pull/11) MERGED；最终f276b00972f77d67d31e1d9b6862edb4c38111ef，合入f22cca18d3667ded5dfed35d06085b260cc5a32d，2026-10-23 20:46:12；用户确认，reviews为空 |
-| M6 / T6 | 六人物/成员详情、真实六角色委派与交接、原恢复/容量 | [0007第9.6—9.11/10.4节P01—P08及V01—V10](../changes/CHG-2026-0007.md)、[第16节](#office-product-agent-review)、[M6核查](#milestone-m6) | 准确15cc908原27/27、真实浏览器68条、真实DeepSeek一主五子/报告/7卡100%通过；用户已交付验收；Windows暂缓，Rx未实施；未合入不标整体完成 | [PR #12](https://github.com/KunlunMeta-Limited/openpaw/pull/12) OPEN，待非作者审核及合入；登记后准确head完整复验另见0007第12.10节 |
+| M6 / T6 | 六人物/成员详情、真实六角色委派与交接、原恢复/容量 | [0007 P/V与后续补修](../changes/CHG-2026-0007.md)、[M6核查](#milestone-m6) | 原准确15cc908交付及853b0a1登记完整验证通过，#12已合入；本轮D58/D51/D59补修及r6工作区迁移分开核查，不覆盖旧验收 | [PR #12](https://github.com/KunlunMeta-Limited/openpaw/pull/12) MERGED，e6a20bd28ae9b1a065f9c98fbec49d356d716235，2026-10-24 12:57:48；Windows暂缓/Rx未实施 |
 | M7 / T7 | 固定SDK可复用同一Host | [T7任务卡](#tx-t7)；真实SDK请求/事件迭代/审批/abort及Office并用 | 待实施 | 未创建；不声明OpenWork桌面已验收 |
 | M8 / T8 | Linux/Windows可启动、演示、备份和恢复的交付包 | [完整演示](#product-demo)、[T8任务卡](#tx-t8)；原生双平台、真实Provider、发布候选与用户验收 | 待实施 | 未创建；T8主PR及最终集成到main的PR分别追踪 |
 
@@ -1747,13 +1747,13 @@ M6仍待本会话用户对准确最终候选交付验收；批准后才创建到
 
 ### 2026-10-24 T6准确交付验收与PR事实更新
 
-2026-10-24 原页面最新状态：8765/41949已从旧T5升级到完整验收的853b0a1及Office fa6ae1f，六Pixi人物、六侧栏与六成员布局完整档案实际点击通过，点击不新增Run。PR #12仍OPEN、未合入；用户本轮对853b0a1作“未改Office且不影响合并”条件确认，不伪造平台Approve。真实DeepSeek在独立新会话完成五角色工作及一次审批写报告，但刘市一次失败后明确重委派暴露D59（旧失败仍占步骤，白板71%）；原失败保留。当前主目录正在修复D58容量成员丢失、D51主角色终态说明及D59明确成功重试投影，尚未把新补丁算成完整验证或已部署。原27项最终精确提交/产品结果以`/home/cheng/.cache/t6-live-final-20261024-a/{full/report.json,product/report.json,review.json}`为准，报告形成前不预填通过。旧段落均保留其当时时点，以本段/0007第12.11节及专用证据为当前入口。不同团队独立物理workspace尚需第12.12节迁移方案审核，旧共享根不直接改；Windows原生仍暂缓，Office所有Rx仍不实施。
+2026-10-24 原页面最新状态：8765/41949已从旧T5升级到完整验收的853b0a1及Office fa6ae1f，六Pixi人物、六侧栏与六成员布局完整档案实际点击通过，点击不新增Run。PR #12已于12:57:48（Asia/Shanghai）合入e6a20bd；用户本轮对853b0a1作“未改Office且不影响合并”条件确认，不伪造平台Approve。真实DeepSeek在独立新会话完成五角色工作及一次审批写报告，但刘市一次失败后明确重委派暴露D59（旧失败仍占步骤，白板71%）；原失败保留。当前主目录正在修复D58容量成员丢失、D51主角色终态说明及D59明确成功重试投影，尚未把新补丁算成完整验证或已部署。原27项最终精确提交/产品结果以`/home/cheng/.cache/t6-live-final-20261024-b/{full/report.json,product/report.json,review.json}`为准，报告形成前不预填通过。旧段落均保留其当时时点，以本段/0007第12.11节及专用证据为当前入口。不同团队独立物理workspace尚需第12.12节迁移方案审核，旧共享根不直接改；Windows原生仍暂缓，Office所有Rx仍不实施。
 
 
 ### 16.6 原8765部署、成员点击与剩余能力（2026-10-24）
 
 本节取代第16.1—16.5节各轮“尚未部署/待批准”等历史时点作为当前入口。原页面已部署853b0a1与fa6ae1f，原home/官方.env/账本保留；六人物、六侧栏、六成员布局完整档案均真实点击通过。部署清单与回退在artifacts/live-office-20261024-t6/runtime-t6.json；D58/D51/D59当前新补丁以最终准确完整报告及更新runtime判定是否上线，不能因主目录文件改变就宣称服务已更新。
 
-整体功能矩阵与明确实施顺序见[产品差距审查最新入口](../verification/CHG-2026-0007/产品差距审查.md#current-product-audit)。原T6允许范围先完成成员/明确成功重试/容量投影修复和原页面对账；一个团队独立物理workspace需要原0007第12.12节迁移审批。动态增加Agent、真正暂停/改派/手工完成、模型通用clarify、系统资源采集、附件/产物下载及首发前草稿就绪均不是“识别协议就已完成”，逐项保留具体候选/验收，不绕原审批扩大功能。T7 SDK真实路由和T8发布/共存仍按原阶段顺序，PR #12未合入前不开始T7。
+整体功能矩阵与明确实施顺序见[产品差距审查最新入口](../verification/CHG-2026-0007/产品差距审查.md#current-product-audit)。原T6允许范围先完成成员/明确成功重试/容量投影修复和原页面对账；一个团队独立物理workspace需要原0007第12.12节迁移审批。动态增加Agent、真正暂停/改派/手工完成、模型通用clarify、系统资源采集、附件/产物下载及首发前草稿就绪均不是“识别协议就已完成”，逐项保留具体候选/验收，不绕原审批扩大功能。T7 SDK真实路由和T8发布/共存仍按原阶段顺序，原T6 #12已合入；本轮仍集中当前产品补修，尚不启动T7。
 
 Office R11默认链接、R12字体、R13原位菜单、R15文档、R16到达ACK、R17默认闲聊互阻均集中暂缓；详见[Office修改申请](office-change-requests.md)。没有修改Office或用取消作用域校验掩盖人物问题。Windows原生继续暂缓，不适配macOS。
