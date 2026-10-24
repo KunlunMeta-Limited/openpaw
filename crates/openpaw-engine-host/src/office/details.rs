@@ -3,8 +3,8 @@
 //! 依赖：原Host::query、原账本工具事实和Store导航元数据。
 //! 禁止职责：不解析Skill/Goal/Todo文件、不保存正文副本、不接受任意文件路径。
 use super::dto;
-use crate::{ClientScope, Host, HostError, HostResult, QueryKind, QueryRequest};
 use crate::{store::Db, RunView};
+use crate::{ClientScope, Host, HostError, HostResult, QueryKind, QueryRequest};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 const CATEGORIES: [(&str, &str); 6] = [
@@ -663,14 +663,18 @@ async fn task_views(
                             })
                     });
                     if let Some(d) = delegated {
-                        selected = Some((read_cached_run(db, &terminal_runs, &d.child_run)?, Some(d.task_id.clone())));
+                        selected = Some((
+                            read_cached_run(db, &terminal_runs, &d.child_run)?,
+                            Some(d.task_id.clone()),
+                        ));
                         break;
                     }
                     let step_owned = task["id"]
                         .as_str()
                         .is_some_and(|id| id.starts_with(&format!("step:{}:", parent.run_id)));
                     if task["id"] == format!("run:{}", parent.run_id) || step_owned {
-                        selected = Some((read_cached_run(db, &terminal_runs, &parent.run_id)?, None));
+                        selected =
+                            Some((read_cached_run(db, &terminal_runs, &parent.run_id)?, None));
                         break;
                     }
                 }
