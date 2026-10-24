@@ -189,18 +189,30 @@ async fn dispatch(
         );
     }
     let s = scope.clone();
-    let binding = host
+    let (binding, cached_snapshot) = host
         .inner
         .store
         .call(move |db| {
             db.check_live_scope(&s)?;
-            db.bindings()?
+            let binding = db
+                .bindings()?
                 .into_iter()
                 .find(|b| b.scope == s)
-                .ok_or_else(|| HostError::new("not_found", "此会话尚未接入Host"))
+                .ok_or_else(|| HostError::new("not_found", "此会话尚未接入Host"))?;
+            let snapshot = db
+                .office_projection(&s.slot_id)?
+                .map(|(snapshot, _)| snapshot);
+            Ok((binding, snapshot))
         })
         .await?;
-    let snapshot = projection::prepare(host, config, &scope.slot_id).await?;
+    // 人物/成员点击是只读查询，直接读取最近一次已持久化的完整投影。
+    // 旧实现每次点击都重建整个办公室，运行数量增加后会排在Store写队列后面，
+    // 使页面看到数秒“等待后端响应”。投影同步器仍负责按事实生成新版本；
+    // 首次尚未有投影时才同步生成一次，不能在详情请求中复制第二套投影逻辑。
+    let snapshot = match cached_snapshot {
+        Some(snapshot) => snapshot,
+        None => projection::prepare(host, config, &scope.slot_id).await?,
+    };
     let conv = snapshot["conversations"]
         .as_array()
         .and_then(|v| v.iter().find(|v| v["id"] == scope.conversation_id))

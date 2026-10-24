@@ -18,10 +18,19 @@ use tokio_util::sync::CancellationToken;
 pub(super) async fn run(host: Host, client: Arc<Client>, stop: CancellationToken) {
     let mut seen = BTreeSet::new();
     let mut first = true;
+    let mut last_revision = None;
     loop {
         if stop.is_cancelled() {
             return;
         }
+        // 场景反馈只由Host事实变化驱动；空闲时不要每200ms反序列化所有Run
+        // 和审批，这会与人物详情共享Store队列并放大点击延迟。
+        let revision = host.inner.store.call(|db| db.revision()).await.ok();
+        if revision == last_revision {
+            tokio::select! {_=stop.cancelled()=>return,_=tokio::time::sleep(Duration::from_millis(200))=>{}}
+            continue;
+        }
+        last_revision = revision;
         let facts = host
             .inner
             .store

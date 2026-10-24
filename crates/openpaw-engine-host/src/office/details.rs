@@ -204,8 +204,8 @@ pub(super) async fn render(
                 ]);
             } else {
                 fields.extend([
-                    json!({"label":"当前任务","value":member_child.as_ref().map(|(d,_)|d.title.as_str()).unwrap_or("暂无已分配任务")}),
-                    json!({"label":"已确认进度","value":if member_child.is_some(){"等待任务进度同步"}else{"暂无任务，不估算进度"}}),
+                    json!({"label":"当前任务","value":if member_child.is_some(){"已登记任务，等待前序交接动画完成"}else{"暂无已分配任务"}}),
+                    json!({"label":"已确认进度","value":if member_child.is_some(){"等待交接后同步任务进度"}else{"暂无任务，不估算进度"}}),
                 ]);
             }
             if let Some((d, run)) = &member_child {

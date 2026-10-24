@@ -54,6 +54,12 @@ pub(crate) struct Db {
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
     pub(crate) live: Arc<Mutex<HashMap<String, RunText>>>,
+    /// 最近一次由Office投影读取的Host事实revision；仅用于避免空闲期
+    /// 重复扫描同一批Run，不是第二份投影或持久事实。
+    pub(crate) office_projection_source: HashMap<String, u64>,
+    /// 交接动画顺序窗口的内存截止时间；过期后才再次重建投影。
+    /// 不写入Office快照，也不作为业务状态来源。
+    pub(crate) office_projection_handoff_until: HashMap<String, chrono::DateTime<chrono::Utc>>,
 }
 impl Store {
     /// 功能：恢复原JSONL及宿主元数据并启动单写协调器。
@@ -325,6 +331,8 @@ impl Db {
             owner: Some(owner),
             notices,
             live,
+            office_projection_source: HashMap::new(),
+            office_projection_handoff_until: HashMap::new(),
         };
         db.validate_workspace_rebinds()?;
         db.recover()?;
