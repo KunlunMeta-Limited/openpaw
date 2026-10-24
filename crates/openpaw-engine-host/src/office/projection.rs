@@ -213,9 +213,26 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             // 每会话只投影最新Run，避免旧失败抢占最新成功的员工状态；完整历史走history。
             let (_,input)=db.run_input(&r)?;
             let main_id=format!("run:{}",r.run_id);
-            let (steps,mut percent)=crate::task_progress::project(db.progress(&r.run_id)?,&r)?;
+            let plan=db.progress(&r.run_id)?;
+            let (steps,mut percent)=crate::task_progress::project(plan.clone(),&r)?;
             let delegations=db.delegations(&r.run_id)?;
             let assignments=db.office_task_assignments(&r.run_id)?;
+            let mut recovered=std::collections::BTreeSet::new();
+            // 只合并被主角色用准确成功证据替代的失败尝试；相似标题不构成重试关系。
+            // 同角色、同父、同步骤缺一不可，旧Run/JSONL/派发事件仍保留。
+            for d in &delegations {
+                let Some(index)=assignments.get(&d.call_id).copied() else {continue;};
+                let Some(step)=plan.as_ref().and_then(|p|p["steps"].get(index)) else {continue;};
+                if step["state"]!="completed" {continue;}
+                let failed=match db.get_run(&d.child_run) {Ok(c)=>c.state.is_terminal()&&c.state!=RunState::Completed,Err(e) if e.kind=="not_found"=>false,Err(e)=>return Err(e)};
+                if !failed {continue;}
+                for replacement in &delegations {
+                    if replacement.role_id!=d.role_id || assignments.get(&replacement.call_id)!=Some(&index) || !step["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&replacement.call_id)) {continue;}
+                    if db.get_run(&replacement.child_run)?.state==RunState::Completed {
+                        recovered.insert(d.call_id.clone());break;
+                    }
+                }
+            }
             let mut child_steps=BTreeMap::new();
             let mut child_tasks=Vec::new();
             let mut child_events=Vec::new();
@@ -224,6 +241,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 let role=crate::agents::role(&d.role_id).ok_or_else(||HostError::new("storage_unavailable","委派引用未知角色"))?;
                 let child=match db.get_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
                 let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
+                let superseded=recovered.contains(&d.call_id);
                 let done=state=="completed";
                 completed_children+=u64::from(done);
                 let summary=if let Some(c)=&child {
@@ -233,7 +251,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 let mut item=task(d.task_id.clone(),d.title.clone(),state,summary,&old,&now,if done{100}else{0});
                 item["assigneeId"]=json!(role.employee);
                 // 派发时已有明确进行中步骤则复用其业务卡片；不按相似标题猜测关联。
-                let linked=assignments.get(&d.call_id).copied().filter(|i|*i<steps.len()&&!child_steps.contains_key(i));
+                let linked=assignments.get(&d.call_id).copied().filter(|i|*i<steps.len()&&(superseded||!child_steps.contains_key(i)));
                 if let Some(index)=linked {
                     let step=&steps[index];
                     item["id"]=step["id"].clone();item["title"]=step["title"].clone();
@@ -243,14 +261,17 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                     }
                 }
                 let task_id=item["id"].clone();
-                if let Some(index)=linked {child_steps.insert(index,item);} else {child_tasks.push(item);}
+                if !superseded {
+                    if let Some(index)=linked {child_steps.insert(index,item);} else {child_tasks.push(item);}
+                }
                 if child.is_some() {
                     child_events.push(json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":d.created_at,"taskId":task_id,"employeeId":role.employee,"fromEmployeeId":"assistant"}));
                 }
             }
             if !delegations.is_empty() {
-                let delivered=r.state==RunState::Completed && completed_children==delegations.len() as u64;
-                let child_percent=(completed_children+u64::from(delivered))*100/(delegations.len() as u64+1);
+                let required_children=(delegations.len()-recovered.len()) as u64;
+                let delivered=r.state==RunState::Completed && completed_children==required_children;
+                let child_percent=(completed_children+u64::from(delivered))*100/(required_children+1);
                 percent=if steps.is_empty() {child_percent}else{percent.min(child_percent)};
             }
             let child_blocked=child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="blocked");
@@ -329,8 +350,14 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
             }
             let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&matches!(c["tasks"][0]["status"].as_str(),Some("completed"|"failed"))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
             let Some((i,_))=candidate else {return Err(HostError::new("protocol_error","Office完整会话目录超限"));};
-            let c=&mut convs[i];c["tasks"]=json!([]);c["events"]=json!([]);c["employees"]=json!([]);
-            c["whiteboard"]=json!({"template":"task-board-v1","title":"","status":"queued","tagline":"","description":"","note":"","link":{"label":"","url":""},"steps":[]});
+            let c=&mut convs[i];c["tasks"]=json!([]);c["events"]=json!([]);
+            // 成员身份是人物点击和侧栏的范围依据，不能随旧任务展示预算一起删除。
+            // 可选职责/白板按上游Schema省略；详情仍从可信目录及原账本读取完整信息。
+            c.as_object_mut().unwrap().remove("whiteboard");
+            for member in c["employees"].as_array_mut().unwrap() {
+                member.as_object_mut().unwrap().remove("role");
+            }
+            c["title"]=json!(dto::bounded(c["title"].as_str().unwrap_or(""),24));
         }
         if prior==Some(&snapshot) {return Ok(snapshot);}
         if let Some(prior)=prior {
@@ -440,7 +467,53 @@ mod tests {
     #[tokio::test]
     async fn delegated_business_step_keeps_one_card_owner_and_stable_assignment() {
         use openpaw_llm::{MockMode, MockProvider};
-        for (mark_active, confirm) in [(true, true), (false, true), (false, false)] {
+        struct OnceFailure {
+            inner: MockProvider,
+            calls: std::sync::atomic::AtomicUsize,
+            fail_at: Option<usize>,
+        }
+        #[async_trait::async_trait]
+        impl openpaw_core::LlmProvider for OnceFailure {
+            async fn complete(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+                self.inner.complete(request).await
+            }
+            async fn stream(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    openpaw_core::Result<openpaw_core::StreamEvent>,
+                >,
+            > {
+                let index = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fail_at == Some(index) {
+                    return Err(openpaw_core::Error::Provider(
+                        "invalid child response".into(),
+                    ));
+                }
+                self.inner.stream(request).await
+            }
+            fn capabilities(&self) -> openpaw_core::Capabilities {
+                self.inner.capabilities()
+            }
+            fn default_model(&self) -> &str {
+                self.inner.default_model()
+            }
+            fn name(&self) -> &str {
+                "one-child-failure"
+            }
+        }
+        for (mark_active, confirm, retry) in [
+            (true, true, false),
+            (false, true, false),
+            (false, false, false),
+            (true, true, true),
+            (true, false, true),
+        ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             std::fs::create_dir(&root).unwrap();
@@ -461,7 +534,13 @@ mod tests {
                     json!({"type":"update","stepId":"lookup","state":"in_progress"}),
                 ));
             }
-            let delegate_call = if mark_active { "call_2" } else { "call_1" };
+            let delegate_call = if retry {
+                "call_3"
+            } else if mark_active {
+                "call_2"
+            } else {
+                "call_1"
+            };
             script.extend(vec![
             call(
                 "delegate_task",
@@ -470,6 +549,10 @@ mod tests {
             call("read_file", json!({"path":"README.md"})),
             MockMode::Fixed("李研已实际读取项目说明".into()),
         ]);
+            if retry {
+                // 首个子模型确实失败；父角色明确发起新的委派，不复用或抹去失败Run。
+                script.insert(3, call("delegate_task", json!({"role_id":"research","title":"李研重新核对项目目标","instructions":"读取README.md","acceptance":"有文件依据"})));
+            }
             if confirm {
                 script.push(call(
                 "report_progress",
@@ -483,7 +566,11 @@ mod tests {
                 ),
                 MockMode::Fixed("王明汇总：同事已读取项目说明，证据已核实".into()),
             ]);
-            let provider = MockProvider::scripted(script);
+            let provider = OnceFailure {
+                inner: MockProvider::scripted(script),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail_at: retry.then_some(3),
+            };
             let host = Host::with_provider(config, std::sync::Arc::new(provider))
                 .await
                 .unwrap();
@@ -531,7 +618,40 @@ mod tests {
                 assert_eq!(conv["tasks"][3]["assigneeId"], "command");
                 assert_eq!(conv["events"][0]["taskId"], conv["tasks"][3]["id"]);
             }
-            assert_eq!(conv["events"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                conv["events"].as_array().unwrap().len(),
+                if retry { 2 } else { 1 }
+            );
+            if retry {
+                let session_id = session.session_id.clone();
+                host.inner
+                    .store
+                    .call(move |db| {
+                        let parent = db
+                            .runs()?
+                            .into_iter()
+                            .find(|r| r.session_id == session_id)
+                            .unwrap();
+                        let ds = db.delegations(&parent.run_id)?;
+                        assert_eq!(ds.len(), 2);
+                        assert_eq!(db.get_run(&ds[0].child_run)?.state, RunState::Failed);
+                        assert_eq!(db.get_run(&ds[1].child_run)?.state, RunState::Completed);
+                        assert_ne!(ds[0].child_session, ds[1].child_session);
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                if confirm {
+                    assert!(
+                        conv["events"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|event| event["taskId"] == conv["tasks"][1]["id"]),
+                        "重试的两次真实交接保留并引用同一业务步骤"
+                    );
+                }
+            }
             assert_eq!(conv["events"][0]["fromEmployeeId"], "assistant");
             assert_eq!(
                 prepare(&host, &office, "office-1").await.unwrap(),
@@ -591,6 +711,15 @@ mod tests {
         }
         let snapshot = prepare(&host, &office, "office-1").await.unwrap();
         assert_eq!(snapshot["conversations"].as_array().unwrap().len(), 100);
+        for conversation in snapshot["conversations"].as_array().unwrap() {
+            let members = conversation["employees"].as_array().unwrap();
+            assert_eq!(members.len(), 6, "容量裁剪不能移除会话人物绑定或左侧成员");
+            for role in crate::agents::ROLES.iter() {
+                assert!(members.iter().any(|member| member["id"] == role.employee
+                    && member["sceneActorId"] == role.actor
+                    && member["name"] == role.name));
+            }
+        }
         assert!(
             serde_json::to_vec(
                 &json!({"type":"office.snapshot","teamId":"office-1","snapshot":snapshot})

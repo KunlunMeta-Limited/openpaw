@@ -143,8 +143,20 @@ pub(super) async fn render(
                     }
                     _ => "正在独立处理分配的任务",
                 }
-            } else if active.is_some() && role.id == "lead" {
-                "正在处理会话任务"
+            } else if role.id == "lead" {
+                // 主角色拥有会话Run；不能把已完成的主Run误报成“没有独立任务”。
+                match current.map(|run| run.state) {
+                    None => "空闲，尚无会话任务",
+                    Some(crate::RunState::Completed) => "本轮运行已完成，业务进度以任务与白板为准",
+                    Some(crate::RunState::Cancelled) => "本轮任务已停止",
+                    Some(crate::RunState::Cancelling) => "正在停止本轮任务，等待实际清理",
+                    Some(
+                        crate::RunState::Failed
+                        | crate::RunState::TimedOut
+                        | crate::RunState::Interrupted,
+                    ) => "本轮任务未完成，实际结果可查询",
+                    _ => "正在处理会话任务",
+                }
             } else if active.is_some_and(|r| {
                 r.tools.iter().any(|t| {
                     super::projection::actor(&t.tool_name).0 == role.employee
