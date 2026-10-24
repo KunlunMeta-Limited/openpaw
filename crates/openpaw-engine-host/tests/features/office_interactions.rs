@@ -433,7 +433,7 @@ async fn interaction_scenario() {
             .as_array()
             .unwrap()
             .len(),
-        7
+        8
     );
     let tasks = action(
         &shared,

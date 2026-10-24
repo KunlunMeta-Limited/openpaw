@@ -130,7 +130,7 @@ pub(super) async fn render(
             let role = member.ok_or_else(|| HostError::new("scope_denied", "缺少成员身份"))?;
             title = format!("{} · 成员详情", role.name);
             description = format!(
-                "{}。下方历史、Skill、Goal、Todo和文件入口为当前会话范围，点击查看不会启动模型。",
+                "{}。查看分工、进度与结果；运行中可刷新状态，查看详情不会重新执行任务。",
                 role.duty
             );
             let (snapshot, _) = host.snapshot_and_subscribe(scope).await?;
@@ -183,13 +183,33 @@ pub(super) async fn render(
             fields.extend([
                 json!({"label":"姓名","value":role.name}),
                 json!({"label":"职责","value":role.duty}),
-                json!({"label":"角色标识","value":role.id}),
-                json!({"label":"运行模式","value":if agents_enabled {"已启用独立主子协作；只有真实派发才产生子运行"}else{"共享会话功能角色；当前未启用独立子Agent"}}),
                 json!({"label":"当前状态","value":state}),
             ]);
+            let tasks = task_views(host, scope, session, Some(role.employee)).await?;
+            let business = tasks.iter().find(|(task, run, child)| {
+                if let Some((d, _)) = &member_child {
+                    run.run_id == d.child_run && child.as_deref() == Some(d.task_id.as_str())
+                } else {
+                    role.id == "lead"
+                        && current.is_some_and(|r| r.run_id == run.run_id)
+                        && task["id"] == format!("run:{}", run.run_id)
+                }
+            });
+            if let Some((task, _, _)) = business {
+                fields.extend([
+                    json!({"label":"当前任务","value":task["title"]}),
+                    json!({"label":"业务状态","value":task_status(task["status"].as_str().unwrap_or("queued"))}),
+                    json!({"label":"已确认进度","value":format!("{}%",task["progress"].as_u64().unwrap_or(0))}),
+                    json!({"label":"进度说明","value":dto::bounded(task["summary"].as_str().unwrap_or("暂无说明"),1000)}),
+                ]);
+            } else {
+                fields.extend([
+                    json!({"label":"当前任务","value":member_child.as_ref().map(|(d,_)|d.title.as_str()).unwrap_or("暂无已分配任务")}),
+                    json!({"label":"已确认进度","value":if member_child.is_some(){"等待任务进度同步"}else{"暂无任务，不估算进度"}}),
+                ]);
+            }
             if let Some((d, run)) = &member_child {
                 fields.extend([
-                    json!({"label":"当前任务","value":d.title}),
                     json!({"label":"独立执行引用","value":format!("角色 {} · Run {} · Session {}",d.role_id,d.child_run,d.child_session)}),
                     json!({"label":"最近结果","value":dto::bounded(if run.text.is_empty(){"尚无可靠回复正文"}else{&run.text},1800)}),
                 ]);
@@ -205,6 +225,10 @@ pub(super) async fn render(
                     fields.push(json!({"label":"最近结果","value":dto::bounded(if run.text.is_empty() {"尚无回复正文"} else {&run.text},1800)}));
                 }
             }
+            fields.extend([
+                json!({"label":"角色标识","value":role.id}),
+                json!({"label":"运行模式","value":if agents_enabled {"独立协作；派发后各自执行"}else{"共享会话功能角色；未启用独立子Agent"}}),
+            ]);
         } else {
             title = "OpenPaw 会话详情".to_owned();
             description =
@@ -226,12 +250,26 @@ pub(super) async fn render(
             "任务进度与结果",
             json!({"kind":"tasks","offset":0}),
         );
+        if kind == "member" {
+            button(
+                &mut buttons,
+                &mut options,
+                "refresh",
+                "刷新任务状态",
+                json!({"kind":"member"}),
+            );
+        }
     } else if kind == "tasks" || kind == "task" {
         let tasks = task_views(host, scope, session, member.map(|role| role.employee)).await?;
         if kind == "task" {
             let (task, run, _) = tasks
                 .iter()
-                .find(|(task, _, _)| task["id"] == context["taskId"])
+                .find(|(task, _, child)| {
+                    task["id"] == context["taskId"]
+                        && context["childTaskId"]
+                            .as_str()
+                            .is_none_or(|wanted| child.as_deref() == Some(wanted))
+                })
                 .ok_or_else(|| {
                     HostError::new(
                         "snapshot_changed",
@@ -508,10 +546,10 @@ pub(super) async fn render(
         );
     }
     if let Some(role) = member {
-        for value in options.values_mut() {
+        for (key, value) in options.iter_mut() {
             value["employeeId"] = json!(role.employee);
             value["actorId"] = json!(role.actor);
-            if let Some((d, _)) = &member_child {
+            if let Some((d, _)) = member_child.as_ref().filter(|_| key != "refresh") {
                 if value.get("childTaskId").is_none() {
                     value["childTaskId"] = json!(d.task_id);
                 }
@@ -741,6 +779,51 @@ mod tests {
             .await
             .unwrap();
         let stop = CancellationToken::new();
+        let member = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "member-overview",
+            json!({"kind":"member","employeeId":"assistant","actorId":"office-lead"}),
+            &stop,
+        )
+        .await
+        .unwrap();
+        assert!(
+            member["content"]["fields"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["label"] == "已确认进度"),
+            "人物首页直接显示业务进度"
+        );
+        assert!(
+            member["content"]["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == "refresh"),
+            "详情能主动刷新而不启动新执行"
+        );
+        let navigation_scope = scope.clone();
+        let navigation = host
+            .inner
+            .store
+            .call(move |db| db.office_navigation("member-overview", &navigation_scope))
+            .await
+            .unwrap();
+        let refreshed = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "member-refreshed",
+            navigation["options"]["refresh"].clone(),
+            &stop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed["content"], member["content"]);
+        assert!(refreshed["content"]["actions"].as_array().unwrap().len() <= 8);
         let first = render(
             &host,
             &scope,
@@ -816,6 +899,10 @@ mod tests {
         )
         .await
         .is_err());
+        assert!(render(
+            &host, &scope, &binding.session_id, "changed-task-owner",
+            json!({"kind":"task","taskId":format!("run:{}",accepted.run_id),"childTaskId":"previous-child-task"}), &stop,
+        ).await.is_err(),"旧子任务按钮不能悄悄打开相同卡片ID对应的父执行");
         host.delete_session(&scope).await.unwrap();
         assert!(render(
             &host,

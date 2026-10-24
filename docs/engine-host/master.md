@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-2026-10-24 当前入口：唯一主目录fix/engine-host-t6-followup；Office远端/冻结/运行均fa6ae1f，工程零修改。Host原8765已上线4621331对应功能，最新运行精确提交以runtime-t6.json为准；准确e轮原27/27、真实Office产品73条通过。原页面一主五个不同子角色、一次审批写报告及真实账本已对账；六Pixi/六侧栏/六成员布局、任务详情/白板、普通追问运行中/终态/刷新与迁移重启后保持通过；42查询入口、5原生场景通过。r6已按批准备份/摘要/原Store事务迁移：三个已有团队各自物理根，真实同名不同内容文件及各队六成员网页通过，原ID/账本/原文件不变；第四槽预授权独立根未激活。D64—D67及原失败/脚本汇总错误均保留，最终证据见0007验证记录。本轮补修PR https://github.com/KunlunMeta-Limited/openpaw/pull/13，目标merge/ai-ofice-react-overagent，不自行批准或合入；当前文档登记后的准确候选另以f轮完整报告核验，不借e绿灯冒充。Windows原生暂缓，云端13作业账单未启动。Office所有Rx仍暂缓，重点R12字体、R17闲聊、R19首页完成卡过滤、R20 AI员工面板不可点；详见集中申请单第8节。T7和手工任务控制/动态Agent/clarify等后续能力不冒充已实现。
+2026-10-24 最新补修入口：原7bc8152已完成准确27项/73条浏览器及生产只读复验，PR #13为OPEN/Ready，尚未合入。本轮继续原0007第12.30节D68—D70：普通多人共用步骤不能归到第一人；人物首页展示任务/业务进度/实际结果并可只读刷新；独立审查角色必须得到前序真实正文。修前普通DeepSeek五个不同子角色已执行，捕获多人总步骤错归和审查缺材料；不以角色对白或“已结束”冒充业务核验。最小修复沿原projection/details/service及原回归入口，无新协议/权限/依赖/持久格式。准确新全量及真实网页以`/home/cheng/.cache/t6-agent-followup-20261024/final-a/{full,product}/report.json`、同根`live-after/report.json`和`closure.json`为准；报告形成前不标通过，旧f只证明7bc8152。唯一开发目录仍Office/openpaw；生产精确版本见artifacts/live-office-20261024-t6/runtime-t6.json，现有工作区迁移保持committed。Office仍fa6ae1f且零修改，用户原文档编辑保留。R11/R12/R13/R16/R17/R19/R20等仍在集中Rx台账暂缓；Windows原生暂缓不计通过；不开始T7。
 
 <details>
 <summary>历史状态记录：保留原时点，不覆盖上方当前入口</summary>

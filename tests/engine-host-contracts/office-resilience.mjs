@@ -91,6 +91,11 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     const actual=response.request().postDataJSON();assert.equal(actual.actorId,person.id)
     const dialog=page.getByRole('dialog',{name:`${person.name} · 成员详情`,exact:true});await dialog.waitFor()
     assert.ok(body.data.content.fields.length>=5)
+    const progress=body.data.content.fields.find(f=>f.label==='已确认进度');assert.equal(progress?.value,'100%')
+    assert.ok(body.data.content.fields.some(f=>f.label==='业务状态'&&f.value==='已核验完成'))
+    assert.equal(body.data.content.actions.length,8)
+    const refreshReply=page.waitForResponse(r=>r.url().endsWith('/api/pawoffice/ui')&&r.request().postDataJSON()?.action==='dialog.action'&&r.request().postDataJSON()?.optionId==='refresh')
+    await page.getByRole('button',{name:'刷新任务状态',exact:true}).click();const refreshed=await(await refreshReply).json();assert.deepEqual(refreshed.data.content,body.data.content)
     await page.screenshot({path:join(output,`t6-actor-${person.id}.png`),fullPage:true})
     await page.getByRole('button',{name:'历史',exact:true}).click();await page.getByRole('button',{name:'返回目录',exact:true}).click();await dialog.waitFor()
     await page.getByRole('button',{name:'关闭详情',exact:true}).click();actors.push({request:actual,response:body})
@@ -135,6 +140,7 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   report.t6={request,parent,children,handoffs,actors,members,timelines,final,scene:snapshot,model:'deterministic real HTTP Provider; animation pacing only in test fixture; real Host execution'}
   report.assertions.push('D61 five real member timelines preserve observed start and verified completion, without additional assignment or visit', 'T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five observed office.visit completions; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards','r6: real five children share their parent team root while second-team existing sessions stay on a distinct physical root')
   report.assertions.push('r7: six members open their own real task/result details and return without losing identity','D65: ordinary follow-up retains completed team cards, original whiteboard and independent member results')
+  report.assertions.push('Six actual actor dialogs show their own verified task/progress/result, and refresh keeps identity without creating another Run')
 }
 
 

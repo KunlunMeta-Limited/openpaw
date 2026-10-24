@@ -1302,6 +1302,10 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
         .filter(|r| r.system.as_deref().is_some_and(|s| s.contains("（lead）")))
     {
         let system = request.system.as_ref().unwrap();
+        assert!(
+            system.contains("子角色看不到父会话历史") && system.contains("context"),
+            "真实Provider必须获知独立子角色的资料交接方式，不能让审查者凭空核验前序结果"
+        );
         for mapping in [
             "王明 -> lead",
             "李研 -> research",
