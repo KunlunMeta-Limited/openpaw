@@ -1,6 +1,6 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
-状态：T0—T5当前用户批准交付范围已合入。T5 PR #11最终head f276b00于2026-10-23 20:46:12合入f22cca18d3667ded5dfed35d06085b260cc5a32d；用户会话确认通过，平台reviews为空，不虚构Approve。原准确head Linux完整27/27、固定Office产品53条及原8765真实模型/账本证据保留。T6的[CHG-2026-0007 r2-product-agents](../changes/CHG-2026-0007.md)已获实施授权，六人物详情和真实一主五子已编码并取得隔离网页/真实DeepSeek证据；完整故障验收尚有失败，不等于T6已交付。流式检查点、Tokio补丁及fa6ae1f协议冻结增量已批准并实施；准确fc5ebd4完整24/27，最新Office真实浏览器68条通过。原0007第12.5节r5已获准确批准；D56原核心最小修复及精确预算/Host共享限额专项通过，当前候选完整27项与最新真实模型待复验；真实模型主/五子已完成但出现D57重复卡片，原允许投影/Store已修并通过正反例专项，最终仍重验；旧失败保留，T6未交付、8765仍T5/d150b96；T7/T8未开始。Windows原生依用户要求暂缓、不计通过；Office所有Rx仍集中待统一审核，R11默认白板链接未改。
+状态：T0—T5已合入。2026-10-24 最新交付状态：用户已验收准确`15cc908287124a2f8dfa7c991f914e5d0e95415d`，T6 [PR #12](https://github.com/KunlunMeta-Limited/openpaw/pull/12) 已创建，目标`merge/ai-ofice-react-overagent`；OPEN、待非作者审核、未合入，T7未开始。准确交付干净原27/27通过，真实Office浏览器68条/0页面错误、五次实际交接；真实DeepSeek一主五子、一次审批后报告落盘、7张唯一任务卡及白板6/6/100%通过。验收/PR元数据登记后的准确提交另以`/home/cheng/.cache/t6-pr-20261024-m/{full/report.json,product/report.json,review.json}`完整复验，报告形成前不预填新提交通过。原失败及历史叙述保留当时语境，以本段及0007第1/12.10节为当前状态。Office冻结fa6ae1f；8765仍已部署T5/d150b96，未随PR升级；Windows原生暂缓、未执行不计通过，Office Rx全部暂缓。
 
 本文件同时服务人工评审和 coding agent：先明确真实协议、用户行为与系统边界，再定义实现方法、产物、测试和 PR 交接。下文方案要求的实际完成状态以第14.1节及各主CHG最新履历为准；不能将设计、fixture 通过或 feature 连线描述为功能已交付。用户提供的 master-plan 仅作为参考材料。
 
@@ -1106,7 +1106,7 @@ T8与最终约定范围验收完成后，登记初期结束基线。后续按CHG
 | M3 / T3 | 可运行的共享Host、并发/审批/锁/恢复 | [T3任务卡](#tx-t3)；[0004第9/10节](../changes/CHG-2026-0004.md#9-影响数据流和实现)的H01—H12 | 已完成本轮批准范围并合入；Linux准确交付与合入head均完整26/26，Windows按用户明确指示暂缓、未验证 | [OpenPaw #7](https://github.com/KunlunMeta-Limited/openpaw/pull/7)，head 825a86c624c1c3d0cee4f61584f41f48b5f09f60，merge d11b944073ea3c3bc8cf3dac308e435647e6ee52；2026-10-21 19:16:12合入；用户会话确认、API无独立Review；[0004履历](../changes/CHG-2026-0004.md#12-验证和审批记录)保留CI未启动与门禁例外冲突 |
 | M4 / T4 | 第一版真实只读Office展示 | [演示步骤1—2](#product-demo)、[T4任务卡](#tx-t4)；[0005第12节](../changes/CHG-2026-0005.md#12-验证和审批记录)及真实M4证据 | 已完成本轮批准只读范围并合入；用户验收9831f59，最终e7ce707完整27/27/产品passed；Windows原生暂缓，不是双平台发布 | [PR #10](https://github.com/KunlunMeta-Limited/openpaw/pull/10)，head e7ce70700f06843c8bfa4112f0f6bfbc00971eb2，merge 37f0a35729fb64639f0e1a8b8a8a4799e1dca9d3，2026-10-23 09:43:00；用户会话确认，API reviews为空；D36/D37及天气输出限制保留 |
 | M5 / T5 | 常规产品闭环：审批写产物、六类详情、删除及真实动画 | [0006第9/10/12节](../changes/CHG-2026-0006.md)、[15.3六包](#office-t5-workpackages)、[M5核查](#milestone-m5) | 当前用户批准Linux交付范围完成；准确最终head完整27/27、产品53条与原8765真实模型/账本证据；Windows原生暂缓 | [PR #11](https://github.com/KunlunMeta-Limited/openpaw/pull/11) MERGED；最终f276b00972f77d67d31e1d9b6862edb4c38111ef，合入f22cca18d3667ded5dfed35d06085b260cc5a32d，2026-10-23 20:46:12；用户确认，reviews为空 |
-| M6 / T6 | 六人物/成员详情、真实六角色委派与交接、原恢复/容量 | [0007第9.6—9.11/10.4节P01—P08及V01—V10](../changes/CHG-2026-0007.md)、[第16节](#office-product-agent-review)、[M6核查](#milestone-m6) | r2已实施；六人物/五子/真实模型100%与准确g浏览器产品66条通过，准确bfeaff1完整25/27；D54/公告/新上游增量待审及V组合未完；Rx不实施 | 未创建；先准确方案批准，再实施/完整验收/用户交付审核后提唯一主PR |
+| M6 / T6 | 六人物/成员详情、真实六角色委派与交接、原恢复/容量 | [0007第9.6—9.11/10.4节P01—P08及V01—V10](../changes/CHG-2026-0007.md)、[第16节](#office-product-agent-review)、[M6核查](#milestone-m6) | 准确15cc908原27/27、真实浏览器68条、真实DeepSeek一主五子/报告/7卡100%通过；用户已交付验收；Windows暂缓，Rx未实施；未合入不标整体完成 | [PR #12](https://github.com/KunlunMeta-Limited/openpaw/pull/12) OPEN，待非作者审核及合入；登记后准确head完整复验另见0007第12.10节 |
 | M7 / T7 | 固定SDK可复用同一Host | [T7任务卡](#tx-t7)；真实SDK请求/事件迭代/审批/abort及Office并用 | 待实施 | 未创建；不声明OpenWork桌面已验收 |
 | M8 / T8 | Linux/Windows可启动、演示、备份和恢复的交付包 | [完整演示](#product-demo)、[T8任务卡](#tx-t8)；原生双平台、真实Provider、发布候选与用户验收 | 待实施 | 未创建；T8主PR及最终集成到main的PR分别追踪 |
 
@@ -1261,7 +1261,7 @@ PR关闭未合入、批准后又有实质变更、必需跨仓PR只合入一方�
 
 ### 14.11 M6 / T6：角色/多Agent产品链与恢复加固
 
-本轮新增核查：先按0007 P01—P08核对六人物、精准成员详情、真实主/子Run、五次可观察交接及父子权限/预算/取消/删除，再检查以下原V01—V10。D50/D51当前未修复；角色/编排尚未实现，准确r2批准前不启动编码。Office R11—R16未实施不记已完成，Windows原生仍暂缓。
+核查范围：按0007 P01—P08核对六人物、精准成员详情、真实主/子Run、五次可观察交接及父子权限/预算/取消/删除，再检查以下原V01—V10；逐项代码、修复和实际证据在0007验证记录。当前状态单一汇总见14.1：准确15cc908交付已验收、PR #12待审核合入；Office Rx未实施不记完成，Windows原生仍暂缓。
 
 **实施入口：**[第10节T6任务卡](#tx-t6)；[协议对照](#protocol-checklist)；[提PR前核查表](#milestone-gate)。当前状态与PR只维护[14.1台账](#milestones)，本小节不保存第二份状态。
 
@@ -1743,3 +1743,8 @@ Office当前冻结升级到fa6ae1f，来源26份及实际变化3Schema同步；D
 最终候选所有代码、文档和最新Office原浏览器旅程的原27项结果以`/home/cheng/.cache/t6-agents-20261024-l/full/report.json`、`product/report.json`和同根review.json为准；预登记入口不代表已执行或已通过，查看complete/results/commit/sourceDirty。前轮k的三条日志编号scrub失败保留，已只移除内部日志前缀、原断言与门禁不变。最终源提交和模型6a6a974的全部生产Rust/Cargo对象一致性由review.json单独核对，不借旧提交全量代替当前候选。
 
 M6仍待本会话用户对准确最终候选交付验收；批准后才创建到merge/ai-ofice-react-overagent的T6唯一主PR，PR获批合入才进入T7。8765原T5服务保持，不把隔离截图宣称原页面已升级。Windows原生按用户决定暂缓未通过；R11白板链接/R12字体/R13原位菜单/R15文档/R16到达ACK/R17默认闲聊互阻等继续集中暂缓，申请单不等于Office修改授权。
+
+
+### 2026-10-24 T6准确交付验收与PR事实更新
+
+2026-10-24 最新交付状态：用户已验收准确`15cc908287124a2f8dfa7c991f914e5d0e95415d`，T6 [PR #12](https://github.com/KunlunMeta-Limited/openpaw/pull/12) 已创建，目标`merge/ai-ofice-react-overagent`；OPEN、待非作者审核、未合入，T7未开始。准确交付干净原27/27通过，真实Office浏览器68条/0页面错误、五次实际交接；真实DeepSeek一主五子、一次审批后报告落盘、7张唯一任务卡及白板6/6/100%通过。验收/PR元数据登记后的准确提交另以`/home/cheng/.cache/t6-pr-20261024-m/{full/report.json,product/report.json,review.json}`完整复验，报告形成前不预填新提交通过。原失败及历史叙述保留当时语境，以本段及0007第1/12.10节为当前状态。Office冻结fa6ae1f；8765仍已部署T5/d150b96，未随PR升级；Windows原生暂缓、未执行不计通过，Office Rx全部暂缓。
