@@ -613,6 +613,33 @@ mod tests {
             };
             let snapshot = prepare(&host, &office, "office-1").await.unwrap();
             let conv = &snapshot["conversations"][0];
+            // 动态按观察时间排序，首条不再必然是最近派工；用持久委派ID精确对账。
+            let session_id = session.session_id.clone();
+            let latest_task = host
+                .inner
+                .store
+                .call(move |db| {
+                    let parent = db
+                        .runs()?
+                        .into_iter()
+                        .find(|r| r.session_id == session_id)
+                        .unwrap();
+                    Ok(db
+                        .delegations(&parent.run_id)?
+                        .last()
+                        .unwrap()
+                        .task_id
+                        .clone())
+                })
+                .await
+                .unwrap();
+            let latest_assignment = conv["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| event["id"] == format!("assign:{latest_task}"))
+                .unwrap();
+            assert_eq!(latest_assignment["kind"], "task.assigned");
             assert_eq!(
                 conv["tasks"].as_array().unwrap().len(),
                 if confirm || (mark_active && !retry) {
@@ -629,7 +656,7 @@ mod tests {
                     "正常保存最终汇总后才确认交付"
                 );
                 assert_eq!(conv["tasks"][1]["assigneeId"], "command");
-                assert_eq!(conv["events"][0]["taskId"], conv["tasks"][1]["id"]);
+                assert_eq!(latest_assignment["taskId"], conv["tasks"][1]["id"]);
             } else {
                 assert_eq!(conv["tasks"][0]["status"], "failed");
                 assert!(conv["tasks"][0]["progress"].as_u64().unwrap() < 100);
@@ -640,7 +667,7 @@ mod tests {
                 let child_index = if mark_active && !retry { 1 } else { 3 };
                 assert_eq!(conv["tasks"][child_index]["assigneeId"], "command");
                 assert_eq!(
-                    conv["events"][0]["taskId"],
+                    latest_assignment["taskId"],
                     conv["tasks"][child_index]["id"]
                 );
             }
