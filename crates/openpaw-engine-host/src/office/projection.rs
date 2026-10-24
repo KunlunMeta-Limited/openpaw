@@ -221,7 +221,9 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
                 }
             }
             let latest_has_work=db.progress(&latest.run_id)?.is_some() || !db.delegations(&latest.run_id)?.is_empty() || latest.tools.iter().any(|t|t.tool_name!="report_progress");
-            let board_id=if !latest.state.is_terminal() || latest_has_work {&display_ids[0]} else {display_ids.get(1).unwrap_or(&display_ids[0])};
+            // 新业务事实出现后才接管白板；普通追问等待Provider时也保留原业务成果。
+            // 当前Run状态仍由独立任务卡展示，无旧业务时自然回退到当前目标。
+            let board_id=if latest_has_work {&display_ids[0]} else {display_ids.get(1).unwrap_or(&display_ids[0])};
             let mut retained_tasks=Vec::new();
             let mut retained_events=Vec::new();
             let mut retained_whiteboard=Value::Null;
@@ -517,6 +519,46 @@ mod tests {
     #[tokio::test]
     async fn consecutive_delegations_use_their_precise_completed_step_without_duplicate_cards() {
         use openpaw_llm::{MockMode, MockProvider};
+        // 在真实Provider等待边界冻结运行，避免只测终态而遗漏用户可见的临时重置。
+        struct Pausable {
+            inner: MockProvider,
+            pause: std::sync::atomic::AtomicBool,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl openpaw_core::LlmProvider for Pausable {
+            async fn complete(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+                self.inner.complete(request).await
+            }
+            async fn stream(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    openpaw_core::Result<openpaw_core::StreamEvent>,
+                >,
+            > {
+                if self.pause.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.acquire().await.unwrap().forget();
+                }
+                self.inner.stream(request).await
+            }
+            fn capabilities(&self) -> openpaw_core::Capabilities {
+                self.inner.capabilities()
+            }
+            fn default_model(&self) -> &str {
+                self.inner.default_model()
+            }
+            fn name(&self) -> &str {
+                "controlled-projection-wait"
+            }
+        }
         for (second_evidence, expected_cards) in [("call_2_1", 3), ("call_2_0", 4)] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
@@ -563,28 +605,26 @@ mod tests {
                     json!({"type":"update","stepId":"organize","state":"completed","evidenceCallIds":[second_evidence]}),
                 ),
                 MockMode::Fixed("王明核验两个子任务完成".into()),
+                MockMode::Fixed("普通追问已回复".into()),
+                call(
+                    "report_progress",
+                    json!({"type":"create","steps":[{"id":"new","title":"独立新业务目标"}]}),
+                ),
+                MockMode::Fixed("新目标尚未核验".into()),
             ];
-            let host =
-                Host::with_provider(config, std::sync::Arc::new(MockProvider::scripted(script)))
-                    .await
-                    .unwrap();
+            let provider = std::sync::Arc::new(Pausable {
+                inner: MockProvider::scripted(script),
+                pause: std::sync::atomic::AtomicBool::new(true),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            let host = Host::with_provider(config, provider.clone()).await.unwrap();
             let scope = ClientScope {
                 namespace: "office".into(),
                 slot_id: "office-1".into(),
                 conversation_id: "consecutive".into(),
             };
             let binding = host.open_session(scope.clone()).await.unwrap();
-            let run = host
-                .submit_run(&scope, &binding.session_id, "核验目标并整理清单".into())
-                .await
-                .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
-                .await
-                .unwrap();
-            assert_eq!(
-                host.get_run(&scope, &run.run_id).await.unwrap().state,
-                RunState::Completed
-            );
             let office = OfficeConfig {
                 base_url: "http://127.0.0.1:9".into(),
                 api_key_env: "PAWOFFICE_TEST_KEY".into(),
@@ -592,6 +632,34 @@ mod tests {
                 names: Default::default(),
                 creation_slots: vec![],
             };
+            let run = host
+                .submit_run(&scope, &binding.session_id, "核验目标并整理清单".into())
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                provider.entered.notified(),
+            )
+            .await
+            .unwrap();
+            let initial = prepare(&host, &office, "office-1").await.unwrap();
+            assert_eq!(
+                initial["conversations"][0]["whiteboard"]["status"],
+                "running"
+            );
+            assert!(initial["conversations"][0]["whiteboard"]["title"]
+                .as_str()
+                .unwrap()
+                .contains("核验目标"));
+            provider.release.add_permits(1);
+            tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
+                .await
+                .unwrap();
+            assert_eq!(
+                host.get_run(&scope, &run.run_id).await.unwrap().state,
+                RunState::Completed
+            );
+
             let snapshot = prepare(&host, &office, "office-1").await.unwrap();
             let conv = &snapshot["conversations"][0];
             assert_eq!(
@@ -651,9 +719,32 @@ mod tests {
             );
             if expected_cards == 3 {
                 // 普通追问不能擦掉此前同事的真实工作、白板和成员详情。
+                provider
+                    .pause
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 host.submit_run(&scope, &binding.session_id, "谢谢，请保留团队成果".into())
                     .await
                     .unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    provider.entered.notified(),
+                )
+                .await
+                .unwrap();
+                let waiting = prepare(&host, &office, "office-1").await.unwrap();
+                assert_eq!(
+                    waiting["conversations"][0]["whiteboard"], conv["whiteboard"],
+                    "普通追问仍在运行时也不能清空已完成业务白板"
+                );
+                assert!(
+                    waiting["conversations"][0]["tasks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|task| task["status"] == "running"),
+                    "追问真实运行状态仍应显示在任务列表"
+                );
+                provider.release.add_permits(1);
                 host.wait_idle().await;
                 let after = prepare(&host, &office, "office-1").await.unwrap();
                 let current = &after["conversations"][0];
@@ -686,6 +777,23 @@ mod tests {
                     prepare(&host, &office, "office-1").await.unwrap(),
                     after,
                     "保留历史不能造成无事实seq增长"
+                );
+                host.submit_run(&scope, &binding.session_id, "建立独立的新业务计划".into())
+                    .await
+                    .unwrap();
+                host.wait_idle().await;
+                let next = prepare(&host, &office, "office-1").await.unwrap();
+                assert!(
+                    next["conversations"][0]["whiteboard"]["title"]
+                        .as_str()
+                        .unwrap()
+                        .contains("新业务计划"),
+                    "真实新计划必须接管白板"
+                );
+                assert_ne!(next["conversations"][0]["whiteboard"], conv["whiteboard"]);
+                assert_ne!(
+                    next["conversations"][0]["whiteboard"]["status"], "completed",
+                    "不能沿用旧目标100%冒充新目标完成"
                 );
             }
             host.shutdown().await.unwrap();
