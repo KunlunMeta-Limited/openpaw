@@ -1,4 +1,4 @@
-2026-10-24 当前入口：原T6 PR #12已合入e6a20bd，本轮补修在唯一主目录fix/engine-host-t6-followup。Office冻结/部署fa6ae1f，工程不改；原8765 Host仍准确7fa8874。用户已批准r6物理工作区迁移及本轮r7-ui-closure非Office范围（0007第12.21节），本轮正在实现/验证，未迁移用户数据、未创建补修PR、不开始T7。已完成D64/D65定向复现与修复、成员任务详情入口及两条真实迁移专项；这不是完整交付通过。准确7fa的原27/27、69条浏览器及原h同Run18入口已通过，真实DeepSeek i/j两轮均失败并保留。新候选必须完整验证和真实网页/模型重验。Office R19首页隐藏完成任务、R20 AI员工面板不可点击新增待审核，请看office-change-requests.md第8节；全部Office申请仍暂缓。Windows原生按用户决定未执行、不计通过。
+2026-10-24 当前入口：原T6 PR #12已合入e6a20bd，本轮补修在唯一主目录fix/engine-host-t6-followup。Office冻结/部署fa6ae1f，工程不改；原8765 Host仍准确7fa8874。用户已批准r6物理工作区迁移及本轮r7-ui-closure非Office范围（0007第12.21节），本轮正在实现/验证，未迁移用户数据、未创建补修PR、不开始T7。已完成D64/D65/D66定向复现与修复、成员任务详情入口及两条真实迁移专项；这不是完整交付通过。准确7fa的原27/27、69条浏览器及原h同Run18入口已通过，真实DeepSeek i/j及本轮隔离四角色失败均保留。新候选必须完整验证和真实网页/模型重验。Office R19首页隐藏完成任务、R20 AI员工面板不可点击新增待审核，请看office-change-requests.md第8节；全部Office申请仍暂缓。Windows原生按用户决定未执行、不计通过。
 
 <details>
 <summary>历史状态记录：保留原时点，不覆盖上方当前入口</summary>

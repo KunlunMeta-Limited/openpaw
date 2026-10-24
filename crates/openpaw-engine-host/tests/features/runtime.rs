@@ -1294,6 +1294,28 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
     );
     let children = delegated(&cfg.home, &run.run_id);
     assert_eq!(children.len(), 5);
+    for request in provider
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.system.as_deref().is_some_and(|s| s.contains("（lead）")))
+    {
+        let system = request.system.as_ref().unwrap();
+        for mapping in [
+            "王明 -> lead",
+            "李研 -> research",
+            "周理 -> organize",
+            "陈书 -> draft",
+            "刘市 -> review",
+            "赵审 -> audit",
+        ] {
+            assert!(
+                system.contains(mapping),
+                "主角色的实际Provider请求必须收到准确人物映射：{mapping}"
+            );
+        }
+    }
     let mut sessions = std::collections::BTreeSet::new();
     let mut runs = std::collections::BTreeSet::new();
     for child in &children {

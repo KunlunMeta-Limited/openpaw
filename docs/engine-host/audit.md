@@ -385,3 +385,8 @@ D62原容量inline回归确切红绿：100旧Run后conv099真实两步骤+pendin
 ## D65：普通追问覆盖团队成果与成员结果
 
 原投影和成员只选同Session最新Run；无委派的普通追问清空上次任务/白板及五成员结果。原D63回归扩追问先红（d65-red.log），再从原Run/计划/委派保留有界近期成果；详情按同scope全部父Run输入顺序找本人真实委派。ID/seq不重放派工、同目标独立计数、原64KiB/100会话约束保留；绿d65-green.log，新增任务详情回归、真实网页和模型尚待完整准确候选。
+
+
+## D66：主角色缺少人物到真实角色ID的完整映射
+
+隔离1262e2c真实DeepSeek五次派发只覆盖四角色，“周理”任务错误使用research，周理未参与；原ui/report.json保持failed。仅在service主角色system复用agents::ROLES提供姓名->role_id及职责，不让标题改身份，不扩大权限。在原runtime p04的实际Provider请求中逐条断言六位映射，d66-red.log缺王明映射失败，d66-green.log通过且原五子Session/Run/账本16次请求断言保留。真实模型及新准确完整检查尚待，不把提示修正当可靠完成证据。

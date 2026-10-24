@@ -458,7 +458,7 @@ async fn interaction_scenario() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|f| f["label"] == "实际执行状态" && f["value"] == "Completed"));
+        .any(|f| f["label"] == "实际执行状态" && f["value"] == "执行已结束"));
     let task_back = action(
         &shared,
         "task-back",

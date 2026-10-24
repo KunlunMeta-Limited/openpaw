@@ -250,7 +250,7 @@ pub(super) async fn render(
                 json!({"label":"业务状态","value":task_status(task["status"].as_str().unwrap_or("queued"))}),
                 json!({"label":"已确认进度","value":format!("{}%",task["progress"].as_u64().unwrap_or(0))}),
                 json!({"label":"进度说明","value":dto::bounded(task["summary"].as_str().unwrap_or("暂无说明"),1800)}),
-                json!({"label":"实际执行状态","value":format!("{:?}",run.state)}),
+                json!({"label":"实际执行状态","value":match run.state {crate::RunState::Accepting=>"正在保存请求",crate::RunState::Accepted=>"已接受，等待执行",crate::RunState::Running=>"正在执行",crate::RunState::Cancelling=>"正在停止，等待清理",crate::RunState::Completed=>"执行已结束",crate::RunState::Failed=>"执行失败",crate::RunState::TimedOut=>"执行超时",crate::RunState::Cancelled=>"已停止并清理",crate::RunState::Interrupted=>"执行被中断"}}),
                 json!({"label":"执行引用","value":format!("Run {} · Session {}",run.run_id,run.session_id)}),
                 json!({"label":"实际回复","value":dto::bounded(if run.text.is_empty(){"尚无可靠回复正文"}else{&run.text},1800)}),
             ]);
@@ -784,7 +784,7 @@ mod tests {
         let fields = detail["content"]["fields"].as_array().unwrap();
         assert!(fields
             .iter()
-            .any(|f| f["label"] == "实际执行状态" && f["value"] == "Completed"));
+            .any(|f| f["label"] == "实际执行状态" && f["value"] == "执行已结束"));
         assert!(fields
             .iter()
             .any(|f| f["label"] == "业务状态" && f["value"] == "等待确认、核验或继续处理"));
