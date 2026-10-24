@@ -1306,6 +1306,12 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
             system.contains("子角色看不到父会话历史") && system.contains("context"),
             "真实Provider必须获知独立子角色的资料交接方式，不能让审查者凭空核验前序结果"
         );
+        assert!(
+            system.contains("不要把草稿和依赖它的审查放在同一批工具调用里")
+                && system.contains("已有前序产物时，review和audit必须实际检查该产物")
+                && system.contains("引用实际返回的原句"),
+            "主角色必须按真实结果的依赖顺序交接，前期验收清单不能代替对稿核验"
+        );
         for mapping in [
             "王明 -> lead",
             "李研 -> research",
