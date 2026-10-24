@@ -658,7 +658,7 @@ mod tests {
                 let after = prepare(&host, &office, "office-1").await.unwrap();
                 let current = &after["conversations"][0];
                 for previous in conv["tasks"].as_array().unwrap() {
-                    assert!(current["tasks"].as_array().unwrap().iter().any(|t| t["id"] == previous["id"] && t["status"] == previous["status"]), "D65：后续普通问答不能移除准确已完成业务任务");
+                    assert!(current["tasks"].as_array().unwrap().iter().any(|t| t["id"] == previous["id"] && t["status"] == previous["status"]), "后续普通问答不能移除准确已完成业务任务");
                 }
                 assert_eq!(
                     current["whiteboard"], conv["whiteboard"],
