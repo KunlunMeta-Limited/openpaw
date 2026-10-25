@@ -1,9 +1,9 @@
 {
-  "out": "/tmp/openpaw-status-repeat-NEgrZg",
-  "base": "http://127.0.0.1:46677",
-  "officePort": 36697,
-  "providerPort": 43279,
-  "commit": "9043fbe6fa69e3685b800767b008c2b5a957dbba",
+  "out": "/tmp/openpaw-status-repeat-ZxT3ym",
+  "base": "http://127.0.0.1:39563",
+  "officePort": 34293,
+  "providerPort": 36555,
+  "commit": "6caec7ec8c5fce2e19561e451731603906502261",
   "single": 100,
   "multi": 100,
   "runs": 1,
@@ -58,113 +58,113 @@
         "events": [
           {
             "employeeId": "code-agent",
-            "id": "activity:delegation:06cab08bcecd4ae1a27783675ed57d2a:completed",
+            "id": "activity:delegation:791a4717abc34a4d8ee8689e60291b74:completed",
             "kind": "task.completed",
-            "occurredAt": "2026-10-25T16:39:29.624Z",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
             "summary": "已核验完成：research完成资料核查",
-            "taskId": "delegation:06cab08bcecd4ae1a27783675ed57d2a"
+            "taskId": "delegation:791a4717abc34a4d8ee8689e60291b74"
           },
           {
             "employeeId": "code-agent",
             "fromEmployeeId": "office-lead",
-            "id": "assign:delegation:06cab08bcecd4ae1a27783675ed57d2a",
+            "id": "assign:delegation:791a4717abc34a4d8ee8689e60291b74",
             "kind": "task.assigned",
-            "occurredAt": "2026-10-25T16:39:29.624Z",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
             "summary": "交给李研：research完成资料核查",
-            "taskId": "delegation:06cab08bcecd4ae1a27783675ed57d2a"
+            "taskId": "delegation:791a4717abc34a4d8ee8689e60291b74"
           },
           {
             "employeeId": "file-agent",
             "fromEmployeeId": "office-lead",
-            "id": "assign:delegation:b306e4295ef6419da53cd9cb42bedb86",
+            "id": "assign:delegation:37742fd9e735454faf65e8c38b1cb5ab",
             "kind": "task.assigned",
-            "occurredAt": "2026-10-25T16:39:29.624Z",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
             "summary": "交给周理：organize完成资料核查",
-            "taskId": "delegation:b306e4295ef6419da53cd9cb42bedb86"
+            "taskId": "delegation:37742fd9e735454faf65e8c38b1cb5ab"
           },
           {
             "employeeId": "app-agent",
             "fromEmployeeId": "office-lead",
-            "id": "assign:delegation:2c966d450b7e47d6aca039e0cb064f05",
+            "id": "assign:delegation:79a37ebd073c434e89abd658e1d0824d",
             "kind": "task.assigned",
-            "occurredAt": "2026-10-25T16:39:29.624Z",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
             "summary": "交给陈书：draft完成资料核查",
-            "taskId": "delegation:2c966d450b7e47d6aca039e0cb064f05"
+            "taskId": "delegation:79a37ebd073c434e89abd658e1d0824d"
           },
           {
             "employeeId": "review-agent",
             "fromEmployeeId": "office-lead",
-            "id": "assign:delegation:85fcf59f777845aa87fc8e340547190d",
+            "id": "assign:delegation:2170f6be147a405da878007d27e416e1",
             "kind": "task.assigned",
-            "occurredAt": "2026-10-25T16:39:29.624Z",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
             "summary": "交给刘市：review完成资料核查",
-            "taskId": "delegation:85fcf59f777845aa87fc8e340547190d"
+            "taskId": "delegation:2170f6be147a405da878007d27e416e1"
           },
           {
             "employeeId": "data-agent",
             "fromEmployeeId": "office-lead",
-            "id": "assign:delegation:6e7687b72255426e902caab41bbc6029",
+            "id": "assign:delegation:a80d154c833b4920bc9bf8d0fbbc3a45",
             "kind": "task.assigned",
-            "occurredAt": "2026-10-25T16:39:29.624Z",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
             "summary": "交给赵审：audit完成资料核查",
-            "taskId": "delegation:6e7687b72255426e902caab41bbc6029"
+            "taskId": "delegation:a80d154c833b4920bc9bf8d0fbbc3a45"
           }
         ],
         "id": "multi-0",
         "tasks": [
           {
             "assigneeId": "office-lead",
-            "id": "run:a3da7672098641cdbb1c259ec0fae0f6",
+            "id": "run:0d1cb8dede124d0b90ce1199b1103af6",
             "progress": 100,
             "status": "completed",
             "summary": "本次目标已完成",
             "title": "MULTI-0",
-            "updatedAt": "2026-10-25T16:39:29.624Z"
+            "updatedAt": "2026-10-25T16:47:54.586Z"
           },
           {
             "assigneeId": "code-agent",
-            "id": "delegation:06cab08bcecd4ae1a27783675ed57d2a",
+            "id": "delegation:791a4717abc34a4d8ee8689e60291b74",
             "progress": 100,
             "status": "completed",
             "summary": "research 独立任务已完成。",
             "title": "research完成资料核查",
-            "updatedAt": "2026-10-25T16:39:29.624Z"
+            "updatedAt": "2026-10-25T16:47:54.586Z"
           },
           {
             "assigneeId": "file-agent",
-            "id": "delegation:b306e4295ef6419da53cd9cb42bedb86",
+            "id": "delegation:37742fd9e735454faf65e8c38b1cb5ab",
             "progress": 100,
             "status": "completed",
             "summary": "organize 独立任务已完成。",
             "title": "organize完成资料核查",
-            "updatedAt": "2026-10-25T16:39:29.624Z"
+            "updatedAt": "2026-10-25T16:47:54.586Z"
           },
           {
             "assigneeId": "app-agent",
-            "id": "delegation:2c966d450b7e47d6aca039e0cb064f05",
+            "id": "delegation:79a37ebd073c434e89abd658e1d0824d",
             "progress": 100,
             "status": "completed",
             "summary": "draft 独立任务已完成。",
             "title": "draft完成资料核查",
-            "updatedAt": "2026-10-25T16:39:29.624Z"
+            "updatedAt": "2026-10-25T16:47:54.586Z"
           },
           {
             "assigneeId": "review-agent",
-            "id": "delegation:85fcf59f777845aa87fc8e340547190d",
+            "id": "delegation:2170f6be147a405da878007d27e416e1",
             "progress": 100,
             "status": "completed",
             "summary": "review 独立任务已完成。",
             "title": "review完成资料核查",
-            "updatedAt": "2026-10-25T16:39:29.624Z"
+            "updatedAt": "2026-10-25T16:47:54.586Z"
           },
           {
             "assigneeId": "data-agent",
-            "id": "delegation:6e7687b72255426e902caab41bbc6029",
+            "id": "delegation:a80d154c833b4920bc9bf8d0fbbc3a45",
             "progress": 100,
             "status": "completed",
             "summary": "audit 独立任务已完成。",
             "title": "audit完成资料核查",
-            "updatedAt": "2026-10-25T16:39:29.624Z"
+            "updatedAt": "2026-10-25T16:47:54.586Z"
           }
         ],
         "title": "MULTI-0",
@@ -178,17 +178,17 @@
           "status": "completed",
           "steps": [
             {
-              "id": "delegation:2c966d450b7e47d6aca039e0cb064f05",
+              "id": "delegation:79a37ebd073c434e89abd658e1d0824d",
               "progress": 100,
               "title": "draft完成资料核查 · 已完成"
             },
             {
-              "id": "delegation:85fcf59f777845aa87fc8e340547190d",
+              "id": "delegation:2170f6be147a405da878007d27e416e1",
               "progress": 100,
               "title": "review完成资料核查 · 已完成"
             },
             {
-              "id": "delegation:6e7687b72255426e902caab41bbc6029",
+              "id": "delegation:a80d154c833b4920bc9bf8d0fbbc3a45",
               "progress": 100,
               "title": "audit完成资料核查 · 已完成"
             }

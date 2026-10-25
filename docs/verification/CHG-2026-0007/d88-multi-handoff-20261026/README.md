@@ -1,6 +1,6 @@
 # D88 多 Agent 交接与进度真实复验（2026-10-26）
 
-本目录保存 OpenPaw Host 使用全新临时数据目录、临时 Office HTTP 服务和确定性 OpenAI 兼容 Provider 完成的一轮真实五人协作证据。测试没有修改 Office 仓库，也没有读取用户 DeepSeek 密钥。
+本目录保存 OpenPaw Host 使用全新临时数据目录、临时 Office HTTP 服务和确定性 OpenAI 兼容 Provider 完成的一轮真实五人协作证据（对应提交 6caec7e）。测试没有修改 Office 仓库，也没有读取用户 DeepSeek 密钥。
 
 ## 复现命令
 
