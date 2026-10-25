@@ -11843,5 +11843,7 @@
         "sha256": "c6df44243ea9d5a842814ee6481ae06bd78effb90d0ee97497dc6322c1367c92"
       }
     ]
-  }
+  },
+  "implementationCommit": "a57b4bc1f383f503a278e4ef21a5668e3abfbe92",
+  "documentationAfterVerification": "Result metadata and generated index/trace only; frozen original verification source retained and 11 code/test hashes match implementationCommit. Not a claimed clean-HEAD full verification."
 }
