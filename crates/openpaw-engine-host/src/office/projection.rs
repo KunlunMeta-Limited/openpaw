@@ -451,10 +451,25 @@ fn compact_business_conversation(conversation: &mut Value) -> bool {
     false
 }
 
+/// 判断终态Run是否已经属于此前成功投影的历史。
+///
+/// `None` 表示尚无成功投影基线；首次看到的终态Run仍需经过逐人交接。
+/// 只有Run revision不晚于上一次成功投影版本时，才可以直接恢复全部交接，
+/// 避免Host重启或历史裁剪后重复播放已经消费过的动画。
+fn is_historical_terminal(run_revision: u64, previous_source_revision: Option<u64>) -> bool {
+    previous_source_revision.is_some_and(|revision| run_revision <= revision)
+}
+
 /// 将一项已由真实子Run产生、但尚未到展示时机的交接事实加入快照。
 /// 该函数只操作内存中的规范快照；Run状态、权限和账本仍由首次投影读取。
 /// 只有最后一个队列变体才允许提升主卡，避免后续人物尚未展示时提前报完成。
-fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value, final_item: bool) {
+fn apply_handoff_item(
+    conversation: &mut Value,
+    item: &Value,
+    event: &Value,
+    final_item: bool,
+    handoff_total: usize,
+) {
     if let Some(tasks) = conversation["tasks"].as_array_mut() {
         tasks.retain(|existing| existing["id"] != item["id"]);
         tasks.push(item.clone());
@@ -470,20 +485,30 @@ fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value, fin
     // the lead card as well.  Previously only the whiteboard steps were
     // recomputed, so a completed run remained visibly blocked forever after
     // the final handoff.
-    if final_item {
-        if let Some(tasks) = conversation["tasks"].as_array_mut() {
-            let all_children_completed = tasks.len() > 1
-                && tasks
-                    .iter()
-                    .skip(1)
-                    .all(|task| task["status"] == "completed");
-            if all_children_completed {
-                if let Some(main) = tasks.first_mut() {
-                    if main["status"] == "blocked" && main["progress"].as_u64().unwrap_or(0) < 100 {
-                        main["status"] = json!("completed");
-                        main["progress"] = json!(100);
-                        main["summary"] = json!("本次目标已完成");
-                    }
+    if let Some(tasks) = conversation["tasks"].as_array_mut() {
+        let all_children_completed = tasks.len() > 1
+            && tasks
+                .iter()
+                .skip(1)
+                .all(|task| task["status"] == "completed");
+        let completed_children = tasks
+            .iter()
+            .skip(1)
+            .filter(|task| task["status"] == "completed")
+            .count() as u64;
+        let total_children = tasks.len().saturating_sub(1) as u64;
+        if let Some(main) = tasks.first_mut() {
+            if main["status"] == "blocked" {
+                if final_item && all_children_completed {
+                    main["status"] = json!("completed");
+                    main["progress"] = json!(100);
+                    main["summary"] = json!("本次目标已完成");
+                } else if total_children > 0 {
+                    // 每个队列变体都要同步主卡进度；只在最后一项公开后
+                    // 才允许提升为completed，避免白板和人物交接出现跳变。
+                    let total = handoff_total.max(total_children as usize) as u64;
+                    main["progress"] = json!(completed_children * 100 / (total + 1));
+                    main["summary"] = json!("回复已结束；正在依次展示后续成员交接");
                 }
             }
         }
@@ -497,7 +522,7 @@ fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value, fin
         .skip(1)
         .filter(|task| task["status"] == "completed")
         .count();
-    let total = tasks.len().saturating_sub(1);
+    let total = handoff_total.max(tasks.len().saturating_sub(1));
     let mut steps = Vec::new();
     for task in tasks.iter().skip(1).rev().take(3).rev() {
         let label = match task["status"].as_str() {
@@ -513,12 +538,23 @@ fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value, fin
             "progress": task["progress"],
         }));
     }
+    let description = if main["status"] == "completed" {
+        format!(
+            "已确认完成 {completed}/{total} 步；{}",
+            main["summary"].as_str().unwrap_or("本次目标已完成")
+        )
+    } else {
+        format!(
+            "已确认完成 {completed} 项；{}",
+            main["summary"].as_str().unwrap_or("正在处理你的请求")
+        )
+    };
     conversation["whiteboard"] = json!({
         "template": "task-board-v1",
         "title": dto::bounded(main["title"].as_str().unwrap_or(""), 32),
         "status": main["status"],
         "tagline": "",
-        "description": dto::bounded(&format!("已确认完成 {completed}/{total} 步；{}", main["summary"].as_str().unwrap_or("正在处理你的请求")), 500),
+        "description": dto::bounded(&description, 500),
         "note": "",
         "link": {"label": "", "url": ""},
         "steps": steps,
@@ -590,6 +626,11 @@ async fn prepare_internal(
         let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
         let fact_started = std::time::Instant::now();
         let source_revision = db.revision()?;
+        // 用上一次成功投影的事实版本区分“本轮新完成的Run”和重启后
+        // 已经展示过的旧终态。不能用本次扫描的source_revision比较：
+        // 当前扫描本来就包含刚完成Run的revision，会把新交接误判成历史，
+        // 从而一次性公开所有人物任务，人物动画尚未到位时任务就显示完成。
+        let previous_source_revision = db.office_projection_source.get(&team).copied();
         let handoff_due = db
             .office_projection_handoff_until
             .get(&team)
@@ -851,7 +892,7 @@ async fn prepare_internal(
             // 当前Store版本是在本次扫描开始时取得的。终态Run若不晚于该
             // 版本，说明它在本次投影前已经存在；重启时即使内存中没有
             // previous_source_revision，也不能把它当成新交接重新播放。
-            let historical_terminal = r.revision <= source_revision;
+            let historical_terminal = is_historical_terminal(r.revision, previous_source_revision);
             let resume_completed_handoff = r.state.is_terminal() && historical_terminal;
             if resume_completed_handoff {
                 handoff_ready.extend(display_calls.iter().cloned());
@@ -918,7 +959,13 @@ async fn prepare_internal(
                 let verified=done && plan.as_ref().map(|p|p["steps"].as_array().into_iter().flatten().any(|s|
                     s["state"]=="completed" && s["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id))
                 )).unwrap_or(r.state==RunState::Completed);
-                if show_card { completed_children+=u64::from(done); }
+                // 子Run可能已经完成，但在Office交接窗口中尚未公开给浏览器。
+                // 主卡进度必须按“已展示且已完成”的成员计算；否则所有子Run
+                // 会在第一张人物卡出现时把主卡直接推到83%，与人物动画和
+                // 白板步骤不一致。最终一项交接公开后由delivered补齐100%。
+                if show_card && handoff_visible {
+                    completed_children += u64::from(done);
+                }
                 let summary=if let Some(c)=&child {
                     if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {"子任务未完成，已保存真实结果".into()}
                     else if state=="blocked" {"等待确认、资源或清理".into()} else {"正在独立处理此任务".into()}
@@ -1052,7 +1099,11 @@ async fn prepare_internal(
                 }).collect()
             } else {vec![json!({"id":"goal","title":dto::bounded(&summary,80),"progress":percent})]};
             let completed=tasks.iter().skip(1).filter(|t|t["status"]=="completed").count();
-            let description=if tasks.len()>1 {format!("已确认完成 {completed}/{} 步；{summary}",tasks.len()-1)}else{summary};
+            let description=if !delegations.is_empty() && handoff_pending {
+                format!("已确认完成 {completed_children} 项；{summary}")
+            } else if tasks.len()>1 {
+                format!("已确认完成 {completed}/{} 步；{summary}",tasks.len()-1)
+            } else {summary};
             let whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,500),"note":"","link":{"label":"","url":""},"steps":board_steps});
             if run_id==board_id {retained_whiteboard=whiteboard;}
             retained_tasks.extend(tasks);
@@ -1200,7 +1251,7 @@ async fn prepare_internal(
                     .as_array_mut()
                     .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
                 {
-                    apply_handoff_item(conv, item, event, false);
+                    apply_handoff_item(conv, item, event, false, 0);
                 }
             }
             while !snapshot_fits_office_message(&team, &preview) {
@@ -1340,7 +1391,7 @@ async fn prepare_internal(
                         .as_array_mut()
                         .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
                     {
-                        apply_handoff_item(conv, item, event, false);
+                    apply_handoff_item(conv, item, event, false, 0);
                     }
                 }
             }
@@ -1364,6 +1415,34 @@ async fn prepare_internal(
                 .iter()
                 .map(|(conversation, items)| (conversation.clone(), items.len()))
                 .collect();
+            // 当前快照中已经公开的交接卡加上队列中尚未公开的卡，构成
+            // 本轮真实成员总数；变体据此计算主卡进度，不能只按当前可见
+            // 子任务数量把2/5误报成2/2。
+            let handoff_totals: BTreeMap<String, usize> = remaining
+                .iter()
+                .map(|(conversation, items)| {
+                    let visible = current["conversations"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|c| c["id"] == *conversation)
+                        .map(|c| {
+                            c["events"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter(|event| {
+                                    event["kind"] == "task.assigned"
+                                        && event["id"]
+                                            .as_str()
+                                            .is_some_and(|id| id.starts_with("assign:delegation:"))
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    (conversation.clone(), visible + items.len())
+                })
+                .collect();
             loop {
                 let mut progressed = false;
                 for (conversation, items) in remaining.iter_mut() {
@@ -1373,7 +1452,13 @@ async fn prepare_internal(
                         .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
                     else { continue; };
                     let final_item = pending_counts.get(conversation).copied() == Some(1);
-                    apply_handoff_item(conv, &item, &event, final_item);
+                    apply_handoff_item(
+                        conv,
+                        &item,
+                        &event,
+                        final_item,
+                        handoff_totals.get(conversation).copied().unwrap_or(0),
+                    );
                     items.remove(0);
                     if let Some(count) = pending_counts.get_mut(conversation) {
                         *count = count.saturating_sub(1);
@@ -1556,6 +1641,7 @@ mod tests {
             &json!({"id":"delegation:food","title":"查美食","status":"completed","progress":100,"summary":"美食已完成"}),
             &json!({"id":"assign:food","kind":"task.assigned"}),
             true,
+            2,
         );
         assert_eq!(conversation["tasks"][0]["status"], "completed");
         assert_eq!(conversation["tasks"][0]["progress"], 100);
@@ -1563,6 +1649,31 @@ mod tests {
         assert_eq!(
             conversation["whiteboard"]["description"],
             "已确认完成 2/2 步；本次目标已完成"
+        );
+    }
+
+    #[test]
+    fn intermediate_handoff_updates_lead_progress_without_finishing_early() {
+        let mut conversation = json!({
+            "tasks": [
+                {"id":"run:lead","title":"旅游攻略","status":"blocked","progress":16,"summary":"回复已结束；正在依次展示后续成员交接"},
+                {"id":"delegation:research","title":"查路线","status":"completed","progress":100,"summary":"路线已完成"}
+            ],
+            "events": []
+        });
+        apply_handoff_item(
+            &mut conversation,
+            &json!({"id":"delegation:food","title":"查美食","status":"completed","progress":100,"summary":"美食已完成"}),
+            &json!({"id":"assign:food","kind":"task.assigned"}),
+            false,
+            5,
+        );
+        assert_eq!(conversation["tasks"][0]["status"], "blocked");
+        assert_eq!(conversation["tasks"][0]["progress"], 33);
+        assert_eq!(conversation["whiteboard"]["status"], "blocked");
+        assert_eq!(
+            conversation["whiteboard"]["description"],
+            "已确认完成 2 项；回复已结束；正在依次展示后续成员交接"
         );
     }
 
@@ -1581,6 +1692,14 @@ mod tests {
         assert!(!snapshot_fits_office_message("office-1", &snapshot));
         snapshot["schemaVersion"] = json!("legacy");
         assert!(!snapshot_fits_office_message("office-1", &snapshot));
+    }
+
+    #[test]
+    fn newly_completed_run_keeps_sequential_handoff_window() {
+        assert!(!is_historical_terminal(12, None));
+        assert!(!is_historical_terminal(12, Some(11)));
+        assert!(is_historical_terminal(12, Some(12)));
+        assert!(is_historical_terminal(11, Some(12)));
     }
 
     #[tokio::test]

@@ -1,0 +1,8 @@
+HOST http://127.0.0.1:46677
+multi 0
+SNAP office-2 multi-0 {"children":0}
+SNAP office-2 multi-0 {"status":"blocked","progress":16,"children":1,"whiteboard":"blocked"}
+SNAP office-2 multi-0 {"status":"blocked","progress":33,"children":2,"whiteboard":"blocked"}
+SNAP office-2 multi-0 {"status":"blocked","progress":50,"children":3,"whiteboard":"blocked"}
+SNAP office-2 multi-0 {"status":"blocked","progress":66,"children":4,"whiteboard":"blocked"}
+SNAP office-2 multi-0 {"status":"completed","progress":100,"children":5,"whiteboard":"completed"}
