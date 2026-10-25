@@ -55,11 +55,19 @@ pub(crate) struct Db {
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
     pub(crate) live: Arc<Mutex<HashMap<String, RunText>>>,
-    /// 最近一次由Office投影读取的Host事实revision；仅用于避免空闲期
-    /// 重复扫描同一批Run，不是第二份投影或持久事实。
+    /// 用途：记录最近一次由Office投影读取的Host事实revision。
+    /// 字段：办公室作用域到事实版本号的映射。
+    /// 来源去向：projection读取和更新，Store重启后从当前事实重新建立。
+    /// 约束：只避免空闲期重复扫描同一批Run，不是第二份投影或持久事实。
+    /// 稳定性：T6进程内调度状态。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
     pub(crate) office_projection_source: HashMap<String, u64>,
-    /// 交接动画顺序窗口的内存截止时间；过期后才再次重建投影。
-    /// 不写入Office快照，也不作为业务状态来源。
+    /// 用途：记录交接动画顺序窗口的内存截止时间。
+    /// 字段：办公室作用域到下一次交接推进时间的映射。
+    /// 来源去向：projection设置和消费，过期后触发下一份已计算快照。
+    /// 约束：不写入Office快照，也不作为业务状态来源；重启后可丢弃。
+    /// 稳定性：T6进程内协调状态。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
     pub(crate) office_projection_handoff_until: HashMap<String, chrono::DateTime<chrono::Utc>>,
 }
 impl Store {
@@ -384,7 +392,11 @@ impl Db {
     /// 功能：按Session读取宿主Run元数据，避免人物详情为查一名成员解析整个办公室历史。
     /// 参数：session为已校验的原JSONL会话ID。
     /// 返回：该Session的Run元数据，工具与正文仍按需读取。
+    /// 错误：SQL准备、查询或JSON反序列化失败时返回存储错误。
     /// 状态：只读，不改变运行生命周期；跨Session仍由调用方校验。
+    /// 并发与取消：在Store单写线程内执行；外层Store调用可取消等待，不提前释放资源。
+    /// 权限：仅供已通过会话作用域校验的Host内部调用。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007。
     pub(crate) fn runs_for_session(&self, session: &str) -> HostResult<Vec<RunView>> {
         let mut stmt = self
             .conn

@@ -80,17 +80,34 @@ pub(crate) struct Inner {
     acceptance: tokio::sync::Mutex<()>,
     notices: broadcast::Sender<HostNotice>,
     live: Arc<Mutex<HashMap<String, RunText>>>,
-    /// Office只读详情的最近完整投影；事实仍以Store中的JSONL/SQLite为准。
+    /// 用途：Office只读详情的最近完整投影，降低人物点击的首屏延迟。
+    /// 字段：按办公室作用域索引的规范JSON快照。
+    /// 来源去向：Coordinator从Store更新，actions只读消费。
+    /// 约束：事实仍以Store中的JSONL/SQLite为准；删除或作用域变化必须失效。
+    /// 稳定性：T6内部缓存，不是第二份账本或授权来源。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
     /// 启动时从持久投影预热，投影保存后更新；删除会话后必须失效对应团队。
     pub(crate) office_projection_cache: Arc<Mutex<HashMap<String, serde_json::Value>>>,
-    /// 当前有Office UI动作在处理时，后台投影暂缓启动新的全量Store扫描。
+    /// 用途：标记当前Office UI动作，避免后台投影扫描争用Store。
+    /// 字段：活动动作计数器。
+    /// 来源去向：actions入口增减，projection在扫描边界读取。
+    /// 约束：只影响后台扫描调度，不跳过UI事实校验或降低权限。
+    /// 稳定性：T6内部协调状态，不持久化。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
     pub(crate) office_ui_busy: Arc<AtomicUsize>,
-    /// 已结束Run的只读完整视图缓存。终态账本不可再变化，避免每次人物详情
-    /// 重新解析同一份大型JSONL；活动Run始终回到Store读取最新事实。
+    /// 用途：缓存已结束Run的只读完整视图，避免重复解析大型JSONL。
+    /// 字段：按Run ID索引的终态RunView。
+    /// 来源去向：projection从Store装载，详情查询只读消费。
+    /// 约束：仅缓存终态；活动Run始终回到Store读取最新事实，不能作为授权来源。
+    /// 稳定性：T6进程内缓存，重启后可重建。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007。
     pub(crate) office_terminal_runs: Arc<Mutex<HashMap<String, RunView>>>,
-    /// 同一事实版本下的交接待展示快照。首次投影从真实账本生成队列，
-    /// 后续动画只推进一个已计算快照，不再次扫描整个办公室；重启后为空，
-    /// 由持久投影和账本重新建立，不能替代事实来源。
+    /// 用途：保存同一事实版本下按顺序待展示的交接快照。
+    /// 字段：按办公室作用域索引的有界快照队列。
+    /// 来源去向：首次投影从真实账本生成，UI读取时逐项推进。
+    /// 约束：不再次扫描整个办公室；重启后为空并由持久投影和账本重建，不能替代事实来源。
+    /// 稳定性：T6进程内动画协调状态，不持久化业务结果。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-009。
     pub(crate) office_handoff_queue: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
 }
 struct Active {

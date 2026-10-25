@@ -77,8 +77,12 @@ pub fn run(args: ChatArgs) -> i32 {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    // `--home` is the CLI's explicit data/config root. Resolve it before
+    // loading the model environment so an isolated invocation cannot fall
+    // through to the user's global ~/.openpaw/.env.
+    let home = args.home.clone().unwrap_or_else(openpaw_core::openpaw_home);
     let settings = match openpaw_llm::model_config::ModelEnvironment::load(
-        &openpaw_core::openpaw_home(),
+        &home,
         args.env_file.as_deref(),
     ) {
         Ok(settings) => settings,
@@ -128,7 +132,6 @@ pub fn run(args: ChatArgs) -> i32 {
         .with_tool_host(tool_host);
 
     // Session transcript: <home>/sessions/<id>.jsonl (plain files).
-    let home = args.home.clone().unwrap_or_else(openpaw_core::openpaw_home);
     let sessions_dir = home.join("sessions");
     let transcript_path = sessions_dir.join(format!("{}.jsonl", session.meta.id));
     let mut writer = match openpaw_store::SessionWriter::create(&transcript_path) {

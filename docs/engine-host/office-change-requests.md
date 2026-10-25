@@ -294,3 +294,11 @@ Office已安全快进到fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518，用户两份�
 ### R20：AI员工面板条目没有点击详情（候选，未实施）
 
 相同真实审计中AI员工页6行.runtime-employee，点击王明未发/api/pawoffice/ui、无详情dialog；OfficeShell.tsx该行仅div，无onClick，而经典侧栏.runtime-person正常派发employee.inspect。候选仅在原OfficeShell.tsx复用现有inspection回调，以button/键盘可达方式打开同一官方详情；显示最近完成摘要需确认产品文案/范围，不能把空闲说成从未工作。验收六行/鼠标键盘/触屏/多会话/禁用/删除和错误状态与原侧栏一致，无新后端协议。Host本轮新增的任务详情导航可复用，不能据此声称AI员工页已可点。证据before/section-AI 员工.png及report.json/trace。未批准、不改Office；回退原UI，无持久影响。
+
+### R21：后端删除后当前会话标签未从 Office 页面移除（候选，未批准）
+
+- **真实复现**：冻结 Office `fa6ae1f` 与当前 OpenPaw Host 产品套件中，`conversation.delete` 已返回成功，随后 `office.read` 已不再返回该 conversation；但 Office 浏览器仍保留被删除的当前 tab，15 秒内没有切换到剩余会话或隐藏该 tab，导致真实产品验收超时。原始报告与截图保留在 `/tmp/openpaw-product-d80-20261025-d/`。
+- **必要性与影响**：用户会看到已删除的聊天标签，刷新/切换时可能继续进入旧本地归档；这破坏“删除聊天和草稿”的公开承诺，也会让任务/历史显示与 Host 事实不一致。Host 不应伪造快照、重复删除或通过隐藏后端数据解决页面状态。
+- **候选最小范围**：只审查 `apps/web/src/chat/ChatWorkspace.ts` 的 `remove/sync` 状态转换及 `OfficeConversations.tsx` 的当前 tab 选择；在后端删除成功且本地归档删除完成后，原子移除 tab，并选择相邻会话或空状态。同步期间不能把短暂的远端旧目录重新插回当前 tab；删除失败必须保留原 tab并展示错误。复用现有 `deletedIds`、`selectedId`、`requestDelete` 和 IndexedDB 保存，不增协议和 Host 路由。
+- **验收与回退**：真实 Host 删除成功/失败/运行中删除、单会话与多会话、刷新/断线/重复点击、键盘/窄屏均验证；确认后端历史返回404/非200、UI tab、selectedId、IndexedDB和剩余会话一致。回退只还原上述前端状态变更，无数据迁移。
+- **状态与授权**：Office 工程、测试、配置和锁文件保持只读；用户已要求 Office 修改统一审核，本 Rx 未批准。OpenPaw D80 只修 CLI 配置根和测试夹具，不依赖本 Rx。

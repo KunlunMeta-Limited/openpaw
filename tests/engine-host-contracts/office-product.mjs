@@ -537,10 +537,11 @@ try {
   const webState=await waitFor(async()=>{const r=await readOffice();return conv(r,webRequest.conversationId)?.tasks[0]?.status==='completed'?r:false})
   const webConversation=conv(webState,webRequest.conversationId)
   assert.ok(webConversation.whiteboard.steps.length>0)
-  // T5 maps real Web calls to the existing search role; actor handoff stays in Office.
-  assert.ok(webConversation.events.some(e=>e.kind==='task.assigned'&&e.employeeId==='search'))
+  // T5 maps real Web calls to the configured data-agent role (赵审);
+  // the official Office actor id is data-agent, not the retired search id.
+  assert.ok(webConversation.events.some(e=>e.kind==='task.assigned'&&e.employeeId==='data-agent'))
   assert.ok(!webConversation.tasks.some(t=>t.title.includes('web_fetch')))
-  assert.ok(webConversation.employees.some(e=>e.id==='search'&&e.sceneActorId==='data-agent'))
+  assert.ok(webConversation.employees.some(e=>e.id==='data-agent'&&e.sceneActorId==='data-agent'))
   assert.ok((await log.innerText()).includes('source_url:'));assert.ok((await log.innerText()).includes('retrieved_at_unix_ms:'))
   await page.screenshot({path:join(output,'16-real-web-fetch.png'),fullPage:true})
   await fresh(page);await send('WEB-SLOW')
@@ -677,7 +678,7 @@ try {
   await fresh(page);await send('T5-命令慢任务');await page.getByRole('button',{name:'收起聊天',exact:true}).click();await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();
   report.t5.shellRequest=structuredClone(latestSend().request);
   await page.getByRole('button',{name:'允许本次',exact:true}).click();
-  report.t5.shellRunning=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.t5.shellRequest.conversationId);return c?.tasks.some(t=>t.assigneeId==='command'&&t.status==='running')?r:false});
+  report.t5.shellRunning=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.t5.shellRequest.conversationId);return c?.tasks.some(t=>t.assigneeId==='code-agent'&&t.status==='running')?r:false});
   report.t5.processes=await waitFor(async()=>{try{return await Promise.all(['parent','child'].map(async role=>({role,pid:Number(await readFile(join(workspace,'managed-'+role+'.pid'),'utf8'))})))}catch{return false}});
   for(const item of report.t5.processes){assert.ok(item.pid>0);if(process.platform==='linux')item.before=await readFile('/proc/'+item.pid+'/stat','utf8')}
   await page.screenshot({path:join(output,'25-t5-real-shell-running.png'),fullPage:true});

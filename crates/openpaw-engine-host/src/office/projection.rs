@@ -11,14 +11,22 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Office messages impose a smaller envelope budget than the HTTP response
-/// limit.  Every cached snapshot must pass the same check as a newly built
-/// snapshot before it can take the fast path.
+/// 用途：限制发送给Office的完整快照消息大小。
+/// 字段：UTF-8编码后的官方消息最大字节数。
+/// 来源去向：协议常量到快照构建、缓存校验和发送边界。
+/// 约束：必须小于等于Office公开的64 KiB消息预算，不能通过截断破坏快照结构。
+/// 稳定性：Office协议兼容常量；调整必须同步协议夹具和验收。
+/// 关联：需求/设计REQ-OP-011；DES-OP-007。
 pub(super) const OFFICE_MESSAGE_LIMIT: usize = 64_000;
 
-/// Return whether a persisted snapshot is safe to send to the configured
-/// Office.  This deliberately validates the envelope and workspace scope so
-/// a stale or manually damaged cache is rebuilt from Host facts.
+/// 功能：判断持久化快照是否可以安全发送给配置的Office。
+/// 参数：team为办公室作用域，snapshot为待验证的完整快照。
+/// 返回：结构、作用域、协议字段和编码字节数均满足限制时为true。
+/// 错误：校验失败以false返回，不向调用方传播序列化错误。
+/// 状态：纯只读校验；失败的旧缓存由Host事实重新构建。
+/// 并发与取消：不执行阻塞I/O、不取得资源锁，调用方自行处理取消。
+/// 权限：只接受与team完全一致的工作区快照，防止跨办公室缓存泄漏。
+/// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
 pub(super) fn snapshot_fits_office_message(team: &str, snapshot: &Value) -> bool {
     if snapshot["schemaVersion"] != "1.0"
         || snapshot["workspace"]["id"] != team
@@ -408,9 +416,14 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
     prepare_internal(host, config, team, false).await
 }
 
-/// Prepare a projection while servicing a UI action.  The action already
-/// owns the UI-priority guard; allowing this one read keeps first-use details
-/// and office creation from returning `projection_deferred` to the browser.
+/// 功能：在处理Office只读UI动作时准备一次可信投影。
+/// 参数：host为共享运行服务，config为Office配置，team为已授权办公室。
+/// 返回：从持久事实构建或推进后的规范快照。
+/// 错误：Store、作用域、协议容量或快照序列错误会直接返回Host错误。
+/// 状态：只推进已确认交接窗口；不改变Run、工具或审批事实。
+/// 并发与取消：调用方持有UI优先协调；Store操作可由上层取消，网络不在此函数内执行。
+/// 权限：仅读取team允许的会话和工作区，不跨办公室复用快照。
+/// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
 pub(super) async fn prepare_for_ui(
     host: &Host,
     config: &OfficeConfig,
