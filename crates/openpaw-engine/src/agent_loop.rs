@@ -469,6 +469,28 @@ impl AgentLoop {
             session.messages.push(message);
 
             if resp.stop_reason != StopReason::ToolUse {
+                // 额度耗尽/不完整响应只是停止生成，不是交付完成；只思考
+                // 而无正文也不能报成功。先保留usage和已输出内容，再可靠写失败
+                // 终态，不自动重试，以免重复文字或重放已经发生的工具副作用。
+                if matches!(
+                    resp.stop_reason,
+                    StopReason::MaxTokens | StopReason::Incomplete
+                ) {
+                    return Err(Error::Provider(
+                        if resp.stop_reason == StopReason::MaxTokens {
+                            "model output limit reached before complete delivery".into()
+                        } else {
+                            "model response incomplete before delivery".into()
+                        },
+                    ));
+                }
+                if !resp.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => !text.trim().is_empty(),
+                    ContentBlock::Image { .. } | ContentBlock::Document { .. } => true,
+                    _ => false,
+                }) {
+                    return Err(Error::Provider("model completed without an answer".into()));
+                }
                 // Token-budget continuation: the model stopped, but if
                 // meaningful budget remains (and returns are not
                 // diminishing), nudge it to keep working.

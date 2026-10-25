@@ -157,6 +157,8 @@ impl Store {
     /// 错误：与普通call相同；优先级不改变事务和权限语义。
     /// 状态：只调整队列顺序，不跳过任何已排队事实。
     /// 并发与取消：仍由唯一Store线程串行执行；调用方取消不丢弃已派发写入。
+    /// 权限：仅可信Host内部调用；请求入口仍负责作用域和授权根校验。
+    /// 关联：需求/设计REQ-OP-008/014；DES-OP-006/008。
     pub(crate) async fn call_priority<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,

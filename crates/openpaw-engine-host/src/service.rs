@@ -93,6 +93,7 @@ pub(crate) struct Inner {
     /// 来源去向：Office read/UI 与后台同步到单次事实扫描。
     /// 约束：等待者在首个扫描完成后复用持久投影，不能重复扫描整本账本。
     /// 稳定性：T6内部协调状态，不是业务数据或第二份账本。
+    /// 关联：需求/设计REQ-OP-011/014；DES-OP-007/008。
     pub(crate) office_projection_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// 用途：标记当前Office UI动作，避免后台投影扫描争用Store。
     /// 字段：活动动作计数器。
@@ -815,8 +816,19 @@ impl Host {
                 let ceiling = if e.role == "lead" { 96 } else { 64 };
                 openpaw_core::IterationBudget::new_elastic_with_ceiling(8, ceiling, ceiling, 1)
             });
+            // 协作复用Provider已声明的单次上限，避免推理输出耗尽固定
+            // 4096后没有正文。只分配既有组预算；reserve/settle及总硬上限不变。
+            let response_limit = if execution.is_some() {
+                match self.inner.provider.capabilities().max_output_tokens {
+                    0 => 4096,
+                    declared => declared.min(8192),
+                }
+            } else {
+                4096
+            };
             let engine = AgentLoop::new(provider)
                 .with_model(&self.inner.model)
+                .with_max_tokens(response_limit)
                 .with_tool_host(tools)
                 .with_approval_manager(approval)
                 .with_budget(
@@ -1492,7 +1504,17 @@ pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
             "provider_arguments",
             "模型返回的工具参数格式无效，本轮未完成；已完成操作不会自动重做",
         )
-    } else if raw.contains("finish_reason") || raw.contains("stream ended") {
+    } else if raw.contains("model output limit reached") {
+        ("provider_output_limit", "模型本次输出额度已用完，尚未形成完整答复；可缩小任务后显式重试，已完成操作不会自动重做")
+    } else if raw.contains("model completed without an answer") {
+        (
+            "provider_empty",
+            "模型未返回有效答复；可缩小任务后显式重试，已完成操作不会自动重做",
+        )
+    } else if raw.contains("finish_reason")
+        || raw.contains("stream ended")
+        || raw.contains("model response incomplete")
+    {
         ("provider_stream", "模型连接未完整返回，本轮未完成")
     } else if raw.contains("provider stream idle")
         || raw.contains("provider connection idle")

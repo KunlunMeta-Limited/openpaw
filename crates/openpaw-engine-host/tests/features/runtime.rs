@@ -1268,6 +1268,173 @@ fn delegated(home: &std::path::Path, parent: &str) -> Vec<serde_json::Value> {
         .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
         .collect()
 }
+
+#[tokio::test]
+async fn d90_empty_child_fails_and_explicit_retry_preserves_role_and_budget_rules() {
+    use openpaw_core::{ContentBlock, StopReason, Usage};
+    struct EmptyThenRetry {
+        children: std::sync::atomic::AtomicUsize,
+        requests: std::sync::Mutex<Vec<CompletionRequest>>,
+    }
+    #[async_trait]
+    impl LlmProvider for EmptyThenRetry {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> openpaw_core::Result<CompletionResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            let lead = request
+                .system
+                .as_deref()
+                .is_some_and(|s| s.contains("（lead）"));
+            let n = request
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .count();
+            let (content, stop_reason) = if lead && n < 3 {
+                (
+                    vec![ContentBlock::ToolUse {
+                        id: format!("audit-attempt-{n}"),
+                        name: "delegate_task".into(),
+                        input: json!({"role_id":"audit","title":"赵审核对路线","instructions":"用三句核对给定路线，不联网","acceptance":"有实际正文"}),
+                    }],
+                    StopReason::ToolUse,
+                )
+            } else if lead {
+                (
+                    vec![ContentBlock::Text {
+                        text: "已取得赵审真实复核正文；重复成功委派被拒".into(),
+                    }],
+                    StopReason::EndTurn,
+                )
+            } else if self
+                .children
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                (vec![], StopReason::MaxTokens)
+            } else {
+                (
+                    vec![ContentBlock::Text {
+                        text: "明确给出实际核验结果".into(),
+                    }],
+                    StopReason::EndTurn,
+                )
+            };
+            Ok(CompletionResponse {
+                content,
+                stop_reason,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 4096,
+                    ..Default::default()
+                },
+            })
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn default_model(&self) -> &str {
+            "retry-fixture"
+        }
+        fn name(&self) -> &str {
+            "retry-fixture"
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = team_config(tmp.path());
+    let provider = Arc::new(EmptyThenRetry {
+        children: std::sync::atomic::AtomicUsize::new(0),
+        requests: std::sync::Mutex::new(vec![]),
+    });
+    let host = Host::with_provider(cfg.clone(), provider.clone())
+        .await
+        .unwrap();
+    let scope = team_scope("empty-retry");
+    let session = host.open_session(scope.clone()).await.unwrap();
+    let parent = host
+        .submit_run(
+            &scope,
+            &session.session_id,
+            "委派赵审，空结果后明确重试".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    let final_run = host.get_run(&scope, &parent.run_id).await.unwrap();
+    assert_eq!(final_run.state, RunState::Completed);
+    let delegations = delegated(&cfg.home, &parent.run_id);
+    assert_eq!(
+        delegations.len(),
+        2,
+        "只允许失败后的显式重试，成功后不重复创建"
+    );
+    for (i, d) in delegations.iter().enumerate() {
+        let run = host
+            .get_run(
+                &serde_json::from_value(d["child_scope"].clone()).unwrap(),
+                d["child_run"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            run.state,
+            if i == 0 {
+                RunState::Failed
+            } else {
+                RunState::Completed
+            }
+        );
+        if i == 0 {
+            assert_eq!(run.error.unwrap().kind, "provider_output_limit");
+        } else {
+            assert!(run.text.contains("实际核验结果"));
+        }
+    }
+    {
+        let requests = provider.requests.lock().unwrap();
+        let results: Vec<_> = requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|b| {
+                if let ContentBlock::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    content,
+                    ..
+                } = b
+                {
+                    Some((tool_use_id.as_str(), *is_error, content.as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            results.iter().map(|r| (r.0, r.1)).collect::<Vec<_>>(),
+            vec![
+                ("audit-attempt-0", true),
+                ("audit-attempt-1", false),
+                ("audit-attempt-2", true)
+            ]
+        );
+        assert!(results[0].2.contains("输出额度"));
+        assert!(results[2].2.contains("已被分配"));
+        assert_eq!(
+            provider.children.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+    host.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_original_ledgers() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1301,6 +1468,10 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
         .iter()
         .filter(|r| r.system.as_deref().is_some_and(|s| s.contains("（lead）")))
     {
+        assert_eq!(
+            request.max_tokens,
+            provider.capabilities().max_output_tokens.min(8192)
+        );
         let system = request.system.as_ref().unwrap();
         assert!(
             system.contains("子角色看不到父会话历史") && system.contains("context"),

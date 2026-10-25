@@ -451,6 +451,33 @@ fn compact_business_conversation(conversation: &mut Value) -> bool {
     false
 }
 
+/// 压缩最旧的可裁剪业务投影；已无可选字段时移除其展示入口。
+/// 受保护、活动及在途交接会话不进入 eligible；原始账本不受影响。
+/// 每次返回 true 都必须缩小目录，不能让已压缩到底的第一项阻塞后续历史。
+fn compact_business_history(
+    conversations: &mut Vec<Value>,
+    eligible: &BTreeSet<String>,
+    priorities: &BTreeMap<String, u64>,
+) -> bool {
+    let candidate = conversations
+        .iter()
+        .enumerate()
+        .filter(|(_, conversation)| {
+            eligible.contains(conversation["id"].as_str().unwrap_or_default())
+        })
+        .min_by_key(|(_, conversation)| {
+            priorities.get(conversation["id"].as_str().unwrap_or_default())
+        })
+        .map(|(index, _)| index);
+    let Some(index) = candidate else {
+        return false;
+    };
+    if !compact_business_conversation(&mut conversations[index]) {
+        conversations.remove(index);
+    }
+    true
+}
+
 /// 判断终态Run是否已经属于此前成功投影的历史。
 ///
 /// `None` 表示尚无成功投影基线；首次看到的终态Run仍需经过逐人交接。
@@ -460,71 +487,84 @@ fn is_historical_terminal(run_revision: u64, previous_source_revision: Option<u6
     previous_source_revision.is_some_and(|revision| run_revision <= revision)
 }
 
-/// 将一项已由真实子Run产生、但尚未到展示时机的交接事实加入快照。
-/// 该函数只操作内存中的规范快照；Run状态、权限和账本仍由首次投影读取。
-/// 只有最后一个队列变体才允许提升主卡，避免后续人物尚未展示时提前报完成。
-fn apply_handoff_item(
-    conversation: &mut Value,
-    item: &Value,
-    event: &Value,
-    final_item: bool,
-    handoff_total: usize,
-) {
+/// 一次真实委派的展示更新；父卡、生命周期与白板归属不可脱离原Run。
+/// 仅进程内排队，不新增持久格式或Office协议字段。
+#[derive(Clone)]
+struct HandoffItem {
+    conversation: String,
+    parent_id: String,
+    child_ids: BTreeSet<String>,
+    task: Value,
+    assignment: Value,
+    lifecycle: Vec<Value>,
+    can_complete: bool,
+    updates_whiteboard: bool,
+}
+
+/// 将真实委派及其生命周期公开到原父任务，不能靠动画推断业务完成。
+fn apply_handoff_item(conversation: &mut Value, item: &HandoffItem, final_item: bool) {
     if let Some(tasks) = conversation["tasks"].as_array_mut() {
-        tasks.retain(|existing| existing["id"] != item["id"]);
-        tasks.push(item.clone());
+        tasks.retain(|existing| existing["id"] != item.task["id"]);
+        tasks.push(item.task.clone());
     }
     if let Some(events) = conversation["events"].as_array_mut() {
-        if !events.iter().any(|existing| existing["id"] == event["id"]) {
-            events.push(event.clone());
-        }
-    }
-    // The initial projection deliberately keeps the lead card blocked while
-    // the handoff queue reveals one colleague at a time.  Once the last
-    // revealed card is a real completed child, the queue variant must promote
-    // the lead card as well.  Previously only the whiteboard steps were
-    // recomputed, so a completed run remained visibly blocked forever after
-    // the final handoff.
-    if let Some(tasks) = conversation["tasks"].as_array_mut() {
-        let all_children_completed = tasks.len() > 1
-            && tasks
-                .iter()
-                .skip(1)
-                .all(|task| task["status"] == "completed");
-        let completed_children = tasks
-            .iter()
-            .skip(1)
-            .filter(|task| task["status"] == "completed")
-            .count() as u64;
-        let total_children = tasks.len().saturating_sub(1) as u64;
-        if let Some(main) = tasks.first_mut() {
-            if main["status"] == "blocked" {
-                if final_item && all_children_completed {
-                    main["status"] = json!("completed");
-                    main["progress"] = json!(100);
-                    main["summary"] = json!("本次目标已完成");
-                } else if total_children > 0 {
-                    // 每个队列变体都要同步主卡进度；只在最后一项公开后
-                    // 才允许提升为completed，避免白板和人物交接出现跳变。
-                    let total = handoff_total.max(total_children as usize) as u64;
-                    main["progress"] = json!(completed_children * 100 / (total + 1));
-                    main["summary"] = json!("回复已结束；正在依次展示后续成员交接");
-                }
+        for event in std::iter::once(&item.assignment).chain(item.lifecycle.iter()) {
+            if !events.iter().any(|existing| existing["id"] == event["id"]) {
+                events.push(event.clone());
             }
         }
+        events.sort_by(|a, b| {
+            b["occurredAt"]
+                .as_str()
+                .cmp(&a["occurredAt"].as_str())
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+        });
     }
-    let Some(tasks) = conversation["tasks"].as_array() else {
+    let Some(tasks) = conversation["tasks"].as_array_mut() else {
         return;
     };
-    let main = tasks.first().cloned().unwrap_or(Value::Null);
     let completed = tasks
         .iter()
-        .skip(1)
-        .filter(|task| task["status"] == "completed")
+        .filter(|task| {
+            task["id"]
+                .as_str()
+                .is_some_and(|id| item.child_ids.contains(id))
+                && task["status"] == "completed"
+        })
         .count();
-    let total = handoff_total.max(tasks.len().saturating_sub(1));
+    let total = item.child_ids.len();
+    let Some(main) = tasks.iter_mut().find(|task| task["id"] == item.parent_id) else {
+        return;
+    };
+    // 只有原Run正常结束、业务计划及所有子结果均已核验，才允许公开完成。
+    // 普通blocked可指审批、未核验或取消清理，不能一概当作动画等待。
+    if main["status"] == "blocked" && item.can_complete {
+        if final_item && total > 0 && completed == total {
+            main["status"] = json!("completed");
+            main["progress"] = json!(100);
+            main["summary"] = json!("本次目标已完成");
+        } else {
+            main["progress"] = json!(completed * 100 / (total + 1));
+        }
+    }
+    if !item.updates_whiteboard {
+        return;
+    }
+    let main = main.clone();
     let mut steps = Vec::new();
-    for task in tasks.iter().skip(1).rev().take(3).rev() {
+    for task in tasks
+        .iter()
+        .filter(|task| {
+            task["id"]
+                .as_str()
+                .is_some_and(|id| item.child_ids.contains(id))
+        })
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
         let label = match task["status"].as_str() {
             Some("completed") => "已完成",
             Some("running") => "处理中",
@@ -552,12 +592,9 @@ fn apply_handoff_item(
     conversation["whiteboard"] = json!({
         "template": "task-board-v1",
         "title": dto::bounded(main["title"].as_str().unwrap_or(""), 32),
-        "status": main["status"],
-        "tagline": "",
-        "description": dto::bounded(&description, 500),
-        "note": "",
-        "link": {"label": "", "url": ""},
-        "steps": steps,
+        "status": main["status"], "tagline": "",
+        "description": dto::bounded(&description, 500), "note": "",
+        "link": {"label": "", "url": ""}, "steps": steps,
     });
 }
 /// 功能：读取事实、生成有界完整快照并在变更时分配持久版本。
@@ -748,7 +785,7 @@ async fn prepare_internal(
         let mut protected_conversations=std::collections::BTreeSet::new();
         let mut active_conversations=std::collections::BTreeSet::new();
         let mut handoff_pending_any = false;
-        let mut handoff_items: Vec<(String, Value, Value)> = Vec::new();
+        let mut handoff_items: Vec<HandoffItem> = Vec::new();
         for binding in bindings {
             if !allow_ui_busy && ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
                 return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
@@ -815,6 +852,12 @@ async fn prepare_internal(
             let main_id=format!("run:{}",r.run_id);
             let plan=db.progress(&r.run_id)?;
             let (steps,mut percent)=crate::task_progress::project(plan.clone(),&r)?;
+            let business_complete = percent == 100;
+            let handoff_start = handoff_items.len();
+            let mut run_child_ids = BTreeSet::new();
+            let mut all_children_verified = true;
+            let mut all_child_failed = false;
+            let mut all_child_blocked = false;
             let delegations=db.delegations(&r.run_id)?;
             let mut assignments=db.office_task_assignments(&r.run_id)?;
             // 开始时多个连续委派可能暂挂同一步；主角色后来用准确证据核验不同
@@ -875,66 +918,37 @@ async fn prepare_internal(
             // 这里不猜测业务完成，也不增加协议字段；事件仍使用官方既有字段。
             let handoff_gap = chrono::Duration::milliseconds(2200);
             let mut handoff_ready = BTreeSet::new();
-            // A completed conversation may be projected again after another
-            // run changes the office revision.  The envelope clipping can
-            // remove old assignment events, but completed child Runs remain
-            // authoritative.  Do not replay a stale handoff window and make
-            // already completed cards regress to blocked.
-            // 重启后已有快照中的交接事件已经被客户端消费过，不能因为内存
-            // 中的 source revision 尚未预热就再次排队。只有发现新的委派没有
-            // 对应既有 assignment 事件时，才重新进入逐人展示窗口；终态失败
-            // 也保留原事实，不把旧失败伪装成新的动画。
-            // 历史终态会话可能已经被容量裁剪掉部分 assignment 事件。它们的
-            // Run 事实没有变化，不能在任何新Run触发投影时再次排队，否则旧交接
-            // 变体会把快照推过64KiB并阻塞整个办公室。只有 revision 晚于最近
-            // 一次成功投影源的终态Run才允许走本轮逐人动画；失败子Run仍按真实
-            // 失败状态展示，不因此获得“完成”结论。
-            // 当前Store版本是在本次扫描开始时取得的。终态Run若不晚于该
-            // 版本，说明它在本次投影前已经存在；重启时即使内存中没有
-            // previous_source_revision，也不能把它当成新交接重新播放。
-            let historical_terminal = is_historical_terminal(r.revision, previous_source_revision);
-            let resume_completed_handoff = r.state.is_terminal() && historical_terminal;
+            // 冷启动已有持久快照只恢复事实，不重播旧终态；首次初始化没有
+            // 快照时仍逐人交接。在途窗口即使因其他Run更新而重建，也不能
+            // 因revision已经被扫描过就跳过尚未公开的成员。
+            let pending_window = db.office_projection_handoff_until.contains_key(&team)
+                && prior_conv.and_then(|c| c["tasks"].as_array()).is_some_and(|tasks| {
+                    tasks.iter().any(|task| task["id"] == main_id
+                        && task["summary"] == "回复已结束；正在依次展示后续成员交接")
+                });
+            let history_revision = previous_source_revision.or_else(|| prior.map(|_| source_revision));
+            let resume_completed_handoff = r.state.is_terminal() && !pending_window
+                && is_historical_terminal(r.revision, history_revision);
             if resume_completed_handoff {
                 handoff_ready.extend(display_calls.iter().cloned());
             } else {
-                let mut chain_open = true;
-                for d in delegations.iter().filter(|d| display_calls.contains(&d.call_id)) {
-                    if !chain_open {
-                        break;
-                    }
-                    let ready = if handoff_ready.is_empty() {
-                        true
-                    } else {
-                        let previous = delegations.iter().rfind(|candidate| {
-                            display_calls.contains(&candidate.call_id)
-                                && handoff_ready.contains(&candidate.call_id)
-                        });
-                        previous
-                            .map(|candidate| {
-                                prior_conv
-                                    .and_then(|v| v["events"].as_array())
-                                    .and_then(|events| {
-                                        events.iter().find(|event| {
-                                            event["id"] == format!("assign:{}", candidate.task_id)
-                                        })
-                                    })
-                                    .and_then(|event| event["occurredAt"].as_str())
-                                    .and_then(|at| {
-                                        chrono::DateTime::parse_from_rfc3339(at).ok()
-                                    })
-                                    .map(|at| {
-                                        chrono::Utc::now()
-                                            - at.with_timezone(&chrono::Utc)
-                                            >= handoff_gap
-                                    })
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false)
-                    };
-                    if ready {
-                        handoff_ready.insert(d.call_id.clone());
-                    } else {
-                        chain_open = false;
+                let visible_events: Vec<_> = delegations.iter()
+                    .filter(|d| display_calls.contains(&d.call_id))
+                    .filter_map(|d| prior_conv.and_then(|c|c["events"].as_array())
+                        .and_then(|events| events.iter().find(|event| event["id"] == format!("assign:{}",d.task_id)))
+                        .map(|event| (d.call_id.clone(), event)))
+                    .collect();
+                handoff_ready.extend(visible_events.iter().map(|(call,_)|call.clone()));
+                let window_open = db.office_projection_handoff_until.get(&team)
+                    .is_none_or(|until| *until <= chrono::Utc::now());
+                let can_reveal = window_open && visible_events.iter().filter_map(|(_,event)|event["occurredAt"].as_str())
+                    .filter_map(|at|chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .max().is_none_or(|at|chrono::Utc::now()-at.with_timezone(&chrono::Utc)>=handoff_gap);
+                if can_reveal {
+                    // 一次重建至多放行一位新成员，不能用同一个过期时间
+                    // 连续放行整组；已有assignment永远保留稳定ID/时间。
+                    if let Some(next) = delegations.iter().find(|d|display_calls.contains(&d.call_id)&&!handoff_ready.contains(&d.call_id)) {
+                        handoff_ready.insert(next.call_id.clone());
                     }
                 }
             }
@@ -983,6 +997,13 @@ async fn prepare_internal(
                     item["id"]=step["id"].clone();item["title"]=step["title"].clone();
                 }
                 let task_id=item["id"].clone();
+                if show_card && !superseded {
+                    run_child_ids.insert(item["id"].as_str().unwrap().to_owned());
+                    all_children_verified &= item["status"] == "completed";
+                    all_child_failed |= item["status"] == "failed";
+                    all_child_blocked |= item["status"] == "blocked";
+                }
+                let mut lifecycle = Vec::new();
                 if let Some(c)=&child {
                     // 生命周期动态复用原完整快照保存首次观察时间，不伪造错过的开始时刻。
                     // 业务核验与子Run结束分开；只有assignment能驱动交接动画。
@@ -997,10 +1018,9 @@ async fn prepare_internal(
                         let id=format!("activity:{}:{phase}",d.task_id);
                         let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|events|events.iter().find(|event|event["id"]==id));
                         if !observed&&existing.is_none() {continue;}
-                        if !show_card || handoff_visible || existing.is_some() {
-                            child_events.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
-                        }
+                        lifecycle.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
                     }
+                    if !show_card || handoff_visible { child_events.extend(lifecycle.clone()); }
                 }
                 if show_card && !superseded && handoff_visible {
                     if let Some(index)=linked {child_steps.insert(index,item.clone());} else {child_tasks.push(item.clone());}
@@ -1015,15 +1035,20 @@ async fn prepare_internal(
                 if handoff_hidden && !superseded {
                     // 记录完整的下一步任务与交接事件。它们仍来自真实子Run，
                     // 这里只是延迟公开；后续快照会按角色顺序一次加入一项。
-                    handoff_items.push((
-                        binding.scope.conversation_id.clone(),
-                        item.clone(),
-                        assignment.clone(),
-                    ));
+                    handoff_items.push(HandoffItem {
+                        conversation: binding.scope.conversation_id.clone(),
+                        parent_id: main_id.clone(), child_ids: BTreeSet::new(),
+                        task: item.clone(), assignment: assignment.clone(), lifecycle,
+                        can_complete: false, updates_whiteboard: run_id == board_id,
+                    });
                 } else if !show_card || handoff_visible {
                     child_events.push(assignment);
                 }
                 }
+            }
+            for item in &mut handoff_items[handoff_start..] {
+                item.child_ids = run_child_ids.clone();
+                item.can_complete = r.state == RunState::Completed && business_complete && all_children_verified;
             }
             if !delegations.is_empty() {
                 let required_children=display_calls.len() as u64;
@@ -1034,8 +1059,8 @@ async fn prepare_internal(
                 if handoff_pending { percent=percent.min(99); }
                 handoff_pending_any |= handoff_pending;
             }
-            let child_blocked=child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="blocked");
-            let child_failed=child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="failed");
+            let child_blocked=all_child_blocked || child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="blocked");
+            let child_failed=all_child_failed || child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="failed");
             if r.state==RunState::Completed && child_blocked {percent=percent.min(99);}
             let handoff_pending = display_calls.iter().any(|call| !handoff_ready.contains(call));
             let summary=match r.state {
@@ -1152,7 +1177,7 @@ async fn prepare_internal(
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
         let handoff_conversations: BTreeSet<String> = handoff_items
             .iter()
-            .map(|(conversation, _, _)| conversation.clone())
+            .map(|item| item.conversation.clone())
             .collect();
         // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
         while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>OFFICE_MESSAGE_LIMIT {
@@ -1245,13 +1270,18 @@ async fn prepare_internal(
         // 只在确实存在交接且预览变体超限时进行额外整理，避免改变普通历史
         // 目录的保留策略。详情查询仍从Run事实读取被压缩的旧历史。
         if !handoff_items.is_empty() {
+            let compactable_business: BTreeSet<_> = business_conversations
+                .intersection(&terminal_conversations)
+                .filter(|id| !handoff_conversations.contains(*id) && !protected_conversations.contains(*id))
+                .cloned()
+                .collect();
             let mut preview = snapshot.clone();
-            for (conversation, item, event) in &handoff_items {
+            for item in &handoff_items {
                 if let Some(conv) = preview["conversations"]
                     .as_array_mut()
-                    .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
+                    .and_then(|all| all.iter_mut().find(|c| c["id"] == item.conversation))
                 {
-                    apply_handoff_item(conv, item, event, false, 0);
+                    apply_handoff_item(conv, item, false);
                 }
             }
             while !snapshot_fits_office_message(&team, &preview) {
@@ -1326,36 +1356,16 @@ async fn prepare_internal(
                     }
                 }
                 if !changed {
-                    let conversation_view = snapshot["conversations"]
-                        .as_array_mut()
-                        .map(Vec::as_mut_slice)
-                        .unwrap_or(&mut []);
-                    if let Some(conversation) = conversation_view
-                        .iter_mut()
-                        .filter(|conversation| {
-                            terminal_conversations.contains(
-                                conversation["id"].as_str().unwrap_or_default(),
-                            ) && !handoff_conversations
-                                .contains(conversation["id"].as_str().unwrap_or_default())
-                                && !protected_conversations
-                                    .contains(conversation["id"].as_str().unwrap_or_default())
-                                && business_conversations
-                                    .contains(conversation["id"].as_str().unwrap_or_default())
-                        })
-                        .min_by_key(|conversation| {
-                            priorities
-                                .get(conversation["id"].as_str().unwrap_or_default())
-                                .copied()
-                                .unwrap_or_default()
-                        })
-                    {
-                        changed = compact_business_conversation(conversation);
-                    }
+                    changed = compact_business_history(
+                        snapshot["conversations"].as_array_mut().expect("conversation array"),
+                        &compactable_business,
+                        &priorities,
+                    );
                 }
                 if !changed {
                     // 最后仅压缩当前会话的非 assignment 活动事件。交接链所需
-                    // 的 assignment 时间戳必须保留，否则下一窗口无法判断动画
-                    // 是否已经展示完成。
+                    // 的 assignment 时间戳必须保留，否则下一窗口无法判断约定
+                    // 展示间隔是否已经结束；该间隔不代表收到人物到达确认。
                     let mut removed_event = false;
                     if let Some(conversations) = snapshot["conversations"].as_array_mut() {
                         for conversation in conversations {
@@ -1386,83 +1396,38 @@ async fn prepare_internal(
                     }
                 }
                 preview = snapshot.clone();
-                for (conversation, item, event) in &handoff_items {
+                for item in &handoff_items {
                     if let Some(conv) = preview["conversations"]
                         .as_array_mut()
-                        .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
+                        .and_then(|all| all.iter_mut().find(|c| c["id"] == item.conversation))
                     {
-                    apply_handoff_item(conv, item, event, false, 0);
+                    apply_handoff_item(conv, item, false);
                     }
                 }
             }
         }
         // 把本次真实扫描中尚未公开的交接项预组装成逐步快照。每个变体
-        // 同时推进各会话的一项，保持“先到人物再显示下一任务”，而不让
-        // 后续窗口再次读取全部Run/JSONL。
+        // 同时推进各会话的一项，按展示窗口逐人公开，不把时间间隔当成
+        // 人物到达确认，也不让后续窗口再次读取全部Run/JSONL。
         if !handoff_items.is_empty() {
-            let mut by_conversation: BTreeMap<String, Vec<(Value, Value)>> = BTreeMap::new();
-            for (conversation, item, event) in handoff_items {
-                by_conversation
-                    .entry(conversation)
-                    .or_default()
-                    .push((item, event));
+            let mut remaining: BTreeMap<String, Vec<HandoffItem>> = BTreeMap::new();
+            for item in handoff_items {
+                remaining.entry(item.conversation.clone()).or_default().push(item);
             }
-            let mut remaining = by_conversation;
             let mut current = snapshot.clone();
             let mut variants = Vec::new();
             let mut overflowed = false;
-            let mut pending_counts: BTreeMap<String, usize> = remaining
-                .iter()
-                .map(|(conversation, items)| (conversation.clone(), items.len()))
-                .collect();
-            // 当前快照中已经公开的交接卡加上队列中尚未公开的卡，构成
-            // 本轮真实成员总数；变体据此计算主卡进度，不能只按当前可见
-            // 子任务数量把2/5误报成2/2。
-            let handoff_totals: BTreeMap<String, usize> = remaining
-                .iter()
-                .map(|(conversation, items)| {
-                    let visible = current["conversations"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find(|c| c["id"] == *conversation)
-                        .map(|c| {
-                            c["events"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter(|event| {
-                                    event["kind"] == "task.assigned"
-                                        && event["id"]
-                                            .as_str()
-                                            .is_some_and(|id| id.starts_with("assign:delegation:"))
-                                })
-                                .count()
-                        })
-                        .unwrap_or(0);
-                    (conversation.clone(), visible + items.len())
-                })
-                .collect();
             loop {
                 let mut progressed = false;
-                for (conversation, items) in remaining.iter_mut() {
-                    let Some((item, event)) = items.first().cloned() else { continue; };
+                for items in remaining.values_mut() {
+                    let Some(item) = items.first().cloned() else { continue; };
                     let Some(conv) = current["conversations"]
                         .as_array_mut()
-                        .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
+                        .and_then(|all| all.iter_mut().find(|c| c["id"] == item.conversation))
                     else { continue; };
-                    let final_item = pending_counts.get(conversation).copied() == Some(1);
-                    apply_handoff_item(
-                        conv,
-                        &item,
-                        &event,
-                        final_item,
-                        handoff_totals.get(conversation).copied().unwrap_or(0),
-                    );
+                    let final_item = !items.iter().skip(1).any(|next| next.parent_id == item.parent_id);
+                    apply_handoff_item(conv, &item, final_item);
                     items.remove(0);
-                    if let Some(count) = pending_counts.get_mut(conversation) {
-                        *count = count.saturating_sub(1);
-                    }
                     progressed = true;
                 }
                 if !progressed {
@@ -1544,12 +1509,42 @@ pub(super) async fn sync_once(
     halted: bool,
     address: std::net::SocketAddr,
 ) -> HostResult<String> {
+    sync_internal(host, config, team, client, halted, address, false).await
+}
+
+/// 功能：为已接受的Office删除动作同步完整快照并核对回执。
+/// 参数：host/config/team/client为既有可信服务，address为聊天监听地址。
+/// 返回：真实applied、cached或ignored状态，不能当作浏览器已消费。
+/// 错误：连接、认证、版本冲突和协议错误不转换为删除成功。
+/// 状态：保留同一外发门与持久seq；删除后的快照先于UI确认。
+/// 并发与取消：调用方持有UI优先标记，仅本次同步允许在该标记下扫描。
+/// 权限：只供可信UI动作使用，不改变后台让行或会话范围校验。
+/// 关联：REQ-OP-014、DES-OP-007/009；原删除动作回执契约。
+pub(super) async fn sync_for_ui(
+    host: &Host,
+    config: &OfficeConfig,
+    team: &str,
+    client: &Client,
+    address: std::net::SocketAddr,
+) -> HostResult<String> {
+    sync_internal(host, config, team, client, false, address, true).await
+}
+
+async fn sync_internal(
+    host: &Host,
+    config: &OfficeConfig,
+    team: &str,
+    client: &Client,
+    halted: bool,
+    address: std::net::SocketAddr,
+    allow_ui_busy: bool,
+) -> HostResult<String> {
     let gate = client.projection_gate(team).await;
     let _guard = gate.lock().await;
     if !super::workspaces::active(host, config, team).await? {
         return Ok("reserved".into());
     }
-    let snapshot = prepare(host, config, team).await?;
+    let snapshot = prepare_internal(host, config, team, allow_ui_busy).await?;
     // `halted` is an in-process latch for a confirmed external sequence
     // conflict. A persisted halted row may represent a recoverable protocol
     // or cache failure from an older Host, so it must not block restart.
@@ -1628,6 +1623,56 @@ mod tests {
     use crate::{ClientScope, HostConfig};
 
     #[test]
+    fn exhausted_old_business_does_not_block_handoff_budget() {
+        let minimal = json!({"id":"oldest","title":"旧业务","events":[],"employees":[],"tasks":[],
+            "whiteboard":{"tagline":"","note":"","description":"","link":{"label":"","url":""},"steps":[]}});
+        let mut newer = minimal.clone();
+        newer["id"] = json!("newer");
+        newer["events"] = json!([{"id":"old-activity","summary":"可裁剪历史"}]);
+        let protected = json!({"id":"current","tasks":[{"id":"real-current","status":"completed","progress":100}]});
+        let mut conversations = vec![minimal.clone(), newer, protected.clone()];
+        let eligible = ["oldest".into(), "newer".into()].into_iter().collect();
+        let priorities = [("oldest".into(), 1), ("newer".into(), 2)]
+            .into_iter()
+            .collect();
+        assert!(!compact_business_conversation(&mut minimal.clone()));
+        let mut prior_size = serde_json::to_vec(&conversations).unwrap().len();
+        let mut iterations = 0;
+        while compact_business_history(&mut conversations, &eligible, &priorities) {
+            let size = serde_json::to_vec(&conversations).unwrap().len();
+            assert!(size < prior_size, "每次必须释放真实预算");
+            prior_size = size;
+            iterations += 1;
+            assert!(iterations < 10);
+            assert_eq!(conversations.last(), Some(&protected));
+        }
+        assert_eq!(iterations, 3);
+        assert_eq!(conversations, vec![protected]);
+    }
+
+    fn handoff_fixture(total: usize) -> HandoffItem {
+        let mut child_ids: BTreeSet<_> = ["delegation:research", "delegation:food"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for i in 2..total {
+            child_ids.insert(format!("delegation:{i}"));
+        }
+        HandoffItem {
+            conversation: "trip".into(),
+            parent_id: "run:lead".into(),
+            child_ids,
+            task: json!({"id":"delegation:food","title":"查美食","status":"completed","progress":100,"summary":"美食已完成"}),
+            assignment: json!({"id":"assign:food","kind":"task.assigned"}),
+            lifecycle: vec![
+                json!({"id":"activity:food:completed","kind":"task.completed","taskId":"delegation:food"}),
+            ],
+            can_complete: true,
+            updates_whiteboard: true,
+        }
+    }
+
+    #[test]
     fn final_handoff_promotes_completed_lead_card() {
         let mut conversation = json!({
             "tasks": [
@@ -1636,13 +1681,7 @@ mod tests {
             ],
             "events": []
         });
-        apply_handoff_item(
-            &mut conversation,
-            &json!({"id":"delegation:food","title":"查美食","status":"completed","progress":100,"summary":"美食已完成"}),
-            &json!({"id":"assign:food","kind":"task.assigned"}),
-            true,
-            2,
-        );
+        apply_handoff_item(&mut conversation, &handoff_fixture(2), true);
         assert_eq!(conversation["tasks"][0]["status"], "completed");
         assert_eq!(conversation["tasks"][0]["progress"], 100);
         assert_eq!(conversation["whiteboard"]["status"], "completed");
@@ -1661,13 +1700,7 @@ mod tests {
             ],
             "events": []
         });
-        apply_handoff_item(
-            &mut conversation,
-            &json!({"id":"delegation:food","title":"查美食","status":"completed","progress":100,"summary":"美食已完成"}),
-            &json!({"id":"assign:food","kind":"task.assigned"}),
-            false,
-            5,
-        );
+        apply_handoff_item(&mut conversation, &handoff_fixture(5), false);
         assert_eq!(conversation["tasks"][0]["status"], "blocked");
         assert_eq!(conversation["tasks"][0]["progress"], 33);
         assert_eq!(conversation["whiteboard"]["status"], "blocked");
@@ -1675,6 +1708,160 @@ mod tests {
             conversation["whiteboard"]["description"],
             "已确认完成 2 项；回复已结束；正在依次展示后续成员交接"
         );
+    }
+
+    #[test]
+    fn queued_handoff_keeps_lifecycle_deduplicated_and_updates_only_its_parent() {
+        let mut conversation = json!({"tasks":[
+            {"id":"run:new","status":"running","progress":0,"summary":"当前追问"},
+            {"id":"run:lead","status":"blocked","progress":33,"summary":"交接中"},
+            {"id":"delegation:research","status":"completed","progress":100}
+        ],"events":[],"whiteboard":{"title":"当前追问","status":"running"}});
+        let current = conversation["tasks"][0].clone();
+        let board = conversation["whiteboard"].clone();
+        let mut item = handoff_fixture(2);
+        item.updates_whiteboard = false;
+        apply_handoff_item(&mut conversation, &item, true);
+        apply_handoff_item(&mut conversation, &item, true);
+        assert_eq!(conversation["tasks"][0], current);
+        assert_eq!(conversation["tasks"][1]["status"], "completed");
+        assert_eq!(conversation["whiteboard"], board);
+        assert_eq!(conversation["events"].as_array().unwrap().len(), 2);
+        assert!(conversation["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "task.completed"));
+    }
+
+    #[test]
+    fn queued_handoff_never_promotes_unverified_failed_or_cancelled_parent() {
+        for state in ["blocked", "failed", "cancelled"] {
+            let parent = json!({"id":"run:lead","title":"核查","status":state,"progress":50,"summary":"保留真实状态"});
+            let mut conversation = json!({"tasks":[parent.clone(),{"id":"delegation:research","status":"completed","progress":100}],"events":[]});
+            let mut item = handoff_fixture(2);
+            item.can_complete = false;
+            apply_handoff_item(&mut conversation, &item, true);
+            assert_eq!(conversation["tasks"][0], parent);
+            assert_eq!(conversation["whiteboard"]["status"], state);
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_handoff_survives_new_revision_and_restart_without_replaying() {
+        use openpaw_llm::mock::{MockMode, MockProvider};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+        let delegate = |role: &str| MockMode::ToolUse {
+            tool_name: "delegate_task".into(),
+            input: json!({"role_id":role,"title":format!("{role}核验"),"instructions":"核验现有信息","acceptance":"返回核验结果"}),
+            text: String::new(),
+        };
+        let provider = std::sync::Arc::new(MockProvider::scripted(vec![
+            delegate("research"),
+            MockMode::Fixed("路线核验完成".into()),
+            delegate("organize"),
+            MockMode::Fixed("美食核验完成".into()),
+            MockMode::Fixed("已汇总两份核验结果".into()),
+        ]));
+        let host = Host::with_provider(config, provider).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "trip".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(
+                &scope,
+                &binding.session_id,
+                "两位同事分别核验路线和美食".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        assert_eq!(
+            host.get_run(&scope, &run.run_id).await.unwrap().state,
+            RunState::Completed
+        );
+        let office = OfficeConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "UNUSED".into(),
+            allowed_origins: vec![],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        let first = prepare(&host, &office, "office-1").await.unwrap();
+        let trip = |snapshot: &Value| {
+            snapshot["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "trip")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(trip(&first)["tasks"].as_array().unwrap().len(), 2);
+        // 新绑定增加事实revision，但没有新的协作事实，不应跳过尚未公开成员。
+        host.open_session(ClientScope {
+            conversation_id: "unrelated".into(),
+            ..scope.clone()
+        })
+        .await
+        .unwrap();
+        let rebuilt = prepare(&host, &office, "office-1").await.unwrap();
+        assert_eq!(trip(&rebuilt)["tasks"].as_array().unwrap().len(), 2);
+        host.inner
+            .store
+            .call(|db| {
+                db.office_projection_handoff_until.insert(
+                    "office-1".into(),
+                    chrono::Utc::now() - chrono::Duration::seconds(1),
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let final_snapshot = prepare(&host, &office, "office-1").await.unwrap();
+        let final_trip = trip(&final_snapshot);
+        assert_eq!(final_trip["tasks"][0]["status"], "completed");
+        assert_eq!(
+            final_trip["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "task.completed")
+                .count(),
+            2
+        );
+        // 模拟重启丢失进程内基线/队列，持久快照中的旧终态不重新排队。
+        host.inner
+            .store
+            .call(|db| {
+                db.office_projection_source.clear();
+                db.office_projection_handoff_until.clear();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.inner.office_handoff_queue.lock().unwrap().clear();
+        let restored = prepare(&host, &office, "office-1").await.unwrap();
+        assert_eq!(trip(&restored)["tasks"][0]["status"], "completed");
+        assert!(host.inner.office_handoff_queue.lock().unwrap().is_empty());
+        let assignments = |c: &Value| {
+            c["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "task.assigned")
+                .map(|e| e["id"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(assignments(&trip(&restored)), assignments(&final_trip));
     }
 
     #[test]

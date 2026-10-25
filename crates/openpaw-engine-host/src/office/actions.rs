@@ -193,7 +193,7 @@ async fn dispatch(
     if action["action"] == "conversation.delete" {
         // 业务删除不随UI60秒期限回滚；成功响应必须在服务端最新快照移除后。
         host.delete_session(&scope).await?;
-        let sync = projection::sync_once(host, config, &scope.slot_id, client, false, address);
+        let sync = projection::sync_for_ui(host, config, &scope.slot_id, client, address);
         tokio::select! {_=cancel.cancelled()=>return Err(HostError::new("ui_expired","已删除，UI未确认")),r=sync=>{r?;}}
         let (_, read) = client
             .post(json!({"type":"office.read","teamId":scope.slot_id}))

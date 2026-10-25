@@ -34,3 +34,7 @@ completed 100% children=5
 - Host 重启时仍跳过已经消费过的旧终态交接，避免重复动画。
 
 这是一轮确定性 Provider 的 Host/协议证据，不能替代真实 DeepSeek 的模型质量结论；真实 DeepSeek 无效流式工具参数的失败仍按真实失败显示。
+
+## 2026-10-26 后续复核勘误
+
+原文“五个task.completed事件”与本目录原始JSON不符，实际只有第一位成员的一条完成动态；五条assignment及五张完成卡是真实存在的。原始JSON保留不覆盖，D89修复队列漏传生命周期后另生成新证据。JSON中single/multi=100是临时脚本沿用的请求默认值，本次实际runs=1，绝不代表100轮；新脚本以requested和实际runs逐轮记录。此目录是确定性HTTP fixture证据，未运行真实Office或浏览器，不作为网页验收。

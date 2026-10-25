@@ -27,7 +27,7 @@ if (!relative(root, output).startsWith('..')) throw new Error('Evidence must be 
 await mkdir(output, { recursive: false })
 const report = { startedAt: new Date().toISOString(), platform: process.platform, commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim(), officeCommit: manifest.office.commit,
   sourceDirty: Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: root }).toString().trim()),
-  provider: 'deterministic OpenAI protocol fixture; actual AgentLoop and tools', commands: [], browserRequests: [], browserErrors: [], modelRequests: [], messages: [], assertions: [], result: 'running' }
+  provider: 'deterministic OpenAI protocol fixture; actual AgentLoop and tools', commands: [], browserRequests: [], browserErrors: [], modelRequests: [], messages: [], assertions: [], reviewFindings: [], result: 'running' }
 const processes = []
 let browser, context, providerServer, page, webFixtureServer, webBase
 const webFixture = { requests: [], active: 0, cancelled: 0 }
@@ -700,7 +700,14 @@ try {
   await page.getByRole('button',{name:'删除会话：T5-允许报告',exact:true}).click();
   await page.getByRole('alertdialog',{name:'删除会话'}).getByRole('button',{name:'删除',exact:true}).click();
   await waitFor(async()=>!conv(await readOffice(),report.t5.approveRequest.conversationId));
-  await page.getByRole('tab',{name:'T5-允许报告',exact:true}).waitFor({state:'hidden',timeout:15000});
+  try {
+    await page.getByRole('tab',{name:'T5-允许报告',exact:true}).waitFor({state:'hidden',timeout:15000});
+  } catch (error) {
+    // R21不允许修改Office。保留真实失败并继续核查后续旅程，最终仍失败。
+    report.reviewFindings.push({ id: 'R21', conversationId: report.t5.approveRequest.conversationId,
+      requirement: '后端删除成功后当前会话标签必须消失', error: String(error) });
+    await page.screenshot({path:join(output,'27-r21-deleted-tab-still-visible.png'),fullPage:true});
+  }
   assert.equal(await readFile(join(workspace,'reports/T5报告.md'),'utf8'),artifact);
   report.t5.deletedHistory=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version:'1.0',teamId:'office-1',conversationId:report.t5.approveRequest.conversationId,type:'history'})}).then(r=>({status:r.status}));
   assert.notEqual(report.t5.deletedHistory.status,200);
@@ -837,6 +844,7 @@ try {
     let activeRun='';const calls=new Set();for(const e of ledger){if(e.type==='run_started')activeRun=e.run_id;if(e.type==='tool_call_complete'){const key=activeRun+':'+e.call_id;assert.ok(!calls.has(key),'same Run/call executed twice');calls.add(key)}}
     report.assertions.push('Session ' + file + ': ' + ledger.filter(e => e.type === 'run_finished').map(e => e.status).join(','))
   }
+  assert.equal(report.reviewFindings.length,0,'未闭环的真实UI问题：'+JSON.stringify(report.reviewFindings))
   report.result = 'passed'
 } catch (e) { report.result = 'failed'; report.error = e.stack; if (page) await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => {}); process.exitCode = 1 }
 finally {

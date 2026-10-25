@@ -43,6 +43,105 @@ fn echo_tool_host() -> Arc<dyn ToolHost> {
     })
 }
 
+#[tokio::test]
+async fn d90_only_deliverable_final_responses_are_completed() {
+    use openpaw_core::{Capabilities, CompletionResponse, SessionEvent, Usage};
+    use openpaw_engine::{RunContext, RunObserver, RunStatus};
+    struct FinalProvider(CompletionResponse, AtomicUsize);
+    #[async_trait::async_trait]
+    impl LlmProvider for FinalProvider {
+        async fn complete(&self, _: CompletionRequest) -> Result<CompletionResponse> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(self.0.clone())
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn default_model(&self) -> &str {
+            "final-fixture"
+        }
+        fn name(&self) -> &str {
+            "final-fixture"
+        }
+    }
+    struct Recorder(Vec<SessionEvent>);
+    #[async_trait::async_trait]
+    impl RunObserver for Recorder {
+        async fn record(&mut self, event: SessionEvent) -> Result<()> {
+            self.0.push(event);
+            Ok(())
+        }
+    }
+    let text = |s: &str| vec![ContentBlock::Text { text: s.into() }];
+    for (reason, content, success) in [
+        (StopReason::MaxTokens, vec![], false),
+        (StopReason::MaxTokens, text("已经输出的部分"), false),
+        (StopReason::Incomplete, text("不完整正文"), false),
+        (StopReason::EndTurn, vec![], false),
+        (StopReason::EndTurn, text(" \n"), false),
+        (
+            StopReason::EndTurn,
+            vec![ContentBlock::Thinking {
+                thinking: "只有思考".into(),
+                signature: None,
+            }],
+            false,
+        ),
+        (StopReason::EndTurn, text("真实交付"), true),
+    ] {
+        let provider = Arc::new(FinalProvider(
+            CompletionResponse {
+                content: content.clone(),
+                stop_reason: reason,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 4096,
+                    ..Default::default()
+                },
+            },
+            AtomicUsize::new(0),
+        ));
+        let engine = AgentLoop::new(provider.clone());
+        let mut session = Session::new("final-fixture", "fixture");
+        session.messages.push(Message::user_text("核验资料"));
+        let mut recorder = Recorder(vec![]);
+        let outcome = engine
+            .run_with_context(
+                &mut session,
+                None,
+                &[],
+                &RunContext {
+                    run_id: "final-run".into(),
+                    cancel: CancellationToken::new(),
+                    total_timeout: None,
+                    tool_timeout: None,
+                },
+                &mut recorder,
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            outcome.status,
+            if success {
+                RunStatus::Completed
+            } else {
+                RunStatus::Failed
+            },
+            "{reason:?}"
+        );
+        assert_eq!(outcome.usage.output_tokens, 4096);
+        assert_eq!(provider.1.load(Ordering::SeqCst), 1, "终态不得自动重放");
+        assert_eq!(
+            serde_json::to_value(&session.messages.last().unwrap().content).unwrap(),
+            serde_json::to_value(&content).unwrap(),
+            "原始输出必须保留"
+        );
+        assert!(
+            matches!(recorder.0.last(), Some(SessionEvent::RunFinished { status, .. }) if status == if success { "completed" } else { "failed" })
+        );
+    }
+}
+
 /// Search host with async sleep so the phased path's spawned tasks truly
 /// overlap (concurrency observation for the parallel assertion).
 struct SearchHost {

@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 export async function teamProduct({page,report,output,readOffice,conv,latestSend,fresh,send,expand,chooseOffice,waitFor,release}) {
-  const roles=[['research','command','code-agent','李研'],['organize','files','file-agent','周理'],['draft','draft','app-agent','陈书'],['review','review','review-agent','刘市'],['audit','search','data-agent','赵审']]
+  const roles=[['research','code-agent','code-agent','李研'],['organize','file-agent','file-agent','周理'],['draft','app-agent','app-agent','陈书'],['review','review-agent','review-agent','刘市'],['audit','data-agent','data-agent','赵审']]
   let exportIndex=0
   async function scene(label) {
     const pending=page.waitForEvent('download')
@@ -23,7 +23,7 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   for(const [role,employee,actor,name] of roles) {
     const data=await waitFor(async()=>{const r=await readOffice();const c=conv(r,request.conversationId);return c?.tasks.some(t=>t.assigneeId===employee&&t.status==='running')?c:false})
     const task=data.tasks.find(t=>t.assigneeId===employee&&t.status==='running')
-    const event=data.events.find(e=>e.kind==='task.assigned'&&e.taskId===task.id&&e.employeeId===employee&&e.fromEmployeeId==='assistant')
+    const event=data.events.find(e=>e.kind==='task.assigned'&&e.taskId===task.id&&e.employeeId===employee&&e.fromEmployeeId==='office-lead')
     assert.ok(event);assert.ok(!/call_|web_fetch|read_file/.test(task.title));assert.ok(data.tasks[0].progress<100)
     assert.ok(data.events.some(e=>e.kind==='task.started'&&e.taskId===task.id&&e.employeeId===employee),'真实工作态必须向成员最近动态投影开始事实')
     const started=await waitFor(async()=>{const s=await scene(role+'-active');return s.records.some(r=>r.command.capability==='office.visit'&&r.command.participants[0].entityId==='office-lead'&&r.command.participants[1].entityId===actor)?s:false},45000)

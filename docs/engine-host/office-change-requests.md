@@ -41,6 +41,7 @@
 
 | R19 / 候选2026-10-24-completed | 首页任务流隐藏完成卡 | 暂缓集中审核，未批准，不实施 | Host保留真实completed及任务中心/成员详情 | 需产品决定首页保留范围/过滤器 |
 | R20 / 候选2026-10-24-employee-panel | AI员工面板无详情点击 | 暂缓集中审核，未批准，不实施 | 现有侧栏/场景人物及Host detail-v1 | 复用employee.inspect，不新增私有协议 |
+| R21 / 勘误2026-10-26 | 删除后标签保留 | 撤回Office申请：Host D91修复后真实UI通过 | 同一同步器的可信UI入口；Office未改 | 原始false回执与准确74条浏览器记录见本节 |
 | R18 / 候选2026-10-24-mobile-notice | 手机尺寸决策侧边提示/倒计时离开视口 | 暂缓集中审核，未批准，不实施 | 桌面原用例通过；不以Host改快照或延长期限掩盖布局问题 | 原静态Demo一次失败、独立重跑两次同点失败；最小CSS/滚动方案仍待定位 |
 
 “撤回”“不在首期”和“暂缓审核”含义不同，均不是已批准；不得为完成里程碑把这些项统一改成已完成。
@@ -295,7 +296,12 @@ Office已安全快进到fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518，用户两份�
 
 相同真实审计中AI员工页6行.runtime-employee，点击王明未发/api/pawoffice/ui、无详情dialog；OfficeShell.tsx该行仅div，无onClick，而经典侧栏.runtime-person正常派发employee.inspect。候选仅在原OfficeShell.tsx复用现有inspection回调，以button/键盘可达方式打开同一官方详情；显示最近完成摘要需确认产品文案/范围，不能把空闲说成从未工作。验收六行/鼠标键盘/触屏/多会话/禁用/删除和错误状态与原侧栏一致，无新后端协议。Host本轮新增的任务详情导航可复用，不能据此声称AI员工页已可点。证据before/section-AI 员工.png及report.json/trace。未批准、不改Office；回退原UI，无持久影响。
 
-### R21：后端删除后当前会话标签未从 Office 页面移除（候选，未批准）
+### R21：删除后标签保留（Host D91修复后真实UI通过，撤回Office修改申请）
+
+**2026-10-26证据勘误。**复查`/home/cheng/.cache/openpaw-d89-final-20261026/product/trace.zip`的准确`conversation.delete`响应：HTTP200封套中的业务结果实际为`success:false`、`projection_deferred：Office UI动作优先，延后投影扫描`。原文“conversation.delete已返回成功”不成立；仅快照不再包含会话不足以证明UI确认已成功。已确认根因是OpenPaw删除处理持有UI优先计数，又调用后台投影入口导致自身让行，归原CHG0007 §12.60 D91，仅修Host并重跑原真实删除旅程。此时Office保留标签符合其等待后端确认的约定。撤回本轮必须修改Office的结论；若Host真实成功回执后仍复现再补准确证据，不能提前认定前端仍有缺陷。Office所有文件保持未修改，下面原候选保留为历史依据。
+
+
+**当前复验结论。**冻结Office不变、D91二进制`f80229f1…`的完整真实产品旅程已通过74条记录，`reviewFindings=[]`、零pageerror；原删除步骤同时核对标签消失、后端历史不可读、旧send/resume/cancel不能复活及工作区产物不删除。准确报告`/home/cheng/.cache/openpaw-d89-final-20261026/product-d91-corrected/report.json`，截图`27-t5-deleted-conversation-artifact-preserved.png`，trace同目录。撤回本R21的Office修改申请；问题是Host自身投影优先规则缺陷，不需要修改Office。以下原前端提案仅保留误判历史，不作为活跃待审项。
 
 - **真实复现**：冻结 Office `fa6ae1f` 与当前 OpenPaw Host 产品套件中，`conversation.delete` 已返回成功，随后 `office.read` 已不再返回该 conversation；但 Office 浏览器仍保留被删除的当前 tab，15 秒内没有切换到剩余会话或隐藏该 tab，导致真实产品验收超时。原始报告与截图保留在 `/tmp/openpaw-product-d80-20261025-d/`。
 - **必要性与影响**：用户会看到已删除的聊天标签，刷新/切换时可能继续进入旧本地归档；这破坏“删除聊天和草稿”的公开承诺，也会让任务/历史显示与 Host 事实不一致。Host 不应伪造快照、重复删除或通过隐藏后端数据解决页面状态。
