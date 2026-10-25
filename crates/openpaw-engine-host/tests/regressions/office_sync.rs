@@ -317,7 +317,26 @@ async fn sync_scenario() {
     );
     let host = Host::start(cfg).await.unwrap();
     let server = HostServer::bind(host, 0).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    wait(|| {
+        fixture
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .filter(|r| r["type"] == "office.snapshot")
+            .count()
+            > count
+    })
+    .await;
+    assert_eq!(state(), "halted", "重启后应重试旧halted并重新确认外部冲突");
+    let retried = fixture
+        .lock()
+        .unwrap()
+        .requests
+        .iter()
+        .filter(|r| r["type"] == "office.snapshot")
+        .count();
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     assert_eq!(
         fixture
             .lock()
@@ -326,7 +345,8 @@ async fn sync_scenario() {
             .iter()
             .filter(|r| r["type"] == "office.snapshot")
             .count(),
-        count
+        retried,
+        "确认外部seq冲突后仍应保持本进程锁存"
     );
     server.shutdown().await.unwrap();
     // 独立数据目录验证旧seq回执，保留前面的真实409锁存场景。

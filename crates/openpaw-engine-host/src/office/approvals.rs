@@ -26,6 +26,8 @@ pub(super) async fn run(
 ) {
     let mut tasks = JoinSet::new();
     let mut active = BTreeSet::new();
+    let mut last_revision = None;
+    let mut last_scan = tokio::time::Instant::now() - Duration::from_secs(1);
     loop {
         while let Some(result) = tasks.try_join_next() {
             if let Ok(id) = result {
@@ -35,6 +37,14 @@ pub(super) async fn run(
         if stop.is_cancelled() {
             break;
         }
+        let revision = host.inner.store.call(|db| db.revision()).await.ok();
+        let now = tokio::time::Instant::now();
+        if revision == last_revision && now.duration_since(last_scan) < Duration::from_secs(1) {
+            tokio::select! {_=stop.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(100))=>{}}
+            continue;
+        }
+        last_revision = revision;
+        last_scan = now;
         let pending = host
             .inner
             .store

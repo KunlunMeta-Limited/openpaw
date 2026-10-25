@@ -354,12 +354,12 @@ async fn interaction_scenario() {
     );
     let mut inspected = std::collections::BTreeMap::new();
     for (employee, actor, name) in [
-        ("assistant", "office-lead", "王明"),
-        ("command", "code-agent", "李研"),
-        ("files", "file-agent", "周理"),
-        ("draft", "app-agent", "陈书"),
-        ("review", "review-agent", "刘市"),
-        ("search", "data-agent", "赵审"),
+        ("office-lead", "office-lead", "王明"),
+        ("code-agent", "code-agent", "李研"),
+        ("file-agent", "file-agent", "周理"),
+        ("app-agent", "app-agent", "陈书"),
+        ("review-agent", "review-agent", "刘市"),
+        ("data-agent", "data-agent", "赵审"),
     ] {
         let actor_reply = action(
             &shared,
@@ -403,9 +403,15 @@ async fn interaction_scenario() {
         );
     }
     assert_ne!(
-        inspected["assistant"]["fields"],
-        inspected["draft"]["fields"]
+        inspected["office-lead"]["fields"],
+        inspected["app-agent"]["fields"]
     );
+    assert!(inspected["office-lead"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field["label"] == "当前状态"
+            && field["value"] == "本轮运行已完成，业务进度以任务与白板为准"));
     let unknown = action(
         &shared,
         "unknown-actor",
@@ -418,7 +424,7 @@ async fn interaction_scenario() {
         &shared,
         "inspect-1",
         "employee.inspect",
-        json!({"employeeId":"assistant"}),
+        json!({"employeeId":"office-lead"}),
     )
     .await;
     assert_eq!(menu["presentation"]["target"], "dialog");
@@ -427,7 +433,42 @@ async fn interaction_scenario() {
             .as_array()
             .unwrap()
             .len(),
-        6
+        8
+    );
+    let tasks = action(
+        &shared,
+        "tasks-1",
+        "dialog.action",
+        json!({"interactionId":"inspect-1","optionId":"tasks"}),
+    )
+    .await;
+    assert_eq!(tasks["presentation"]["content"]["title"], "任务进度与结果");
+    assert!(!tasks["presentation"]["content"]["fields"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let detail = action(
+        &shared,
+        "task-1",
+        "dialog.action",
+        json!({"interactionId":"tasks-1","optionId":"task-0"}),
+    )
+    .await;
+    assert!(detail["presentation"]["content"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["label"] == "实际执行状态" && f["value"] == "执行已结束"));
+    let task_back = action(
+        &shared,
+        "task-back",
+        "dialog.action",
+        json!({"interactionId":"task-1","optionId":"back"}),
+    )
+    .await;
+    assert_eq!(
+        task_back["presentation"]["content"]["title"],
+        "任务进度与结果"
     );
     let files = action(
         &shared,
@@ -459,7 +500,7 @@ async fn interaction_scenario() {
     {
         let mut extra = json!({"taskId":format!("run:{}",r.run_id)});
         if *kind == "task.assign" {
-            extra["assigneeId"] = json!("assistant");
+            extra["assigneeId"] = json!("office-lead");
         }
         let unsupported = action(&shared, &format!("task-5-{i}"), kind, extra).await;
         assert_eq!(unsupported["presentation"]["success"], false);
@@ -514,7 +555,7 @@ async fn interaction_scenario() {
     {
         let mut s = shared.lock().await;
         for i in 0..32 {
-            s.actions.push_back(json!({"id":format!("pressure-{i}"),"teamId":"office-1","conversationId":"ui-test","action":"employee.inspect","employeeId":"assistant"}));
+            s.actions.push_back(json!({"id":format!("pressure-{i}"),"teamId":"office-1","conversationId":"ui-test","action":"employee.inspect","employeeId":"office-lead"}));
         }
     }
     tokio::time::timeout(Duration::from_secs(8), async {

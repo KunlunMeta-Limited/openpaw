@@ -1294,6 +1294,46 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
     );
     let children = delegated(&cfg.home, &run.run_id);
     assert_eq!(children.len(), 5);
+    for request in provider
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.system.as_deref().is_some_and(|s| s.contains("（lead）")))
+    {
+        let system = request.system.as_ref().unwrap();
+        assert!(
+            system.contains("子角色看不到父会话历史") && system.contains("context"),
+            "真实Provider必须获知独立子角色的资料交接方式，不能让审查者凭空核验前序结果"
+        );
+        assert!(
+            system.contains("不要把草稿和依赖它的审查放在同一批工具调用里")
+                && system.contains("已有前序产物时，review和audit必须实际检查该产物")
+                && system.contains("引用实际返回的原句"),
+            "主角色必须按真实结果的依赖顺序交接，前期验收清单不能代替对稿核验"
+        );
+        for mapping in [
+            "王明 -> lead",
+            "李研 -> research",
+            "周理 -> organize",
+            "陈书 -> draft",
+            "刘市 -> review",
+            "赵审 -> audit",
+        ] {
+            assert!(
+                system.contains(mapping),
+                "主角色的实际Provider请求必须收到准确人物映射：{mapping}"
+            );
+        }
+        assert!(
+            system.contains("本轮各子角色实际工具白名单")
+                && system.contains("赵审（audit）：read_file")
+                && system.contains(
+                    "需要新建或修改文件的任务只能交给白名单含write_file或edit_file的角色"
+                ),
+            "主角色必须看到每个子角色的实际工具能力，避免把写入任务派给只读角色"
+        );
+    }
     let mut sessions = std::collections::BTreeSet::new();
     let mut runs = std::collections::BTreeSet::new();
     for child in &children {

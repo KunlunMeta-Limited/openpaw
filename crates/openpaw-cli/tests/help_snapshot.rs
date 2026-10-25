@@ -34,6 +34,8 @@ const SUBCOMMANDS: &[&str] = &[
     "init",
     #[cfg(feature = "engine-host")]
     "engine-host",
+    #[cfg(feature = "engine-host")]
+    "engine-host-workspace",
     #[cfg(feature = "sidecar")]
     "sidecar",
 ];
@@ -77,7 +79,8 @@ fn top_level_subcommands_match_exact_feature_surface() {
         .collect();
     assert_eq!(
         SUBCOMMANDS.len(),
-        12 + usize::from(cfg!(feature = "engine-host")) + usize::from(cfg!(feature = "sidecar")),
+        12 + 2 * usize::from(cfg!(feature = "engine-host"))
+            + usize::from(cfg!(feature = "sidecar")),
         "默认十二项不能因增加可选命令而改变"
     );
     assert_eq!(
@@ -132,12 +135,19 @@ fn each_subcommand_help_carries_key_names() {
                 "`openpaw engine-host` help must contain `{key}`:\n{help}"
             );
         }
+        let help = sub_help("engine-host-workspace");
+        for key in ["plan", "apply"] {
+            assert!(
+                help.contains(key),
+                "离线工作区迁移帮助必须包含{key}：{help}"
+            );
+        }
     }
     assert_eq!(
         cases.len(),
         SUBCOMMANDS.len()
             - usize::from(cfg!(feature = "sidecar"))
-            - usize::from(cfg!(feature = "engine-host")),
+            - 2 * usize::from(cfg!(feature = "engine-host")),
         "the snapshot table must cover every non-gated subcommand"
     );
     for (name, keys) in cases {

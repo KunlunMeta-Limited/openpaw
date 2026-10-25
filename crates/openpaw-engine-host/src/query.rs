@@ -118,9 +118,28 @@ impl Host {
                     })
                     .await?
             }
-            QueryKind::File { path } => vec![
-                serde_json::json!({"path":path,"text":openpaw_tools::fs::read::read_text_bounded(&root.path,&path,256*1024).await.map_err(|_|HostError::new("invalid_input","文件越界、非文本、过大或不可读取"))?}),
-            ],
+            QueryKind::File { path } => {
+                let (session, original) = (binding.session_id.clone(), path.clone());
+                let migrated = self
+                    .inner
+                    .store
+                    .call(move |db| db.migrated_artifact(&session, &original))
+                    .await?;
+                let resolved = migrated
+                    .as_ref()
+                    .map_or(path.as_str(), |(relative, _)| relative);
+                let text =
+                    openpaw_tools::fs::read::read_text_bounded(&root.path, resolved, 256 * 1024)
+                        .await
+                        .map_err(|_| {
+                            HostError::new("invalid_input", "文件越界、非文本、过大或不可读取")
+                        })?;
+                if let Some((relative, expected)) = migrated {
+                    let target = root.path.join(relative);
+                    crate::workspace_migration::verify_migrated_text(&target, &text, &expected)?;
+                }
+                vec![serde_json::json!({"path":path,"text":text})]
+            }
             kind => {
                 let home = self.inner.config.home.clone();
                 tokio::task::spawn_blocking(move||{

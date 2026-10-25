@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -54,6 +55,20 @@ pub(crate) struct Db {
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
     pub(crate) live: Arc<Mutex<HashMap<String, RunText>>>,
+    /// 用途：记录最近一次由Office投影读取的Host事实revision。
+    /// 字段：办公室作用域到事实版本号的映射。
+    /// 来源去向：projection读取和更新，Store重启后从当前事实重新建立。
+    /// 约束：只避免空闲期重复扫描同一批Run，不是第二份投影或持久事实。
+    /// 稳定性：T6进程内调度状态。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
+    pub(crate) office_projection_source: HashMap<String, u64>,
+    /// 用途：记录交接动画顺序窗口的内存截止时间。
+    /// 字段：办公室作用域到下一次交接推进时间的映射。
+    /// 来源去向：projection设置和消费，过期后触发下一份已计算快照。
+    /// 约束：不写入Office快照，也不作为业务状态来源；重启后可丢弃。
+    /// 稳定性：T6进程内协调状态。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
+    pub(crate) office_projection_handoff_until: HashMap<String, chrono::DateTime<chrono::Utc>>,
 }
 impl Store {
     /// 功能：恢复原JSONL及宿主元数据并启动单写协调器。
@@ -105,14 +120,23 @@ impl Store {
         &self,
         f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
     ) -> HostResult<T> {
+        let queued_at = Instant::now();
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(Job::Call(Box::new(move |db| {
+                let started_at = Instant::now();
                 let result = if db.owner.is_some() {
                     f(db)
                 } else {
                     Err(HostError::new("storage_unavailable", "Host存储已关闭"))
                 };
+                if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() {
+                    eprintln!(
+                        "engine-host diagnostics store queue_ms={} run_ms={}",
+                        started_at.duration_since(queued_at).as_millis(),
+                        started_at.elapsed().as_millis()
+                    );
+                }
                 let _ = tx.send(result);
             })))
             .await
@@ -148,8 +172,19 @@ impl Db {
     /// 权限：校验Run和Session删除门禁。
     /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn progress(&self, run: &str) -> HostResult<Option<serde_json::Value>> {
-        let view = self.get_run(run)?;
-        self.binding(&view.session_id)?;
+        // 投影会按办公室中的每个Run查询进度；这里不需要完整Run视图或JSONL正文。
+        // 旧实现调用get_run会解码整个Session账本，多个办公室启动时把数百次昂贵读取
+        // 串在同一Store队列中。只读取既有host_runs.session并完成同样的范围校验，
+        // 进度事实仍来自host_events，正文和终态语义保持不变。
+        let session: String = self
+            .conn
+            .query_row("SELECT session FROM host_runs WHERE id=?1", [run], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(HostError::storage)?
+            .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
+        self.binding(&session)?;
         let raw:Option<String>=self.conn.query_row("SELECT reference FROM host_events WHERE kind='run_progress' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[run],|r|r.get(0)).optional().map_err(HostError::storage)?;
         raw.map(|v| serde_json::from_str(&v).map_err(HostError::storage))
             .transpose()
@@ -325,7 +360,10 @@ impl Db {
             owner: Some(owner),
             notices,
             live,
+            office_projection_source: HashMap::new(),
+            office_projection_handoff_until: HashMap::new(),
         };
+        db.validate_workspace_rebinds()?;
         db.recover()?;
         Ok(db)
     }
@@ -351,6 +389,27 @@ impl Db {
     pub(crate) fn runs(&self) -> HostResult<Vec<RunView>> {
         self.all("SELECT data FROM host_runs")
     }
+    /// 功能：按Session读取宿主Run元数据，避免人物详情为查一名成员解析整个办公室历史。
+    /// 参数：session为已校验的原JSONL会话ID。
+    /// 返回：该Session的Run元数据，工具与正文仍按需读取。
+    /// 错误：SQL准备、查询或JSON反序列化失败时返回存储错误。
+    /// 状态：只读，不改变运行生命周期；跨Session仍由调用方校验。
+    /// 并发与取消：在Store单写线程内执行；外层Store调用可取消等待，不提前释放资源。
+    /// 权限：仅供已通过会话作用域校验的Host内部调用。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007。
+    pub(crate) fn runs_for_session(&self, session: &str) -> HostResult<Vec<RunView>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT data FROM host_runs WHERE session=?1")
+            .map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([session], |row| row.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(HostError::storage)?).map_err(HostError::storage)
+        })
+        .collect()
+    }
     /// 功能：读取持久审批记录。
     /// 参数：self为单写线程内Db。
     /// 返回：完整绑定及消费状态列表。
@@ -363,14 +422,7 @@ impl Db {
         self.all("SELECT data FROM host_approvals")
     }
     fn all<T: serde::de::DeserializeOwned>(&self, sql: &str) -> HostResult<Vec<T>> {
-        let mut stmt = self.conn.prepare(sql).map_err(HostError::storage)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(HostError::storage)?;
-        rows.map(|s| {
-            serde_json::from_str(&s.map_err(HostError::storage)?).map_err(HostError::storage)
-        })
-        .collect()
+        read_json_rows(&self.conn, sql)
     }
     /// 功能：读取已提交事实序号。
     /// 参数：self为单写线程内Db。
@@ -446,11 +498,15 @@ impl Db {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub(crate) fn get_run(&self, id: &str) -> HostResult<RunView> {
-        let mut run = self
-            .runs()?
-            .into_iter()
-            .find(|r| r.run_id == id)
+        // 人物详情及周期投影会逐个查询Run；不要反复解码其他历史Run和工具事实。
+        // 仍使用同一Store序列与原账本，精确筛选不引入缓存或改变状态覆盖顺序。
+        let data: String = self
+            .conn
+            .query_row("SELECT data FROM host_runs WHERE id=?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(HostError::storage)?
             .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
+        let mut run: RunView = serde_json::from_str(&data).map_err(HostError::storage)?;
         let events = self.events(&run.session_id)?;
         let mut active = false;
         let text = committed_run_text(&events, id);
@@ -486,9 +542,11 @@ impl Db {
                 _ => {}
             }
         }
-        let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_waiting_resource','tool_started','tool_result') ORDER BY revision").map_err(HostError::storage)?;
+        let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_waiting_resource','tool_started','tool_result') AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .query_map([id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(HostError::storage)?;
         for row in rows {
             let (kind, value) = row.map_err(HostError::storage)?;
@@ -509,7 +567,16 @@ impl Db {
                 }
             }
         }
-        for a in self.approvals()? {
+        let mut approvals = self
+            .conn
+            .prepare("SELECT data FROM host_approvals WHERE run=?1")
+            .map_err(HostError::storage)?;
+        let rows = approvals
+            .query_map([id], |row| row.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        for row in rows {
+            let a: ApprovalView = serde_json::from_str(&row.map_err(HostError::storage)?)
+                .map_err(HostError::storage)?;
             if a.binding.run_id == id && a.status == "pending" {
                 if let Some(t) = tools.get_mut(&a.binding.call_id) {
                     t.state = "awaiting_approval".into();
@@ -535,6 +602,21 @@ impl Db {
             }
         }
         Ok(run)
+    }
+    /// 功能：读取Office投影所需的轻量Run视图，不解析完整JSONL正文。
+    /// 参数：id为已持久化Run标识。
+    /// 返回：状态、工具阶段和错误；回复正文由详情/历史查询按需读取。
+    /// 错误：SQL、控制事实损坏或未知Run。
+    /// 状态：只读，不改变Run或工具事实；仅供投影扫描使用。
+    /// 并发与取消：单Store序列内按Run主键和Host事实精确读取，避免全会话账本扫描。
+    /// 权限：调用方仍须先校验Office绑定；不扩大工具或文件权限。
+    /// 关联：D76人物详情冷启动优化；不改变公共Run接口。
+    pub(crate) fn get_run_projection(&self, id: &str) -> HostResult<RunView> {
+        // 轻量路径不能丢失账本正文、终态事实或工具调用关联。投影缓存已经
+        // 让人物点击不再触发此方法；没有可信缓存时沿用完整读取，保证旧数据
+        // 和测试夹具与公开Run视图完全一致。后续若增加持久化摘要，必须先用
+        // JSONL golden 验证它覆盖 get_run 的全部字段，再替换这里。
+        self.get_run(id)
     }
     /// 功能：将本Run的有界实时展示尾部合并保存到既有元数据。
     /// 参数：id和session为已接受运行的精确身份。
@@ -1029,15 +1111,43 @@ impl Db {
                 |r| r.get(0),
             )
             .map_err(HostError::storage)?;
-        let events = self.events(&run.session_id)?;
         let committed:bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM host_events WHERE kind='run_input_committed' AND reference=?1)",[&run.run_id],|r|r.get(0)).map_err(HostError::storage)?;
-        let started = events
-            .iter()
-            .any(|e| matches!(e,SessionEvent::RunStarted{run_id} if run_id==&run.run_id));
-        if !committed && !started {
+        if !committed {
             // 升级前真正开始的Run有原RunStarted事实；从未接受的失败请求不得借用后来追加的User。
-            return Ok((offset, String::new()));
+            let started = self
+                .events(&run.session_id)?
+                .iter()
+                .any(|e| matches!(e, SessionEvent::RunStarted { run_id } if run_id == &run.run_id));
+            if !started {
+                return Ok((offset, String::new()));
+            }
         }
+        // 正常接受的Run在host_requests中已有规范请求；直接取最后一条user消息，
+        // 避免投影为每个Run重新扫描和解析整份JSONL。请求表只是幂等输入索引，
+        // 账本仍是事实来源；缺少索引的旧/导入Run继续走下面的JSONL回退路径。
+        if let Some(raw) = self
+            .conn
+            .query_row(
+                "SELECT request FROM host_requests WHERE run=?1",
+                [&run.run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?
+        {
+            let messages: serde_json::Value =
+                serde_json::from_str(&raw).map_err(HostError::storage)?;
+            if let Some(input) = messages.as_array().and_then(|items| {
+                items.iter().rev().find_map(|item| {
+                    (item["role"] == "user")
+                        .then(|| item["content"].as_str().map(str::to_owned))
+                        .flatten()
+                })
+            }) {
+                return Ok((offset, input));
+            }
+        }
+        let events = self.events(&run.session_id)?;
         let text = match events.get(offset) {
             Some(SessionEvent::Message(m)) if m.role == openpaw_core::Role::User => m.text(),
             _ if matches!(
@@ -1754,6 +1864,17 @@ impl Db {
         &self,
         parent: &str,
     ) -> HostResult<Vec<crate::orchestration::Delegation>> {
+        let parent_session: String = self
+            .conn
+            .query_row(
+                "SELECT session FROM host_runs WHERE id=?1",
+                [parent],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?
+            .ok_or_else(|| HostError::new("not_found", "父运行不存在"))?;
+        let owner = self.binding(&parent_session)?;
         let mut stmt = self.conn.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
         let rows = stmt
             .query_map([parent], |r| r.get::<_, String>(0))
@@ -1763,13 +1884,12 @@ impl Db {
             let d: crate::orchestration::Delegation =
                 serde_json::from_str(&row.map_err(HostError::storage)?)
                     .map_err(HostError::storage)?;
-            let owner = self.binding(&d.parent_session)?;
             let child = self.binding(&d.child_session)?;
             if d.version != 1
                 || d.run_id != parent
+                || owner.session_id != d.parent_session
                 || owner.scope != d.parent_scope
                 || owner.scope.namespace != "office"
-                || self.get_run(parent)?.session_id != d.parent_session
                 || child.scope != d.child_scope
                 || child.scope.namespace != "host-agent"
                 || child.scope.slot_id != owner.scope.slot_id
@@ -2116,12 +2236,484 @@ fn merge_run_display(run: &mut RunView, candidate: &str, truncated: bool) -> Hos
     Ok(())
 }
 
+fn read_json_rows<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    sql: &str,
+) -> HostResult<Vec<T>> {
+    let mut statement = conn.prepare(sql).map_err(HostError::storage)?;
+    let result = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(HostError::storage)?
+        .map(|row| {
+            serde_json::from_str(&row.map_err(HostError::storage)?).map_err(HostError::storage)
+        })
+        .collect();
+    result
+}
+
+fn rebind_events(conn: &Connection) -> HostResult<Vec<serde_json::Value>> {
+    let events: Vec<serde_json::Value> = read_json_rows(
+        conn,
+        "SELECT reference FROM host_events WHERE kind='workspace_rebind' ORDER BY revision",
+    )?;
+    for event in &events {
+        crate::workspace_migration::validate_migration_event(event)?;
+        if event["version"] != 1
+            || event["team"].as_str().is_none()
+            || event["old_root"].as_str().is_none()
+            || event["new_root"].as_str().is_none()
+            || !event["old_path"]
+                .as_str()
+                .is_some_and(|s| std::path::Path::new(s).is_absolute())
+            || !event["new_path"]
+                .as_str()
+                .is_some_and(|s| std::path::Path::new(s).is_absolute())
+            || event["sessions"].as_array().is_none()
+            || event["files"].as_array().is_none()
+            || event["manifest_sha256"].as_str().is_none()
+            || event["confirmation_sha256"].as_str().is_none()
+        {
+            return Err(HostError::new(
+                "storage_unavailable",
+                "工作区迁移审计版本或字段损坏",
+            ));
+        }
+    }
+    Ok(events)
+}
+
+fn migration_inventory(conn: &Connection) -> HostResult<serde_json::Value> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .map_err(HostError::storage)?;
+    if version != 4 {
+        return Err(HostError::new(
+            "unsupported",
+            "迁移仅接受完整的Host版本4元数据",
+        ));
+    }
+    let bindings: Vec<SessionBinding> =
+        read_json_rows(conn, "SELECT data FROM host_bindings ORDER BY id")?;
+    let mismatches: u64 = conn.query_row("SELECT COUNT(*) FROM host_bindings WHERE id IS NOT json_extract(data,'$.session_id') OR namespace IS NOT json_extract(data,'$.scope.namespace') OR slot IS NOT json_extract(data,'$.scope.slot_id') OR conversation IS NOT json_extract(data,'$.scope.conversation_id')",[],|row|row.get(0)).map_err(HostError::storage)?;
+    if mismatches != 0 {
+        return Err(HostError::new(
+            "storage_unavailable",
+            "迁移前绑定主键与完整范围不一致",
+        ));
+    }
+
+    let runs: Vec<RunView> = read_json_rows(conn, "SELECT data FROM host_runs ORDER BY id")?;
+    let approvals: Vec<ApprovalView> =
+        read_json_rows(conn, "SELECT data FROM host_approvals ORDER BY id")?;
+    let revision: u64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(revision),0) FROM host_events",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(HostError::storage)?;
+    let deleting: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM host_session_deletions WHERE phase != 'deleted'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(HostError::storage)?;
+    if runs.iter().any(|run| !run.state.is_terminal())
+        || approvals
+            .iter()
+            .any(|a| a.status == "pending" || a.status == "approved" && !a.consumed)
+        || deleting != 0
+    {
+        return Err(HostError::new(
+            "conflict",
+            "迁移要求无活动Run、未消费审批和未完成删除；请先正常清理并关闭Host",
+        ));
+    }
+    let roots: BTreeMap<String, String> = conn
+        .prepare("SELECT id,path FROM host_roots ORDER BY id")
+        .map_err(HostError::storage)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(HostError::storage)?
+        .collect::<Result<_, _>>()
+        .map_err(HostError::storage)?;
+    let requests: u64 = conn
+        .query_row("SELECT COUNT(*) FROM host_requests", [], |r| r.get(0))
+        .map_err(HostError::storage)?;
+    let mut team_counts = BTreeMap::new();
+    for team in bindings
+        .iter()
+        .map(|b| &b.scope.slot_id)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let count = |sql: &str| -> HostResult<u64> {
+            conn.query_row(sql, [team], |r| r.get(0))
+                .map_err(HostError::storage)
+        };
+        // 分项聚合，避免Run、请求、审批多表连接把数量乘大。
+        let sessions = count("SELECT COUNT(*) FROM host_bindings WHERE slot=?1")?;
+        let runs = count("SELECT COUNT(*) FROM host_runs WHERE session IN (SELECT id FROM host_bindings WHERE slot=?1)")?;
+        let requests = count("SELECT COUNT(*) FROM host_requests WHERE session IN (SELECT id FROM host_bindings WHERE slot=?1)")?;
+        let approvals = count("SELECT COUNT(*) FROM host_approvals WHERE run IN (SELECT id FROM host_runs WHERE session IN (SELECT id FROM host_bindings WHERE slot=?1))")?;
+        let children = count("SELECT COUNT(*) FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.parent_scope.slot_id')=?1")?;
+        team_counts.insert(team.clone(), serde_json::json!({"sessions":sessions,"runs":runs,"requests":requests,"approvals":approvals,"children":children}));
+    }
+    let rebinds = rebind_events(conn)?;
+    // 只输出审核需要的ID和数量；审批输入、消息和Provider秘密不进入计划。
+    Ok(
+        serde_json::json!({"revision":revision,"bindings":bindings,"roots":roots,"run_count":runs.len(),"request_count":requests,"approval_count":approvals.len(),"team_counts":team_counts,"rebinds":rebinds}),
+    )
+}
+
+impl Db {
+    /// 功能：只读取得离线迁移所需原绑定和数量，不恢复或新建元数据。
+    /// 参数：home为已核验且持有原OS独占锁的数据目录。
+    /// 返回：同一SQLite读事务中的范围和审核信息。
+    /// 错误：残留WAL、未知版本、活动执行、审批或损坏均拒绝。
+    /// 状态：immutable只读打开，不创建WAL/SHM、索引或锁文件。
+    /// 并发与取消：调用方必须持有原home独占锁，禁止与Host同跑。
+    /// 权限：只供本机已批准迁移协调器，不向HTTP暴露。
+    /// 关联：需求/设计REQ-OP-025；DES-OP-013；CHG-2026-0007第12.12节。
+    pub(crate) fn workspace_inventory(home: &std::path::Path) -> HostResult<serde_json::Value> {
+        for suffix in ["-wal", "-journal"] {
+            let path = home.join(format!("engine-host/host.db{suffix}"));
+            match std::fs::metadata(path) {
+                Ok(meta) if meta.len() != 0 => {
+                    return Err(HostError::new(
+                        "conflict",
+                        "数据库仍有未检查点日志；先用原配置正常启动并关闭Host，不删除日志",
+                    ))
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(HostError::storage(e)),
+            }
+        }
+        let path = home.join("engine-host/host.db");
+        let mut uri = "file:".to_owned();
+        for byte in path.to_string_lossy().as_bytes() {
+            if byte.is_ascii_alphanumeric() || b"/-_.:".contains(byte) {
+                uri.push(*byte as char);
+            } else {
+                uri.push_str(&format!("%{byte:02X}"));
+            }
+        }
+        uri.push_str("?mode=ro&immutable=1");
+        let conn = Connection::open_with_flags(
+            uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(HostError::storage)?;
+        migration_inventory(&conn)
+    }
+
+    /// 功能：在原Host数据库单事务中登记目标根、重绑父子会话并保存迁移审计。
+    /// 参数：home及expected为已锁定预检对象，roots为原有加新根，moves为已复制核验的团队事件。
+    /// 返回：全部绑定和审计原子提交成功。
+    /// 错误：预检漂移、旧绑定不符、根身份冲突或SQL失败回滚事务。
+    /// 状态：不改JSONL、消息、运行、请求或审批事实，不新建表。
+    /// 并发与取消：调用方持有home和工作根OS独占锁，提交不可半途释放锁。
+    /// 权限：仅本机协调器可调用；事件中的团队与全部既有绑定逐项核对。
+    /// 关联：需求/设计REQ-OP-025；DES-OP-013；CHG-2026-0007第12.12节。
+    pub(crate) fn commit_workspace_rebind(
+        home: &std::path::Path,
+        expected: &serde_json::Value,
+        roots: &BTreeMap<String, PathBuf>,
+        moves: &[serde_json::Value],
+    ) -> HostResult<()> {
+        let mut conn = Connection::open_with_flags(
+            home.join("engine-host/host.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .map_err(HostError::storage)?;
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(HostError::storage)?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(HostError::storage)?;
+        if migration_inventory(&tx)? != *expected {
+            return Err(HostError::new(
+                "conflict",
+                "迁移前元数据已变化，必须重新预检",
+            ));
+        }
+        for (id, path) in roots {
+            let prior: Option<String> = tx
+                .query_row("SELECT path FROM host_roots WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .map_err(HostError::storage)?;
+            if prior
+                .as_ref()
+                .is_some_and(|p| std::path::Path::new(p) != path)
+            {
+                return Err(HostError::new(
+                    "scope_denied",
+                    "迁移禁止替换既有根标识的物理路径",
+                ));
+            }
+            tx.execute(
+                "INSERT OR IGNORE INTO host_roots(id,path) VALUES(?1,?2)",
+                params![id, path.to_string_lossy()],
+            )
+            .map_err(HostError::storage)?;
+        }
+        let mut changed = std::collections::BTreeSet::new();
+        for event in moves {
+            crate::workspace_migration::validate_migration_event(event)?;
+            let field = |key: &str| {
+                event[key]
+                    .as_str()
+                    .ok_or_else(|| HostError::new("invalid_input", "迁移事件字段缺失"))
+            };
+            let (team, old, new) = (field("team")?, field("old_root")?, field("new_root")?);
+            if roots.get(old).map(|p| p.as_path()) != Some(std::path::Path::new(field("old_path")?))
+                || roots.get(new).map(|p| p.as_path())
+                    != Some(std::path::Path::new(field("new_path")?))
+            {
+                return Err(HostError::new(
+                    "scope_denied",
+                    "迁移根与已核验物理目录不一致",
+                ));
+            }
+            let ids: Vec<String> =
+                serde_json::from_value(event["sessions"].clone()).map_err(HostError::storage)?;
+            let mut actual = Vec::new();
+            for mut binding in
+                read_json_rows::<SessionBinding>(&tx, "SELECT data FROM host_bindings ORDER BY id")?
+            {
+                if binding.scope.slot_id != team {
+                    continue;
+                }
+                if binding.root_id != old || !changed.insert(binding.session_id.clone()) {
+                    return Err(HostError::new("scope_denied", "迁移团队绑定不一致或重复"));
+                }
+                actual.push(binding.session_id.clone());
+                binding.root_id = new.to_owned();
+                tx.execute(
+                    "UPDATE host_bindings SET data=?2 WHERE id=?1",
+                    params![
+                        binding.session_id,
+                        serde_json::to_string(&binding).map_err(HostError::storage)?
+                    ],
+                )
+                .map_err(HostError::storage)?;
+            }
+            if ids != actual {
+                return Err(HostError::new("conflict", "迁移会话清单不完整"));
+            }
+            tx.execute(
+                "INSERT INTO host_events(kind,reference) VALUES('workspace_rebind',?1)",
+                [serde_json::to_string(event).map_err(HostError::storage)?],
+            )
+            .map_err(HostError::storage)?;
+        }
+        tx.commit().map_err(HostError::storage)?;
+        Ok(())
+    }
+
+    /// 功能：仅按可信迁移事实解析此会话的历史绝对产物路径。
+    /// 参数：session为已鉴权Session，path为原工具账本中的路径。
+    /// 返回：本团队新根下的规范相对路径与迁移时SHA256，或无历史映射。
+    /// 错误：迁移版本、清单或路径损坏明确拒绝，不回退到旧共享根。
+    /// 状态：只读原host_events，不改JSONL或建立浏览器可写别名。
+    /// 并发与取消：原Store序列内执行，文件读取仍持有所属根共享锁。
+    /// 权限：逐项核对session/team归属，不能用另一团队的迁移读取旧根。
+    /// 关联：需求/设计REQ-OP-025；DES-OP-013。
+    pub(crate) fn migrated_artifact(
+        &self,
+        session: &str,
+        path: &str,
+    ) -> HostResult<Option<(String, String)>> {
+        let binding = self.binding(session)?;
+        if !std::path::Path::new(path).is_absolute() {
+            return Ok(None);
+        }
+        for event in rebind_events(&self.conn)?.into_iter().rev() {
+            if event["team"].as_str() != Some(&binding.scope.slot_id)
+                || !event["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|id| id.as_str() == Some(session))
+            {
+                continue;
+            }
+            let old = std::path::Path::new(event["old_path"].as_str().unwrap());
+            let Ok(relative) = std::path::Path::new(path).strip_prefix(old) else {
+                continue;
+            };
+            if relative
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(HostError::new("scope_denied", "历史产物路径不规范"));
+            }
+            let name = relative
+                .to_str()
+                .ok_or_else(|| HostError::new("invalid_input", "历史产物路径不可表示"))?
+                .replace('\\', "/");
+            let file = event["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["path"].as_str() == Some(&name))
+                .ok_or_else(|| HostError::new("not_found", "该历史产物没有被此次团队迁移复制"))?;
+            let hash = file["sha256"]
+                .as_str()
+                .ok_or_else(|| HostError::new("storage_unavailable", "历史产物迁移摘要损坏"))?;
+            return Ok(Some((name, hash.to_owned())));
+        }
+        Ok(None)
+    }
+
+    fn validate_workspace_rebinds(&self) -> HostResult<()> {
+        let mut latest = BTreeMap::new();
+        for event in rebind_events(&self.conn)? {
+            let root = event["new_root"].as_str().unwrap();
+            // 源和目标均核对持久根目录，避免损坏的旧路径被当成可信产物别名。
+            for (id, field) in [
+                (event["old_root"].as_str().unwrap(), "old_path"),
+                (root, "new_path"),
+            ] {
+                let path: String = self
+                    .conn
+                    .query_row("SELECT path FROM host_roots WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .map_err(HostError::storage)?;
+                if event[field].as_str() != Some(&path) {
+                    return Err(HostError::new(
+                        "storage_unavailable",
+                        "迁移根身份与审计不一致",
+                    ));
+                }
+            }
+            for id in event["sessions"].as_array().unwrap() {
+                let id = id
+                    .as_str()
+                    .ok_or_else(|| HostError::new("storage_unavailable", "迁移会话标识损坏"))?;
+                latest.insert(
+                    id.to_owned(),
+                    (event["team"].as_str().unwrap().to_owned(), root.to_owned()),
+                );
+            }
+        }
+        for binding in self.bindings()? {
+            if latest.get(&binding.session_id).is_some_and(|(team, root)| {
+                team != &binding.scope.slot_id || root != &binding.root_id
+            }) {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "迁移后父子绑定与最新审计不一致",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod office_regressions {
     use super::*;
     use crate::{ClientScope, Host, HostConfig};
     use openpaw_core::{Message, Role};
     use serde_json::json;
+    #[tokio::test]
+    async fn targeted_run_read_preserves_tool_order_approval_scope_and_readonly_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let binding = host
+            .open_session(ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "targeted-read".into(),
+            })
+            .await
+            .unwrap();
+        host.inner
+            .store
+            .call(move |db| {
+                let session = &binding.session_id;
+                for id in ["target", "other"] {
+                    let offset = db.events(session)?.len();
+                    db.append(session, SessionEvent::RunStarted { run_id: id.into() })?;
+                    db.append(
+                        session,
+                        SessionEvent::ToolCallStart {
+                            call_id: "same-call".into(),
+                            tool_name: "read_file".into(),
+                        },
+                    )?;
+                    db.save_run(
+                        RunView {
+                            run_id: id.into(),
+                            session_id: session.clone(),
+                            state: RunState::Running,
+                            revision: 0,
+                            text: String::new(),
+                            tools: vec![],
+                            error: None,
+                            text_truncated: false,
+                        },
+                        offset,
+                    )?;
+                }
+                for (run, kind, success) in [
+                    ("target", "tool_waiting_resource", false),
+                    ("target", "tool_started", false),
+                    ("other", "tool_result", false),
+                    ("target", "tool_result", true),
+                ] {
+                    db.bump(
+                        kind,
+                        &json!({"run_id": run, "call_id":"same-call", "tool_name":"read_file", "input":{}, "success":success}).to_string(),
+                    )?;
+                }
+                let approval = |id: &str, run: &str| ApprovalView {
+                    approval_id: id.into(),
+                    binding: openpaw_core::ToolCallBinding {
+                        run_id: run.into(),
+                        call_id: "same-call".into(),
+                        tool_name: "read_file".into(),
+                        input: json!({"path":"example"}),
+                    },
+                    status: "pending".into(),
+                    consumed: false,
+                    revision: 0,
+                    expires_at_ms: i64::MAX,
+                };
+                db.save_approval(approval("other-approval", "other"))?;
+                let revision = db.revision()?;
+                let target = db.get_run("target")?;
+                assert_eq!(target.tools.len(), 1);
+                assert_eq!(target.tools[0].state, "completed");
+                assert_eq!(db.get_run("other")?.tools[0].state, "awaiting_approval");
+                assert_eq!(db.revision()?, revision);
+                db.save_approval(approval("target-approval", "target"))?;
+                assert_eq!(db.get_run("target")?.tools[0].state, "awaiting_approval");
+                let mut resolved = approval("target-approval", "target");
+                resolved.status = "rejected".into();
+                db.save_approval(resolved)?;
+                assert_eq!(db.get_run("target")?.tools[0].state, "completed");
+                assert_eq!(db.get_run("missing").unwrap_err().kind, "not_found");
+                db.conn
+                    .execute("UPDATE host_runs SET data='broken' WHERE id='target'", [])
+                    .map_err(HostError::storage)?;
+                assert_eq!(
+                    db.get_run("target").unwrap_err().kind,
+                    "storage_unavailable"
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn stream_checkpoint_is_bounded_scoped_prefix_only_and_never_revives_deleted_data() {
         let temp = tempfile::tempdir().unwrap();

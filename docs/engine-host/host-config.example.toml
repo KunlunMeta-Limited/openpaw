@@ -1,4 +1,4 @@
-# Linux示例：先建立独立目录/home/user/openpaw-data和/home/user/project。
+# Linux示例：先建立独立目录/home/user/openpaw-data以及/home/user/project、project-2、project-3、project-4。
 # Windows原生：使用正斜杠路径，例如home = "C:/Users/user/openpaw-data"，root = "C:/Users/user/project"。
 # home与所有工作根互不包含；不能把项目根设成用户整个home或磁盘根。
 home = "/home/user/openpaw-data"
@@ -29,11 +29,14 @@ tools = ["read_file", "glob", "grep", "todo_list", "think"]
 # basic_password_env = "OPENPAW_HOST_PASSWORD"
 [roots]
 project = "/home/user/project"
+project-2 = "/home/user/project-2"
+project-3 = "/home/user/project-3"
+project-4 = "/home/user/project-4"
 [slots]
 office-1 = "project"
-office-2 = "project"
-office-3 = "project"
-office-4 = "project"
+office-2 = "project-2"
+office-3 = "project-3"
+office-4 = "project-4"
 
 # Office接入：取消以下注释才启用；默认tools仍只读。
 # 不填模型字段即可沿用原生 ~/.openpaw/.env 的DeepSeek配置。
@@ -50,3 +53,18 @@ office-4 = "project"
 # office-2 = "产品办公室"
 # office-3 = "资料办公室"
 # office-4 = "测试办公室"
+
+# 团队内主Agent与所有子Agent共用该团队根；默认各团队使用独立物理目录。
+# 既有共享目录不能直接改slots后启动。先停止Host，生成只读迁移计划并审核摘要，
+# 再以全新备份目录apply；旧配置/原项目文件/JSONL保留。不要把plan文件放入源工作根。
+# 模型.env仍保留在OpenPaw官方配置位置。若与Host业务home混放，预检明确拒绝，
+# 不复制密钥，也不以省略该文件的方式宣称完整home备份。
+# openpaw engine-host-workspace plan --config old.toml --target-config target.toml --team office-2,office-3,office-4 > plan.json
+# 上行为Linux shell用法。Windows PowerShell 5.1的 > 默认写UTF-16，不能直接用于JSON计划。
+# PowerShell先捕获输出并检查退出码，再用无BOM UTF-8写入：
+# $plan = & .\openpaw.exe engine-host-workspace plan --config old.toml --target-config target.toml --team office-2,office-3,office-4
+# if ($LASTEXITCODE -ne 0) { throw '迁移预检失败；不保存计划' }
+# [IO.File]::WriteAllText((Join-Path (Get-Location) 'plan.json'), ($plan -join "`n"), [Text.UTF8Encoding]::new($false))
+# openpaw engine-host-workspace apply --config old.toml --target-config target.toml --plan plan.json --confirm-sha256 <计划sha256> --backup <全新备份目录>
+# 成功后才用target.toml启动；回退时先停新Host，再恢复完整配套home和old.toml，
+# 新根中新产物另行保留，不以回退为由删除。共享根仅为明确配置的可选旧行为。

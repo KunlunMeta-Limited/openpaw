@@ -26,11 +26,42 @@ impl Host {
             }
             host.quiesce_session(&view.session_id).await;
             let session = view.session_id.clone();
+            let removed = {
+                let target = session.clone();
+                host.inner
+                    .store
+                    .call(move |db| {
+                        Ok(db
+                            .runs()?
+                            .into_iter()
+                            .filter(|run| run.session_id == target)
+                            .map(|run| run.run_id)
+                            .collect::<Vec<_>>())
+                    })
+                    .await?
+            };
             let key = serde_json::to_string(&scope).map_err(HostError::storage)?;
             host.inner
                 .store
                 .call(move |db| db.purge_session(&key, &session))
                 .await?;
+            host.inner
+                .office_projection_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&scope.slot_id);
+            host.inner
+                .office_handoff_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&scope.slot_id);
+            // 删除后的Run标识不可复活；清掉终态视图，避免人物详情在墓碑之后
+            // 命中旧内存数据。不同办公室的缓存仍保留。
+            host.inner
+                .office_terminal_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|id, _| !removed.iter().any(|removed_id| removed_id == id));
             Ok(DeleteView {
                 phase: "deleted".into(),
                 ..view
