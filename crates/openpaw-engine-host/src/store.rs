@@ -28,6 +28,7 @@ enum Job {
 /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
 pub(crate) struct Store {
     tx: mpsc::Sender<Job>,
+    priority_tx: mpsc::Sender<Job>,
 }
 /// 用途：原JSONL写入器及Host元数据的唯一串行所有者。
 /// 字段：下列成员或状态由宿主统一管理。
@@ -89,11 +90,39 @@ impl Store {
             .await
             .map_err(HostError::storage)??;
         let (tx, mut rx) = mpsc::channel::<Job>(256);
+        let (priority_tx, mut priority_rx) = mpsc::channel::<Job>(256);
         std::thread::Builder::new()
             .name("openpaw-host-store".into())
             .spawn(move || {
                 let mut db = db;
-                while let Some(job) = rx.blocking_recv() {
+                // Run facts and JSONL writes use a priority lane.  Office
+                // projection is an intentionally large read/derive job; it
+                // must not delay a child's RunFinished or the parent's tool
+                // receipt long enough to make a real chat request time out.
+                // Polling both bounded channels keeps the single SQLite owner
+                // while allowing urgent work to run before queued projections.
+                loop {
+                    let job = match priority_rx.try_recv() {
+                        Ok(job) => Some(job),
+                        Err(mpsc::error::TryRecvError::Disconnected) => None,
+                        Err(mpsc::error::TryRecvError::Empty) => match rx.try_recv() {
+                            Ok(job) => Some(job),
+                            Err(mpsc::error::TryRecvError::Disconnected) => return,
+                            Err(mpsc::error::TryRecvError::Empty) => {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                continue;
+                            }
+                        },
+                    };
+                    let Some(job) = job else {
+                        // The priority sender can be dropped during normal
+                        // shutdown; continue draining ordinary Close until
+                        // the owning Store is dropped.
+                        if rx.is_closed() {
+                            return;
+                        }
+                        continue;
+                    };
                     match job {
                         Job::Call(job) => job(&mut db),
                         Job::Close(reply) => {
@@ -106,7 +135,7 @@ impl Store {
                 }
             })
             .map_err(HostError::storage)?;
-        Ok(Self { tx })
+        Ok(Self { tx, priority_tx })
     }
     /// 功能：将同步存储操作送入单写线程并等待完成。
     /// 参数：f为不跨异步等待的原存储操作。
@@ -120,9 +149,28 @@ impl Store {
         &self,
         f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
     ) -> HostResult<T> {
+        self.call_on(&self.tx, f).await
+    }
+    /// 功能：提交运行事实优先任务，先于排队中的Office投影执行。
+    /// 参数：f为不跨异步等待的原存储操作。
+    /// 返回：原操作已完成的结果。
+    /// 错误：与普通call相同；优先级不改变事务和权限语义。
+    /// 状态：只调整队列顺序，不跳过任何已排队事实。
+    /// 并发与取消：仍由唯一Store线程串行执行；调用方取消不丢弃已派发写入。
+    pub(crate) async fn call_priority<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
+    ) -> HostResult<T> {
+        self.call_on(&self.priority_tx, f).await
+    }
+    async fn call_on<T: Send + 'static>(
+        &self,
+        sender: &mpsc::Sender<Job>,
+        f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
+    ) -> HostResult<T> {
         let queued_at = Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.tx
+        sender
             .send(Job::Call(Box::new(move |db| {
                 let started_at = Instant::now();
                 let result = if db.owner.is_some() {

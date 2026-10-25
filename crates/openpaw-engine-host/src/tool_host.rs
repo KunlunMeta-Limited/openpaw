@@ -102,7 +102,7 @@ impl ToolExecutionObserver for Started {
         let binding = binding.clone();
         if let Err(e) = self
             .store
-            .call(move |db| {
+            .call_priority(move |db| {
                 let run = db.get_run(&binding.run_id)?;
                 db.binding(&run.session_id)?; // 最后一道开始门禁与删除意图按Store序列排序。
                 let rev = db.bump(
@@ -217,7 +217,7 @@ impl HostTools {
             let cancel = context.cancel();
             return self
                 .store
-                .call(move |db| {
+                .call_priority(move |db| {
                     if cancel.is_cancelled() {
                         return Err(HostError::new("cancelled", "本轮正在停止"));
                     }
@@ -279,7 +279,7 @@ impl HostTools {
         let waiting_binding = context.binding().clone();
         if let Err(error) = self
             .store
-            .call(move |db| {
+            .call_priority(move |db| {
                 let revision = db.bump(
                     "tool_waiting_resource",
                     &serde_json::to_string(&waiting_binding).map_err(HostError::storage)?,
@@ -321,7 +321,7 @@ impl HostTools {
         let result = self.registry.call_with_context(name, args, context).await;
         let success = result.as_ref().is_ok_and(|r| !r.is_error);
         let receipt_binding = binding.clone();
-        if let Err(e)=self.store.call(move|db|{let rev=db.bump("tool_result",&serde_json::json!({"run_id":binding.run_id,"call_id":binding.call_id,"success":success}).to_string())?;let _=db.notices.send(crate::HostNotice::Changed{revision:rev});Ok(())}).await {self.control.fail(e);return Err(Error::Store("工具结果保存失败".into()));}
+        if let Err(e)=self.store.call_priority(move|db|{let rev=db.bump("tool_result",&serde_json::json!({"run_id":binding.run_id,"call_id":binding.call_id,"success":success}).to_string())?;let _=db.notices.send(crate::HostNotice::Changed{revision:rev});Ok(())}).await {self.control.fail(e);return Err(Error::Store("工具结果保存失败".into()));}
         // 回执在原结果可靠保存后追加；不提前宣称执行成功，也不把回执当作步骤完成。
         result.map(|outcome| {
             crate::task_progress::with_execution_receipt(

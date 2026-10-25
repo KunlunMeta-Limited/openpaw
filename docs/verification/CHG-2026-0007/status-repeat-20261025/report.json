@@ -1,0 +1,27 @@
+{
+  "out": "/tmp/openpaw-status-repeat-Odxj0c",
+  "base": "http://127.0.0.1:40115",
+  "officePort": 38747,
+  "providerPort": 35411,
+  "commit": "a26fa85af0db82a9160136db73cab5148577cc63",
+  "single": 100,
+  "multi": 100,
+  "runs": 200,
+  "failures": [],
+  "source_commit": "a26fa85af0db82a9160136db73cab5148577cc63",
+  "source_worktree_diff_sha256": "38b2d1abcbd7a29c2827e26793441eca71b40ee329bc3fabc6bdb00a004b2d77",
+  "harness": "tests/engine-host-contracts/status-repeat-100.mjs",
+  "harness_sha256": "174434664b2c97fa16c88256109b3ad3649412f97396af77d7edf9d6c9cccf20",
+  "stderr_sha256": "45ee9cf24f1816313b83436ecd5dd417445044d964e57befb138c2b54199d536",
+  "stdout_sha256": "960ed54e568a1e598ad2e0c9872c7c6bd020fa9fa732682853243200769b570e",
+  "assertions": {
+    "single_final_completed_100": true,
+    "multi_final_completed_100": true,
+    "multi_children": 5,
+    "multi_distinct_assignees": 5,
+    "whiteboard_completed": true,
+    "failed_tasks": 0,
+    "request_timeouts": 0,
+    "protocol_errors": 0
+  }
+}

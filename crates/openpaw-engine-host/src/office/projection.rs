@@ -358,7 +358,8 @@ fn task(
 
 /// 将一项已由真实子Run产生、但尚未到展示时机的交接事实加入快照。
 /// 该函数只操作内存中的规范快照；Run状态、权限和账本仍由首次投影读取。
-fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value) {
+/// 只有最后一个队列变体才允许提升主卡，避免后续人物尚未展示时提前报完成。
+fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value, final_item: bool) {
     if let Some(tasks) = conversation["tasks"].as_array_mut() {
         tasks.retain(|existing| existing["id"] != item["id"]);
         tasks.push(item.clone());
@@ -366,6 +367,30 @@ fn apply_handoff_item(conversation: &mut Value, item: &Value, event: &Value) {
     if let Some(events) = conversation["events"].as_array_mut() {
         if !events.iter().any(|existing| existing["id"] == event["id"]) {
             events.push(event.clone());
+        }
+    }
+    // The initial projection deliberately keeps the lead card blocked while
+    // the handoff queue reveals one colleague at a time.  Once the last
+    // revealed card is a real completed child, the queue variant must promote
+    // the lead card as well.  Previously only the whiteboard steps were
+    // recomputed, so a completed run remained visibly blocked forever after
+    // the final handoff.
+    if final_item {
+        if let Some(tasks) = conversation["tasks"].as_array_mut() {
+            let all_children_completed = tasks.len() > 1
+                && tasks
+                    .iter()
+                    .skip(1)
+                    .all(|task| task["status"] == "completed");
+            if all_children_completed {
+                if let Some(main) = tasks.first_mut() {
+                    if main["status"] == "blocked" && main["progress"].as_u64().unwrap_or(0) < 100 {
+                        main["status"] = json!("completed");
+                        main["progress"] = json!(100);
+                        main["summary"] = json!("本次目标已完成");
+                    }
+                }
+            }
         }
     }
     let Some(tasks) = conversation["tasks"].as_array() else {
@@ -455,6 +480,7 @@ async fn prepare_internal(
         let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
         let fact_started = std::time::Instant::now();
         let source_revision = db.revision()?;
+        let previous_source_revision = db.office_projection_source.get(&team).copied();
         let handoff_due = db
             .office_projection_handoff_until
             .get(&team)
@@ -539,7 +565,6 @@ async fn prepare_internal(
         let previous=db.office_projection(&team)?;
         let prior=previous.as_ref().map(|(v,_)|v);
         let bindings:Vec<_>=db.bindings()?.into_iter().filter(|b|b.scope.namespace=="office"&&b.scope.slot_id==team).collect();
-        let all_runs=db.runs()?;
         // 终态Run的账本和工具事实已封存，可在进程内复用完整视图；活动Run
         // 每次仍从Store重建，避免把正在变化的任务投影为旧状态。
         let read_run = |id: &str| -> HostResult<crate::RunView> {
@@ -571,7 +596,11 @@ async fn prepare_internal(
                 return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
             }
             let mut runs=Vec::new();
-            for r in all_runs.iter().filter(|r|r.session_id==binding.session_id) {
+            // 每个办公室绑定只需要自己的Session。直接复用Store的按Session
+            // 只读查询，避免历史会话增多后对每个绑定重复扫描全局Run集合，
+            // 也避免把一个办公室的投影延迟放大成 O(绑定数×全局Run数)。
+            let session_runs = db.runs_for_session(&binding.session_id)?;
+            for r in session_runs.iter() {
                 if !allow_ui_busy && ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
                     return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
                 }
@@ -667,39 +696,70 @@ async fn prepare_internal(
             // 这里不猜测业务完成，也不增加协议字段；事件仍使用官方既有字段。
             let handoff_gap = chrono::Duration::milliseconds(2200);
             let mut handoff_ready = BTreeSet::new();
-            let mut chain_open = true;
-            for d in delegations.iter().filter(|d| display_calls.contains(&d.call_id)) {
-                if !chain_open {
-                    break;
-                }
-                let ready = if handoff_ready.is_empty() {
-                    true
-                } else {
-                    let previous = delegations
-                        .iter()
-                        .rfind(|candidate| {
+            // A completed conversation may be projected again after another
+            // run changes the office revision.  The envelope clipping can
+            // remove old assignment events, but completed child Runs remain
+            // authoritative.  Do not replay a stale handoff window and make
+            // already completed cards regress to blocked.
+            let resume_completed_handoff = prior_conv.is_some()
+                && r.state == RunState::Completed
+                && delegations.iter().all(|delegation| {
+                    read_run(&delegation.child_run)
+                        .map(|child| child.state == RunState::Completed)
+                        .unwrap_or(false)
+                })
+                // 容量裁剪可以暂时从快照移除旧终态会话。只要该Run的
+                // revision早于上次成功投影源，就不能把它当成新交接再次
+                // 排队；否则旧会话会在每轮重播并把变体推过64KiB预算。
+                || (r.state == RunState::Completed
+                    && previous_source_revision.is_some_and(|revision| r.revision <= revision)
+                    && delegations.iter().all(|delegation| {
+                        read_run(&delegation.child_run)
+                            .map(|child| child.state == RunState::Completed)
+                            .unwrap_or(false)
+                    }));
+            if resume_completed_handoff {
+                handoff_ready.extend(display_calls.iter().cloned());
+            } else {
+                let mut chain_open = true;
+                for d in delegations.iter().filter(|d| display_calls.contains(&d.call_id)) {
+                    if !chain_open {
+                        break;
+                    }
+                    let ready = if handoff_ready.is_empty() {
+                        true
+                    } else {
+                        let previous = delegations.iter().rfind(|candidate| {
                             display_calls.contains(&candidate.call_id)
                                 && handoff_ready.contains(&candidate.call_id)
                         });
-                    previous.map(|candidate| {
-                        prior_conv
-                            .and_then(|v| v["events"].as_array())
-                            .and_then(|events| {
-                                events.iter().find(|event| {
-                                    event["id"] == format!("assign:{}", candidate.task_id)
-                                })
+                        previous
+                            .map(|candidate| {
+                                prior_conv
+                                    .and_then(|v| v["events"].as_array())
+                                    .and_then(|events| {
+                                        events.iter().find(|event| {
+                                            event["id"] == format!("assign:{}", candidate.task_id)
+                                        })
+                                    })
+                                    .and_then(|event| event["occurredAt"].as_str())
+                                    .and_then(|at| {
+                                        chrono::DateTime::parse_from_rfc3339(at).ok()
+                                    })
+                                    .map(|at| {
+                                        chrono::Utc::now()
+                                            - at.with_timezone(&chrono::Utc)
+                                            >= handoff_gap
+                                    })
+                                    .unwrap_or(false)
                             })
-                            .and_then(|event| event["occurredAt"].as_str())
-                            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
-                            .map(|at| chrono::Utc::now() - at.with_timezone(&chrono::Utc) >= handoff_gap)
                             .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
-                };
-                if ready {
-                    handoff_ready.insert(d.call_id.clone());
-                } else {
-                    chain_open = false;
+                    };
+                    if ready {
+                        handoff_ready.insert(d.call_id.clone());
+                    } else {
+                        chain_open = false;
+                    }
                 }
             }
             for d in &delegations {
@@ -880,11 +940,29 @@ async fn prepare_internal(
         }
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
+        let handoff_conversations: BTreeSet<String> = handoff_items
+            .iter()
+            .map(|(conversation, _, _)| conversation.clone())
+            .collect();
         // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
         while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>OFFICE_MESSAGE_LIMIT {
             let convs=snapshot["conversations"].as_array_mut().unwrap();
-            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&terminal_conversations.contains(c["id"].as_str().unwrap_or(""))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
-            let Some((i,_))=candidate else {return Err(HostError::new("protocol_error","Office完整会话目录超限"));};
+            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&terminal_conversations.contains(c["id"].as_str().unwrap_or("") ) && !handoff_conversations.contains(c["id"].as_str().unwrap_or(""))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
+            let Some((i,_))=candidate else {
+                // 交接快照还可能因旧会话只剩成员目录而超限。当前交接会话
+                // 不能删除；最旧终态会话可从快照移除，详情仍由原账本提供。
+                if !handoff_items.is_empty() {
+                    if let Some(index)=convs.iter().enumerate()
+                        .filter(|(_,c)| terminal_conversations.contains(c["id"].as_str().unwrap_or(""))
+                            && !handoff_conversations.contains(c["id"].as_str().unwrap_or("")))
+                        .min_by_key(|(_,c)| priorities.get(c["id"].as_str().unwrap_or("")))
+                        .map(|(index,_)|index) {
+                        convs.remove(index);
+                        continue;
+                    }
+                }
+                return Err(HostError::new("protocol_error","Office完整会话目录超限"));
+            };
             let c=&mut convs[i];
             // 会话ID的字典序不代表新旧；审批中的步骤不能被旧历史挤掉。
             if c["tasks"].as_array().is_some_and(|a|a.len()>1){
@@ -901,6 +979,129 @@ async fn prepare_internal(
             }
             c["title"]=json!(dto::bounded(c["title"].as_str().unwrap_or(""),24));
         }
+        // 交接变体会在当前快照上逐项加入同事任务和 assignment 事件。普通
+        // 目录只需满足当前 envelope；交接目录还必须为“最终一项”预留空间，
+        // 否则第一个人物能显示而后续人物会因为一次超限被整批丢弃。
+        // 只在确实存在交接且预览变体超限时进行额外整理，避免改变普通历史
+        // 目录的保留策略。详情查询仍从Run事实读取被压缩的旧历史。
+        if !handoff_items.is_empty() {
+            let mut preview = snapshot.clone();
+            for (conversation, item, event) in &handoff_items {
+                if let Some(conv) = preview["conversations"]
+                    .as_array_mut()
+                    .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
+                {
+                    apply_handoff_item(conv, item, event, false);
+                }
+            }
+            while !snapshot_fits_office_message(&team, &preview) {
+                let mut changed = false;
+                // 先删除旧终态会话中的详情，保留成员身份和会话入口；这比
+                // 删除当前会话的任务卡安全，也使人物点击仍能通过作用域校验。
+                let conversation_view = snapshot["conversations"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                if let Some((index, _)) = conversation_view
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, conversation)| {
+                        terminal_conversations.contains(
+                            conversation["id"].as_str().unwrap_or_default(),
+                        ) && !handoff_conversations
+                            .contains(conversation["id"].as_str().unwrap_or_default())
+                            && (conversation["tasks"].as_array().is_some_and(|tasks| !tasks.is_empty())
+                                || conversation["events"].as_array().is_some_and(|events| !events.is_empty())
+                                || !conversation["whiteboard"].is_null())
+                    })
+                    .min_by_key(|(_, conversation)| {
+                        priorities
+                            .get(conversation["id"].as_str().unwrap_or_default())
+                            .copied()
+                            .unwrap_or_default()
+                    })
+                {
+                    let conversation = &mut snapshot["conversations"]
+                        .as_array_mut()
+                        .expect("conversation array")[index];
+                    conversation["tasks"] = json!([]);
+                    conversation["events"] = json!([]);
+                    conversation["whiteboard"] = Value::Null;
+                    changed = true;
+                }
+                if !changed {
+                    // 旧终态会话的可选详情已经清空仍然超限时，移除最旧的
+                    // 会话对象。当前会话和最近交接会话永远受保护；完整历史
+                    // 仍可从 detail-v1 查询，不能把预算错误转化为投影失败。
+                    let conversation_view = snapshot["conversations"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    if let Some(index) = conversation_view
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, conversation)| {
+                            terminal_conversations.contains(
+                                conversation["id"].as_str().unwrap_or_default(),
+                            ) && !handoff_conversations
+                                .contains(conversation["id"].as_str().unwrap_or_default())
+                        })
+                        .min_by_key(|(_, conversation)| {
+                            priorities
+                                .get(conversation["id"].as_str().unwrap_or_default())
+                                .copied()
+                                .unwrap_or_default()
+                        })
+                        .map(|(index, _)| index)
+                    {
+                        snapshot["conversations"]
+                            .as_array_mut()
+                            .expect("conversation array")
+                            .remove(index);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    // 最后仅压缩当前会话的非 assignment 活动事件。交接链所需
+                    // 的 assignment 时间戳必须保留，否则下一窗口无法判断动画
+                    // 是否已经展示完成。
+                    let mut removed_event = false;
+                    if let Some(conversations) = snapshot["conversations"].as_array_mut() {
+                        for conversation in conversations {
+                            if !handoff_conversations
+                                .contains(conversation["id"].as_str().unwrap_or_default())
+                            {
+                                continue;
+                            }
+                            if let Some(events) = conversation["events"].as_array_mut() {
+                                if let Some(index) = events.iter().rposition(|event| {
+                                    event["kind"] != "task.assigned"
+                                }) {
+                                    events.remove(index);
+                                    removed_event = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !removed_event {
+                        return Err(HostError::new(
+                            "protocol_error",
+                            "Office交接快照在保留当前任务后仍超过64KiB",
+                        ));
+                    }
+                }
+                preview = snapshot.clone();
+                for (conversation, item, event) in &handoff_items {
+                    if let Some(conv) = preview["conversations"]
+                        .as_array_mut()
+                        .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
+                    {
+                        apply_handoff_item(conv, item, event, false);
+                    }
+                }
+            }
+        }
         // 把本次真实扫描中尚未公开的交接项预组装成逐步快照。每个变体
         // 同时推进各会话的一项，保持“先到人物再显示下一任务”，而不让
         // 后续窗口再次读取全部Run/JSONL。
@@ -916,6 +1117,10 @@ async fn prepare_internal(
             let mut current = snapshot.clone();
             let mut variants = Vec::new();
             let mut overflowed = false;
+            let mut pending_counts: BTreeMap<String, usize> = remaining
+                .iter()
+                .map(|(conversation, items)| (conversation.clone(), items.len()))
+                .collect();
             loop {
                 let mut progressed = false;
                 for (conversation, items) in remaining.iter_mut() {
@@ -924,8 +1129,12 @@ async fn prepare_internal(
                         .as_array_mut()
                         .and_then(|all| all.iter_mut().find(|c| c["id"] == *conversation))
                     else { continue; };
-                    apply_handoff_item(conv, &item, &event);
+                    let final_item = pending_counts.get(conversation).copied() == Some(1);
+                    apply_handoff_item(conv, &item, &event, final_item);
                     items.remove(0);
+                    if let Some(count) = pending_counts.get_mut(conversation) {
+                        *count = count.saturating_sub(1);
+                    }
                     progressed = true;
                 }
                 if !progressed {
@@ -1089,6 +1298,30 @@ pub(super) async fn sync_once(
 mod tests {
     use super::*;
     use crate::{ClientScope, HostConfig};
+
+    #[test]
+    fn final_handoff_promotes_completed_lead_card() {
+        let mut conversation = json!({
+            "tasks": [
+                {"id":"run:lead","title":"旅游攻略","status":"blocked","progress":83,"summary":"回复已结束；正在依次展示后续成员交接"},
+                {"id":"delegation:research","title":"查路线","status":"completed","progress":100,"summary":"路线已完成"}
+            ],
+            "events": []
+        });
+        apply_handoff_item(
+            &mut conversation,
+            &json!({"id":"delegation:food","title":"查美食","status":"completed","progress":100,"summary":"美食已完成"}),
+            &json!({"id":"assign:food","kind":"task.assigned"}),
+            true,
+        );
+        assert_eq!(conversation["tasks"][0]["status"], "completed");
+        assert_eq!(conversation["tasks"][0]["progress"], 100);
+        assert_eq!(conversation["whiteboard"]["status"], "completed");
+        assert_eq!(
+            conversation["whiteboard"]["description"],
+            "已确认完成 2/2 步；本次目标已完成"
+        );
+    }
 
     #[test]
     fn cached_snapshot_validation_rejects_wrong_scope_and_oversize_envelopes() {

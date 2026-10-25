@@ -348,7 +348,7 @@ impl Host {
         };
         let b = binding.clone();
         let limit = execution.group.config.max_delegations;
-        let intent = self.inner.store.call(move |db| {
+        let intent = self.inner.store.call_priority(move |db| {
             let parent = db.get_run(&b.run_id)?;
             let owner = db.binding(&parent.session_id)?;
             db.check_live_scope(&owner.scope)?;
@@ -447,7 +447,7 @@ impl Host {
         let success = result.state == RunState::Completed;
         self.inner
             .store
-            .call(move |db| {
+            .call_priority(move |db| {
                 let rev = db.bump(
                     "tool_result",
                     &json!({"run_id":receipt.run_id,"call_id":receipt.call_id,"success":success})

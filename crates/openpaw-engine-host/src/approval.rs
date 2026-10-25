@@ -160,7 +160,7 @@ impl HostApproval {
     pub(crate) async fn consume(&self, b: ToolCallBinding) -> HostResult<()> {
         let run = self.control.run_id.clone();
         self.store
-            .call(move |db| {
+            .call_priority(move |db| {
                 let current = db.get_run(&run)?;
                 db.binding(&current.session_id)?; // 同一Store序列检查删除意图，旧批准不能跨删除消费。
                 let mut a = db
@@ -231,7 +231,7 @@ impl HostApproval {
         let query_id = id.clone();
         let timeout_ms = i64::try_from(self.timeout.as_millis()).unwrap_or(i64::MAX);
         self.store
-            .call(move |db| {
+            .call_priority(move |db| {
                 let run = db.get_run(&binding.run_id)?;
                 db.binding(&run.session_id)?;
                 if db.approvals()?.iter().any(|a| {
@@ -278,7 +278,7 @@ impl HostApproval {
             if let Some(status) = status {
                 let id = query_id.clone();
                 self.store
-                    .call(move |db| {
+                    .call_priority(move |db| {
                         if let Some(mut a) =
                             db.approvals()?.into_iter().find(|a| a.approval_id == id)
                         {

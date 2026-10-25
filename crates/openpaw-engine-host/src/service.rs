@@ -167,7 +167,11 @@ impl RunObserver for Observer {
         let assistant_message =
             matches!(&event, SessionEvent::Message(m) if m.role == openpaw_core::Role::Assistant);
         let id = self.session_id.clone();
-        if let Err(e) = self.store.call(move |db| db.append(&id, event)).await {
+        if let Err(e) = self
+            .store
+            .call_priority(move |db| db.append(&id, event))
+            .await
+        {
             self.control.fail(e);
             return Err(openpaw_core::Error::Store("运行事实保存失败".into()));
         }
@@ -471,7 +475,7 @@ impl Host {
             let binding = self
                 .inner
                 .store
-                .call(move |db| {
+                .call_priority(move |db| {
                     let b = db.binding(&sid)?;
                     db.check_live_scope(&s)?;
                     check_scope(&b, &s)?;
@@ -594,7 +598,7 @@ impl Host {
             let accepted = self
                 .inner
                 .store
-                .call(move |db| {
+                .call_priority(move |db| {
                     if let Some(history) = history {
                         db.reconcile_history(&view.session_id, &history)?;
                     }
@@ -626,7 +630,7 @@ impl Host {
                     let _ = self
                         .inner
                         .store
-                        .call(move |db| {
+                        .call_priority(move |db| {
                             if let Ok(mut r) = db.get_run(&rid) {
                                 r.state = RunState::Failed;
                                 r.error = Some(error);
@@ -661,7 +665,7 @@ impl Host {
                     let _ = host
                         .inner
                         .store
-                        .call(move |db| {
+                        .call_priority(move |db| {
                             db.save_run(failed, 0)?;
                             Ok(())
                         })
@@ -691,7 +695,10 @@ impl Host {
         let operation = async {
             view.state = RunState::Running;
             let v = view.clone();
-            self.inner.store.call(move |db| db.save_run(v, 0)).await?;
+            self.inner
+                .store
+                .call_priority(move |db| db.save_run(v, 0))
+                .await?;
             let approval = Arc::new(HostApproval::new(
                 self.inner.store.clone(),
                 root.clone(),
@@ -895,7 +902,7 @@ impl Host {
         if let Err(error) = self
             .inner
             .store
-            .call(move |db| {
+            .call_priority(move |db| {
                 for mut a in db.approvals()? {
                     if a.binding.run_id == id
                         && (a.status == "pending" || a.status == "approved" && !a.consumed)
@@ -936,7 +943,7 @@ impl Host {
             if let Err(error) = self
                 .inner
                 .store
-                .call(move |db| db.checkpoint_run(&id, &session))
+                .call_priority(move |db| db.checkpoint_run(&id, &session))
                 .await
             {
                 control.fail(error);
