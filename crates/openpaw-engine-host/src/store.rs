@@ -531,11 +531,23 @@ impl Db {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub(crate) fn binding(&self, id: &str) -> HostResult<SessionBinding> {
-        let binding = self
-            .bindings()?
-            .into_iter()
-            .find(|b| b.session_id == id)
+        // 委派校验会逐一读取父子绑定；不能为每个ID重新解析整个历史目录。
+        // 主键查询仍校验JSON中的身份及原墓碑，不能以性能优化绕过作用域。
+        let raw: String = self
+            .conn
+            .query_row("SELECT data FROM host_bindings WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(HostError::storage)?
             .ok_or_else(|| HostError::new("not_found", "会话不存在"))?;
+        let binding: SessionBinding = serde_json::from_str(&raw).map_err(HostError::storage)?;
+        if binding.session_id != id {
+            return Err(HostError::new(
+                "storage_unavailable",
+                "会话绑定身份与主键不一致",
+            ));
+        }
         self.check_live_scope(&binding.scope)?;
         Ok(binding)
     }
@@ -2670,6 +2682,39 @@ mod office_regressions {
     use crate::{ClientScope, Host, HostConfig};
     use openpaw_core::{Message, Role};
     use serde_json::json;
+    #[tokio::test]
+    async fn binding_lookup_targets_one_row_and_preserves_corruption_and_deletion_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let binding = host
+            .open_session(ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "target".into(),
+            })
+            .await
+            .unwrap();
+        host.inner.store.call(move |db| {
+            let revision = db.revision()?;
+            db.conn.execute("INSERT INTO host_bindings VALUES('unrelated','office','other','other','malformed')", []).map_err(HostError::storage)?;
+            assert_eq!(db.binding(&binding.session_id)?.session_id, binding.session_id,
+                "按主键读取不能解析其他会话；全量恢复另行检查整个库");
+            assert_eq!(db.binding("missing").unwrap_err().kind, "not_found");
+            assert_eq!(db.revision()?, revision, "绑定查询必须只读");
+            db.conn.execute("DELETE FROM host_bindings WHERE id='unrelated'", []).map_err(HostError::storage)?;
+            db.conn.execute("UPDATE host_bindings SET data='malformed' WHERE id=?1", [&binding.session_id]).map_err(HostError::storage)?;
+            assert_eq!(db.binding(&binding.session_id).unwrap_err().kind, "storage_unavailable");
+            db.conn.execute("UPDATE host_bindings SET data=?1 WHERE id=?2", rusqlite::params![serde_json::to_string(&binding).unwrap(), binding.session_id]).map_err(HostError::storage)?;
+            db.conn.execute("INSERT INTO host_session_deletions VALUES(?1,?2,'marked',0)", rusqlite::params![serde_json::to_string(&binding.scope).unwrap(), binding.session_id]).map_err(HostError::storage)?;
+            assert_eq!(db.binding(&binding.session_id).unwrap_err().kind, "session_deleted");
+            db.conn.execute("DELETE FROM host_session_deletions", []).map_err(HostError::storage)?;
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn targeted_run_read_preserves_tool_order_approval_scope_and_readonly_revision() {
         let temp = tempfile::tempdir().unwrap();

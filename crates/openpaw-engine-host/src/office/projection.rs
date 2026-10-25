@@ -32,6 +32,60 @@ const RECENT_BUSINESS_CANDIDATES: usize = 12;
 /// 联系起来，避免旧验收会话无限增长后阻塞整个办公室的新消息。
 const MAX_PROTECTED_BUSINESS_CONVERSATIONS: usize = 4;
 
+// 只缓存本次裁剪前的字节数，不缓存业务事实，也不改变原裁剪次序。
+struct ConversationSizeEdit {
+    id: String,
+    bytes: usize,
+    count: usize,
+}
+
+fn conversation_size_edit(
+    conversations: &[Value],
+    index: usize,
+) -> HostResult<ConversationSizeEdit> {
+    Ok(ConversationSizeEdit {
+        id: conversations[index]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+        bytes: serde_json::to_vec(&conversations[index])
+            .map_err(HostError::storage)?
+            .len(),
+        count: conversations.len(),
+    })
+}
+
+/// 按唯一被修改的会话更新完整封套长度；删除数组元素还需扣除一个逗号。
+/// UTF-8及JSON转义仍由原序列化器计算，不用字符数估计协议字节预算。
+fn message_size_after_edit(
+    snapshot: &Value,
+    previous: usize,
+    edit: ConversationSizeEdit,
+) -> HostResult<usize> {
+    let conversations = snapshot["conversations"]
+        .as_array()
+        .ok_or_else(|| HostError::new("protocol_error", "快照缺少会话目录"))?;
+    let remaining = conversations.iter().find(|c| c["id"] == edit.id);
+    let (bytes, comma) = match (conversations.len(), remaining) {
+        (count, Some(value)) if count == edit.count => (
+            serde_json::to_vec(value).map_err(HostError::storage)?.len(),
+            0,
+        ),
+        (count, None) if count + 1 == edit.count => (0, usize::from(edit.count > 1)),
+        _ => {
+            return Err(HostError::new(
+                "protocol_error",
+                "快照裁剪范围与字节预算不一致",
+            ))
+        }
+    };
+    previous
+        .checked_sub(edit.bytes)
+        .and_then(|n| n.checked_sub(comma))
+        .and_then(|n| n.checked_add(bytes))
+        .ok_or_else(|| HostError::new("protocol_error", "快照字节预算溢出"))
+}
+
 /// 功能：判断持久化快照是否可以安全发送给配置的Office。
 /// 参数：team为办公室作用域，snapshot为待验证的完整快照。
 /// 返回：结构、作用域、协议字段和编码字节数均满足限制时为true。
@@ -1180,7 +1234,15 @@ async fn prepare_internal(
             .map(|item| item.conversation.clone())
             .collect();
         // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
-        while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>OFFICE_MESSAGE_LIMIT {
+        // 历史增长时逐字段裁剪仍遵循原策略，但每步只序列化被修改的会话。
+        // 完整目录只计量一次，避免每次删除一个字段都复制/编码整个办公室。
+        let mut message_size=serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len();
+        let mut previous_edit=None;
+        loop {
+            if let Some(edit)=previous_edit.take() {
+                message_size=message_size_after_edit(&snapshot,message_size,edit)?;
+            }
+            if message_size<=OFFICE_MESSAGE_LIMIT {break;}
             let convs=snapshot["conversations"].as_array_mut().unwrap();
             let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&terminal_conversations.contains(c["id"].as_str().unwrap_or("") ) && !handoff_conversations.contains(c["id"].as_str().unwrap_or("")) && !business_conversations.contains(c["id"].as_str().unwrap_or(""))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
             let Some((i,_))=candidate else {
@@ -1205,6 +1267,7 @@ async fn prepare_internal(
                     }
                     return Err(HostError::new("protocol_error","Office完整会话目录超限"));
                 };
+                previous_edit=Some(conversation_size_edit(convs,index)?);
                 let c=&mut convs[index];
                 if business_conversations.contains(c["id"].as_str().unwrap_or("")) {
                     if compact_business_conversation(c) {
@@ -1248,6 +1311,7 @@ async fn prepare_internal(
                 convs.remove(index);
                 continue;
             };
+            previous_edit=Some(conversation_size_edit(convs,i)?);
             let c=&mut convs[i];
             // 会话ID的字典序不代表新旧；审批中的步骤不能被旧历史挤掉。
             if c["tasks"].as_array().is_some_and(|a|a.len()>1){
@@ -1621,6 +1685,43 @@ async fn sync_internal(
 mod tests {
     use super::*;
     use crate::{ClientScope, HostConfig};
+
+    #[test]
+    fn incremental_message_budget_matches_full_encoding_through_compaction_and_removal() {
+        for count in [1, 2, 30] {
+            let conversations: Vec<_> = (0..count).map(|index| json!({
+                "id":format!("会话-{index}"), "title":"中文😀与转义\"标题", "events":[{"summary":"旧事件\n内容"}],
+                "employees":[{"id":"person","role":"职责","online":true,"sceneActorId":"actor"}],
+                "tasks":[{"id":"task","summary":"真实结果","status":"completed","progress":100}],
+                "whiteboard":{"tagline":"标签","note":"说明","description":"中文\n结果", "link":{"label":"旧链接","url":"/old"},"steps":[]}
+            })).collect();
+            let mut snapshot = json!({"schemaVersion":"1.0","seq":1,"workspace":{"id":"团队"},"conversations":conversations});
+            let full_size = |value: &Value| {
+                serde_json::to_vec(
+                    &json!({"type":"office.snapshot","teamId":"团队","snapshot":value}),
+                )
+                .unwrap()
+                .len()
+            };
+            let mut size = full_size(&snapshot);
+            let mut steps = 0;
+            while !snapshot["conversations"].as_array().unwrap().is_empty() {
+                let all = snapshot["conversations"].as_array_mut().unwrap();
+                let edit = conversation_size_edit(all, 0).unwrap();
+                if !compact_business_conversation(&mut all[0]) {
+                    all.remove(0);
+                }
+                size = message_size_after_edit(&snapshot, size, edit).unwrap();
+                assert_eq!(
+                    size,
+                    full_size(&snapshot),
+                    "每一步必须等于完整UTF-8封套，包含删最后一项和数组逗号"
+                );
+                steps += 1;
+                assert!(steps < 1000);
+            }
+        }
+    }
 
     #[test]
     fn exhausted_old_business_does_not_block_handoff_budget() {

@@ -8,27 +8,30 @@ import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createHash } from 'node:crypto'
 import assert from 'node:assert/strict'
+import { DatabaseSync } from 'node:sqlite'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const out = await mkdtemp(join(process.env.OPENPAW_REPEAT_OUTPUT_PARENT || tmpdir(), 'openpaw-status-repeat-'))
 const singleCount = Number(process.env.OPENPAW_REPEAT_SINGLE ?? 100)
 const multiCount = Number(process.env.OPENPAW_REPEAT_MULTI ?? 100)
-assert.ok([singleCount, multiCount].every(n => Number.isInteger(n) && n >= 0 && n <= 100))
+assert.ok([singleCount, multiCount].every(n => Number.isInteger(n) && n >= 0))
+assert.ok(singleCount <= 100 && multiCount <= 200 && singleCount + Math.max(0, multiCount - 100) <= 100, '每个团队最多100个独立会话')
 const runtime = process.env.OPENPAW_REPEAT_OFFICE_RUNTIME
 const delay = ms => new Promise(r => setTimeout(r, ms))
 const workspace = join(out, 'workspace'), workspace2 = join(out, 'workspace-2'), home = join(out, 'home')
 for (const p of [workspace, workspace2, home]) await mkdir(p)
 await writeFile(join(workspace, 'README.md'), 'repeat fixture\n')
 await writeFile(join(workspace2, 'README.md'), 'repeat fixture 2\n')
-const report = { out, commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim(),
+const report = { out, startedAt: new Date().toISOString(), scriptSha256: createHash('sha256').update(await readFile(fileURLToPath(import.meta.url))).digest('hex'), commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim(),
   dirty: Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: root }).toString().trim()),
   provider: 'deterministic OpenAI fixture, real AgentLoop; no live weather claims', mode: runtime ? 'real Office + Chromium UI' : 'HTTP fixture, no browser',
-  requested: { single: singleCount, multi: multiCount }, runs: [], failures: [], pageErrors: [], httpErrors: [], clicks: [], transitions: [], status: 'running' }
+  requested: { single: singleCount, multi: multiCount }, runs: [], failures: [], pageErrors: [], httpErrors: [], clicks: [], idleControls: [], transitions: [], status: 'running' }
 const processes = []
 let browser, officeProcess, host, provider, office, hostConfig, hostEnvironment, hostBinary
+let activeTeam
 const snapshots = new Map(), names = ['王明', '李研', '周理', '陈书', '刘市', '赵审']
 const employeeIds = ['office-lead', 'code-agent', 'file-agent', 'app-agent', 'review-agent', 'data-agent']
-async function persist() { await writeFile(join(out, 'report.json'), JSON.stringify(report, null, 2)) }
+async function persist() { report.updatedAt = new Date().toISOString(); await writeFile(join(out, 'report.json'), JSON.stringify(report, null, 2)) }
 function start(file, args, cwd, env, label) {
   const p = spawn(file, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); let stdout = '', stderr = ''
   p.stdout.on('data', b => { stdout += b }); p.stderr.on('data', b => { stderr += b })
@@ -54,15 +57,45 @@ async function readOffice(team) {
   }
   assert.equal(r.status, 200, JSON.stringify(body)); return body.data.snapshot
 }
+async function disableIdleChatter(phase) {
+  // 场景控件异步出现，isVisible的一次检查不能证明已经关闭。
+  // 只操作公开按钮并核验其状态，不写入场景或假造人物点击。
+  const control = page.getByRole('button', { name: /^(开启|关闭)空闲闲聊$/ })
+  await control.waitFor({ state: 'visible' })
+  await waitFor(() => control.isEnabled())
+  const before = await control.getAttribute('aria-pressed')
+  assert.ok(before === 'true' || before === 'false')
+  if (before === 'true') await control.click()
+  await waitFor(async () => await control.getAttribute('aria-pressed') === 'false')
+  assert.equal(await control.getAttribute('aria-label'), '开启空闲闲聊')
+  report.idleControls.push({ phase, checkedAt: new Date().toISOString(), before, after: 'false' })
+  report.idleChatter = 'disabled and verified through public UI before each round and Pixi click; default-traffic R17 remains unresolved'
+}
 async function chooseOffice(team) {
   await page.getByText(/正在加载办公室/).waitFor({ state: 'hidden', timeout: 60000 })
   const collapse = page.getByRole('button', { name: '收起聊天', exact: true }); if (await collapse.isVisible()) await collapse.click()
   await page.getByRole('button', { name: /^团队空间，当前团队/ }).click()
   await page.getByRole('button', { name: '进入' + team, exact: true }).click()
   await page.getByRole('dialog').waitFor({ state: 'hidden' })
+  await page.getByText(/正在加载办公室/).waitFor({ state: 'hidden', timeout: 60000 })
+  await disableIdleChatter('choose-' + team)
+}
+async function sceneSnapshot(file) {
+  const pending = page.waitForEvent('download')
+  await page.getByRole('button', { name: '导出快照', exact: true }).click()
+  const path = join(out, file)
+  await (await pending).saveAs(path)
+  return JSON.parse(await readFile(path, 'utf8'))
+}
+async function canvasPoint(x, y) {
+  const canvas = await page.locator('canvas').first().boundingBox(); assert.ok(canvas)
+  const scale = Math.min(canvas.width / 1100, canvas.height / 850)
+  return [canvas.x + (canvas.width - 1100 * scale) / 2 + x * scale,
+    canvas.y + (canvas.height - 850 * scale) / 2 + y * scale]
 }
 async function send(prompt, i, kind) {
-  let identity, events, earlySnapshots = []
+  const startedAt = new Date().toISOString()
+  let identity, events, earlySnapshots = [], replyText
   if (runtime) {
     const expand = page.getByRole('button', { name: '展开对话', exact: true }); if (await expand.isVisible()) await expand.click()
     await page.getByRole('button', { name: '新会话', exact: true }).first().click()
@@ -85,6 +118,7 @@ async function send(prompt, i, kind) {
       await page.getByRole('button', { name: '停止生成', exact: true }).waitFor({ state: 'hidden', timeout: 60000 })
     } finally { sampling = false; await collector }
     if (sampleError) throw sampleError
+    replyText = await page.getByRole('log', { name: '对话内容' }).innerText()
     events = []
   } else {
     identity = { version: '1.0', type: 'send', turnId: `turn-${kind}-${i}`, teamId: kind === 'multi' ? 'office-2' : 'office-1', conversationId: `${kind}-${i}`, messages: [{ role: 'user', content: prompt }] }
@@ -92,7 +126,7 @@ async function send(prompt, i, kind) {
     assert.equal(r.status, 200); events = (await r.text()).trim().split('\n').filter(Boolean).map(JSON.parse)
     assert.ok(events.some(e => e.type === 'done'), 'Run must really finish')
   }
-  return { i, kind, conversation: identity.conversationId, turn: identity.turnId, team: identity.teamId, events: events.length, earlySnapshots }
+  return { i, kind, prompt, startedAt, replyText, conversation: identity.conversationId, turn: identity.turnId, team: identity.teamId, events: events.length, earlySnapshots }
 }
 async function checkSnapshot(row) {
   let last = '', previousChildren = 0
@@ -175,16 +209,59 @@ async function checkSnapshot(row) {
     row.taskDetail = await page.locator('.runtime-task-detail').first().innerText()
     assert.ok(!/scope_denied|回复未完成|等待后端响应处理/.test(row.taskDetail))
     if (row.kind === 'multi') {
-      for (const person of row.i === 0 ? [0, 1, 2, 3, 4, 5] : [row.i % 5 + 1]) {
+      for (const person of [0, 1, 2, 3, 4, 5]) {
       const name = names[person]
       const actor = page.locator('.runtime-person').filter({ hasText: name }).first()
       const start = Date.now(); await actor.click()
       const dialog = page.getByRole('dialog', { name: name + ' · 成员详情', exact: true }); await dialog.waitFor()
       const text = await dialog.innerText()
       assert.ok(!/scope_denied|未绑定|等待后端响应处理/.test(text)); assert.ok(text.includes('任务') && text.includes('完成'), text)
-      report.clicks.push({ i: row.i, name, elapsedMs: Date.now() - start, text })
+      assert.ok(text.includes('100%') && text.includes('已核验完成'), text)
+      report.clicks.push({ i: row.i, name, entrance: 'sidebar', elapsedMs: Date.now() - start, text })
       await dialog.getByRole('button', { name: '关闭详情', exact: true }).click()
       }
+      // 导出的是格点位置，渲染移动有插值。等待人物实际入座再点击，禁止改世界或伪造命中。
+      await waitFor(async () => {
+        const scene = await sceneSnapshot('scene-latest.json')
+        return scene.world.actors.length === 6 && scene.world.actors.every(a => a.posture === 'seated')
+      }, 90000)
+      row.actors = []
+      for (const actorId of employeeIds) {
+        await disableIdleChatter(`multi-${row.i}-pixi-${actorId}`)
+        // 真实Pixi位置可随闲聊移动；每次点击前导出当前世界，不复用旧坐标。
+        const person = await waitFor(async () => {
+          const scene = await sceneSnapshot('scene-latest.json')
+          const actor = scene.world.actors.find(a => a.id === actorId); assert.ok(actor)
+          return actor.posture === 'seated' && !actor.motion && !actor.step && !actor.seatTransition ? actor : false
+        }, 90000)
+        assert.equal(person.presentation.status, 'idle', '成功终态人物不得仍显示工作/失败')
+        const [x, y] = await canvasPoint((person.position.x + .5) * 50 + (person.posture === 'seated' ? 25 : 0),
+          (person.position.y + .5) * 50 - (person.posture === 'seated' ? 10 : 0) - 40)
+        const pending = page.waitForResponse(r => r.url().endsWith('/api/pawoffice/ui') && r.request().postDataJSON()?.action === 'actor.inspect')
+        const started = Date.now(); await page.mouse.click(x, y)
+        const response = await pending; const body = await response.json()
+        assert.equal(response.request().postDataJSON().actorId, actorId)
+        assert.equal(body.data.target, 'dialog')
+        assert.ok(body.data.content.fields.some(f => f.label === '已确认进度' && f.value === '100%'))
+        assert.ok(body.data.content.fields.some(f => f.label === '业务状态' && f.value === '已核验完成'))
+        const dialog = page.getByRole('dialog', { name: person.name + ' · 成员详情', exact: true }); await dialog.waitFor()
+        const text = await dialog.innerText(); assert.ok(!/scope_denied|未绑定|等待后端响应处理/.test(text))
+        const item = { i: row.i, name: person.name, entrance: 'pixi', elapsedMs: Date.now() - started, actor: person, text }
+        report.clicks.push(item); row.actors.push(item)
+        await dialog.getByRole('button', { name: '关闭详情', exact: true }).click()
+      }
+      const scene = await sceneSnapshot(`multi-${row.i}-scene.json`)
+      const board = scene.world.props.find(p => p.templateId === 'office.wall-whiteboard'); assert.ok(board)
+      assert.deepEqual(board.state.taskBoard, c.whiteboard, '实际场景白板须与当前会话事实一致')
+      const [x, y] = await canvasPoint(board.position.x * 50 + 290, board.position.y * 50 - 70)
+      await page.mouse.click(x, y)
+      const reader = page.getByRole('dialog', { name: '协作白板', exact: true }); await reader.waitFor()
+      row.whiteboardText = await reader.innerText()
+      assert.ok(row.whiteboardText.includes(c.whiteboard.title) && row.whiteboardText.includes('5/5'))
+      const values = await reader.getByRole('progressbar').evaluateAll(nodes => nodes.map(n => n.getAttribute('aria-valuenow')))
+      assert.equal(values.length, c.whiteboard.steps.length); assert.ok(values.every(v => v === '100'))
+      await page.screenshot({ path: join(out, `multi-${row.i}-whiteboard.png`), fullPage: true })
+      await reader.getByRole('button', { name: '关闭白板', exact: true }).click()
     }
     if (row.i === 0 || row.i === (row.kind === 'multi' ? multiCount : singleCount) - 1) await page.screenshot({ path: join(out, `${row.kind}-${row.i}.png`), fullPage: true })
   }
@@ -224,6 +301,8 @@ try {
       const results = x.messages.filter(m => m.role === 'tool'), roles = ['research', 'organize', 'draft', 'review', 'audit']
       if (results.length < roles.length) { const r = roles[results.length]; tool_calls = [{ index: 0, id: `delegate-${r}-${prompt.slice(0,12)}`, type: 'function', function: { name: 'delegate_task', arguments: JSON.stringify({ role_id: r, title: `${r}完成资料核查`, instructions: '完成一个独立核查并返回结果', acceptance: '给出独立结果' }) } }] }
       else content = `${prompt} 五个角色均已完成，主角色已汇总。已完成。`
+    } else if (role && role !== 'lead' && !x.messages.some(m => m.role === 'tool')) {
+      tool_calls = [{ index: 0, id: `read-${role}`, type: 'function', function: { name: 'read_file', arguments: JSON.stringify({ path: 'README.md' }) } }]
     } else content = `${role || prompt} 独立任务已完成。`
     res.writeHead(200, { 'content-type': 'text/event-stream' })
     res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: tool_calls ? { tool_calls } : { content }, finish_reason: null }] }) + '\n\n')
@@ -248,14 +327,31 @@ try {
     await page.goto(officeBase + '/office/', { waitUntil: 'domcontentloaded' })
   }
   for (const [kind, count, team] of [['single', singleCount, 'office-1'], ['multi', multiCount, 'office-2']]) {
-    if (runtime && count) await chooseOffice(team)
+    if (runtime && count) { await chooseOffice(team); activeTeam = team }
     for (let i = 0; i < count; i++) {
-      try { const row = await send(kind === 'multi' ? `MULTI-${i} 请王明统筹五位同事，分别核查路线、美食、住宿、行程和资料。` : `SINGLE-${i} 请直接回复已完成。`, i, kind); await checkSnapshot(row); report.runs.push(row); console.error('PASS', kind, i + 1, '/', count) }
+      const roundTeam = kind === 'multi' && i >= 100 ? 'office-1' : team
+      if (runtime && activeTeam !== roundTeam) { await chooseOffice(roundTeam); activeTeam = roundTeam }
+      if (runtime) await disableIdleChatter(`${kind}-${i}-before-send`)
+      try { const row = await send(kind === 'multi' ? `MULTI-${i} 请王明统筹五位同事，分别核查路线、美食、住宿、行程和资料。` : `SINGLE-${i} 请直接回复已完成。`, i, kind); await checkSnapshot(row); row.finishedAt = new Date().toISOString(); report.runs.push(row); console.error('PASS', kind, i + 1, '/', count) }
       catch (e) { report.failures.push({ kind, i, error: e.stack }); if (page) await page.screenshot({ path: join(out, `failure-${kind}-${i}.png`), fullPage: true }).catch(() => {}); throw e }
       await persist()
     }
   }
-  assert.equal(report.pageErrors.length, 0); report.status = 'passed'
+  const db = new DatabaseSync(join(home, 'engine-host/host.db'), { readOnly: true })
+  try {
+    for (const row of report.runs.filter(r => r.kind === 'multi')) {
+      const parent = db.prepare('SELECT run FROM host_requests WHERE key=?').get(row.turn).run
+      const children = db.prepare("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=? ORDER BY revision").all(parent).map(r => JSON.parse(r.reference))
+      assert.equal(children.length, 5)
+      for (const child of children) {
+        const ledger = (await readFile(join(home, 'sessions', child.child_session + '.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse)
+        assert.ok(ledger.some(e => e.type === 'tool_call_complete' && e.tool_name === 'read_file'))
+        assert.ok(ledger.some(e => e.type === 'run_finished' && e.status === 'completed'))
+      }
+      row.execution = { parent, children }
+    }
+  } finally { db.close() }
+  assert.equal(report.pageErrors.length, 0); assert.equal(report.httpErrors.length, 0); report.finishedAt = new Date().toISOString(); report.status = 'passed'
 } catch (e) { report.status = 'failed'; report.error = e.stack; process.exitCode = 1 }
 finally {
   await persist(); if (browser) await browser.close()
