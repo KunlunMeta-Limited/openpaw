@@ -79,6 +79,40 @@ fn needs_write(title: &str) -> bool {
         .any(|s| action.contains(s))
 }
 
+/// 判断一个步骤是否属于最终文字交付。
+///
+/// 这类步骤的完成事实是：Run 已正常结束且已经保存了非空最终答复。
+/// 不能把所有“查询”步骤都按文字存在自动完成；只有明确表示结论、摘要、
+/// 汇总或答复的标题才使用这个规则，检索步骤仍必须引用真实工具证据。
+fn is_answer_step(title: &str) -> bool {
+    ["整理", "总结", "汇总", "答复", "交付"]
+        .iter()
+        .any(|verb| title.contains(verb))
+        || (title.contains("给出")
+            && ["结论", "摘要", "结果", "来源"]
+                .iter()
+                .any(|word| title.contains(word)))
+        || (title.contains("返回")
+            && ["结论", "摘要", "结果"]
+                .iter()
+                .any(|word| title.contains(word)))
+}
+
+/// 判断一个步骤是否由真实委派事实完成。
+///
+/// `delegate_task` 是 Host 已接受并记录的交接事实。它只能确认分工/交接
+/// 本身，不能替代子任务的资料、写入或审核证据；子任务失败时主任务仍保持
+/// 失败或待处理。
+fn is_coordination_step(title: &str, run: &RunView) -> bool {
+    ["分工", "交接", "派发", "分派"]
+        .iter()
+        .any(|word| title.contains(word))
+        && run
+            .tools
+            .iter()
+            .any(|tool| tool.tool_name == "delegate_task" && tool.state == "completed")
+}
+
 /// 功能：声明仅Office运行内使用的元数据工具。
 /// 参数：无。
 /// 返回：复用原ToolSpec的严格输入声明。
@@ -391,8 +425,13 @@ pub(crate) fn project(value: Option<Value>, run: &RunView) -> HostResult<(Vec<Va
     let mut completed = 0;
     let steps=plan.steps.iter().enumerate().map(|(index,s)| {
         // 纯整理步骤没有工具证据，只能在最终文本已可靠保存且Run正常结束后确认。
-        let answer = ["整理","总结","汇总","答复","交付"].iter().any(|v|s.title.contains(v));
-        let done=s.state=="completed" || run.state==RunState::Completed && !run.text.trim().is_empty() && !needs_write(&s.title) && answer;
+        let answer = is_answer_step(&s.title);
+        let coordination = is_coordination_step(&s.title, run);
+        let done=s.state=="completed"
+            || run.state==RunState::Completed
+                && !run.text.trim().is_empty()
+                && !needs_write(&s.title)
+                && (answer || coordination);
         if done {completed+=1;}
         let waiting=s.evidence.iter().any(|id|run.tools.iter().any(|t|&t.call_id==id && matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")));
         // 正常回复结束与业务核验是不同事实，不能将漏报或待继续步骤伪报为执行失败。
@@ -755,6 +794,34 @@ mod tests {
         assert_eq!(project(Some(p.clone()), &r).unwrap().1, 0);
         r.state = RunState::Completed;
         assert_eq!(project(Some(p), &r).unwrap().1, 100);
+    }
+
+    #[test]
+    fn final_source_summary_and_real_delegation_close_their_steps() {
+        let mut r = run();
+        r.tools.push(ToolView {
+            call_id: "delegate".into(),
+            tool_name: "delegate_task".into(),
+            state: "completed".into(),
+        });
+        let p = update(
+            None,
+            &json!({"type":"create","steps":[
+                {"id":"handoff","title":"确定分工与交接顺序"},
+                {"id":"lookup","title":"联网检索长沙亲子场馆"},
+                {"id":"answer","title":"给出带来源的结论与摘要"}
+            ]}),
+            &r,
+            &[],
+        )
+        .unwrap();
+        r.state = RunState::Completed;
+        r.text = "已完成查询，以下是来源摘要：https://example.test".into();
+        let (steps, percent) = project(Some(p), &r).unwrap();
+        assert_eq!(steps[0]["status"], "completed", "真实委派确认分工步骤");
+        assert_eq!(steps[1]["status"], "blocked", "检索步骤仍需要真实工具证据");
+        assert_eq!(steps[2]["status"], "completed", "带来源答复由可靠终态确认");
+        assert_eq!(percent, 50);
     }
 }
 

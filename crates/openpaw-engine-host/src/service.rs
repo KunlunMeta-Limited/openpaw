@@ -88,6 +88,12 @@ pub(crate) struct Inner {
     /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
     /// 启动时从持久投影预热，投影保存后更新；删除会话后必须失效对应团队。
     pub(crate) office_projection_cache: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// 用途：合并同一办公室同时到达的只读投影请求。
+    /// 字段：按办公室作用域的异步互斥锁；不锁不同办公室。
+    /// 来源去向：Office read/UI 与后台同步到单次事实扫描。
+    /// 约束：等待者在首个扫描完成后复用持久投影，不能重复扫描整本账本。
+    /// 稳定性：T6内部协调状态，不是业务数据或第二份账本。
+    pub(crate) office_projection_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// 用途：标记当前Office UI动作，避免后台投影扫描争用Store。
     /// 字段：活动动作计数器。
     /// 来源去向：actions入口增减，projection在扫描边界读取。
@@ -235,6 +241,7 @@ impl Host {
         let (notices, _) = broadcast::channel(256);
         let live = Arc::new(Mutex::new(HashMap::new()));
         let office_projection_cache = Arc::new(Mutex::new(HashMap::new()));
+        let office_projection_locks = Arc::new(Mutex::new(HashMap::new()));
         let office_terminal_runs = Arc::new(Mutex::new(HashMap::new()));
         let office_handoff_queue = Arc::new(Mutex::new(HashMap::new()));
         let store = Store::open(
@@ -271,6 +278,7 @@ impl Host {
                 notices,
                 live,
                 office_projection_cache,
+                office_projection_locks,
                 office_ui_busy: Arc::new(AtomicUsize::new(0)),
                 office_terminal_runs,
                 office_handoff_queue,
@@ -561,6 +569,19 @@ impl Host {
                 if used + 1 + reserved_children
                     > self.inner.config.max_active_runs + usize::from(consume)
                 {
+                    if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() {
+                        eprintln!(
+                            "engine-host diagnostics capacity scope={} session={} active={} reserved={} requested_reserved={} max={} consume={} parent={:?}",
+                            scope.namespace,
+                            session_id,
+                            state.active.len(),
+                            used.saturating_sub(state.active.len()),
+                            reserved_children,
+                            self.inner.config.max_active_runs,
+                            consume,
+                            parent_id,
+                        );
+                    }
                     return Err(HostError::new(
                         "capacity_exceeded",
                         "宿主运行容量已满，协作需预留主子容量",

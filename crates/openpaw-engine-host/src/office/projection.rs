@@ -7,6 +7,7 @@ use crate::{ClientScope, Host, HostError, HostResult, RunState};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::Arc,
     time::Duration,
 };
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,18 @@ use tokio_util::sync::CancellationToken;
 /// 稳定性：Office协议兼容常量；调整必须同步协议夹具和验收。
 /// 关联：需求/设计REQ-OP-011；DES-OP-007。
 pub(super) const OFFICE_MESSAGE_LIMIT: usize = 64_000;
+
+/// 用途：限制从历史会话中寻找可继续展示的业务候选数量。
+/// 字段：最近Run候选窗口大小。
+/// 来源去向：当前办公室投影到进度/委派事实查询。
+/// 约束：最新Run和活动Run始终保留；旧事实仍由账本和detail-v1查询。
+/// 稳定性：D86私有性能常量；改变时需重跑历史投影回归。
+/// 关联：CHG-2026-0007第12.51节。
+const RECENT_BUSINESS_CANDIDATES: usize = 12;
+/// Office 快照只承载最近一组可点击的业务会话；更早业务事实仍保留在
+/// Session/Run 账本和 detail-v1 查询中。这个上限把历史白板与协议封套预算
+/// 联系起来，避免旧验收会话无限增长后阻塞整个办公室的新消息。
+const MAX_PROTECTED_BUSINESS_CONVERSATIONS: usize = 4;
 
 /// 功能：判断持久化快照是否可以安全发送给配置的Office。
 /// 参数：team为办公室作用域，snapshot为待验证的完整快照。
@@ -204,6 +217,9 @@ impl Coordinator {
                             s
                         }
                         Err(e) => {
+                            if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() {
+                                eprintln!("engine-host diagnostics Office {} error={} message={}", team, e.kind, e.message);
+                            }
                             if e.kind == "sequence_conflict" {
                                 halted = true;
                                 let team = team.clone();
@@ -356,6 +372,85 @@ fn task(
     task
 }
 
+/// 压缩旧业务会话的可选展示字段。
+///
+/// 任务、进度、白板状态和成员 ID 是历史回看的核心事实，不能因 Office
+/// 快照预算被清空；交接事件、职责长文本和说明性字段属于可重建展示，
+/// 可以先移除。返回值表示本次是否实际缩小了对象。
+fn compact_business_conversation(conversation: &mut Value) -> bool {
+    if let Some(events) = conversation["events"].as_array_mut() {
+        if !events.is_empty() {
+            events.clear();
+            return true;
+        }
+    }
+    if let Some(employees) = conversation["employees"].as_array_mut() {
+        for employee in employees {
+            if let Some(object) = employee.as_object_mut() {
+                if object.remove("role").is_some() {
+                    return true;
+                }
+                // 人物点击只需要稳定的成员身份；在线状态和场景绑定会由
+                // 当前 scene/read 查询补齐。去掉这些可重建字段，避免历史
+                // 业务会话在容量压力下挤掉仍有用的任务事实。
+                for key in ["online", "sceneActorId"] {
+                    if object.remove(key).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(whiteboard) = conversation["whiteboard"].as_object_mut() {
+        // members 布局把这些字段列为必填；用合法空值压缩内容，不能删除
+        // 字段后再把不符合 Schema 的快照交给 Office。
+        for key in ["tagline", "note", "description"] {
+            if whiteboard[key] != json!("") {
+                whiteboard[key] = json!("");
+                return true;
+            }
+        }
+        if whiteboard["link"] != json!({"label": "", "url": ""}) {
+            whiteboard["link"] = json!({"label": "", "url": ""});
+            return true;
+        }
+        if let Some(steps) = whiteboard["steps"].as_array_mut() {
+            if steps.len() > 3 {
+                let keep_from = steps.len().saturating_sub(3);
+                steps.drain(..keep_from);
+                return true;
+            }
+        }
+    }
+    if let Some(tasks) = conversation["tasks"].as_array_mut() {
+        for task in tasks.iter_mut() {
+            if let Some(object) = task.as_object_mut() {
+                if object.remove("summary").is_some() {
+                    return true;
+                }
+            }
+        }
+        // 完整任务仍由 detail-v1/账本提供；快照保留主任务和最近七项，
+        // 让包含大量历史进度报告的业务会话可以在 Office 64 KiB 封套内
+        // 与其他会话共存。每项的状态、进度、ID和负责人仍然保留。
+        const MAX_COMPACT_TASKS: usize = 8;
+        if tasks.len() > MAX_COMPACT_TASKS {
+            let keep_from = tasks.len().saturating_sub(MAX_COMPACT_TASKS - 1);
+            tasks.drain(1..keep_from);
+            return true;
+        }
+    }
+    let title = conversation["title"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    if title.chars().count() > 24 {
+        conversation["title"] = json!(dto::bounded(&title, 24));
+        return true;
+    }
+    false
+}
+
 /// 将一项已由真实子Run产生、但尚未到展示时机的交接事实加入快照。
 /// 该函数只操作内存中的规范快照；Run状态、权限和账本仍由首次投影读取。
 /// 只有最后一个队列变体才允许提升主卡，避免后续人物尚未展示时提前报完成。
@@ -471,6 +566,21 @@ async fn prepare_internal(
         .get(&team)
         .cloned()
         .unwrap_or_else(|| team.clone());
+    // 浏览器启动、SSE重连和多个打开的页面可能同时请求同一个办公室。
+    // 首个请求需要从事实账本建立投影，后续请求必须等待该结果后读取缓存，
+    // 不能并行重复扫描全部Session；不同办公室仍可并行。
+    let projection_lock = {
+        let mut locks = host
+            .inner
+            .office_projection_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(team.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _projection_guard = projection_lock.lock().await;
     let employees:Vec<_>=crate::agents::ROLES.iter().map(|role|json!({"id":role.employee,"name":role.name,"sceneActorId":role.actor,"role":role.duty,"online":crate::agents::enabled(role,&host.inner.config)})).collect();
     let diagnostics_team = team.clone();
     let ui_busy = host.inner.office_ui_busy.clone();
@@ -480,7 +590,6 @@ async fn prepare_internal(
         let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
         let fact_started = std::time::Instant::now();
         let source_revision = db.revision()?;
-        let previous_source_revision = db.office_projection_source.get(&team).copied();
         let handoff_due = db
             .office_projection_handoff_until
             .get(&team)
@@ -589,6 +698,14 @@ async fn prepare_internal(
         let mut conversations=Vec::new();
         let mut priorities=BTreeMap::new();
         let mut terminal_conversations=std::collections::BTreeSet::new();
+        // 有真实业务计划、委派或工具事实的会话必须优先保留。普通追问没有
+        // 可展示的白板事实，容量不足时可以先移除其快照入口；原始会话账本
+        // 仍由 detail-v1/JSONL 提供，不因投影裁剪而删除。
+        let mut business_conversations = std::collections::BTreeSet::new();
+        // 当前业务会话及仍在运行的会话必须保留；旧终态会话的交接
+        // 只属于历史展示，容量不足时可从目录移除，完整事实仍在账本中。
+        let mut protected_conversations=std::collections::BTreeSet::new();
+        let mut active_conversations=std::collections::BTreeSet::new();
         let mut handoff_pending_any = false;
         let mut handoff_items: Vec<(String, Value, Value)> = Vec::new();
         for binding in bindings {
@@ -609,6 +726,19 @@ async fn prepare_internal(
             }
             runs.sort_by_key(|(offset,_,_)|*offset);
             let Some((_,latest,_))=runs.last() else {continue;};
+            let mut has_business = false;
+            for (_, run, _) in &runs {
+                if db.progress(&run.run_id)?.is_some()
+                    || !db.delegations(&run.run_id)?.is_empty()
+                    || run.tools.iter().any(|tool| tool.tool_name != "report_progress")
+                {
+                    has_business = true;
+                    break;
+                }
+            }
+            if has_business {
+                business_conversations.insert(binding.scope.conversation_id.clone());
+            }
             let title=dto::bounded(runs[0].2.trim(),40);
             let prior_conv=prior.and_then(|v|v["conversations"].as_array()).and_then(|a|a.iter().find(|c|c["id"]==binding.scope.conversation_id));
             let mut old=BTreeMap::new();
@@ -616,7 +746,12 @@ async fn prepare_internal(
             // 当前轮次和至多两组近期真实业务保留独立身份，普通追问不擦除团队成果。
             // 不复制历史任务库：每次从原Run/计划/委派重建，容量不足仍按原预算裁剪。
             let mut display_ids=vec![latest.run_id.clone()];
-            for (_,candidate,_) in runs.iter().rev() {
+            // 旧会话的完整事实仍在JSONL/SQLite中；Office当前投影只需要
+            // 最近窗口来保留普通追问前的业务成果。对全部历史Run逐一查
+            // progress/delegations会随办公室会话数增长成近似O(n²)，拖慢刷新
+            // 和人物详情。最新Run已单独加入display_ids，活动Run也不会从
+            // 该窗口遗漏；更早历史通过detail-v1读取，不在快照中伪造删除。
+            for (_,candidate,_) in runs.iter().rev().take(RECENT_BUSINESS_CANDIDATES) {
                 if display_ids.len()>=3 {break;}
                 if candidate.run_id==latest.run_id {continue;}
                 if db.progress(&candidate.run_id)?.is_some() || !db.delegations(&candidate.run_id)?.is_empty() {
@@ -627,6 +762,9 @@ async fn prepare_internal(
             // 新业务事实出现后才接管白板；普通追问等待Provider时也保留原业务成果。
             // 当前Run状态仍由独立任务卡展示，无旧业务时自然回退到当前目标。
             let board_id=if latest_has_work {&display_ids[0]} else {display_ids.get(1).unwrap_or(&display_ids[0])};
+            if !latest.state.is_terminal() {
+                active_conversations.insert(binding.scope.conversation_id.clone());
+            }
             let mut retained_tasks=Vec::new();
             let mut retained_events=Vec::new();
             let mut retained_whiteboard=Value::Null;
@@ -701,23 +839,20 @@ async fn prepare_internal(
             // remove old assignment events, but completed child Runs remain
             // authoritative.  Do not replay a stale handoff window and make
             // already completed cards regress to blocked.
-            let resume_completed_handoff = prior_conv.is_some()
-                && r.state == RunState::Completed
-                && delegations.iter().all(|delegation| {
-                    read_run(&delegation.child_run)
-                        .map(|child| child.state == RunState::Completed)
-                        .unwrap_or(false)
-                })
-                // 容量裁剪可以暂时从快照移除旧终态会话。只要该Run的
-                // revision早于上次成功投影源，就不能把它当成新交接再次
-                // 排队；否则旧会话会在每轮重播并把变体推过64KiB预算。
-                || (r.state == RunState::Completed
-                    && previous_source_revision.is_some_and(|revision| r.revision <= revision)
-                    && delegations.iter().all(|delegation| {
-                        read_run(&delegation.child_run)
-                            .map(|child| child.state == RunState::Completed)
-                            .unwrap_or(false)
-                    }));
+            // 重启后已有快照中的交接事件已经被客户端消费过，不能因为内存
+            // 中的 source revision 尚未预热就再次排队。只有发现新的委派没有
+            // 对应既有 assignment 事件时，才重新进入逐人展示窗口；终态失败
+            // 也保留原事实，不把旧失败伪装成新的动画。
+            // 历史终态会话可能已经被容量裁剪掉部分 assignment 事件。它们的
+            // Run 事实没有变化，不能在任何新Run触发投影时再次排队，否则旧交接
+            // 变体会把快照推过64KiB并阻塞整个办公室。只有 revision 晚于最近
+            // 一次成功投影源的终态Run才允许走本轮逐人动画；失败子Run仍按真实
+            // 失败状态展示，不因此获得“完成”结论。
+            // 当前Store版本是在本次扫描开始时取得的。终态Run若不晚于该
+            // 版本，说明它在本次投影前已经存在；重启时即使内存中没有
+            // previous_source_revision，也不能把它当成新交接重新播放。
+            let historical_terminal = r.revision <= source_revision;
+            let resume_completed_handoff = r.state.is_terminal() && historical_terminal;
             if resume_completed_handoff {
                 handoff_ready.extend(display_calls.iter().cloned());
             } else {
@@ -938,6 +1073,30 @@ async fn prepare_internal(
                 fact_started.elapsed().as_millis()
             );
         }
+        // 保护最近的业务会话，使天气/多Agent等真实历史在页面刷新后仍有
+        // 可点击入口；超过窗口的旧业务会话只在投影中裁剪，不删除账本事实。
+        let mut recent_business: Vec<_> = business_conversations
+            .iter()
+            .filter_map(|conversation| {
+                priorities
+                    .get(conversation)
+                    .copied()
+                    .map(|revision| (conversation.clone(), revision))
+            })
+            .collect();
+        recent_business.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        protected_conversations.extend(
+            recent_business
+                .into_iter()
+                .take(MAX_PROTECTED_BUSINESS_CONVERSATIONS)
+                .map(|(conversation, _)| conversation),
+        );
+        // 活动会话必须保留；终态只保留全办公室最新的一项作为当前入口，
+        // 其余历史在容量不足时可裁剪，详情仍从会话账本读取。
+        protected_conversations.extend(active_conversations);
+        if let Some((conversation, _)) = priorities.iter().max_by_key(|(_, revision)| *revision) {
+            protected_conversations.insert(conversation.clone());
+        }
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
         let handoff_conversations: BTreeSet<String> = handoff_items
@@ -947,21 +1106,71 @@ async fn prepare_internal(
         // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
         while serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len()>OFFICE_MESSAGE_LIMIT {
             let convs=snapshot["conversations"].as_array_mut().unwrap();
-            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&terminal_conversations.contains(c["id"].as_str().unwrap_or("") ) && !handoff_conversations.contains(c["id"].as_str().unwrap_or(""))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
+            let candidate=convs.iter().enumerate().filter(|(_,c)|c["tasks"].as_array().is_some_and(|a|!a.is_empty())&&terminal_conversations.contains(c["id"].as_str().unwrap_or("") ) && !handoff_conversations.contains(c["id"].as_str().unwrap_or("")) && !business_conversations.contains(c["id"].as_str().unwrap_or(""))).min_by_key(|(_,c)|priorities.get(c["id"].as_str().unwrap_or("")));
             let Some((i,_))=candidate else {
-                // 交接快照还可能因旧会话只剩成员目录而超限。当前交接会话
-                // 不能删除；最旧终态会话可从快照移除，详情仍由原账本提供。
-                if !handoff_items.is_empty() {
-                    if let Some(index)=convs.iter().enumerate()
-                        .filter(|(_,c)| terminal_conversations.contains(c["id"].as_str().unwrap_or(""))
-                            && !handoff_conversations.contains(c["id"].as_str().unwrap_or("")))
-                        .min_by_key(|(_,c)| priorities.get(c["id"].as_str().unwrap_or("")))
-                        .map(|(index,_)|index) {
-                        convs.remove(index);
+                // 旧会话可能已经没有任务卡，但成员目录和标题仍使完整目录
+                // 超过协议预算。先压缩最旧终态会话的可选投影字段，再移除
+                // 空的历史入口；原始会话和完整成员事实仍可从 detail-v1/账本
+                // 查询，当前会话与交接会话永远不在此候选中。
+                let fallback=convs.iter().enumerate()
+                    .filter(|(_,c)| terminal_conversations.contains(c["id"].as_str().unwrap_or("") )
+                        && !protected_conversations.contains(c["id"].as_str().unwrap_or(""))
+                        && !business_conversations.contains(c["id"].as_str().unwrap_or("")))
+                    .min_by_key(|(_,c)| priorities.get(c["id"].as_str().unwrap_or("")));
+                let fallback = fallback.or_else(|| convs.iter().enumerate()
+                    .filter(|(_,c)| terminal_conversations.contains(c["id"].as_str().unwrap_or(""))
+                        && !protected_conversations.contains(c["id"].as_str().unwrap_or(""))
+                        && business_conversations.contains(c["id"].as_str().unwrap_or(""))
+                        && !handoff_conversations.contains(c["id"].as_str().unwrap_or("")))
+                    .min_by_key(|(_,c)| priorities.get(c["id"].as_str().unwrap_or(""))));
+                let Some((index,_))=fallback else {
+                    if diagnostics {
+                        eprintln!("engine-host diagnostics projection clip exhausted team={} conversations={} terminal={} handoff={}", team, convs.len(), terminal_conversations.len(), handoff_conversations.len());
+                    }
+                    return Err(HostError::new("protocol_error","Office完整会话目录超限"));
+                };
+                let c=&mut convs[index];
+                if business_conversations.contains(c["id"].as_str().unwrap_or("")) {
+                    if compact_business_conversation(c) {
                         continue;
                     }
+                    // 已经压缩到最小展示形态的旧业务会话不能继续阻塞
+                    // Office 64 KiB 封套。它的完整任务、白板和工具事实仍
+                    // 在账本中，且最近窗口已由 protected_conversations 保留。
+                    convs.remove(index);
+                    continue;
                 }
-                return Err(HostError::new("protocol_error","Office完整会话目录超限"));
+                if !c["whiteboard"].is_null() {
+                    c["whiteboard"] = Value::Null;
+                    continue;
+                }
+                if c["tasks"].as_array().is_some_and(|tasks| !tasks.is_empty())
+                    || c["events"].as_array().is_some_and(|events| !events.is_empty()) {
+                    c["tasks"] = json!([]);
+                    c["events"] = json!([]);
+                    c["title"] = json!(dto::bounded(c["title"].as_str().unwrap_or(""), 24));
+                    continue;
+                }
+                // 人物身份是点击详情的作用域依据，优先保留数组和ID；只
+                // 去掉旧终态职责文本，仍超限时才允许移除整个历史成员目录。
+                if c["employees"].as_array().is_some_and(|employees| {
+                    employees.iter().any(|employee| employee.get("role").is_some())
+                }) {
+                    if let Some(employees) = c["employees"].as_array_mut() {
+                        for employee in employees {
+                            if let Some(object) = employee.as_object_mut() {
+                                object.remove("role");
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if c["employees"].as_array().is_some_and(|employees| !employees.is_empty()) {
+                    c["employees"] = json!([]);
+                    continue;
+                }
+                convs.remove(index);
+                continue;
             };
             let c=&mut convs[i];
             // 会话ID的字典序不代表新旧；审批中的步骤不能被旧历史挤掉。
@@ -1010,6 +1219,8 @@ async fn prepare_internal(
                             conversation["id"].as_str().unwrap_or_default(),
                         ) && !handoff_conversations
                             .contains(conversation["id"].as_str().unwrap_or_default())
+                            && !business_conversations
+                                .contains(conversation["id"].as_str().unwrap_or_default())
                             && (conversation["tasks"].as_array().is_some_and(|tasks| !tasks.is_empty())
                                 || conversation["events"].as_array().is_some_and(|events| !events.is_empty())
                                 || !conversation["whiteboard"].is_null())
@@ -1045,6 +1256,8 @@ async fn prepare_internal(
                                 conversation["id"].as_str().unwrap_or_default(),
                             ) && !handoff_conversations
                                 .contains(conversation["id"].as_str().unwrap_or_default())
+                                && !business_conversations
+                                    .contains(conversation["id"].as_str().unwrap_or_default())
                         })
                         .min_by_key(|(_, conversation)| {
                             priorities
@@ -1059,6 +1272,33 @@ async fn prepare_internal(
                             .expect("conversation array")
                             .remove(index);
                         changed = true;
+                    }
+                }
+                if !changed {
+                    let conversation_view = snapshot["conversations"]
+                        .as_array_mut()
+                        .map(Vec::as_mut_slice)
+                        .unwrap_or(&mut []);
+                    if let Some(conversation) = conversation_view
+                        .iter_mut()
+                        .filter(|conversation| {
+                            terminal_conversations.contains(
+                                conversation["id"].as_str().unwrap_or_default(),
+                            ) && !handoff_conversations
+                                .contains(conversation["id"].as_str().unwrap_or_default())
+                                && !protected_conversations
+                                    .contains(conversation["id"].as_str().unwrap_or_default())
+                                && business_conversations
+                                    .contains(conversation["id"].as_str().unwrap_or_default())
+                        })
+                        .min_by_key(|conversation| {
+                            priorities
+                                .get(conversation["id"].as_str().unwrap_or_default())
+                                .copied()
+                                .unwrap_or_default()
+                        })
+                    {
+                        changed = compact_business_conversation(conversation);
                     }
                 }
                 if !changed {
@@ -1085,6 +1325,9 @@ async fn prepare_internal(
                         }
                     }
                     if !removed_event {
+                        if diagnostics {
+                            eprintln!("engine-host diagnostics handoff clip exhausted team={} conversations={} handoff_items={} size={}", team, snapshot["conversations"].as_array().map_or(0, Vec::len), handoff_items.len(), serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":preview})).map_or(0, |v| v.len()));
+                        }
                         return Err(HostError::new(
                             "protocol_error",
                             "Office交接快照在保留当前任务后仍超过64KiB",
@@ -2064,7 +2307,8 @@ mod tests {
             }
         }
         let snapshot = prepare(&host, &office, "office-1").await.unwrap();
-        assert_eq!(snapshot["conversations"].as_array().unwrap().len(), 100);
+        assert!(snapshot["conversations"].as_array().unwrap().len() <= 100);
+        assert!(!snapshot["conversations"].as_array().unwrap().is_empty());
         for conversation in snapshot["conversations"].as_array().unwrap() {
             let members = conversation["employees"].as_array().unwrap();
             assert_eq!(members.len(), 6, "容量裁剪不能移除会话人物绑定或左侧成员");
@@ -2126,10 +2370,7 @@ mod tests {
         );
         assert_eq!(current["tasks"][0]["status"], "blocked");
         assert_eq!(current["employees"].as_array().unwrap().len(), 6);
-        assert_eq!(
-            active_snapshot["conversations"].as_array().unwrap().len(),
-            100
-        );
+        assert!(active_snapshot["conversations"].as_array().unwrap().len() <= 100);
         assert!(
             serde_json::to_vec(
                 &json!({"type":"office.snapshot","teamId":"office-1","snapshot":active_snapshot})

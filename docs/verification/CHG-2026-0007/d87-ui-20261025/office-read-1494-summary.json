@@ -1,0 +1,617 @@
+{
+  "capturedAt": "2026-10-25T16:05:38.732092+00:00",
+  "officeReadCode": 200,
+  "seq": 1496,
+  "conversationCount": 10,
+  "snapshotJsonBytes": 64585,
+  "conversations": [
+    {
+      "id": "01a723c5-8343-49c7-91d2-f8e888c289b4",
+      "title": "请王明负责长沙两日游攻略，明确分工并实际完成：李研单独查找路线和交通；周理单独查",
+      "taskCount": 9,
+      "tasks": [
+        {
+          "id": "run:f4613170765e478ab6562d1949c257b1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "run:c87321b3c1574133932fd800c3ab55bc",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:c87321b3c1574133932fd800c3ab55bc:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:c87321b3c1574133932fd800c3ab55bc:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:c87321b3c1574133932fd800c3ab55bc:2",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "run:c855e1f2ace84e888cd152aa2f8011a7",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:c855e1f2ace84e888cd152aa2f8011a7:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:c855e1f2ace84e888cd152aa2f8011a7:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:c855e1f2ace84e888cd152aa2f8011a7:2",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        }
+      ],
+      "eventCount": 3,
+      "whiteboardStatus": "completed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "074aead8-85fc-4cc4-a24f-40cb48343f0f",
+      "title": "今天是几号",
+      "taskCount": 9,
+      "tasks": [
+        {
+          "id": "run:1ac70482dc87461283e45a6944c4fb83",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:1ac70482dc87461283e45a6944c4fb83:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:1ac70482dc87461283e45a6944c4fb83:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "run:b5b120f74fd8406cbc1e46f510cbdd53",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:b5b120f74fd8406cbc1e46f510cbdd53:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "run:138512a34e414c49a9539418c28c12dc",
+          "status": "failed",
+          "progress": 25,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:138512a34e414c49a9539418c28c12dc:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:138512a34e414c49a9539418c28c12dc:1",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:138512a34e414c49a9539418c28c12dc:2",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        }
+      ],
+      "eventCount": 3,
+      "whiteboardStatus": "completed",
+      "whiteboardStepCount": 2,
+      "employeeCount": 6
+    },
+    {
+      "id": "2feb187f-2170-4afb-935b-2306d019786f",
+      "title": "请王明组织五位同事完成一个长沙两日游攻略：李研只查路线和交通，周理只查美食，陈书",
+      "taskCount": 8,
+      "tasks": [
+        {
+          "id": "run:02228937cb4c4c76875f3efaaec237b9",
+          "status": "failed",
+          "progress": 28,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:02228937cb4c4c76875f3efaaec237b9:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "step:02228937cb4c4c76875f3efaaec237b9:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "step:02228937cb4c4c76875f3efaaec237b9:2",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:02228937cb4c4c76875f3efaaec237b9:3",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:02228937cb4c4c76875f3efaaec237b9:4",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:02228937cb4c4c76875f3efaaec237b9:5",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "delegation:4fb3e7db2f804035852ef20fdd1caeba",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "app-agent"
+        }
+      ],
+      "eventCount": 6,
+      "whiteboardStatus": "failed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "337e8116-a5ae-43b5-b21d-6f2e3af869c9",
+      "title": "请王明负责长沙两日游攻略，明确分工并实际完成：李研单独查找路线和交通；周理单独查",
+      "taskCount": 10,
+      "tasks": [
+        {
+          "id": "run:10d9568f5f9d404f9324a94b2a7dc831",
+          "status": "failed",
+          "progress": 28,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:10d9568f5f9d404f9324a94b2a7dc831:0",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:10d9568f5f9d404f9324a94b2a7dc831:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "step:10d9568f5f9d404f9324a94b2a7dc831:2",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "app-agent"
+        },
+        {
+          "id": "step:10d9568f5f9d404f9324a94b2a7dc831:3",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:10d9568f5f9d404f9324a94b2a7dc831:4",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:10d9568f5f9d404f9324a94b2a7dc831:5",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "delegation:1c1a68f3d77a450a8f409a415f818fff",
+          "status": "blocked",
+          "progress": 100,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "delegation:77048d7e1591435fb5c49c103222174c",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "review-agent"
+        },
+        {
+          "id": "delegation:833d21898e414d53b46afaeee8994978",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "data-agent"
+        }
+      ],
+      "eventCount": 14,
+      "whiteboardStatus": "failed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "3926aa05-ede9-4d98-9714-a8a0528259ae",
+      "title": "请王明负责长沙两日游攻略，明确分工并实际完成：李研单独查找路线和交通；周理单独查",
+      "taskCount": 8,
+      "tasks": [
+        {
+          "id": "run:45b41723790b40ea87e5cbdb2fbfd456",
+          "status": "failed",
+          "progress": 37,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:45b41723790b40ea87e5cbdb2fbfd456:0",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:45b41723790b40ea87e5cbdb2fbfd456:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "step:45b41723790b40ea87e5cbdb2fbfd456:2",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "step:45b41723790b40ea87e5cbdb2fbfd456:3",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "app-agent"
+        },
+        {
+          "id": "step:45b41723790b40ea87e5cbdb2fbfd456:4",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:45b41723790b40ea87e5cbdb2fbfd456:5",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:45b41723790b40ea87e5cbdb2fbfd456:6",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        }
+      ],
+      "eventCount": 6,
+      "whiteboardStatus": "failed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "47911256-7b73-409a-b971-7cba938dab30",
+      "title": "请王明负责长沙两日游攻略，明确分工并实际完成：李研单独查找路线和交通；周理单独查",
+      "taskCount": 8,
+      "tasks": [
+        {
+          "id": "run:b1a21aafb6a640e88142775775450e75",
+          "status": "failed",
+          "progress": 42,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:b1a21aafb6a640e88142775775450e75:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "step:b1a21aafb6a640e88142775775450e75:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "step:b1a21aafb6a640e88142775775450e75:2",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "app-agent"
+        },
+        {
+          "id": "step:b1a21aafb6a640e88142775775450e75:3",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:b1a21aafb6a640e88142775775450e75:4",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:b1a21aafb6a640e88142775775450e75:5",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "delegation:1a3f12ee06fc4b0a9fd71131e5b84ab9",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "review-agent"
+        }
+      ],
+      "eventCount": 8,
+      "whiteboardStatus": "failed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "5e28ea55-8026-45e1-9e4e-b75f07f2f4fe",
+      "title": "请王明组织五位同事完成长沙两日游常识攻略，按依赖顺序实际派发并最后汇总；不联网、",
+      "taskCount": 7,
+      "tasks": [
+        {
+          "id": "run:5170fd1dcb9340ec9bb93e475ffe8550",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:5170fd1dcb9340ec9bb93e475ffe8550:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "step:5170fd1dcb9340ec9bb93e475ffe8550:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "step:5170fd1dcb9340ec9bb93e475ffe8550:2",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "app-agent"
+        },
+        {
+          "id": "step:5170fd1dcb9340ec9bb93e475ffe8550:3",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "review-agent"
+        },
+        {
+          "id": "step:5170fd1dcb9340ec9bb93e475ffe8550:4",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "data-agent"
+        },
+        {
+          "id": "step:5170fd1dcb9340ec9bb93e475ffe8550:5",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        }
+      ],
+      "eventCount": 10,
+      "whiteboardStatus": "completed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "7e4e3ac5-e9d1-4faa-8387-b0b4f49f9bfe",
+      "title": "请王明负责长沙两日游攻略，明确分工并实际完成：李研单独查找路线和交通；周理单独查",
+      "taskCount": 9,
+      "tasks": [
+        {
+          "id": "run:ab0509ac6a974ea6aa7db3a28fd93f96",
+          "status": "failed",
+          "progress": 62,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:ab0509ac6a974ea6aa7db3a28fd93f96:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:ab0509ac6a974ea6aa7db3a28fd93f96:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "step:ab0509ac6a974ea6aa7db3a28fd93f96:2",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "step:ab0509ac6a974ea6aa7db3a28fd93f96:3",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "app-agent"
+        },
+        {
+          "id": "step:ab0509ac6a974ea6aa7db3a28fd93f96:4",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:ab0509ac6a974ea6aa7db3a28fd93f96:5",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "data-agent"
+        },
+        {
+          "id": "step:ab0509ac6a974ea6aa7db3a28fd93f96:6",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "delegation:21bf3f3d10c543dea7cd576f104c9683",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "review-agent"
+        }
+      ],
+      "eventCount": 0,
+      "whiteboardStatus": "failed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "a3be9c2d-3359-4f98-870a-53bf7be59c43",
+      "title": "请王明组织五位同事完成一个长沙两日游攻略：李研只查路线和交通，周理只查美食，陈书",
+      "taskCount": 8,
+      "tasks": [
+        {
+          "id": "run:732e5cee14274af8bf4401643c030376",
+          "status": "failed",
+          "progress": 28,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:732e5cee14274af8bf4401643c030376:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "step:732e5cee14274af8bf4401643c030376:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "step:732e5cee14274af8bf4401643c030376:2",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:732e5cee14274af8bf4401643c030376:3",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:732e5cee14274af8bf4401643c030376:4",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:732e5cee14274af8bf4401643c030376:5",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "delegation:6afa0109ce464cb098002a213f468619",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "app-agent"
+        }
+      ],
+      "eventCount": 6,
+      "whiteboardStatus": "failed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    },
+    {
+      "id": "d2390d3a-1d55-4fdb-9896-67165ac7abf8",
+      "title": "今天长沙天气怎么样，适合在哪个地方玩，带小孩，帮我规划好，并记录一下",
+      "taskCount": 7,
+      "tasks": [
+        {
+          "id": "run:a322b886ea3a4715a35861914cb3096f",
+          "status": "failed",
+          "progress": 25,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:a322b886ea3a4715a35861914cb3096f:0",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:a322b886ea3a4715a35861914cb3096f:1",
+          "status": "completed",
+          "progress": 100,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "step:a322b886ea3a4715a35861914cb3096f:2",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "office-lead"
+        },
+        {
+          "id": "delegation:cb1c267e873e46f8b404f14ae46af385",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "code-agent"
+        },
+        {
+          "id": "delegation:db8d342c84f24bbc98b7266bc8c668fb",
+          "status": "failed",
+          "progress": 0,
+          "assigneeId": "file-agent"
+        },
+        {
+          "id": "delegation:829aec7f53254bcebb28741648ac3d13",
+          "status": "blocked",
+          "progress": 100,
+          "assigneeId": "app-agent"
+        }
+      ],
+      "eventCount": 6,
+      "whiteboardStatus": "failed",
+      "whiteboardStepCount": 3,
+      "employeeCount": 6
+    }
+  ]
+}
