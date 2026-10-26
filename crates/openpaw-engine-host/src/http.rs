@@ -2150,7 +2150,14 @@ mod tests {
                     Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute"|"goal-replan") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
                     Some("office.read") if body["teamId"].is_string() => {
                         let messages = seen.lock().await;
-                        let snapshot = messages.iter().rev().find(|message| message["type"] == "office.snapshot" && message["teamId"] == body["teamId"]).unwrap()["snapshot"].clone();
+                        let snapshot = if scenario.starts_with("goal-") {
+                            // Goal fixture 像真实 Gateway 一样接收周期全量同步，旧队列消息不覆盖新版本。
+                            messages.iter().filter_map(|message| {
+                                if message["type"] == "office.snapshot" && message["teamId"] == body["teamId"] { Some(&message["snapshot"]) }
+                                else if message["type"] == "offices.initialize" { message["offices"].as_array().and_then(|offices| offices.iter().find(|snapshot| snapshot["workspace"]["id"] == body["teamId"])) }
+                                else { None }
+                            }).max_by_key(|snapshot| snapshot["seq"].as_u64().unwrap_or(0)).unwrap().clone()
+                        } else { messages.iter().rev().find(|message| message["type"] == "office.snapshot" && message["teamId"] == body["teamId"]).unwrap()["snapshot"].clone() };
                         let actors = ["office-lead","code-agent","file-agent","app-agent","review-agent","data-agent"].into_iter().map(|id|
                             serde_json::json!({"id":id,"presentation":{"sourceRevision":0}})).collect::<Vec<_>>();
                         serde_json::json!({"snapshot":snapshot,"scene":{"actors":actors},"pendingDecisions":[]})
