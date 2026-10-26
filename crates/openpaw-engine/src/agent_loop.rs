@@ -120,8 +120,8 @@ fn add_usage(left: openpaw_core::Usage, right: openpaw_core::Usage) -> openpaw_c
     }
 }
 
-/// The agent loop. Cheap to share (`Arc`); per-turn state lives in the
-/// [`openpaw_core::Session`] passed to [`AgentLoop::run_turn`].
+/// 功能：驱动模型与工具的有界回合；会话事实仍由调用方持有。
+/// 数据边界：可选正常结束续行回调只返回提示，不启动新回合或增加预算。
 pub struct AgentLoop {
     provider: Arc<dyn LlmProvider>,
     tool_host: Arc<dyn ToolHost>,
@@ -137,9 +137,18 @@ pub struct AgentLoop {
     compact_options: Option<crate::compaction::CompactOptions>,
     token_budget: std::sync::Mutex<Option<crate::token_budget::TokenBudgetTracker>>,
     hook_chain: Option<Arc<HookChain>>,
+    end_turn_continuation: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl AgentLoop {
+    /// 功能：创建默认有界模型与工具回合驱动器。
+    /// 参数：provider 为模型供应商边界。
+    /// 返回：尚未安装可选续行策略的 AgentLoop。
+    /// 错误：无。
+    /// 状态：创建实例级预算与取消状态，不启动请求。
+    /// 并发与取消：每个实例同一时间只允许一个活动回合。
+    /// 权限：使用默认工具与审批配置，可由 builder 明确替换。
+    /// 关联：run_turn、with_end_turn_continuation。
     pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
         Self {
             provider,
@@ -162,7 +171,24 @@ impl AgentLoop {
             compact_options: None,
             token_budget: std::sync::Mutex::new(None),
             hook_chain: None,
+            end_turn_continuation: None,
         }
+    }
+
+    /// 功能：安装正常 EndTurn 时的可选续行判断。
+    /// 参数：continuation 返回下一提示，或 None 表示允许结束。
+    /// 返回：具有该续行策略的 AgentLoop。
+    /// 错误：无。
+    /// 状态：原回合内续行，沿用同一迭代预算和截止时间。
+    /// 并发与取消：同步回调只在正常结束且未取消时调用。
+    /// 权限：不扩展工具权限；预算终答、错误和 MaxTokens 不续行。
+    /// 关联：Host Goal 前台协调；未配置时保持原行为。
+    pub fn with_end_turn_continuation(
+        mut self,
+        continuation: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    ) -> Self {
+        self.end_turn_continuation = Some(continuation);
+        self
     }
 
     /// Enable per-iteration compaction checks with these options (E2).
@@ -613,7 +639,14 @@ impl AgentLoop {
 
             if resp.stop_reason != StopReason::ToolUse {
                 // Token 预算继续：模型已停止，但仍有有效预算且收益未递减时，提示其继续工作。
-                let nudge = {
+                let nudge = if resp.stop_reason == StopReason::EndTurn
+                    && !self.is_cancelled()
+                    && self.end_turn_continuation.is_some()
+                {
+                    self.end_turn_continuation
+                        .as_ref()
+                        .and_then(|continuation| continuation())
+                } else {
                     let mut guard = self.token_budget_mut();
                     match guard.as_mut() {
                         Some(tracker)
@@ -1984,6 +2017,76 @@ mod tests {
         assert_eq!(result.unwrap(), StopReason::EndTurn);
         assert_eq!(calls, 2);
         assert_eq!(session.messages.last().unwrap().text(), "recovered");
+    }
+
+    #[tokio::test]
+    async fn end_turn_continuation_keeps_original_budget_and_budget_final_is_terminal() {
+        let provider = Arc::new(EmptyFinalProvider {
+            empty_calls: AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            stop_reason: StopReason::EndTurn,
+        });
+        let continuations = Arc::new(AtomicUsize::new(0));
+        let count = continuations.clone();
+        let agent = AgentLoop::new(provider.clone())
+            .with_budget(IterationBudget::new(1))
+            .with_end_turn_continuation(Arc::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                Some("继续剩余工作".into())
+            }));
+        let mut session = Session::new("bounded", "bounded");
+        session.messages.push(Message::user_text("work"));
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            agent.run_turn(&mut session, None, &[], &mut |_| {}),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, StopReason::EndTurn);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            3,
+            "一次预算、一次原grace、一次禁工具终答"
+        );
+        assert_eq!(
+            continuations.load(Ordering::SeqCst),
+            2,
+            "预算终答不得再调用续行策略"
+        );
+    }
+
+    #[tokio::test]
+    async fn end_turn_continuation_never_runs_after_cancel_or_max_tokens() {
+        for cancelled in [false, true] {
+            let provider = Arc::new(EmptyFinalProvider {
+                empty_calls: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                stop_reason: StopReason::MaxTokens,
+            });
+            let count = Arc::new(AtomicUsize::new(0));
+            let observed = count.clone();
+            let agent =
+                AgentLoop::new(provider.clone()).with_end_turn_continuation(Arc::new(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Some("must not continue".into())
+                }));
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            let mut session = Session::new("terminal", "terminal");
+            session.messages.push(Message::user_text("work"));
+            let result = agent
+                .run_turn_with_cancel_token(&mut session, None, &[], &mut |_| {}, token)
+                .await;
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                usize::from(!cancelled)
+            );
+            assert_eq!(result.is_err(), !cancelled);
+        }
     }
 
     #[tokio::test]

@@ -68,17 +68,35 @@ fn projection_text(text: &str, limit: usize) -> String {
 
 fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
     let tasks = goal["tasks"].as_array().cloned().unwrap_or_default();
-    let ended = goal["phase"] == "ended";
+    let phase = goal["phase"].as_str().unwrap_or("draft");
+    let ended = phase == "ended";
     let count = tasks.len();
-    snapshot["goal"] = serde_json::json!({"id":goal["id"],"phase":goal["phase"],"planVersion":goal["plan_version"],"acceptedTaskCount":0,"taskCount":count,"progress":-1,"reason":goal["reason"]});
+    let accepted = tasks
+        .iter()
+        .filter(|task| task["status"] == "accepted")
+        .count();
+    let progress = if goal["confirmed_version"].as_u64().unwrap_or(0) == 0 || count == 0 {
+        -1
+    } else {
+        (accepted * 100 / count) as i64
+    };
+    snapshot["goal"] = serde_json::json!({"id":goal["id"],"phase":phase,"planVersion":goal["plan_version"],"acceptedTaskCount":accepted,"taskCount":count,"progress":progress,"reason":goal["reason"]});
     snapshot["tasks"] = Value::Array(tasks.iter().map(|task| {
         let criteria = task["acceptance_criteria"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("；");
         let dependencies = task["dependencies"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("、");
-        let summary = format!("预期结果：{}\n验收条件：{criteria}\n依赖：{}",task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies});
+        let summary = format!("预期结果：{}\n验收条件：{criteria}\n依赖：{}\n实际产出：{}\n验收依据：{}",task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies},task["result"].as_str().unwrap_or("尚未产出"),if task["status"] == "accepted" {"已根据真实工具观察逐项核对，完整依据见聊天"} else {"未验证，不计为通过"});
         let summary = if summary.encode_utf16().count() > 1000 { format!("{}…完整条件与依赖见聊天计划。",projection_text(&summary,960)) } else { summary };
-        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":goal["session_id"],"title":task["title"],"status":if ended {"failed"} else {"queued"},"progress":-1,"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
+        let status = if ended { "failed" } else { match task["status"].as_str() { Some("accepted")=>"completed",Some("running")=>"running",Some("produced"|"interrupted")=>"blocked",_=>"queued" } };
+        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":goal["session_id"],"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {-1},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
     }).collect());
-    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":if ended {"failed"} else {"queued"},"tagline":if ended {"目标已结束"} else {"计划待确认"},"description":"完整任务与验收条件见聊天计划","note":"未确认计划的进度未知","link":{"label":"","url":""},"progressMode":"reported","steps":[{"id":goal["id"],"title":format!("已验收 0/{count} 项"),"progress":-1}]});
+    let status = match phase {
+        "completed" => "completed",
+        "ended" => "failed",
+        "active" => "running",
+        "paused" | "blocked" => "blocked",
+        _ => "queued",
+    };
+    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":status,"tagline":projection_text(goal["reason"].as_str().unwrap_or(""),160),"description":"完整任务与验收条件见聊天计划","note":if phase == "draft" {"未确认计划的进度未知"} else {"任务全部通过仍需独立整体验收"},"link":{"label":"","url":""},"progressMode":"reported","steps":[{"id":goal["id"],"title":format!("已验收 {accepted}/{count} 项"),"progress":progress}]});
 }
 
 // 人物外观的名字属于展示名册；子会话职责和任务名称保留在原执行事实中。
