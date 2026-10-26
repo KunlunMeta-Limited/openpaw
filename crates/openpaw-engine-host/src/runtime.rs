@@ -1381,6 +1381,7 @@ impl AppState {
             session.meta.model.clone(),
             tool_host,
             approvals.clone(),
+            goal.clone(),
         )
         .map_err(|_| SessionLoadError::Unavailable)?;
         let title = session_title(&mutation, &messages, &message_presentations);
@@ -1542,7 +1543,13 @@ impl AppState {
             child.is_some(),
         );
         let tools = tool_host.list_tools().await.map_err(|e| e.to_string())?;
-        let agent = configured_agent(provider, model_name, tool_host, approvals.clone())?;
+        let agent = configured_agent(
+            provider,
+            model_name,
+            tool_host,
+            approvals.clone(),
+            goal.clone(),
+        )?;
         let home = self.config.home.clone();
         let path = home.join("sessions").join(format!("{id}.jsonl"));
         let mut writer = SessionWriter::create(&path).map_err(|e| e.to_string())?;
@@ -1895,11 +1902,14 @@ impl AppState {
                 &model_name,
                 false,
             );
-            let agent =
-                configured_agent(provider, model_name.clone(), tool_host, approvals.clone())
-                    .map_err(|_| {
-                        SessionMutationError::Persistence("无法创建会话分支运行时".into())
-                    })?;
+            let agent = configured_agent(
+                provider,
+                model_name.clone(),
+                tool_host,
+                approvals.clone(),
+                goal.clone(),
+            )
+            .map_err(|_| SessionMutationError::Persistence("无法创建会话分支运行时".into()))?;
             let mut session = Session::new(model_name, provider_name);
             session.meta.id = new_id.clone();
             session.messages = messages.clone();
@@ -2389,8 +2399,10 @@ fn configured_agent(
     model: String,
     tool_host: Arc<dyn openpaw_core::ToolHost>,
     approvals: Arc<HostApprovalManager>,
+    goal: Arc<GoalContext>,
 ) -> Result<AgentLoop, String> {
     let mut agent = AgentLoop::new(provider)
+        .with_end_turn_continuation(Arc::new(move || goal.continuation()))
         .with_model(model)
         .with_tool_host(tool_host)
         .with_compact_options(openpaw_engine::compaction::CompactOptions {
@@ -3350,7 +3362,9 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     if handle.goal.prompt().is_some() {
         provider_tools.extend(crate::goal::plan_tools());
     }
-    provider_tools.retain(|tool| handle.goal.allowed(&tool.name).is_ok());
+    if !handle.goal.is_execution_turn() {
+        provider_tools.retain(|tool| handle.goal.allowed(&tool.name).is_ok());
+    }
     let system_prompt = if handle.child.is_some() {
         Some("你是主 Agent 委派的独立子 Agent。只完成任务及明确提供的背景，必要时使用工作区工具；不得再次委派。最终给出供父 Agent 整合的真实结果。".to_string())
     } else {

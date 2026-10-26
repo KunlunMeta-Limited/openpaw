@@ -1,7 +1,7 @@
-//! 功能：保存会话归属的 Goal 草稿、完整计划及用户编辑来源，包装规划工具权限。
+//! 功能：保存会话归属的 Goal、计划、执行和验收事实，强制回合与任务权限。
 //! 输入输出边界：真实用户回合和模型工具输入进入，持久事实由 runtime 唯一 writer 提交。
-//! 禁止承担：不执行交付任务，不写共享 Todo，不创建后台驱动或独立 session writer。
-//! 关联：CHG-2026-0050、goal-command ticket 01。
+//! 禁止承担：不直接执行交付工具，不写共享 Todo，不创建后台驱动或独立 writer。
+//! 关联：CHG-2026-0050、goal-command tickets 01–02。
 
 use crate::runtime::SessionHandle;
 use async_trait::async_trait;
@@ -30,6 +30,12 @@ struct GoalRecord {
     tasks: Vec<GoalTask>,
     reason: String,
     history: Vec<Value>,
+    #[serde(default)]
+    confirmed_version: u64,
+    #[serde(default)]
+    observations: Vec<Observation>,
+    #[serde(default)]
+    evidence: Vec<Evidence>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -40,6 +46,36 @@ struct GoalTask {
     expected_result: String,
     acceptance_criteria: Vec<String>,
     dependencies: Vec<String>,
+    #[serde(default = "pending")]
+    status: String,
+    #[serde(default)]
+    result: String,
+    #[serde(default)]
+    evidence: Vec<Evidence>,
+}
+
+fn pending() -> String {
+    "pending".into()
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Evidence {
+    criterion: usize,
+    observation_id: String,
+    conclusion: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Observation {
+    id: String,
+    task_id: Option<String>,
+    tool: String,
+    input: Value,
+    output: String,
+    verification: bool,
+    #[serde(default)]
+    whole_goal: bool,
 }
 
 struct UserTurn {
@@ -47,6 +83,8 @@ struct UserTurn {
     message_id: String,
     text: String,
     editable: bool,
+    executing: bool,
+    task_id: Option<String>,
 }
 
 /// 功能：承载单个会话的 Goal 事实与当前真实用户回合，不持有 session 强引用。
@@ -122,13 +160,13 @@ impl GoalContext {
         handle.commit_goal(json!({"type":"session_goal_state_v1","owner":self.owner,"state":state}))
     }
 
-    /// 功能：绑定真实用户回合并接收精确 Goal 创建命令。
+    /// 功能：绑定真实用户回合，处理创建和最近展示版本的初始执行确认。
     /// 参数：turn 与 message 为 runtime 身份，text 为未替换的原输入。
     /// 返回：确定性拒绝回复，或交给模型规划。
     /// 错误：持久化失败停止处理。
-    /// 状态：新草稿先落盘；重复目标不会覆盖当前记录。
+    /// 状态：新草稿和确认事实先落盘；重复目标不会覆盖当前记录。
     /// 并发与取消：每个会话已有单活动回合，Goal 锁串行化提交。
-    /// 权限：所有草稿回合只有编辑权限。
+    /// 权限：草稿只有编辑权限；初始确认只授予本回合执行许可。
     /// 关联：runtime::run_turn。
     pub(crate) fn begin(
         &self,
@@ -163,11 +201,29 @@ impl GoalContext {
                     tasks: Vec::new(),
                     reason: "等待生成初始计划".into(),
                     history: Vec::new(),
+                    confirmed_version: 0,
+                    observations: Vec::new(),
+                    evidence: Vec::new(),
                 });
                 self.commit(&next)?;
                 *state = next;
                 None
             }
+        } else if command == "确认执行"
+            && current.is_some_and(|goal| {
+                goal.phase == "draft"
+                    && goal.plan_version > 0
+                    && goal.displayed_version == goal.plan_version
+            })
+        {
+            let mut next = state.clone();
+            let goal = next.records.last_mut().unwrap();
+            goal.confirmed_version = goal.plan_version;
+            goal.phase = "active".into();
+            goal.reason = "用户确认最近展示的完整计划，开始前台执行".into();
+            self.commit(&next)?;
+            *state = next;
+            None
         } else if unfinished && matches!(command, "/goal continue" | "确认执行") {
             Some("当前计划尚未开始执行。请核对最近展示的完整计划。".into())
         } else {
@@ -183,13 +239,20 @@ impl GoalContext {
             message_id: message.into(),
             text: text.into(),
             editable,
+            executing: reply.is_none()
+                && command == "确认执行"
+                && state
+                    .records
+                    .last()
+                    .is_some_and(|goal| goal.phase == "active"),
+            task_id: None,
         });
         Ok(reply)
     }
 
-    /// 功能：提供草稿规划的模型约束。
+    /// 功能：提供当前 Goal 的规划或执行验收约束。
     /// 参数：无。
-    /// 返回：存在待确认 Goal 时的系统上下文。
+    /// 返回：存在未结束 Goal 时的系统上下文。
     /// 错误：无。
     /// 状态：只读。
     /// 并发与取消：短锁，不持 session 锁。
@@ -197,7 +260,10 @@ impl GoalContext {
     /// 关联：goal_read、goal_update。
     pub(crate) fn prompt(&self) -> Option<String> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let goal = state.records.last().filter(|goal| goal.phase == "draft")?;
+        let goal = state.records.last()?;
+        if goal.phase != "draft" {
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read。仅在本次确认授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；record_result(result) 只表示产出未验证；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。执行期间不得修改整体目标或验收条件；遇到普通失败先修复。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
+        }
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
 
@@ -225,7 +291,10 @@ impl GoalContext {
     }
 
     fn update(&self, input: Value) -> Result<Value, String> {
-        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let mut user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        if user.as_ref().is_some_and(|user| user.executing) {
+            return self.execute_update(user.as_mut().unwrap(), input);
+        }
         let user = user
             .as_ref()
             .filter(|user| user.editable)
@@ -248,6 +317,24 @@ impl GoalContext {
         let previous = json!({"plan_version":goal.plan_version,"objective":goal.objective,"acceptance_criteria":goal.acceptance_criteria,"tasks":goal.tasks,"phase":goal.phase,"reason":reason,"turn_id":user.turn_id,"user_message_id":user.message_id});
         match input["action"].as_str() {
             Some("set_plan") => {
+                if input["tasks"].as_array().is_some_and(|tasks| {
+                    tasks.iter().any(|task| {
+                        task.as_object().is_none_or(|task| {
+                            task.keys().any(|key| {
+                                ![
+                                    "id",
+                                    "title",
+                                    "expected_result",
+                                    "acceptance_criteria",
+                                    "dependencies",
+                                ]
+                                .contains(&key.as_str())
+                            })
+                        })
+                    })
+                }) {
+                    return Err("待确认任务只能包含计划定义，不得提供执行状态或验收事实".into());
+                }
                 let tasks: Vec<GoalTask> =
                     serde_json::from_value(input["tasks"].clone()).map_err(|_| "任务格式无效")?;
                 validate_tasks(&tasks)?;
@@ -291,15 +378,248 @@ impl GoalContext {
         Ok(result)
     }
 
-    /// 功能：生成已持久化草稿的规范完整聊天展示。
+    fn execute_update(&self, user: &mut UserTurn, input: Value) -> Result<Value, String> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        let goal = next.records.last_mut().ok_or("当前聊天没有 Goal")?;
+        if goal.phase != "active"
+            || input["goal_id"] != goal.id
+            || input["expected_version"].as_u64() != Some(goal.plan_version)
+        {
+            return Err("Goal 归属、版本或当前执行授权不匹配".into());
+        }
+        let reason = input["reason"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty() && s.encode_utf16().count() <= 1000)
+            .ok_or("必须提供变更原因")?;
+        let action = input["action"].as_str().unwrap_or("");
+        if action == "accept_goal" {
+            if !goal.tasks.iter().all(|task| task.status == "accepted") {
+                return Err("整体验收前必须先验收所有当前任务".into());
+            }
+            goal.evidence = validate_evidence(
+                &input["evidence"],
+                &goal.acceptance_criteria,
+                &goal.observations,
+                None,
+            )
+            .map_err(|error| format!("整体验收需要任务全部通过后的独立检查：{error}"))?;
+            goal.phase = "completed".into();
+        } else {
+            let id = input["task_id"].as_str().ok_or("必须提供任务身份")?;
+            let index = goal
+                .tasks
+                .iter()
+                .position(|task| task.id == id)
+                .ok_or("任务不属于当前 Goal")?;
+            match action {
+                "start_task" => {
+                    if goal.tasks[index].status != "pending"
+                        || goal
+                            .tasks
+                            .iter()
+                            .any(|task| task.status == "running" || task.status == "produced")
+                    {
+                        return Err("请先完成当前任务的产出与验收，不能重复启动任务".into());
+                    }
+                    if !goal.tasks[index].dependencies.iter().all(|dep| {
+                        goal.tasks
+                            .iter()
+                            .any(|task| task.id == *dep && task.status == "accepted")
+                    }) {
+                        return Err("任务依赖尚未验收，不能启动".into());
+                    }
+                    goal.tasks[index].status = "running".into();
+                }
+                "record_result" => {
+                    if user.task_id.as_deref() != Some(id) || goal.tasks[index].status != "running"
+                    {
+                        return Err("任务尚未由本回合启动".into());
+                    }
+                    goal.tasks[index].result = input["result"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or("产出说明不得为空，尚未验证不算通过")?
+                        .into();
+                    goal.tasks[index].status = "produced".into();
+                }
+                "accept_task" => {
+                    if user.task_id.as_deref() != Some(id) || goal.tasks[index].status != "produced"
+                    {
+                        return Err("任务必须先记录实际产出，未验证内容不能通过".into());
+                    }
+                    goal.tasks[index].evidence = validate_evidence(
+                        &input["evidence"],
+                        &goal.tasks[index].acceptance_criteria,
+                        &goal.observations,
+                        Some(id),
+                    )?;
+                    goal.tasks[index].status = "accepted".into();
+                }
+                _ => {
+                    return Err(
+                        "执行回合只允许任务执行与验收，不能自行修改整体目标或验收条件".into(),
+                    )
+                }
+            }
+        }
+        goal.reason = reason.into();
+        goal.history.push(json!({"action":action,"task_id":input["task_id"],"reason":reason,"turn_id":user.turn_id,"user_message_id":user.message_id}));
+        let result = json!(goal);
+        self.commit(&next)?;
+        *state = next;
+        if action == "start_task" {
+            user.task_id = input["task_id"].as_str().map(str::to_owned);
+        }
+        if action == "accept_task" || action == "accept_goal" {
+            user.task_id = None;
+        }
+        drop(state);
+        self.project();
+        Ok(result)
+    }
+
+    fn project(&self) {
+        if let (Some(handle), Some(goal)) = (
+            self.handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade(),
+            self.current(),
+        ) {
+            handle.office.project_goal(&self.owner, goal);
+        }
+    }
+
+    fn observe(
+        &self,
+        name: &str,
+        input: Value,
+        outcome: &mut ToolCallOutcome,
+    ) -> Result<(), String> {
+        if outcome.is_error {
+            return Ok(());
+        }
+        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(user) = user.as_ref().filter(|user| user.executing) else {
+            return Ok(());
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        let Some(goal) = next
+            .records
+            .last_mut()
+            .filter(|goal| goal.phase == "active")
+        else {
+            return Ok(());
+        };
+        let id = format!("obs-{}", uuid::Uuid::new_v4().simple());
+        goal.observations.push(Observation {
+            id: id.clone(),
+            task_id: user.task_id.clone(),
+            tool: name.into(),
+            input,
+            output: outcome.content.clone(),
+            verification: matches!(
+                name,
+                "read_file" | "read_attachment" | "grep" | "glob" | "bash"
+            ),
+            whole_goal: user.task_id.is_none()
+                && goal.tasks.iter().all(|task| task.status == "accepted"),
+        });
+        self.commit(&next)?;
+        *state = next;
+        outcome
+            .content
+            .push_str(&format!("\nGoal observation: {id}"));
+        Ok(())
+    }
+
+    /// 功能：在原 AgentLoop 的正常结束处判断是否还有目标工作。
     /// 参数：无。
-    /// 返回：存在计划时返回完整文本。
+    /// 返回：有当前执行许可且未完成时返回续行提示。
+    /// 错误：无。
+    /// 状态：只读，不创建回合或重置预算。
+    /// 并发与取消：Engine 在原取消及迭代闸门内调用。
+    /// 权限：磁盘 active 状态不构成许可。
+    /// 关联：AgentLoop::with_end_turn_continuation。
+    pub(crate) fn continuation(&self) -> Option<String> {
+        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        if !user.as_ref().is_some_and(|user| user.executing) {
+            return None;
+        }
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).records.last().filter(|goal| goal.phase == "active").map(|_| "Goal 仍有未完成工作。继续按当前依赖执行、检查产出或核对整体验收；普通回复结束不能代替目标完成，继续使用本回合剩余预算。".into())
+    }
+
+    /// 功能：判断本回合是否有真实用户授予的前台执行许可。
+    /// 参数：无。
+    /// 返回：当前回合的执行模式。
+    /// 错误：无。
+    /// 状态：只读，不依赖磁盘阶段推断权限。
+    /// 并发与取消：工具实际执行仍逐次检查取消和任务。
+    /// 权限：仅用于展示工具集合，不能代替 allowed。
+    /// 关联：runtime::run_turn 工具声明筛选。
+    pub(crate) fn is_execution_turn(&self) -> bool {
+        self.user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|user| user.executing)
+    }
+
+    /// 功能：生成已持久计划或执行验收事实的规范聊天展示。
+    /// 参数：无。
+    /// 返回：计划全文或当前执行结果与可追溯验收结论。
     /// 错误：无。
     /// 状态：不会把生成文本当成已提交展示。
     /// 并发与取消：短锁快照。
     /// 权限：不启动执行。
     /// 关联：runtime::run_turn 终态事务。
     pub(crate) fn presentation(&self) -> Option<String> {
+        if self
+            .user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|user| user.executing)
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let goal = state.records.last()?;
+            let accepted = goal
+                .tasks
+                .iter()
+                .filter(|task| task.status == "accepted")
+                .count();
+            let mut text = format!(
+                "\n\nGoal {}：已验收 {accepted}/{} 项。{}\n",
+                goal.id,
+                goal.tasks.len(),
+                if goal.phase == "completed" {
+                    "整体验收已通过"
+                } else {
+                    "整体尚未验收通过"
+                }
+            );
+            for task in &goal.tasks {
+                text.push_str(&format!(
+                    "\n任务 {}（{}）：{}\n",
+                    task.title, task.status, task.result
+                ));
+                for evidence in &task.evidence {
+                    text.push_str(&format!(
+                        "验收依据 {}：{}\n",
+                        evidence.observation_id, evidence.conclusion
+                    ));
+                }
+            }
+            for evidence in &goal.evidence {
+                text.push_str(&format!(
+                    "整体验收依据 {}：{}\n",
+                    evidence.observation_id, evidence.conclusion
+                ));
+            }
+            return Some(text);
+        }
         let editing = self
             .user
             .lock()
@@ -353,6 +673,43 @@ impl GoalContext {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|user| user.editable);
+        let executing = self
+            .user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|user| user.executing);
+        if executing {
+            if self
+                .handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade()
+                .is_none_or(|handle| handle.main_cancel_token().is_cancelled())
+            {
+                return Err("当前 Goal 回合已取消，不再启动工作".into());
+            }
+            if matches!(
+                name,
+                "goal_read" | "goal_update" | "read_file" | "read_attachment" | "grep" | "glob"
+            ) {
+                return Ok(());
+            }
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .records
+                .last()
+                .is_some_and(|goal| {
+                    goal.phase == "active" && goal.tasks.iter().any(|task| task.status == "running")
+                })
+                && name != "delegate_task"
+            {
+                return Ok(());
+            }
+            return Err("Goal 交付工具必须绑定已满足依赖且正在执行的任务".into());
+        }
         if (!editing
             && self
                 .state
@@ -371,17 +728,67 @@ impl GoalContext {
         Err("Goal 计划尚待确认，禁止执行交付工具；请先展示计划并等待确认执行".into())
     }
 
-    /// 功能：在回合所有终态清除临时用户编辑来源。
+    /// 功能：在所有终态清除临时许可，并保存未完成 Goal 的暂停事实。
     /// 参数：无。
     /// 返回：无。
-    /// 错误：无。
-    /// 状态：只清理进程内许可，持久计划保留。
+    /// 错误：暂停提交失败记安全日志，不授予后续执行权限。
+    /// 状态：已有验收保留，running 转 interrupted；不启动后台执行。
     /// 并发与取消：由 runtime 收尾调用。
     /// 权限：下轮必须重新绑定真实用户输入。
     /// 关联：TurnCleanup。
     pub(crate) fn finish(&self) {
         self.user.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        if let Some(goal) = next
+            .records
+            .last_mut()
+            .filter(|goal| goal.phase == "active")
+        {
+            goal.phase = "paused".into();
+            goal.reason = "本次前台执行已结束，未完成工作等待原聊天显式继续".into();
+            for task in &mut goal.tasks {
+                if task.status == "running" {
+                    task.status = "interrupted".into();
+                }
+            }
+            if let Err(error) = self.commit(&next) {
+                tracing::error!(%error,"Goal 暂停事实保存失败");
+            } else {
+                *state = next;
+            }
+        }
+        drop(state);
+        self.project();
     }
+}
+
+fn validate_evidence(
+    input: &Value,
+    criteria: &[String],
+    observations: &[Observation],
+    task: Option<&str>,
+) -> Result<Vec<Evidence>, String> {
+    let evidence: Vec<Evidence> =
+        serde_json::from_value(input.clone()).map_err(|_| "必须提供逐项验收依据")?;
+    if evidence.is_empty()
+        || (0..criteria.len()).any(|index| !evidence.iter().any(|entry| entry.criterion == index))
+        || evidence.iter().any(|entry| {
+            entry.criterion >= criteria.len()
+                || entry.conclusion.trim().is_empty()
+                || !observations.iter().any(|observation| {
+                    observation.id == entry.observation_id
+                        && observation.task_id.as_deref() == task
+                        && observation.verification
+                        && (task.is_some() || observation.whole_goal)
+                })
+        })
+    {
+        return Err(
+            "验收依据必须逐项引用本任务实际成功的读取或检查，不能仅声明 done 或编造编号".into(),
+        );
+    }
+    Ok(evidence)
 }
 
 fn validate_criteria(criteria: &[String]) -> Result<(), String> {
@@ -518,7 +925,13 @@ impl ToolExecutor for GoalToolHost {
         let value = match name {
             "goal_read" => Ok(self.context.read()),
             "goal_update" => self.context.update(args),
-            _ => return self.inner.call(name, args).await,
+            _ => {
+                let mut outcome = self.inner.call(name, args.clone()).await?;
+                if let Err(error) = self.context.observe(name, args, &mut outcome) {
+                    return Err(openpaw_core::Error::Session(error));
+                }
+                return Ok(outcome);
+            }
         };
         Ok(match value {
             Ok(value) => ToolCallOutcome {
@@ -547,7 +960,7 @@ impl ToolHostValidator for GoalToolHost {
     }
 }
 
-/// 功能：声明仅供 Goal 草稿规划回合使用的模型工具。
+/// 功能：声明仅供当前 Goal 回合使用的规划、执行和验收工具。
 /// 参数：无。
 /// 返回：读取与完整计划更新工具声明。
 /// 错误：无。
@@ -563,13 +976,13 @@ pub(crate) fn plan_tools() -> Vec<ToolSpec> {
             if name == "goal_read" {
                 "读取当前聊天 Goal 及完整计划版本"
             } else {
-                "提交完整待确认计划或按真实用户要求结束目标；携带 goal_id、expected_version、非空 reason"
+                "规划用 set_plan/end；执行用 start_task、record_result、accept_task；全任务通过后独立检查 accept_goal。更新携带 goal_id、expected_version、reason；验收 evidence 逐条件引用真实工具观察编号"
             },
         );
         spec.input_schema = if name == "goal_read" {
             json!({"type":"object","properties":{},"additionalProperties":false})
         } else {
-            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"}},"additionalProperties":false})
+            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","start_task","record_result","accept_task","accept_goal"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
         };
         spec.category = Some(ToolCategory::ReadOnly);
         spec.concurrency = Some(ToolConcurrency::NeverParallel);
