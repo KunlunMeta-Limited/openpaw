@@ -2118,7 +2118,7 @@ mod tests {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
                 let data = match body["type"].as_str() {
-                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
+                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute"|"goal-replan") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
                     Some("office.read") if body["teamId"].is_string() => {
                         let messages = seen.lock().await;
                         let snapshot = messages.iter().rev().find(|message| message["type"] == "office.snapshot" && message["teamId"] == body["teamId"]).unwrap()["snapshot"].clone();
@@ -2176,11 +2176,11 @@ mod tests {
                     if scenario == "goal-delegate" {
                         return goal_tests::delegation_model_response(&body, &gate).await;
                     }
-                    if scenario == "goal-execute" {
+                    if scenario == "goal-execute" || scenario == "goal-replan" {
                         if let Some(confirm) = messages.iter().rposition(|message|message["role"] == "user" && message["content"] == "确认执行") {
                             let tools = messages[confirm..].iter().filter(|message|message["role"] == "tool").count();
                             let nudged = messages[confirm..].iter().any(|message|message["content"].as_str().is_some_and(|text|text.starts_with("Goal 仍有")));
-                            if (tools == 9 && !nudged) || tools == 15 { gate.notified().await; }
+                            if (scenario == "goal-execute" && ((tools == 9 && !nudged) || tools == 15)) || (scenario == "goal-replan" && matches!(tools,11|14)) { gate.notified().await; }
                         }
                     }
                     return goal_tests::goal_model_response(&body);
