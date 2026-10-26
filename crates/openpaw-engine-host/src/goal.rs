@@ -1,7 +1,7 @@
 //! 功能：保存会话归属的 Goal、计划、执行和验收事实，强制回合与任务权限。
 //! 输入输出边界：真实用户回合和模型工具输入进入，持久事实由 runtime 唯一 writer 提交。
 //! 禁止承担：不直接执行交付工具，不写共享 Todo，不创建后台驱动或独立 writer。
-//! 关联：CHG-2026-0050、goal-command tickets 01–02。
+//! 关联：CHG-2026-0050、goal-command tickets 01–05。
 
 use crate::runtime::SessionHandle;
 use async_trait::async_trait;
@@ -46,6 +46,10 @@ struct GoalTask {
     expected_result: String,
     acceptance_criteria: Vec<String>,
     dependencies: Vec<String>,
+    #[serde(default)]
+    replaces: Vec<String>,
+    #[serde(default = "current_task")]
+    current: bool,
     #[serde(default = "pending")]
     status: String,
     #[serde(default)]
@@ -56,6 +60,10 @@ struct GoalTask {
 
 fn pending() -> String {
     "pending".into()
+}
+
+fn current_task() -> bool {
+    true
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -76,6 +84,8 @@ struct Observation {
     verification: bool,
     #[serde(default)]
     whole_goal: bool,
+    #[serde(default)]
+    is_error: bool,
 }
 
 struct UserTurn {
@@ -262,7 +272,7 @@ impl GoalContext {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let goal = state.records.last()?;
         if goal.phase != "draft" {
-            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read。仅在本次确认授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；record_result(result) 只表示产出未验证；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。执行期间不得修改整体目标或验收条件；遇到普通失败先修复。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read。仅在本次确认授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；record_result(result) 只表示产出未验证；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用replan提交完整当前任务定义（含replaces来源）增补、拆分、改写、替换和调整依赖；保留失败观察及仍有效验收。移除任务必须声明替换来源，旧身份不能复用；不得提交status/result/evidence/current等运行事实，中断或已产出任务先复核。执行期间不得修改整体目标或验收条件；越界请求会暂停并等待用户编辑和显式继续。遇到普通失败先修复或重规划。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
         }
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
@@ -293,7 +303,21 @@ impl GoalContext {
     fn update(&self, input: Value) -> Result<Value, String> {
         let mut user = self.user.lock().unwrap_or_else(|e| e.into_inner());
         if user.as_ref().is_some_and(|user| user.executing) {
-            return self.execute_update(user.as_mut().unwrap(), input);
+            let result = self.execute_update(user.as_mut().unwrap(), input);
+            let paused = self.read()["phase"] == "paused";
+            drop(user);
+            if paused {
+                let handle = self
+                    .handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .upgrade();
+                if let Some(handle) = handle {
+                    handle.cancel_goal_children();
+                }
+            }
+            self.project();
+            return result;
         }
         let user = user
             .as_ref()
@@ -317,27 +341,7 @@ impl GoalContext {
         let previous = json!({"plan_version":goal.plan_version,"objective":goal.objective,"acceptance_criteria":goal.acceptance_criteria,"tasks":goal.tasks,"phase":goal.phase,"reason":reason,"turn_id":user.turn_id,"user_message_id":user.message_id});
         match input["action"].as_str() {
             Some("set_plan") => {
-                if input["tasks"].as_array().is_some_and(|tasks| {
-                    tasks.iter().any(|task| {
-                        task.as_object().is_none_or(|task| {
-                            task.keys().any(|key| {
-                                ![
-                                    "id",
-                                    "title",
-                                    "expected_result",
-                                    "acceptance_criteria",
-                                    "dependencies",
-                                ]
-                                .contains(&key.as_str())
-                            })
-                        })
-                    })
-                }) {
-                    return Err("待确认任务只能包含计划定义，不得提供执行状态或验收事实".into());
-                }
-                let tasks: Vec<GoalTask> =
-                    serde_json::from_value(input["tasks"].clone()).map_err(|_| "任务格式无效")?;
-                validate_tasks(&tasks)?;
+                let tasks = parse_plan_definitions(&input["tasks"])?;
                 let criteria: Vec<String> =
                     serde_json::from_value(input["acceptance_criteria"].clone())
                         .map_err(|_| "整体验收条件格式无效")?;
@@ -349,7 +353,7 @@ impl GoalContext {
                         .ok_or("整体目标无效")?
                         .into();
                 }
-                goal.tasks = tasks;
+                goal.tasks = merge_plan_definitions(&goal.tasks, tasks)?;
                 goal.acceptance_criteria = criteria;
                 goal.plan_version = goal
                     .plan_version
@@ -393,8 +397,69 @@ impl GoalContext {
             .filter(|s| !s.trim().is_empty() && s.encode_utf16().count() <= 1000)
             .ok_or("必须提供变更原因")?;
         let action = input["action"].as_str().unwrap_or("");
-        if action == "accept_goal" {
-            if !goal.tasks.iter().all(|task| task.status == "accepted") {
+        if input.get("objective").is_some() || input.get("acceptance_criteria").is_some() {
+            goal.phase = "paused".into();
+            goal.reason =
+                "执行模型请求改变整体目标或整体验收条件；已拒绝，等待用户停止后编辑并显式继续"
+                    .into();
+            for task in goal
+                .tasks
+                .iter_mut()
+                .filter(|task| task.current && task.status == "running")
+            {
+                task.status = "interrupted".into();
+            }
+            goal.history.push(json!({"action":"scope_change_rejected","reason":goal.reason,"turn_id":user.turn_id,"user_message_id":user.message_id}));
+            self.commit(&next)?;
+            *state = next;
+            user.task_id = None;
+            drop(state);
+            return Err(
+                "整体目标或整体验收条件变更已拒绝；已停止执行，等待用户编辑并显式继续".into(),
+            );
+        }
+        if action == "replan" {
+            let definitions = parse_plan_definitions(&input["tasks"])?;
+            let mut previous = goal.tasks.clone();
+            for task in previous
+                .iter_mut()
+                .filter(|task| task.current && task.status == "running")
+            {
+                let changed = definitions
+                    .iter()
+                    .find(|new| new.id == task.id)
+                    .is_none_or(|new| !same_task_definition(task, new));
+                if changed
+                    && goal
+                        .observations
+                        .iter()
+                        .rev()
+                        .find(|o| o.task_id.as_deref() == Some(&task.id))
+                        .is_some_and(|o| o.is_error)
+                {
+                    task.status = "pending".into();
+                }
+            }
+            let tasks = merge_plan_definitions(&previous, definitions)?;
+            let previous = json!({"action":"replan","plan_version":goal.plan_version,"objective":goal.objective,"acceptance_criteria":goal.acceptance_criteria,"tasks":goal.tasks,"reason":reason,"turn_id":user.turn_id,"user_message_id":user.message_id});
+            goal.tasks = tasks;
+            goal.plan_version = goal
+                .plan_version
+                .checked_add(1)
+                .filter(|v| *v <= 9_007_199_254_740_991)
+                .ok_or("计划版本已耗尽")?;
+            goal.evidence.clear();
+            goal.history.push(previous);
+            if render_plan(goal).encode_utf16().count() > 45_000 {
+                return Err("完整计划过长，请精简描述后重新提交".into());
+            }
+        } else if action == "accept_goal" {
+            if !goal
+                .tasks
+                .iter()
+                .filter(|task| task.current)
+                .all(|task| task.status == "accepted")
+            {
                 return Err("整体验收前必须先验收所有当前任务".into());
             }
             goal.evidence = validate_evidence(
@@ -410,22 +475,21 @@ impl GoalContext {
             let index = goal
                 .tasks
                 .iter()
-                .position(|task| task.id == id)
+                .position(|task| task.current && task.id == id)
                 .ok_or("任务不属于当前 Goal")?;
             match action {
                 "start_task" => {
                     if goal.tasks[index].status != "pending"
-                        || goal
-                            .tasks
-                            .iter()
-                            .any(|task| task.status == "running" || task.status == "produced")
+                        || goal.tasks.iter().any(|task| {
+                            task.current && (task.status == "running" || task.status == "produced")
+                        })
                     {
                         return Err("请先完成当前任务的产出与验收，不能重复启动任务".into());
                     }
                     if !goal.tasks[index].dependencies.iter().all(|dep| {
-                        goal.tasks
-                            .iter()
-                            .any(|task| task.id == *dep && task.status == "accepted")
+                        goal.tasks.iter().any(|task| {
+                            task.current && task.id == *dep && task.status == "accepted"
+                        })
                     }) {
                         return Err("任务依赖尚未验收，不能启动".into());
                     }
@@ -464,7 +528,9 @@ impl GoalContext {
             }
         }
         goal.reason = reason.into();
-        goal.history.push(json!({"action":action,"task_id":input["task_id"],"reason":reason,"turn_id":user.turn_id,"user_message_id":user.message_id}));
+        if action != "replan" {
+            goal.history.push(json!({"action":action,"task_id":input["task_id"],"reason":reason,"turn_id":user.turn_id,"user_message_id":user.message_id}));
+        }
         let result = json!(goal);
         self.commit(&next)?;
         *state = next;
@@ -474,19 +540,26 @@ impl GoalContext {
         if action == "accept_task" || action == "accept_goal" {
             user.task_id = None;
         }
+        if action == "replan"
+            && !state.records.last().unwrap().tasks.iter().any(|task| {
+                task.current
+                    && task.status == "running"
+                    && user.task_id.as_deref() == Some(&task.id)
+            })
+        {
+            user.task_id = None;
+        }
         drop(state);
-        self.project();
         Ok(result)
     }
 
     fn project(&self) {
-        if let (Some(handle), Some(goal)) = (
-            self.handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .upgrade(),
-            self.current(),
-        ) {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let (Some(handle), Some(goal)) = (handle, self.current()) {
             handle.office.project_goal(&self.owner, goal);
         }
     }
@@ -497,9 +570,6 @@ impl GoalContext {
         input: Value,
         outcome: &mut ToolCallOutcome,
     ) -> Result<(), String> {
-        if outcome.is_error {
-            return Ok(());
-        }
         let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
         let Some(user) = user.as_ref().filter(|user| user.executing) else {
             return Ok(());
@@ -520,12 +590,18 @@ impl GoalContext {
             tool: name.into(),
             input,
             output: outcome.content.clone(),
-            verification: matches!(
-                name,
-                "read_file" | "read_attachment" | "grep" | "glob" | "bash"
-            ),
+            verification: !outcome.is_error
+                && matches!(
+                    name,
+                    "read_file" | "read_attachment" | "grep" | "glob" | "bash"
+                ),
             whole_goal: user.task_id.is_none()
-                && goal.tasks.iter().all(|task| task.status == "accepted"),
+                && goal
+                    .tasks
+                    .iter()
+                    .filter(|task| task.current)
+                    .all(|task| task.status == "accepted"),
+            is_error: outcome.is_error,
         });
         self.commit(&next)?;
         *state = next;
@@ -588,19 +664,30 @@ impl GoalContext {
             let accepted = goal
                 .tasks
                 .iter()
-                .filter(|task| task.status == "accepted")
+                .filter(|task| task.current && task.status == "accepted")
                 .count();
             let mut text = format!(
                 "\n\nGoal {}：已验收 {accepted}/{} 项。{}\n",
                 goal.id,
-                goal.tasks.len(),
+                goal.tasks.iter().filter(|task| task.current).count(),
                 if goal.phase == "completed" {
                     "整体验收已通过"
                 } else {
                     "整体尚未验收通过"
                 }
             );
-            for task in &goal.tasks {
+            text.push_str(&format!("变更原因：{}\n", goal.reason));
+            for entry in goal
+                .history
+                .iter()
+                .filter(|entry| entry["action"] == "replan")
+            {
+                text.push_str(&format!(
+                    "重规划原因：{}\n",
+                    entry["reason"].as_str().unwrap_or("")
+                ));
+            }
+            for task in goal.tasks.iter().filter(|task| task.current) {
                 text.push_str(&format!(
                     "\n任务 {}（{}）：{}\n",
                     task.title, task.status, task.result
@@ -611,6 +698,7 @@ impl GoalContext {
                         evidence.observation_id, evidence.conclusion
                     ));
                 }
+                text.push_str(&format!("{}\n", task_summary(task)));
             }
             for evidence in &goal.evidence {
                 text.push_str(&format!(
@@ -702,7 +790,11 @@ impl GoalContext {
                 .records
                 .last()
                 .is_some_and(|goal| {
-                    goal.phase == "active" && goal.tasks.iter().any(|task| task.status == "running")
+                    goal.phase == "active"
+                        && goal
+                            .tasks
+                            .iter()
+                            .any(|task| task.current && task.status == "running")
                 })
                 && name != "delegate_task"
             {
@@ -748,7 +840,7 @@ impl GoalContext {
             goal.phase = "paused".into();
             goal.reason = "本次前台执行已结束，未完成工作等待原聊天显式继续".into();
             for task in &mut goal.tasks {
-                if task.status == "running" {
+                if task.current && task.status == "running" {
                     task.status = "interrupted".into();
                 }
             }
@@ -796,6 +888,103 @@ fn validate_criteria(criteria: &[String]) -> Result<(), String> {
         return Err("验收条件不得为空".into());
     }
     Ok(())
+}
+
+fn parse_plan_definitions(input: &Value) -> Result<Vec<GoalTask>, String> {
+    if input.as_array().is_some_and(|tasks| {
+        tasks.iter().any(|task| {
+            task.as_object().is_none_or(|task| {
+                task.keys().any(|key| {
+                    ![
+                        "id",
+                        "title",
+                        "expected_result",
+                        "acceptance_criteria",
+                        "dependencies",
+                        "replaces",
+                    ]
+                    .contains(&key.as_str())
+                })
+            })
+        })
+    }) {
+        return Err("任务只能包含计划定义，不得提供执行状态或验收事实".into());
+    }
+    let tasks: Vec<GoalTask> = serde_json::from_value(input.clone()).map_err(|_| "任务格式无效")?;
+    validate_tasks(&tasks)?;
+    Ok(tasks)
+}
+
+fn same_task_definition(old: &GoalTask, new: &GoalTask) -> bool {
+    old.title == new.title
+        && old.expected_result == new.expected_result
+        && old.acceptance_criteria == new.acceptance_criteria
+        && old.dependencies == new.dependencies
+}
+
+fn merge_plan_definitions(
+    previous: &[GoalTask],
+    mut definitions: Vec<GoalTask>,
+) -> Result<Vec<GoalTask>, String> {
+    let current_ids: HashSet<_> = definitions.iter().map(|task| task.id.clone()).collect();
+    for new in &mut definitions {
+        if let Some(old) = previous.iter().find(|old| old.id == new.id) {
+            if !old.current {
+                return Err("历史任务身份不可重新使用；请新建任务并声明replaces来源".into());
+            }
+            if !new.replaces.is_empty() && new.replaces != old.replaces {
+                return Err("已有任务的替换来源不可改写".into());
+            }
+            new.replaces = old.replaces.clone();
+            if same_task_definition(old, new) {
+                *new = old.clone();
+            } else if matches!(old.status.as_str(), "running" | "produced" | "interrupted") {
+                return Err(
+                    "正在执行、已产出或中断任务必须先检查实际结果，不能通过重规划清除执行事实"
+                        .into(),
+                );
+            }
+        } else {
+            if new.replaces.iter().any(|id| current_ids.contains(id)) {
+                return Err("替换来源必须退出当前计划；拆分后使用新身份保留来源关系".into());
+            }
+            let sources: HashSet<_> = new.replaces.iter().collect();
+            if sources.len() != new.replaces.len()
+                || new.replaces.iter().any(|id| {
+                    id == &new.id
+                        || !previous.iter().any(|old| old.current && old.id == *id)
+                        || previous
+                            .iter()
+                            .any(|old| old.id == *id && old.status == "interrupted")
+                })
+            {
+                return Err("替换来源必须是本计划中未中断的现有任务，且不可重复或自引用".into());
+            }
+        }
+    }
+    for old in previous.iter().filter(|old| old.current) {
+        if !definitions.iter().any(|new| new.id == old.id) {
+            if matches!(old.status.as_str(), "running" | "produced" | "interrupted") {
+                return Err("执行中的任务须先检查或处理失败，再替换".into());
+            }
+            if !definitions.iter().any(|new| new.replaces.contains(&old.id)) {
+                return Err("移除当前任务必须声明替换或拆分来源replaces，历史不会删除".into());
+            }
+        }
+    }
+    let mut historical: Vec<_> = previous
+        .iter()
+        .filter(|old| !old.current || !definitions.iter().any(|new| new.id == old.id))
+        .cloned()
+        .collect();
+    for old in &mut historical {
+        if old.current {
+            old.current = false;
+            old.status = "superseded".into();
+        }
+    }
+    definitions.extend(historical);
+    Ok(definitions)
 }
 
 fn task_summary(task: &GoalTask) -> String {
@@ -867,7 +1056,7 @@ fn render_plan(goal: &GoalRecord) -> String {
         goal.acceptance_criteria.join("\n- "),
         goal.plan_version
     );
-    for task in &goal.tasks {
+    for task in goal.tasks.iter().filter(|task| task.current) {
         text.push_str(&format!(
             "\n任务 {}：{}\n{}\n",
             task.id,
@@ -976,13 +1165,13 @@ pub(crate) fn plan_tools() -> Vec<ToolSpec> {
             if name == "goal_read" {
                 "读取当前聊天 Goal 及完整计划版本"
             } else {
-                "规划用 set_plan/end；执行用 start_task、record_result、accept_task；全任务通过后独立检查 accept_goal。更新携带 goal_id、expected_version、reason；验收 evidence 逐条件引用真实工具观察编号"
+                "规划用 set_plan/end；执行用 replan、start_task、record_result、accept_task；replan仅提交任务定义，replaces记录替换/拆分来源；全任务通过后独立检查 accept_goal。更新携带 goal_id、expected_version、reason；验收 evidence 逐条件引用真实工具观察编号"
             },
         );
         spec.input_schema = if name == "goal_read" {
             json!({"type":"object","properties":{},"additionalProperties":false})
         } else {
-            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","start_task","record_result","accept_task","accept_goal"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
+            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","replan","start_task","record_result","accept_task","accept_goal"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}},"replaces":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
         };
         spec.category = Some(ToolCategory::ReadOnly);
         spec.concurrency = Some(ToolConcurrency::NeverParallel);
