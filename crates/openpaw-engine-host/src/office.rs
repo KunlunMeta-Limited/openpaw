@@ -106,7 +106,7 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
         "paused" | "blocked" => "blocked",
         _ => "queued",
     };
-    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":status,"tagline":projection_text(goal["reason"].as_str().unwrap_or(""),160),"description":"完整任务与验收条件见聊天计划","note":if phase == "draft" {"未确认计划的进度未知"} else {"任务全部通过仍需独立整体验收"},"link":{"label":"","url":""},"progressMode":"reported","steps":[{"id":goal["id"],"title":format!("已验收 {accepted}/{count} 项"),"progress":progress}]});
+    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":status,"tagline":projection_text(goal["reason"].as_str().unwrap_or(""),40),"description":"完整任务与验收条件见聊天计划","note":if phase == "draft" {"未确认计划的进度未知"} else {"任务全部通过仍需独立整体验收"},"link":{"label":"","url":""},"progressMode":"reported","steps":[{"id":goal["id"],"title":format!("已验收 {accepted}/{count} 项"),"progress":progress}]});
 }
 
 // 人物外观的名字属于展示名册；子会话职责和任务名称保留在原执行事实中。

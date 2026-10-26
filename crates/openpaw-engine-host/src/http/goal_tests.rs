@@ -3,6 +3,437 @@ mod goal_tests {
     use super::*;
 
     #[tokio::test]
+    async fn main_goal_shell_verifies_produced_and_whole_results_without_unbinding_delivery() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-review", "confirm").await;
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "review",
+            "plan",
+            "/goal 审查验证脚本",
+        )
+        .await;
+        let answer = goal_send(&fixture.app, &fixture.team, "review", "execute", "确认执行").await;
+        assert!(answer["text"].as_str().unwrap().contains("整体验收已通过"));
+        assert!(!fixture
+            .workspace
+            .path()
+            .join("unbound-produced.txt")
+            .exists());
+        assert!(!fixture.workspace.path().join("unbound-whole.txt").exists());
+        let requests = fixture.model_seen.lock().await;
+        let results = requests
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>();
+        assert!(results
+            .iter()
+            .any(|text| text.contains("shell verified") && text.contains("Goal observation:")));
+        assert!(
+            results
+                .iter()
+                .filter(|text| text.contains("交付工具必须绑定"))
+                .count()
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn main_goal_long_block_reason_keeps_whiteboard_within_receiving_contract() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-isolation", "confirm").await;
+        fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "review",
+            "plan",
+            "/goal 审查验证脚本长原因投影",
+        )
+        .await;
+        goal_send(&fixture.app, &fixture.team, "review", "execute", "确认执行").await;
+        let (snapshot, conversation) = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let (_, read) = fixture
+                    .state
+                    .main_office
+                    .message(
+                        serde_json::json!({"type":"office.read","teamId":fixture.team}),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                if let Some(conversation) =
+                    read["snapshot"]["conversations"]
+                        .as_array()
+                        .and_then(|rows| {
+                            rows.iter().find(|row| {
+                                row["id"] == "review" && row["goal"]["phase"] == "blocked"
+                            })
+                        })
+                {
+                    break (read["snapshot"].clone(), conversation.clone());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("真实Gateway应收到带长原因的阻塞快照");
+        if let Ok(path) = std::env::var("GOAL_REVIEW_PROJECTION_FILE") {
+            std::fs::write(path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+        }
+        assert!(
+            conversation["goal"]["reason"]
+                .as_str()
+                .unwrap()
+                .encode_utf16()
+                .count()
+                > 40
+        );
+        assert!(conversation["tasks"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("外部地区资料"));
+        for (field, limit) in [
+            ("title", 160),
+            ("tagline", 40),
+            ("description", 300),
+            ("note", 160),
+        ] {
+            assert!(
+                conversation["whiteboard"][field]
+                    .as_str()
+                    .unwrap()
+                    .encode_utf16()
+                    .count()
+                    <= limit,
+                "白板字段 {field} 超出接收端合同"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn main_goal_plan_changes_require_fresh_overall_check_after_replan_and_user_edit() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for mode in ["重规划", "用户编辑"] {
+            let fixture = main_fixture("goal-review", "confirm").await;
+            goal_send(
+                &fixture.app,
+                &fixture.team,
+                "proof",
+                "plan",
+                &format!("/goal 审查旧整体验收依据{mode}"),
+            )
+            .await;
+            let mut answer =
+                goal_send(&fixture.app, &fixture.team, "proof", "execute", "确认执行").await;
+            if mode == "用户编辑" {
+                assert!(!answer["text"].as_str().unwrap().contains("整体验收已通过"));
+                goal_send(
+                    &fixture.app,
+                    &fixture.team,
+                    "proof",
+                    "edit",
+                    "整体标准改为调整后的资料准确",
+                )
+                .await;
+                answer = goal_send(
+                    &fixture.app,
+                    &fixture.team,
+                    "proof",
+                    "continue",
+                    "/goal continue",
+                )
+                .await;
+            }
+            assert!(
+                answer["text"].as_str().unwrap().contains("整体验收已通过"),
+                "变更后完成真实新检查才能通过：{mode}"
+            );
+            let requests = fixture.model_seen.lock().await;
+            let results = requests
+                .iter()
+                .flat_map(|r| r["messages"].as_array().unwrap())
+                .filter(|m| m["role"] == "tool")
+                .filter_map(|m| m["content"].as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                results
+                    .iter()
+                    .any(|text| text.starts_with("整体验收需要任务全部通过后的独立检查")),
+                "旧整体观察必须拒绝：{mode}"
+            );
+            if mode == "用户编辑" {
+                assert!(results.iter().any(|text| text.contains("交付工具必须绑定")));
+                assert!(results.iter().any(|text| text.contains("计划尚待确认")));
+                assert!(!results.iter().any(|text| text.starts_with("paused-bypass")));
+            }
+        }
+    }
+
+    fn review_proof_model_response(messages: &[serde_json::Value]) -> Response {
+        let latest = messages
+            .iter()
+            .rposition(|m| {
+                m["role"] == "user" && !m["content"].as_str().unwrap_or("").starts_with("Goal 仍有")
+            })
+            .unwrap();
+        let text = messages[latest]["content"].as_str().unwrap_or("");
+        let tools = messages[latest..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>();
+        let current = tools
+            .iter()
+            .rev()
+            .find_map(|m| {
+                m["content"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter(|g| g["id"].is_string())
+            })
+            .unwrap_or_default();
+        let editing = messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("审查旧整体验收依据用户编辑"))
+        });
+        let definition = |id: &str| serde_json::json!({"id":id,"title":format!("交付{id}"),"expected_result":format!("{id}.txt"),"acceptance_criteria":["资料为七"],"dependencies":[]});
+        let update = |action: &str, task: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"goal_id":current["id"],"expected_version":current["plan_version"],"task_id":task,"reason":"核对变更后的整体资料"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        let evidence = |index: usize| {
+            let id = tools[index]["content"]
+                .as_str()
+                .unwrap_or("")
+                .rsplit("Goal observation: ")
+                .next()
+                .unwrap_or("")
+                .trim();
+            serde_json::json!({"evidence":[{"criterion":0,"observation_id":id,"conclusion":"实际资料为七"}]})
+        };
+        let read = |id: &str| Some(("read_file", serde_json::json!({"path":format!("{id}.txt")})));
+        let call = if text.starts_with("/goal ") && text != "/goal continue" {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update(
+                    "set_plan",
+                    "",
+                    serde_json::json!({"acceptance_criteria":["整体资料准确"],"tasks":[definition("a")]}),
+                ),
+                _ => None,
+            }
+        } else if text.starts_with("整体标准改为") {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update(
+                    "set_plan",
+                    "",
+                    serde_json::json!({"acceptance_criteria":["调整后的资料准确"],"tasks":[definition("a")],"user_excerpt":text}),
+                ),
+                2 => Some((
+                    "bash",
+                    serde_json::json!({"command":"printf paused-bypass"}),
+                )),
+                _ => None,
+            }
+        } else if text == "/goal continue" {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => {
+                    let old = current["observations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|o| o["whole_goal"] == true)
+                        .unwrap();
+                    update(
+                        "accept_goal",
+                        "",
+                        serde_json::json!({"evidence":[{"criterion":0,"observation_id":old["id"],"conclusion":"旧检查不能用于新验收"}]}),
+                    )
+                }
+                2 => read("a"),
+                3 => update("accept_goal", "", evidence(2)),
+                _ => None,
+            }
+        } else {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update("start_task", "a", serde_json::json!({})),
+                2 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"a.txt","content":"七"}),
+                )),
+                3 => update(
+                    "record_result",
+                    "a",
+                    serde_json::json!({"result":"a资料已交付"}),
+                ),
+                4 => read("a"),
+                5 => update("accept_task", "a", evidence(4)),
+                6 => read("a"),
+                7 if editing => update(
+                    "replan",
+                    "",
+                    serde_json::json!({"objective":"请求用户调整整体标准"}),
+                ),
+                8 if editing => Some((
+                    "bash",
+                    serde_json::json!({"command":"printf paused-bypass"}),
+                )),
+                _ if editing => None,
+                7 => update(
+                    "replan",
+                    "",
+                    serde_json::json!({"tasks":[definition("a"),definition("b")]}),
+                ),
+                8 => update("start_task", "b", serde_json::json!({})),
+                9 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"b.txt","content":"七"}),
+                )),
+                10 => update(
+                    "record_result",
+                    "b",
+                    serde_json::json!({"result":"b资料已交付"}),
+                ),
+                11 => read("b"),
+                12 => update("accept_task", "b", evidence(11)),
+                13 => update("accept_goal", "", evidence(6)),
+                14 => read("b"),
+                15 => update("accept_goal", "", evidence(14)),
+                _ => None,
+            }
+        };
+        goal_fixture_chunk(call, tools.len())
+    }
+
+    fn review_model_response(messages: &[serde_json::Value]) -> Response {
+        let latest = messages
+            .iter()
+            .rposition(|m| {
+                m["role"] == "user" && !m["content"].as_str().unwrap_or("").starts_with("Goal 仍有")
+            })
+            .unwrap();
+        let tools = messages[latest..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>();
+        let current = tools
+            .first()
+            .and_then(|m| m["content"].as_str())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .unwrap_or_default();
+        let long_reason = messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("长原因投影"))
+        });
+        let reason = if long_reason {
+            format!("需要补充外部地区资料与截止日期：{}", "🔎".repeat(30))
+        } else {
+            "审查真实shell检查与交付权限".into()
+        };
+        let update = |action: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"goal_id":current["id"],"expected_version":current["plan_version"],"reason":reason,"task_id":"script"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        let evidence = |index: usize| {
+            let id = tools[index]["content"]
+                .as_str()
+                .unwrap_or("")
+                .rsplit("Goal observation: ")
+                .next()
+                .unwrap_or("")
+                .trim();
+            serde_json::json!({"evidence":[{"criterion":0,"observation_id":id,"conclusion":"shell输出通过"}]})
+        };
+        let executing = messages[latest]["content"] == "确认执行";
+        let call = if !executing {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update(
+                    "set_plan",
+                    serde_json::json!({"acceptance_criteria":["shell输出通过"],"tasks":[{"id":"script","title":"交付检查脚本","expected_result":"check.py","acceptance_criteria":["shell输出通过"],"dependencies":[]}]}),
+                ),
+                _ => None,
+            }
+        } else if long_reason {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update("block_task", serde_json::json!({})),
+                _ => None,
+            }
+        } else {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update("start_task", serde_json::json!({})),
+                2 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"check.py","content":"print('shell verified')\n"}),
+                )),
+                3 => update(
+                    "record_result",
+                    serde_json::json!({"result":"检查脚本已交付"}),
+                ),
+                4 | 7 => Some(("bash", serde_json::json!({"command":"python3 check.py"}))),
+                5 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"unbound-produced.txt","content":"不能重开交付"}),
+                )),
+                6 => update("accept_task", evidence(4)),
+                8 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"unbound-whole.txt","content":"不能重开交付"}),
+                )),
+                9 => update("accept_goal", evidence(7)),
+                10 if !tools.last().unwrap()["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("\"phase\":\"completed\"") =>
+                {
+                    update(
+                        "replan",
+                        serde_json::json!({"objective":"停止失败的审查fixture"}),
+                    )
+                }
+                _ => None,
+            }
+        };
+        goal_fixture_chunk(call, tools.len())
+    }
+
+    #[tokio::test]
     async fn main_goal_block_rechecks_keep_shortage_and_stopped_conditions_need_explicit_continue()
     {
         let _guard = PROVIDER_ENV_LOCK
@@ -1900,8 +2331,50 @@ mod goal_tests {
         copy_lifecycle_home(fixture.home.path(), captured.path());
         let mut config = fixture.state.config.clone();
         config.home = captured.path().into();
-        let restarted = build_router(AppState::new(config));
+        let published = fixture.seen.lock().await.len();
+        let mut reloaded_state = AppState::new(config.clone());
+        Arc::get_mut(&mut reloaded_state).unwrap().main_office = crate::office::MainOffice::new(
+            &config.home,
+            &config.workspace,
+            Some(
+                std::env::var("OPENPAW_OPENAI_BASE_URL")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .to_string(),
+            ),
+        );
+        reloaded_state
+            .office
+            .attach_main(&reloaded_state.main_office);
+        let restarted = build_router(reloaded_state);
         let calls = fixture.model_seen.lock().await.len();
+        let overview = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Some(snapshot) = fixture.seen.lock().await[published..]
+                    .iter()
+                    .filter(|message| message["type"] == "offices.initialize")
+                    .filter_map(|message| message["offices"].as_array())
+                    .flatten()
+                    .find(|snapshot| {
+                        snapshot["workspace"]["id"] == fixture.team
+                            && snapshot["goal"]["phase"] == "paused"
+                    })
+                    .cloned()
+                {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("打开聊天历史前，冷启动的真实办公室快照必须显示暂停");
+        assert_eq!(overview["tasks"][0]["status"], "completed");
+        assert_eq!(overview["tasks"][1]["status"], "blocked");
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            calls,
+            "办公室恢复不启动模型"
+        );
         let loaded = goal_request(
             &restarted,
             &fixture.team,
@@ -2262,6 +2735,15 @@ mod goal_tests {
                 "停止前的 produced 也必须先复核，不能沿用旧验收授权"
             );
         }
+        if text == "/goal continue" && tools.len() == 5 {
+            assert!(
+                tools[4]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("交付工具必须绑定"),
+                "未复核中断结果不能取得产出后的shell验收许可"
+            );
+        }
         let call = if text == "确认执行" {
             match tools.len() {
                 0 => Some(("goal_read", serde_json::json!({}))),
@@ -2306,15 +2788,19 @@ mod goal_tests {
                     "report",
                     serde_json::json!({"status":"produced","result":"未经复核不得采用","observation_id":"invented"}),
                 ),
-                4 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
-                5 => update(
+                4 => Some((
+                    "bash",
+                    serde_json::json!({"command":"printf interrupted-bypass"}),
+                )),
+                5 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
+                6 => update(
                     "recheck_task",
                     "report",
-                    serde_json::json!({"status":"produced","result":"已读取中断前的真实报告，无需重复写入","observation_id":observation(4)}),
+                    serde_json::json!({"status":"produced","result":"已读取中断前的真实报告，无需重复写入","observation_id":observation(5)}),
                 ),
-                6 => update("accept_task", "report", evidence(4)),
-                7 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
-                8 => update("accept_goal", "", evidence(7)),
+                7 => update("accept_task", "report", evidence(5)),
+                8 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
+                9 => update("accept_goal", "", evidence(8)),
                 _ => None,
             }
         };
@@ -2555,6 +3041,22 @@ mod goal_tests {
     /// 关联：主聊天 HTTP 测试。
     pub(super) fn goal_model_response(body: &serde_json::Value) -> Response {
         let messages = body["messages"].as_array().unwrap();
+        if messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("审查旧整体验收依据"))
+        }) {
+            return review_proof_model_response(messages);
+        }
+        if messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("审查验证脚本"))
+        }) {
+            return review_model_response(messages);
+        }
         if messages.iter().any(|m| {
             m["role"] == "user"
                 && m["content"]
