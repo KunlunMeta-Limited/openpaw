@@ -132,7 +132,7 @@ start() {
         env PAWOFFICE_API_KEY="$PAWOFFICE_API_KEY" PAWOFFICE_STATIC_ROOT="$OFFICE_SOURCE/dist" \
         PORT="$OFFICE_PORT" "$OFFICE_NODE" "$OFFICE_SOURCE/server/dist/index.js"
     if ! wait_health "$OFFICE_PORT" "Office"; then
-        stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" 10 0 || true
+        stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" "server/dist/index.js" 10 0 || true
         die "Office健康检查失败；日志：$OFFICE_LOG"
     fi
 
@@ -141,15 +141,15 @@ start() {
         OPENPAW_HOST_DIAGNOSTICS="${OPENPAW_HOST_DIAGNOSTICS:-0}" \
         "$HOST_BIN" --env-file "$ENV_FILE" engine-host --config "$HOST_CONFIG" --port "$HOST_PORT"
     if ! wait_health "$HOST_PORT" "Host"; then
-        stop_one "Host" "$HOST_PID_FILE" "$HOST_LOG" 10 0 || true
-        stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" 10 0 || true
+        stop_one "Host" "$HOST_PID_FILE" "$HOST_LOG" "engine-host" 10 0 || true
+        stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" "server/dist/index.js" 10 0 || true
         die "Host健康检查失败；日志：$HOST_LOG"
     fi
     note "all services started; logs: $OFFICE_LOG and $HOST_LOG"
 }
 
 stop_one() {
-    local name="$1" pid_file="$2" log_file="$3" timeout="$4" force="$5" pid i
+    local name="$1" pid_file="$2" log_file="$3" expected="$4" timeout="$5" force="$6" pid i
     pid="$(read_pid "$pid_file" 2>/dev/null || true)"
     if [[ -z "$pid" ]]; then
         rm -f "$pid_file"
@@ -159,6 +159,11 @@ stop_one() {
     if ! pid_alive "$pid"; then
         rm -f "$pid_file"
         note "$name already stopped (stale PID removed)"
+        return 0
+    fi
+    if ! pid_matches "$pid" "$expected"; then
+        rm -f "$pid_file"
+        note "$name PID $pid 不再匹配受管理命令，已移除过期PID文件；未终止该进程"
         return 0
     fi
     kill -TERM "$pid" || true
@@ -181,8 +186,8 @@ stop() {
     [[ "${1:-}" == "--force" ]] && force=1
     ensure_run_dir
     local failed=0
-    stop_one "Host" "$HOST_PID_FILE" "$HOST_LOG" 60 "$force" || failed=1
-    stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" 30 "$force" || failed=1
+    stop_one "Host" "$HOST_PID_FILE" "$HOST_LOG" "engine-host" 60 "$force" || failed=1
+    stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" "server/dist/index.js" 30 "$force" || failed=1
     (( failed == 0 )) || exit 1
 }
 
@@ -193,7 +198,9 @@ status() {
         IFS='|' read -r name pid_file port <<<"$entry"
         pid="$(read_pid "$pid_file" 2>/dev/null || true)"
         state="stopped"; health="down"
-        if [[ -n "$pid" ]] && pid_alive "$pid"; then state="running (PID $pid)"; fi
+        expected="server/dist/index.js"
+        [[ "$name" == "Host" ]] && expected="engine-host"
+        if [[ -n "$pid" ]] && pid_matches "$pid" "$expected"; then state="running (PID $pid)"; fi
         health_ok "$port" && health="healthy"
         printf '%s: %s, port=%s, health=%s\n' "$name" "$state" "$port" "$health"
     done

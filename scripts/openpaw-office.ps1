@@ -49,6 +49,15 @@ function Get-ProcessSafe([int] $ProcessId) {
     try { return Get-Process -Id $ProcessId -ErrorAction Stop } catch { return $null }
 }
 
+function Test-ManagedProcess([int] $ProcessId, [string] $Expected) {
+    if (-not (Get-ProcessSafe $ProcessId)) { return $false }
+    try {
+        $record = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
+        if (-not $record -or [string]::IsNullOrWhiteSpace($record.CommandLine)) { return $false }
+        return $record.CommandLine.IndexOf($Expected, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    } catch { return $false }
+}
+
 function Get-EnvValue([string] $Path, [string] $Name) {
     if (-not (Test-Path -LiteralPath $Path)) { return '' }
     $line = Get-Content -LiteralPath $Path | Where-Object { $_ -match ('^\s*' + [regex]::Escape($Name) + '\s*=') } | Select-Object -First 1
@@ -114,11 +123,12 @@ function Start-ServiceProcess([string] $Label, [string] $PidPath, [string] $LogP
     Write-Host ("openpaw-office: {0} started (PID {1})" -f $Label, $process.Id)
 }
 
-function Stop-One([string] $Label, [string] $PidPath, [int] $Timeout, [bool] $AllowForce) {
+function Stop-One([string] $Label, [string] $PidPath, [string] $Expected, [int] $Timeout, [bool] $AllowForce) {
     $processId = Read-Pid $PidPath
     if (-not $processId) { Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue; Write-Host "openpaw-office: $Label already stopped"; return }
     $process = Get-ProcessSafe $processId
     if (-not $process) { Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue; Write-Host "openpaw-office: $Label already stopped (stale PID removed)"; return }
+    if (-not (Test-ManagedProcess $processId $Expected)) { Remove-Item -LiteralPath $PidPath -Force -ErrorAction SilentlyContinue; Write-Host "openpaw-office: $Label PID $processId 不再匹配受管理命令，未终止该进程"; return }
     try { $process.CloseMainWindow() | Out-Null } catch { }
     try { $process.WaitForExit($Timeout * 1000) } catch { }
     if (-not $process.HasExited) {
@@ -135,15 +145,15 @@ function Start-Services {
     if (-not (Test-Path -LiteralPath (Join-Path $OfficeSource 'server\dist\index.js') -PathType Leaf)) { Fail 'Office生产服务不存在，请先执行 build' }
     Assert-PortFree $OfficePort 'Office'; Assert-PortFree $HostPort 'Host'
     Start-ServiceProcess 'Office' $OfficePidFile $OfficeLog $Node @((Join-Path $OfficeSource 'server\dist\index.js')) @{ PAWOFFICE_API_KEY = $env:PAWOFFICE_API_KEY; PAWOFFICE_STATIC_ROOT = (Join-Path $OfficeSource 'dist'); PORT = $OfficePort }
-    try { Wait-Health $OfficePort 'Office'; Start-ServiceProcess 'Host' $HostPidFile $HostLog $HostBinary @('--env-file', $EnvFile, 'engine-host', '--config', $HostConfig, '--port', [string]$HostPort) @{ PAWOFFICE_API_KEY = $env:PAWOFFICE_API_KEY }; Wait-Health $HostPort 'Host' } catch { Stop-One 'Host' $HostPidFile 10 $true; Stop-One 'Office' $OfficePidFile 10 $true; throw }
+    try { Wait-Health $OfficePort 'Office'; Start-ServiceProcess 'Host' $HostPidFile $HostLog $HostBinary @('--env-file', $EnvFile, 'engine-host', '--config', $HostConfig, '--port', [string]$HostPort) @{ PAWOFFICE_API_KEY = $env:PAWOFFICE_API_KEY }; Wait-Health $HostPort 'Host' } catch { Stop-One 'Host' $HostPidFile 'engine-host' 10 $true; Stop-One 'Office' $OfficePidFile 'server\dist\index.js' 10 $true; throw }
     Write-Host "openpaw-office: all services started; logs: $OfficeLog and $HostLog"
 }
 
 function Status {
     Ensure-RunDir
-    foreach ($item in @(@{ Label = 'Host'; Pid = $HostPidFile; Port = $HostPort }, @{ Label = 'Office'; Pid = $OfficePidFile; Port = $OfficePort })) {
+    foreach ($item in @(@{ Label = 'Host'; Pid = $HostPidFile; Port = $HostPort; Expected = 'engine-host' }, @{ Label = 'Office'; Pid = $OfficePidFile; Port = $OfficePort; Expected = 'server\dist\index.js' })) {
         $processId = Read-Pid $item.Pid; $state = 'stopped'; $health = 'down'
-        if ($processId -and (Get-ProcessSafe $processId)) { $state = "running (PID $processId)" }
+        if ($processId -and (Test-ManagedProcess $processId $item.Expected)) { $state = "running (PID $processId)" }
         try { $r = Invoke-WebRequest -UseBasicParsing -Uri ("http://127.0.0.1:{0}/health" -f $item.Port) -TimeoutSec 2; if ($r.StatusCode -eq 200) { $health = 'healthy' } } catch { }
         Write-Host ("{0}: {1}, port={2}, health={3}" -f $item.Label, $state, $item.Port, $health)
     }
@@ -153,7 +163,7 @@ try {
     switch ($Command) {
         'build' { Build }
         'start' { Start-Services }
-        'stop' { Ensure-RunDir; $failed = $false; try { Stop-One 'Host' $HostPidFile 60 $Force.IsPresent } catch { Write-Error $_; $failed = $true }; try { Stop-One 'Office' $OfficePidFile 30 $Force.IsPresent } catch { Write-Error $_; $failed = $true }; if ($failed) { exit 1 } }
+        'stop' { Ensure-RunDir; $failed = $false; try { Stop-One 'Host' $HostPidFile 'engine-host' 60 $Force.IsPresent } catch { Write-Error $_; $failed = $true }; try { Stop-One 'Office' $OfficePidFile 'server\dist\index.js' 30 $Force.IsPresent } catch { Write-Error $_; $failed = $true }; if ($failed) { exit 1 } }
         'status' { Status }
     }
 } catch { Write-Error $_; exit 2 }
