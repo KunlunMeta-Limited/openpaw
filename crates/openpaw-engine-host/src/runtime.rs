@@ -645,7 +645,7 @@ impl AppState {
     }
 
     /// 功能：通过普通接收、执行及 writer 完成一次前台子委派。
-    /// 参数：task_id 为可选真实子身份，child 为可信父关系与新建展示身份，其余为目录、任务、模型、取消和审批。
+    /// 参数：task_id 为可选真实子身份，goal_task_id 为独立 Goal Task 绑定，child 为可信父关系与展示身份，其余为目录、任务、模型、取消和审批。
     /// 返回：包含真实子编号和结果的工具结果。
     /// 错误：登记或持久化失败返回错误，未登记不执行。
     /// 状态：明确 ID 续用自己的历史，否则建立普通子会话；只返回本轮结果。
@@ -656,6 +656,7 @@ impl AppState {
     pub(crate) fn run_delegated(
         self: &Arc<Self>,
         task_id: Option<String>,
+        goal_task_id: Option<String>,
         mut child: ChildSession,
         workspace: PathBuf,
         task: String,
@@ -670,6 +671,9 @@ impl AppState {
                 .get_typed(&child.parent_id)
                 .await
                 .map_err(|_| "父会话不存在或不可读".to_string())?;
+            let mut goal_binding = parent
+                .goal
+                .reserve_delegation(goal_task_id.as_deref(), &child.workspace_id)?;
             let handle = if let Some(id) = task_id {
                 let handle = state
                     .get_typed(&id)
@@ -737,6 +741,9 @@ impl AppState {
                 {
                     return Err("父回合已停止，未接收子任务".into());
                 }
+                if let Some(binding) = &goal_binding {
+                    binding.bind(&handle.id, &child.workspace_id)?;
+                }
                 let accepted = match accept_turn_with_policy(
                     &state,
                     &handle,
@@ -776,9 +783,30 @@ impl AppState {
                 // 接收后至登记之间不能 await。父 AgentLoop 丢弃工具 future 也只丢弃通知，
                 // 独立任务继续响应原取消并持久提交自己的终态；父在终态发布前 join。
                 let (done, completed) = tokio::sync::oneshot::channel();
+                let child_turn_id = turn_id.clone();
                 let task = tokio::spawn(async move {
                     let _approvals = _approvals;
-                    run_turn(child_handle, scheduled).await;
+                    run_turn(child_handle.clone(), scheduled).await;
+                    if let Some(binding) = goal_binding.as_mut() {
+                        if let Some(terminal) = child_handle
+                            .turn_outcomes()
+                            .into_iter()
+                            .find(|turn| turn.turn_id == child_turn_id)
+                        {
+                            let status = if terminal.state == TurnState::Completed {
+                                "completed"
+                            } else if terminal.state == TurnState::Cancelled {
+                                "cancelled"
+                            } else {
+                                "failed"
+                            };
+                            let result =
+                                delegated_result(&child_handle, &terminal.turn_id, &terminal);
+                            if let Err(error) = binding.finish(status, &result) {
+                                tracing::error!(%error, "Goal 子执行结果保存失败");
+                            }
+                        }
+                    }
                     let _ = done.send(());
                 });
                 let standalone = if let Some(registry) = registry.as_mut() {
@@ -804,28 +832,7 @@ impl AppState {
                 .find(|turn| turn.turn_id == turn_id)
                 .ok_or("子回合未保存终态")?;
             let completed = terminal.state == TurnState::Completed;
-            let result = if completed {
-                handle
-                    .message_cache
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .rev()
-                    .find(|message| {
-                        message.role == openpaw_core::Role::Assistant
-                            && message.uuid.as_ref().is_some_and(|id| {
-                                id.starts_with(&format!("msg_{}_{}_", handle.id, turn_id))
-                            })
-                    })
-                    .map(openpaw_core::Message::text)
-                    .unwrap_or_else(|| "子 Agent 已完成任务，但没有返回文本结果。".into())
-            } else {
-                terminal
-                    .error
-                    .as_ref()
-                    .map(|error| error.message.clone())
-                    .unwrap_or_else(|| "子任务未完成".into())
-            };
+            let result = delegated_result(&handle, &turn_id, &terminal);
             let status = if completed {
                 "completed"
             } else if terminal.state == TurnState::Cancelled {
@@ -837,8 +844,16 @@ impl AppState {
                 media: Vec::new(),
                 is_error: !completed,
                 content: format!(
-                    "子 Agent“{}” task_id={}，status={}：\n{}",
-                    child.name, handle.id, status, result
+                    "子 Agent“{}” task_id={}，status={}：\n{}{}",
+                    child.name,
+                    handle.id,
+                    status,
+                    result,
+                    if goal_task_id.is_some() {
+                        "\nGoal 子任务已返回实际结果，尚未验收；由主 Agent 读取或检查后决定。"
+                    } else {
+                        ""
+                    }
                 ),
                 structured: Some(
                     serde_json::json!({"task_id":handle.id,"sessionId":handle.id,"turnId":turn_id,"workspaceId":child.workspace_id,"workspaceName":child.name,"parentSessionId":child.parent_id,"status":status,"result":result}),
@@ -2387,6 +2402,31 @@ pub(crate) fn restored_office_children(
     children.sort_by(|a, b| a.0.cmp(&b.0));
     children
 }
+fn delegated_result(handle: &SessionHandle, turn_id: &str, terminal: &TurnOutcome) -> String {
+    if terminal.state == TurnState::Completed {
+        handle
+            .message_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == openpaw_core::Role::Assistant
+                    && message.uuid.as_ref().is_some_and(|id| {
+                        id.starts_with(&format!("msg_{}_{}_", handle.id, turn_id))
+                    })
+            })
+            .map(openpaw_core::Message::text)
+            .unwrap_or_else(|| "子 Agent 已完成任务，但没有返回文本结果。".into())
+    } else {
+        terminal
+            .error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| "子任务未完成".into())
+    }
+}
+
 fn valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -3358,7 +3398,12 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     }
     handle.set_activity("thinking", None, "正在思考");
     handle.emit(events::session_status(&handle.id, "busy"));
-    let goal_reply = handle.goal.begin(&turn_id, &user_message_id, &text);
+    // 委派文本不是新的主用户输入，子会话不得解析 /goal 或取得用户控制许可。
+    let goal_reply = if handle.child.is_none() {
+        handle.goal.begin(&turn_id, &user_message_id, &text)
+    } else {
+        Ok(None)
+    };
     if handle.goal.prompt().is_some() {
         provider_tools.extend(crate::goal::plan_tools());
     }

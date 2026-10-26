@@ -87,7 +87,7 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
         let summary = format!("预期结果：{}\n验收条件：{criteria}\n依赖：{}\n实际产出：{}\n验收依据：{}",task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies},task["result"].as_str().unwrap_or("尚未产出"),if task["status"] == "accepted" {"已根据真实工具观察逐项核对，完整依据见聊天"} else {"未验证，不计为通过"});
         let summary = if summary.encode_utf16().count() > 1000 { format!("{}…完整条件与依赖见聊天计划。",projection_text(&summary,960)) } else { summary };
         let status = if ended { "failed" } else { match task["status"].as_str() { Some("accepted")=>"completed",Some("running")=>"running",Some("produced"|"interrupted")=>"blocked",_=>"queued" } };
-        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":goal["session_id"],"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {-1},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
+        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":task.get("child_workspace_id").unwrap_or(&goal["session_id"]),"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {-1},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
     }).collect());
     let status = match phase {
         "completed" => "completed",
@@ -1842,12 +1842,15 @@ impl MainOffice {
             } else if let Some(employee) = employees.iter_mut().find(|employee| employee["id"] == child) {
                 employee["online"] = Value::Bool(true);
             }
-            let task = format!("exec-{}",uuid::Uuid::new_v4().simple());
+            let bound_task = record.snapshot["tasks"].as_array().into_iter().flatten().find(|task| task.get("goalId").is_some() && task["assigneeId"] == child).and_then(|task|task["id"].as_str()).map(str::to_owned);
+            let task = bound_task.clone().unwrap_or_else(|| format!("exec-{}",uuid::Uuid::new_v4().simple()));
             record.child_tasks.insert(child.into(),task.clone());
             let tasks = record.snapshot["tasks"].as_array_mut().expect("owned tasks");
             if tasks.len() >= 1000 { tasks.retain(|task| task["status"] == "running"); }
             let now = chrono::Utc::now().to_rfc3339();
-            tasks.push(serde_json::json!({"id":task,"title":"执行子任务","assigneeId":child,"status":"running","progress":-1,"updatedAt":now,"summary":"真实子 Agent 执行"}));
+            if bound_task.is_none() {
+                tasks.push(serde_json::json!({"id":task,"title":"执行子任务","assigneeId":child,"status":"running","progress":-1,"updatedAt":now,"summary":"真实子 Agent 执行"}));
+            }
             record.snapshot["events"] = serde_json::json!([{"id":format!("assigned-{task}"),"kind":"task.assigned",
                 "summary":"主 Agent 向子 Agent 交接任务","occurredAt":now,"taskId":task,"employeeId":child,"fromEmployeeId":session}]);
             record.snapshot["employees"].as_array().into_iter().flatten()
@@ -1861,7 +1864,7 @@ impl MainOffice {
     fn child_end(&self, session: &str, child: &str, completed: bool) {
         self.update(session,|team,record| {
             let Some(task_id) = record.child_tasks.remove(child) else { return Vec::new(); };
-            if let Some(task) = record.snapshot["tasks"].as_array_mut().expect("owned tasks").iter_mut().find(|task| task["id"] == task_id) {
+            if let Some(task) = record.snapshot["tasks"].as_array_mut().expect("owned tasks").iter_mut().find(|task| task["id"] == task_id && task.get("goalId").is_none()) {
                 task["status"] = Value::from(if completed {"completed"}else{"failed"});
                 task["updatedAt"] = Value::from(chrono::Utc::now().to_rfc3339());
                 task["summary"] = Value::from(if completed {"真实执行已返回结果"}else{"执行未成功完成"});
