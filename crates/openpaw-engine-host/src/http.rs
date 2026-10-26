@@ -2173,6 +2173,9 @@ mod tests {
                 }
                 let messages = body["messages"].as_array().unwrap();
                 if scenario.starts_with("goal-") {
+                    if scenario == "goal-delegate" {
+                        return goal_tests::delegation_model_response(&body, &gate).await;
+                    }
                     if scenario == "goal-execute" {
                         if let Some(confirm) = messages.iter().rposition(|message|message["role"] == "user" && message["content"] == "确认执行") {
                             let tools = messages[confirm..].iter().filter(|message|message["role"] == "tool").count();
@@ -2267,6 +2270,7 @@ mod tests {
                 if matches!(
                     scenario,
                     "delegate-concurrent"
+                        | "goal-delegate"
                         | "delegate-cancel"
                         | "delegate-conversations"
                         | "delegate-conversations-approval"

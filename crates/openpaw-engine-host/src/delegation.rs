@@ -101,6 +101,8 @@ struct DelegateTaskInput {
     name: Option<String>,
     #[serde(default)]
     task_id: Option<String>,
+    #[serde(default)]
+    goal_task_id: Option<String>,
 }
 
 struct ProviderModel {
@@ -295,6 +297,7 @@ impl DelegationContext {
         runtime
             .run_delegated(
                 input.task_id,
+                input.goal_task_id,
                 crate::runtime::ChildSession {
                     parent_id: self.parent_session_id.clone(),
                     workspace_id,
@@ -593,7 +596,7 @@ fn save_delegations(
 fn delegate_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate_task".into(),
-        description: "把清晰独立的子任务交给真实子 Agent 并等待结果。继续已有员工必须传上次结果或员工清单中的真实 task_id，保留其自己的工作历史；不传 task_id 始终创建新身份，即使 name 或 task 相同。name 仅用于新员工显示，优先中文；不能传 workspaceId 代替 task_id。简单任务不要调用。".into(),
+        description: "把清晰独立的子任务交给真实子 Agent 并等待结果。Goal 执行必须用 goal_task_id 绑定当前可执行计划任务，子结果只算产出，主 Agent 检查验收。继续已有员工必须传上次结果或员工清单中的真实 task_id，保留其自己的工作历史；不传 task_id 始终创建新身份，即使 name 或 task 相同。name 仅用于新员工显示，优先中文；不能传 workspaceId 或 Goal 任务编号代替 task_id。简单任务不要调用。".into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -601,7 +604,8 @@ fn delegate_spec() -> ToolSpec {
             "properties": {
                 "task": { "type": "string", "minLength": 1, "maxLength": MAX_DELEGATE_TASK_CHARS },
                 "name": { "type": "string", "minLength": 1, "maxLength": MAX_DELEGATE_NAME_CHARS },
-                "task_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+                "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+                "goal_task_id": { "type": "string", "minLength": 1, "maxLength": 50 }
             }
         }),
         category: Some(ToolCategory::Communication),

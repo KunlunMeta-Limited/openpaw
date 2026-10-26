@@ -1,6 +1,436 @@
 #[cfg(test)]
 mod goal_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn main_goal_cancel_joins_bound_children_without_late_delivery_or_restart() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-delegate", "confirm").await;
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "cancel-parallel",
+            "plan",
+            "/goal 并行交付甲乙并整合",
+        )
+        .await;
+        let app = fixture.app.clone();
+        let team = fixture.team.clone();
+        let running = tokio::spawn(async move {
+            goal_send(&app, &team, "cancel-parallel", "execute", "确认执行").await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture
+                    .model_seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|r| {
+                        r["messages"].as_array().unwrap().iter().any(|m| {
+                            matches!(
+                                m["content"].as_str(),
+                                Some("goal-child-a" | "/goal child-b")
+                            )
+                        })
+                    })
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("等待两个在途子请求");
+        let response = goal_request(
+            &fixture.app,
+            &fixture.team,
+            "cancel-parallel",
+            serde_json::json!({"type":"cancel","turnId":"execute"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let answer = tokio::time::timeout(Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(answer["state"], "stopped");
+        let calls = fixture.model_seen.lock().await.len();
+        fixture.release_model.notify_waiters();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        let response = goal_request(
+            &restarted,
+            &fixture.team,
+            "cancel-parallel",
+            serde_json::json!({"type":"history"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            calls,
+            "停止后的迟到模型响应与历史加载均不能重新执行"
+        );
+        for file in ["a.txt", "b.txt", "report.txt"] {
+            assert!(!fixture.workspace.path().join(file).exists());
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (_, read) = fixture
+                    .state
+                    .main_office
+                    .message(
+                        serde_json::json!({"type":"office.read","teamId":fixture.team}),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                if read["snapshot"]["goal"]["phase"] == "paused" {
+                    assert_eq!(read["snapshot"]["goal"]["acceptedTaskCount"], 0);
+                    let tasks = read["snapshot"]["tasks"].as_array().unwrap();
+                    assert_eq!(tasks.len(), 3);
+                    assert_eq!(
+                        tasks
+                            .iter()
+                            .filter(|task| task["status"] == "blocked")
+                            .count(),
+                        2
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("取消后的 Goal 与子任务中断事实应投影");
+    }
+
+    #[tokio::test]
+    async fn main_goal_delegates_independent_children_and_parent_verifies_before_dependencies() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-delegate", "confirm").await;
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "parallel",
+            "plan",
+            "/goal 并行交付甲乙并整合",
+        )
+        .await;
+        let app = fixture.app.clone();
+        let team = fixture.team.clone();
+        let running = tokio::spawn(async move {
+            goal_send(&app, &team, "parallel", "execute", "确认执行").await
+        });
+        let overlap = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let requests = fixture.model_seen.lock().await;
+                let children = requests
+                    .iter()
+                    .filter(|request| {
+                        request["messages"].as_array().unwrap().iter().any(|m| {
+                            m["role"] == "user"
+                                && matches!(
+                                    m["content"].as_str(),
+                                    Some("goal-child-a" | "/goal child-b")
+                                )
+                        })
+                    })
+                    .count();
+                if children == 2 {
+                    break;
+                }
+                drop(requests);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            overlap.is_ok(),
+            "两个真实子模型请求必须重叠等待：{:?}",
+            fixture
+                .model_seen
+                .lock()
+                .await
+                .iter()
+                .map(|r| r["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|m| (m["role"].clone(), m["content"].clone()))
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        let read = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (_, read) = fixture
+                    .state
+                    .main_office
+                    .message(
+                        serde_json::json!({"type":"office.read","teamId":fixture.team}),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                if read["snapshot"]["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|task| task["status"] == "running")
+                    .count()
+                    == 2
+                {
+                    break read;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("异步 Office 投影应同步真实子任务归属");
+        let tasks = read["snapshot"]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 3, "Goal 委派不生成重复 exec-* 任务");
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task["status"] == "running")
+                .count(),
+            2
+        );
+        let assignees: Vec<_> = tasks
+            .iter()
+            .filter(|task| task["status"] == "running")
+            .map(|task| task["assigneeId"].as_str().unwrap())
+            .collect();
+        assert_ne!(assignees[0], assignees[1]);
+        assert!(!fixture.workspace.path().join("report.txt").exists());
+        fixture.release_model.notify_one();
+        fixture.release_model.notify_one();
+        // 子结果已返回、主模型在验收前等待：比例仍为0，依赖任务仍不能启动。
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.model_seen.lock().await.iter().any(|r| {
+                    r["messages"].as_array().unwrap().iter().any(|m| {
+                        m["role"] == "tool"
+                            && m["content"]
+                                .as_str()
+                                .is_some_and(|s| s.contains("尚未验收"))
+                    })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!fixture.workspace.path().join("report.txt").exists());
+        let (_, read) = fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.read","teamId":fixture.team}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            read["snapshot"]["goal"]["acceptedTaskCount"], 0,
+            "子返回不等于验收"
+        );
+        fixture.release_model.notify_one();
+        let answer = running.await.unwrap();
+        assert_eq!(answer["state"], "complete");
+        assert!(answer["text"].as_str().unwrap().contains("整体验收已通过"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("a.txt")).unwrap(),
+            "甲"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("b.txt")).unwrap(),
+            "乙"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("report.txt")).unwrap(),
+            "甲乙"
+        );
+        let requests = fixture.model_seen.lock().await;
+        assert!(
+            !requests.iter().any(|r| r["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "user" && m["content"] == "terminal-child")),
+            "整体验收后同一回合不能退化为普通聊天继续启动子执行"
+        );
+        let results: Vec<_> = requests
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(results.iter().any(|s| s.contains("依赖")));
+        assert!(results
+            .iter()
+            .any(|s| s.contains("重复") || s.contains("已被")));
+        assert!(results.iter().any(|s| s.contains("验收依据")));
+        assert!(results.iter().any(|s| s.contains("Goal 交付工具必须绑定")));
+    }
+
+    /// 功能：通过外部模型边界驱动真实父子委派和父验收。
+    /// 参数：body 为真实请求，gate 为测试控制的外部响应屏障。
+    /// 返回：模型 SSE 响应。
+    /// 错误：fixture 格式错误通过断言暴露。
+    /// 状态：不修改 Host、Goal 或会话。
+    /// 并发与取消：子初始请求与主验收请求等待独立通知，取消由真实运行时处理。
+    /// 权限：仅测试模型边界。
+    /// 关联：主聊天 Goal 并行集成测试。
+    pub(super) async fn delegation_model_response(
+        body: &serde_json::Value,
+        gate: &tokio::sync::Notify,
+    ) -> Response {
+        let messages = body["messages"].as_array().unwrap();
+        let latest = messages.iter().rposition(|m| m["role"] == "user").unwrap();
+        let tools: Vec<_> = messages[latest..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        let text = messages[latest]["content"].as_str().unwrap();
+        if matches!(text, "goal-child-a" | "/goal child-b") {
+            assert!(
+                !body["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| matches!(
+                        tool["function"]["name"].as_str(),
+                        Some("goal_read" | "goal_update" | "delegate_task")
+                    )),
+                "委派文本不是用户 Goal 命令，子会话没有目标控制权限"
+            );
+            if tools.is_empty() {
+                gate.notified().await;
+                return goal_fixture_chunk(
+                    Some((
+                        "goal_update",
+                        serde_json::json!({"action":"accept_goal","goal_id":"parent","expected_version":1,"reason":"child must not control Goal"}),
+                    )),
+                    0,
+                );
+            }
+            return goal_fixture_chunk(
+                if tools.len() == 1 {
+                    Some((
+                        "write_file",
+                        serde_json::json!({"path":if text.ends_with('a') {"a.txt"} else {"b.txt"},"content":if text.ends_with('a') {"甲"} else {"乙"}}),
+                    ))
+                } else {
+                    None
+                },
+                tools.len(),
+            );
+        }
+        let current: serde_json::Value = tools
+            .first()
+            .and_then(|m| m["content"].as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let update = |action: &str, task: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"goal_id":current["id"],"expected_version":current["plan_version"],"reason":"核对真实委派结果","task_id":task});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        let evidence = |index: usize| {
+            let id = tools[index]["content"]
+                .as_str()
+                .unwrap()
+                .rsplit("Goal observation: ")
+                .next()
+                .unwrap()
+                .trim();
+            serde_json::json!({"evidence":[{"criterion":0,"observation_id":id,"conclusion":"实际文件符合验收条件"}]})
+        };
+        if text != "确认执行" {
+            return goal_fixture_chunk(
+                match tools.len() {
+                    0 => Some(("goal_read", serde_json::json!({}))),
+                    1 => Some((
+                        "goal_update",
+                        serde_json::json!({"action":"set_plan","goal_id":current["id"],"expected_version":current["plan_version"],"reason":"独立交付后整合","acceptance_criteria":["报告为甲乙"],"tasks":[
+                            {"id":"a","title":"甲","expected_result":"a.txt","acceptance_criteria":["文件为甲"],"dependencies":[]},
+                            {"id":"b","title":"乙","expected_result":"b.txt","acceptance_criteria":["文件为乙"],"dependencies":[]},
+                            {"id":"report","title":"整合","expected_result":"report.txt","acceptance_criteria":["文件为甲乙"],"dependencies":["a","b"]}
+                        ]}),
+                    )),
+                    _ => None,
+                },
+                tools.len(),
+            );
+        }
+        if tools.len() == 1 {
+            let calls: Vec<_> = [("a","goal-child-a"),("b","/goal child-b"),("a","duplicate-child"),("report","premature-child")].into_iter().enumerate().map(|(i,(id,task))| serde_json::json!({"index":i,"id":format!("delegate-{i}"),"type":"function","function":{"name":"delegate_task","arguments":serde_json::json!({"task":task,"name":id,"goal_task_id":id}).to_string()}})).collect();
+            let mut calls = calls;
+            calls.push(serde_json::json!({"index":4,"id":"unbound-parent","type":"function","function":{"name":"sleep","arguments":"{\"duration_ms\":0}"}}));
+            let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+            return (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response();
+        }
+        if tools.len() == 6 {
+            gate.notified().await;
+        }
+        goal_fixture_chunk(
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                6 => update("start_task", "report", serde_json::json!({})),
+                7 => update("start_task", "a", serde_json::json!({})),
+                8 => update(
+                    "accept_task",
+                    "a",
+                    serde_json::json!({"evidence":[{"criterion":0,"observation_id":"child_unverified","conclusion":"子返回不算验收"}]}),
+                ),
+                9 => Some(("read_file", serde_json::json!({"path":"a.txt"}))),
+                10 => update("accept_task", "a", evidence(9)),
+                11 => update("start_task", "b", serde_json::json!({})),
+                12 => Some(("read_file", serde_json::json!({"path":"b.txt"}))),
+                13 => update("accept_task", "b", evidence(12)),
+                14 => update("start_task", "report", serde_json::json!({})),
+                15 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"report.txt","content":"甲乙"}),
+                )),
+                16 => update(
+                    "record_result",
+                    "report",
+                    serde_json::json!({"result":"report.txt 已产出"}),
+                ),
+                17 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
+                18 => update("accept_task", "report", evidence(17)),
+                19 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
+                20 => update("accept_goal", "", evidence(19)),
+                21 => Some((
+                    "delegate_task",
+                    serde_json::json!({"task":"terminal-child","name":"结束后越权"}),
+                )),
+                _ => None,
+            },
+            tools.len(),
+        )
+    }
     fn observed_goal<'a>(
         message: &'a serde_json::Value,
         conversation: &str,
