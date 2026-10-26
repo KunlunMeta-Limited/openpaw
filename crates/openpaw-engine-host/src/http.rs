@@ -2216,6 +2216,12 @@ mod tests {
                     return goal_tests::lifecycle_model_response(&body);
                 }
                 if scenario.starts_with("goal-") {
+                    if scenario == "goal-manual" {
+                        let messages = body["messages"].as_array().unwrap();
+                        if let Some(latest) = messages.iter().rposition(|m| m["role"] == "user" && !m["content"].as_str().unwrap_or("").starts_with("Goal 仍有")) {
+                            if messages[latest]["content"] == "确认执行" && messages[latest..].iter().filter(|m| m["role"] == "tool").count() == 1 { gate.notified().await; }
+                        }
+                    }
                     if scenario == "goal-delegate" {
                         return goal_tests::delegation_model_response(&body, &gate).await;
                     }

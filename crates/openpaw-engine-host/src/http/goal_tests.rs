@@ -3,6 +3,406 @@ mod goal_tests {
     use super::*;
 
     #[tokio::test]
+    async fn main_goal_manual_pause_records_real_user_source_without_resuming_delivery() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-manual", "confirm").await;
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "manual",
+            "plan",
+            "/goal 人工约束下交付资料",
+        )
+        .await;
+        let app = fixture.app.clone();
+        let team = fixture.team.clone();
+        let running = tokio::spawn(async move {
+            goal_send(&app, &team, "manual", "execute", "确认执行").await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.model_seen.lock().await.iter().any(|request| {
+                    let messages = request["messages"].as_array().unwrap();
+                    messages
+                        .iter()
+                        .rposition(|m| m["role"] == "user" && m["content"] == "确认执行")
+                        .is_some_and(|latest| {
+                            messages[latest..]
+                                .iter()
+                                .filter(|m| m["role"] == "tool")
+                                .count()
+                                == 1
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            goal_request(
+                &fixture.app,
+                &fixture.team,
+                "manual",
+                serde_json::json!({"type":"cancel","turnId":"execute"})
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(running.await.unwrap()["state"], "stopped");
+        let answer = goal_send(
+            &fixture.app,
+            &fixture.team,
+            "manual",
+            "pause",
+            "供应商那份资料先搁着，等我点头再碰。其余可以照做。",
+        )
+        .await;
+        let text = answer["text"].as_str().unwrap();
+        assert!(
+            text.contains("manual_blocked"),
+            "人工暂停应持久显示：{text}"
+        );
+        assert!(text.contains("供应商那份资料先搁着"));
+        assert!(!fixture.workspace.path().join("edit-write.txt").exists());
+        let requests = fixture.model_seen.lock().await;
+        let goal = requests
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(m["content"].as_str()?).ok())
+            .find(|g| g["tasks"][0]["status"] == "manual_blocked")
+            .unwrap();
+        assert_eq!(
+            goal["tasks"][1]["status"], "manual_blocked",
+            "原依赖后继也受人工约束"
+        );
+        assert_eq!(goal["tasks"][2]["status"], "pending");
+        assert!(goal["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["action"] == "manual_pause"
+                && entry["user_message_id"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+                && entry["user_excerpt"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("先搁着"))));
+        drop(requests);
+        let continued = goal_send(
+            &fixture.app,
+            &fixture.team,
+            "manual",
+            "continue",
+            "/goal continue",
+        )
+        .await;
+        assert!(
+            !fixture.workspace.path().join("bypass.txt").exists(),
+            "拆分来源或删除依赖边不能绕过人工约束"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("independent.txt")).unwrap(),
+            "独立清单"
+        );
+        assert!(continued["text"]
+            .as_str()
+            .unwrap()
+            .contains("manual_blocked"));
+        let snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let snapshot = fixture
+                    .state
+                    .main_office
+                    .message(
+                        serde_json::json!({"type":"office.read","teamId":fixture.team}),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap()
+                    .1;
+                if snapshot["snapshot"]["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|task| task["id"].as_str().unwrap_or("").ends_with("-held-a"))
+                {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("异步当前计划投影应到达既有任务区");
+        let held = snapshot["snapshot"]["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|task| task["id"].as_str().unwrap_or("").ends_with("-held-a"))
+            .unwrap();
+        assert_eq!(held["status"], "blocked", "既有任务区应显示人工暂停");
+        assert!(
+            held["summary"].as_str().unwrap().contains("先搁着"),
+            "既有摘要应说明人工来源"
+        );
+        let calls = fixture.model_seen.lock().await.len();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        assert_eq!(
+            goal_request(
+                &restarted,
+                &fixture.team,
+                "manual",
+                serde_json::json!({"type":"history"})
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            calls,
+            "重载人工约束不能自行执行"
+        );
+        let restored = goal_send(
+            &restarted,
+            &fixture.team,
+            "manual",
+            "restore",
+            "供应商已经允许，之前搁置的那份现在可以接着办。",
+        )
+        .await;
+        assert!(restored["text"]
+            .as_str()
+            .unwrap()
+            .contains("/goal continue"));
+        assert!(
+            !fixture.workspace.path().join("held-a.txt").exists(),
+            "用户恢复决定仍不授予编辑回合交付权限"
+        );
+        assert!(!fixture.workspace.path().join("edit-write.txt").exists());
+        let finished = goal_send(
+            &restarted,
+            &fixture.team,
+            "manual",
+            "continued-restored",
+            "/goal continue",
+        )
+        .await;
+        assert!(
+            finished["text"].as_str().unwrap().contains("已验收 2/4"),
+            "明确恢复及continue后保留独立结果并推进原Goal：{finished}"
+        );
+        assert!(fixture.workspace.path().join("held-a.txt").exists());
+        assert!(
+            !fixture.workspace.path().join("dependent.txt").exists(),
+            "恢复后仍须等待任务依赖验收"
+        );
+    }
+
+    fn manual_tasks() -> serde_json::Value {
+        serde_json::json!([
+            {"id":"held","title":"供应商资料","expected_result":"供应商资料文件","acceptance_criteria":["资料完整"],"dependencies":[]},
+            {"id":"dependent","title":"资料报告","expected_result":"依据资料的报告","acceptance_criteria":["引用供应商资料"],"dependencies":["held"]},
+            {"id":"independent","title":"本地清单","expected_result":"独立本地清单","acceptance_criteria":["清单可读取"],"dependencies":[]}
+        ])
+    }
+
+    fn manual_model_response(messages: &[serde_json::Value]) -> Response {
+        let latest = messages
+            .iter()
+            .rposition(|m| {
+                m["role"] == "user" && !m["content"].as_str().unwrap_or("").starts_with("Goal 仍有")
+            })
+            .unwrap();
+        let text = messages[latest]["content"].as_str().unwrap_or("");
+        let tools = messages[latest..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>();
+        let current: serde_json::Value = tools
+            .iter()
+            .rev()
+            .find(|m| {
+                m["content"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .is_some_and(|goal| goal["id"].is_string() && goal["plan_version"].is_number())
+            })
+            .and_then(|m| m["content"].as_str())
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+        let update = |action: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"goal_id":current["id"],"expected_version":current["plan_version"],"reason":"尊重本轮用户控制"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        let call = if tools.is_empty() {
+            Some(("goal_read", serde_json::json!({})))
+        } else if text.starts_with("/goal ") && text != "/goal continue" {
+            if tools.len() == 1 {
+                update(
+                    "set_plan",
+                    serde_json::json!({"acceptance_criteria":["三份资料完整可核对"],"tasks":manual_tasks()}),
+                )
+            } else {
+                None
+            }
+        } else if text.contains("先搁着") {
+            match tools.len() {
+                1 => update(
+                    "manual_pause",
+                    serde_json::json!({"task_id":"held","user_excerpt":text}),
+                ),
+                2 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"edit-write.txt","content":"禁止编辑回合执行"}),
+                )),
+                3 => Some(("goal_read", serde_json::json!({}))),
+                _ => None,
+            }
+        } else if text.contains("之前搁置") {
+            match tools.len() {
+                1 => update(
+                    "manual_resume",
+                    serde_json::json!({"task_id":"held","user_excerpt":"不存在的用户原文"}),
+                ),
+                2 => update(
+                    "manual_resume",
+                    serde_json::json!({"task_id":"held","user_excerpt":text}),
+                ),
+                3 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"edit-write.txt","content":"编辑恢复不能交付"}),
+                )),
+                4 => Some(("goal_read", serde_json::json!({}))),
+                _ => None,
+            }
+        } else if text == "/goal continue"
+            && current["tasks"].as_array().is_some_and(|tasks| {
+                tasks
+                    .iter()
+                    .any(|task| task["current"] != false && task["status"] == "manual_blocked")
+            })
+        {
+            let mut tasks = manual_tasks().as_array().unwrap().clone();
+            let held = tasks.remove(0);
+            tasks[0]["dependencies"] = serde_json::json!([]);
+            for id in ["held-a", "held-b"] {
+                let mut split = held.clone();
+                split["id"] = serde_json::json!(id);
+                split["replaces"] = serde_json::json!(["held"]);
+                tasks.push(split);
+            }
+            match tools.len() {
+                1 => update(
+                    "manual_resume",
+                    serde_json::json!({"task_id":"held","user_excerpt":"用户允许恢复"}),
+                ),
+                2 => update("start_task", serde_json::json!({"task_id":"held"})),
+                3 => update("replan", serde_json::json!({"tasks":tasks})),
+                4 => update("start_task", serde_json::json!({"task_id":"held-a"})),
+                5 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"bypass.txt","content":"不能绕过用户暂停"}),
+                )),
+                6 => update("start_task", serde_json::json!({"task_id":"dependent"})),
+                7 => update(
+                    "recheck_task",
+                    serde_json::json!({"task_id":"held-a","status":"pending","reason":"模型自行恢复"}),
+                ),
+                8 => {
+                    tasks[1]["expected_result"] = serde_json::json!("独立本地清单，可重新安排");
+                    update("replan", serde_json::json!({"tasks":tasks}))
+                }
+                9 => update("start_task", serde_json::json!({"task_id":"independent"})),
+                10 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"independent.txt","content":"独立清单"}),
+                )),
+                11 => update(
+                    "record_result",
+                    serde_json::json!({"task_id":"independent","result":"独立清单已产出"}),
+                ),
+                12 => Some(("read_file", serde_json::json!({"path":"independent.txt"}))),
+                13 => {
+                    let content = tools
+                        .get(12)
+                        .and_then(|m| m["content"].as_str())
+                        .unwrap_or("");
+                    update(
+                        "accept_task",
+                        serde_json::json!({"task_id":"independent","evidence":[{"criterion":0,"observation_id":content.rsplit("Goal observation: ").next().unwrap_or("").trim(),"conclusion":"独立清单读取通过"}]}),
+                    )
+                }
+                _ => None,
+            }
+        } else if text == "/goal continue" {
+            let current_tasks = current["tasks"].as_array().unwrap();
+            let tasks = current_tasks
+                .iter()
+                .filter(|task| task["current"] != false)
+                .map(|task| {
+                    let mut def = serde_json::Map::new();
+                    for key in [
+                        "id",
+                        "title",
+                        "expected_result",
+                        "acceptance_criteria",
+                        "dependencies",
+                        "replaces",
+                    ] {
+                        if let Some(value) = task.get(key) {
+                            def.insert(key.into(), value.clone());
+                        }
+                    }
+                    if task["id"] == "dependent" {
+                        def.insert(
+                            "dependencies".into(),
+                            serde_json::json!(["held-a", "held-b"]),
+                        );
+                    }
+                    serde_json::Value::Object(def)
+                })
+                .collect::<Vec<_>>();
+            let evidence = |index: usize, task: &str| {
+                let content = tools
+                    .get(index)
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("");
+                serde_json::json!({"task_id":task,"evidence":[{"criterion":0,"observation_id":content.rsplit("Goal observation: ").next().unwrap_or("").trim(),"conclusion":"实际读取结果通过"}]})
+            };
+            match tools.len() {
+                1 => update("replan", serde_json::json!({"tasks":tasks})),
+                2 => update("start_task", serde_json::json!({"task_id":"dependent"})),
+                3 => update("start_task", serde_json::json!({"task_id":"held-a"})),
+                4 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"held-a.txt","content":"供应商资料已核对"}),
+                )),
+                5 => update(
+                    "record_result",
+                    serde_json::json!({"task_id":"held-a","result":"实际文件已产出"}),
+                ),
+                6 => Some(("read_file", serde_json::json!({"path":"held-a.txt"}))),
+                7 => update("accept_task", evidence(6, "held-a")),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        goal_fixture_chunk(call, tools.len())
+    }
+
+    #[tokio::test]
     async fn main_goal_cancel_joins_bound_children_without_late_delivery_or_restart() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -1658,6 +2058,14 @@ mod goal_tests {
     /// 关联：主聊天 HTTP 测试。
     pub(super) fn goal_model_response(body: &serde_json::Value) -> Response {
         let messages = body["messages"].as_array().unwrap();
+        if messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("人工约束下交付资料"))
+        }) {
+            return manual_model_response(messages);
+        }
         if messages.iter().any(|m| {
             m["role"] == "user"
                 && m["content"]
