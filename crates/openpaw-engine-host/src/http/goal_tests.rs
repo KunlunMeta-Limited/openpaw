@@ -8,7 +8,7 @@ mod goal_tests {
         }
         let tasks = snapshot["tasks"].as_array().unwrap();
         let steps = snapshot["whiteboard"]["steps"].as_array().unwrap();
-        assert_eq!(steps.len(), tasks.len());
+        assert_eq!(steps.len(), tasks.len().min(3));
         for (task, step) in tasks.iter().zip(steps) {
             assert_eq!(step["id"], task["id"]);
             assert_eq!(step["progress"], task["progress"]);
@@ -1868,7 +1868,15 @@ mod goal_tests {
                 .unwrap();
             assert_goal_task_board(snapshot);
             let steps = snapshot["whiteboard"]["steps"].as_array().unwrap();
-            assert_eq!(steps.len(), if version == 1 { 4 } else { 5 });
+            assert_eq!(steps.len(), 3);
+            assert_eq!(
+                snapshot["tasks"].as_array().unwrap().len(),
+                if version == 1 { 4 } else { 5 }
+            );
+            assert!(snapshot["whiteboard"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("白板展示前3项"));
             assert_eq!(
                 steps.iter().filter(|step| step["progress"] == 100).count(),
                 2
