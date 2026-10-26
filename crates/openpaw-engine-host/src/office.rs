@@ -97,7 +97,7 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
         let summary = if source.is_empty() {summary} else {format!("{source}\n{summary}")};
         let summary = if summary.encode_utf16().count() > 1000 { format!("{}…完整条件与依赖见聊天计划。",projection_text(&summary,960)) } else { summary };
         let status = if ended { "failed" } else if waiting { "blocked" } else { match task["status"].as_str() { Some("accepted")=>"completed",Some("running")=>"running",Some("produced"|"interrupted"|"blocked"|"manual_blocked")=>"blocked",_=>"queued" } };
-        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":task.get("child_workspace_id").unwrap_or(&goal["session_id"]),"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {-1},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
+        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":task.get("child_workspace_id").unwrap_or(&goal["session_id"]),"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {0},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
     }).collect());
     let status = match phase {
         "completed" => "completed",
@@ -106,7 +106,8 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
         "paused" | "blocked" => "blocked",
         _ => "queued",
     };
-    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":status,"tagline":projection_text(goal["reason"].as_str().unwrap_or(""),40),"description":"完整任务与验收条件见聊天计划","note":if phase == "draft" {"未确认计划的进度未知"} else {"任务全部通过仍需独立整体验收"},"link":{"label":"","url":""},"progressMode":"reported","steps":[{"id":goal["id"],"title":format!("已验收 {accepted}/{count} 项"),"progress":progress}]});
+    let steps: Vec<_> = tasks.iter().map(|task| serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"title":projection_text(task["title"].as_str().unwrap_or(""),160),"progress":if task["status"] == "accepted" {100} else {0}})).collect();
+    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":status,"tagline":projection_text(goal["reason"].as_str().unwrap_or(""),40),"description":format!("已验收 {accepted}/{count} 项；完整任务与验收条件见聊天计划"),"note":if phase == "draft" {"计划待确认；每项验收完成后显示100%"} else {"任务全部通过仍需独立整体验收"},"link":{"label":"","url":""},"progressMode":"reported","steps":steps});
 }
 
 // 人物外观的名字属于展示名册；子会话职责和任务名称保留在原执行事实中。

@@ -2,6 +2,21 @@
 mod goal_tests {
     use super::*;
 
+    fn assert_goal_task_board(snapshot: &serde_json::Value) {
+        if !snapshot["goal"]["id"].is_string() {
+            return;
+        }
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        let steps = snapshot["whiteboard"]["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), tasks.len());
+        for (task, step) in tasks.iter().zip(steps) {
+            assert_eq!(step["id"], task["id"]);
+            assert_eq!(step["progress"], task["progress"]);
+            assert!(step["progress"] == 0 || step["progress"] == 100);
+            assert!(step["title"].as_str().unwrap().encode_utf16().count() <= 160);
+        }
+    }
+
     #[tokio::test]
     async fn main_goal_shell_verifies_produced_and_whole_results_without_unbinding_delivery() {
         let _guard = PROVIDER_ENV_LOCK
@@ -692,6 +707,16 @@ mod goal_tests {
             )
         });
         assert_eq!(snapshot["goal"]["progress"], 33);
+        assert_goal_task_board(&snapshot);
+        assert_eq!(
+            snapshot["whiteboard"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["progress"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 0, 100]
+        );
         assert!(snapshot["goal"]["reason"]
             .as_str()
             .unwrap()
@@ -1826,6 +1851,34 @@ mod goal_tests {
             })
             .await
             .expect("重规划必须投影真实的2/4到2/5比例");
+            let messages = fixture.seen.lock().await;
+            let message = messages
+                .iter()
+                .rev()
+                .find(|m| {
+                    observed_goal(m, "replan")["progress"] == progress
+                        && observed_goal(m, "replan")["planVersion"] == version
+                })
+                .unwrap();
+            let snapshot = message["snapshot"]["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "replan")
+                .unwrap();
+            assert_goal_task_board(snapshot);
+            let steps = snapshot["whiteboard"]["steps"].as_array().unwrap();
+            assert_eq!(steps.len(), if version == 1 { 4 } else { 5 });
+            assert_eq!(
+                steps.iter().filter(|step| step["progress"] == 100).count(),
+                2
+            );
+            if version == 2 {
+                assert!(!steps
+                    .iter()
+                    .any(|step| step["id"].as_str().unwrap().ends_with("-failed")));
+            }
+            drop(messages);
             fixture.release_model.notify_one();
         }
         let answer = running.await.unwrap();
@@ -2984,6 +3037,16 @@ mod goal_tests {
         .await
         .expect("整体完成事实应投影");
         let snapshots = fixture.seen.lock().await;
+        for message in snapshots.iter() {
+            assert_goal_task_board(&message["snapshot"]);
+            for row in message["snapshot"]["conversations"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                assert_goal_task_board(row);
+            }
+        }
         assert!(snapshots
             .iter()
             .any(|m| observed_goal(m, "execute")["progress"] == 50));
@@ -3360,7 +3423,7 @@ mod goal_tests {
     }
 
     #[tokio::test]
-    async fn main_goal_draft_projects_real_tasks_and_unknown_whiteboard_progress() {
+    async fn main_goal_draft_projects_each_task_with_zero_completion() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
@@ -3399,7 +3462,7 @@ mod goal_tests {
         let tasks = snapshot["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(tasks[0]["goalId"], snapshot["goal"]["id"]);
-        assert_eq!(tasks[0]["progress"], -1);
+        assert_eq!(tasks[0]["progress"], 0);
         assert!(tasks[0]["summary"].as_str().unwrap().encode_utf16().count() <= 1000);
         assert!(tasks[0]["summary"]
             .as_str()
@@ -3407,8 +3470,10 @@ mod goal_tests {
             .contains("完整条件与依赖见聊天计划"));
         assert!(tasks[1]["summary"].as_str().unwrap().contains("依赖：data"));
         assert_eq!(snapshot["whiteboard"]["progressMode"], "reported");
-        assert_eq!(snapshot["whiteboard"]["steps"].as_array().unwrap().len(), 1);
-        assert_eq!(snapshot["whiteboard"]["steps"][0]["progress"], -1);
+        assert_goal_task_board(&snapshot);
+        assert_eq!(snapshot["whiteboard"]["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(snapshot["whiteboard"]["steps"][0]["progress"], 0);
+        assert_eq!(snapshot["whiteboard"]["steps"][1]["progress"], 0);
     }
 
     #[tokio::test]
@@ -3659,6 +3724,8 @@ mod goal_tests {
         let conversations = snapshot["conversations"].as_array().unwrap();
         let a = conversations.iter().find(|row| row["id"] == "a").unwrap();
         let b = conversations.iter().find(|row| row["id"] == "b").unwrap();
+        assert_goal_task_board(a);
+        assert_goal_task_board(b);
         assert_ne!(a["goal"]["id"], b["goal"]["id"]);
         assert_eq!(b["goal"]["planVersion"], 1);
         assert_ne!(a["tasks"][0]["id"], b["tasks"][0]["id"]);
