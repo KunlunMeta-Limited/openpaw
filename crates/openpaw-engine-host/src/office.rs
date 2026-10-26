@@ -67,7 +67,13 @@ fn projection_text(text: &str, limit: usize) -> String {
 }
 
 fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
-    let tasks = goal["tasks"].as_array().cloned().unwrap_or_default();
+    let tasks: Vec<_> = goal["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|task| task["current"] != false)
+        .cloned()
+        .collect();
     let phase = goal["phase"].as_str().unwrap_or("draft");
     let ended = phase == "ended";
     let count = tasks.len();
