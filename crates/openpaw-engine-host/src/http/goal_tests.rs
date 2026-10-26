@@ -285,6 +285,18 @@ mod goal_tests {
             .any(|s| s.contains("重复") || s.contains("已被")));
         assert!(results.iter().any(|s| s.contains("验收依据")));
         assert!(results.iter().any(|s| s.contains("Goal 交付工具必须绑定")));
+        assert!(
+            results
+                .iter()
+                .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .any(|goal| goal["plan_version"] == 2
+                    && goal["tasks"].as_array().is_some_and(|tasks| tasks
+                        .iter()
+                        .filter(|task| task["assignee_id"].is_string())
+                        .count()
+                        == 2)),
+            "重规划保留未改定义任务的真实子归属"
+        );
     }
 
     /// 功能：通过外部模型边界驱动真实父子委派和父验收。
@@ -341,9 +353,11 @@ mod goal_tests {
             );
         }
         let current: serde_json::Value = tools
-            .first()
-            .and_then(|m| m["content"].as_str())
-            .and_then(|s| serde_json::from_str(s).ok())
+            .iter()
+            .rev()
+            .filter_map(|m| m["content"].as_str())
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .find(|goal| goal["id"].is_string())
             .unwrap_or_default();
         let update = |action: &str, task: &str, extra: serde_json::Value| {
             let mut args = serde_json::json!({"action":action,"goal_id":current["id"],"expected_version":current["plan_version"],"reason":"核对真实委派结果","task_id":task});
@@ -396,33 +410,42 @@ mod goal_tests {
         goal_fixture_chunk(
             match tools.len() {
                 0 => Some(("goal_read", serde_json::json!({}))),
-                6 => update("start_task", "report", serde_json::json!({})),
-                7 => update("start_task", "a", serde_json::json!({})),
-                8 => update(
+                6 => update(
+                    "replan",
+                    "",
+                    serde_json::json!({"tasks":[
+                        {"id":"a","title":"甲","expected_result":"a.txt","acceptance_criteria":["文件为甲"],"dependencies":[]},
+                        {"id":"b","title":"乙","expected_result":"b.txt","acceptance_criteria":["文件为乙"],"dependencies":[]},
+                        {"id":"report","title":"整合","expected_result":"report.txt","acceptance_criteria":["文件为甲乙"],"dependencies":["a","b"]}
+                    ]}),
+                ),
+                7 => update("start_task", "report", serde_json::json!({})),
+                8 => update("start_task", "a", serde_json::json!({})),
+                9 => update(
                     "accept_task",
                     "a",
                     serde_json::json!({"evidence":[{"criterion":0,"observation_id":"child_unverified","conclusion":"子返回不算验收"}]}),
                 ),
-                9 => Some(("read_file", serde_json::json!({"path":"a.txt"}))),
-                10 => update("accept_task", "a", evidence(9)),
-                11 => update("start_task", "b", serde_json::json!({})),
-                12 => Some(("read_file", serde_json::json!({"path":"b.txt"}))),
-                13 => update("accept_task", "b", evidence(12)),
-                14 => update("start_task", "report", serde_json::json!({})),
-                15 => Some((
+                10 => Some(("read_file", serde_json::json!({"path":"a.txt"}))),
+                11 => update("accept_task", "a", evidence(10)),
+                12 => update("start_task", "b", serde_json::json!({})),
+                13 => Some(("read_file", serde_json::json!({"path":"b.txt"}))),
+                14 => update("accept_task", "b", evidence(13)),
+                15 => update("start_task", "report", serde_json::json!({})),
+                16 => Some((
                     "write_file",
                     serde_json::json!({"path":"report.txt","content":"甲乙"}),
                 )),
-                16 => update(
+                17 => update(
                     "record_result",
                     "report",
                     serde_json::json!({"result":"report.txt 已产出"}),
                 ),
-                17 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
-                18 => update("accept_task", "report", evidence(17)),
-                19 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
-                20 => update("accept_goal", "", evidence(19)),
-                21 => Some((
+                18 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
+                19 => update("accept_task", "report", evidence(18)),
+                20 => Some(("read_file", serde_json::json!({"path":"report.txt"}))),
+                21 => update("accept_goal", "", evidence(20)),
+                22 => Some((
                     "delegate_task",
                     serde_json::json!({"task":"terminal-child","name":"结束后越权"}),
                 )),
@@ -430,6 +453,343 @@ mod goal_tests {
             },
             tools.len(),
         )
+    }
+
+    #[tokio::test]
+    async fn main_goal_replans_after_real_failure_retains_acceptance_and_replacement_history() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-replan", "confirm").await;
+        fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "replan",
+            "plan",
+            "/goal 重规划交付四份资料",
+        )
+        .await;
+        let app = fixture.app.clone();
+        let team = fixture.team.clone();
+        let running = tokio::spawn(async move {
+            goal_send(&app, &team, "replan", "execute", "确认执行").await
+        });
+        for (progress, version) in [(50, 1), (40, 2)] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if fixture.seen.lock().await.iter().any(|m| {
+                        observed_goal(m, "replan")["progress"] == progress
+                            && observed_goal(m, "replan")["planVersion"] == version
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("重规划必须投影真实的2/4到2/5比例");
+            fixture.release_model.notify_one();
+        }
+        let answer = running.await.unwrap();
+        assert!(answer["text"]
+            .as_str()
+            .unwrap()
+            .contains("缺失文件，拆分修复并补充复核"));
+        assert!(answer["text"].as_str().unwrap().contains("修订汇总"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("repair.txt")).unwrap(),
+            "修复已交付"
+        );
+        assert!(
+            !fixture.workspace.path().join("bypass.txt").exists(),
+            "目标越界暂停之后不能继续交付"
+        );
+        let requests = fixture.model_seen.lock().await;
+        let results: Vec<_> = requests
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(
+            results.iter().any(|s| s.contains("依赖尚未验收")),
+            "改写后的依赖必须生效"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|s| s.contains("计划定义") || s.contains("执行状态")),
+            "不能注入accepted状态"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|s| s.contains("整体目标") && s.contains("停止")),
+            "执行模型不得改变目标"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|s| s.contains("替换来源必须退出当前计划")),
+            "保留原任务时不能伪造替换关系"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|s| s.contains("历史任务身份不可重新使用")),
+            "历史身份不能重生覆盖执行事实"
+        );
+        let latest: serde_json::Value = results
+            .iter()
+            .rev()
+            .find_map(|s| {
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .filter(|v| v["phase"] == "paused")
+            })
+            .expect("越界请求应持久暂停");
+        assert_eq!(latest["objective"], "重规划交付四份资料");
+        assert_eq!(
+            latest["acceptance_criteria"],
+            serde_json::json!(["四份资料一致且完整"])
+        );
+        let tasks = latest["tasks"].as_array().unwrap();
+        assert_eq!(tasks.iter().filter(|t| t["current"] == true).count(), 5);
+        assert_eq!(
+            tasks.iter().find(|t| t["id"] == "one").unwrap()["status"],
+            "accepted"
+        );
+        assert_eq!(
+            tasks.iter().find(|t| t["id"] == "two").unwrap()["status"],
+            "accepted"
+        );
+        assert_eq!(
+            tasks.iter().find(|t| t["id"] == "failed").unwrap()["current"],
+            false
+        );
+        assert_eq!(
+            tasks.iter().find(|t| t["id"] == "repair").unwrap()["replaces"],
+            serde_json::json!(["failed"])
+        );
+        assert!(latest["observations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["is_error"] == true
+                && o["task_id"] == "failed"
+                && o["input"]["path"] == "missing.txt"));
+        assert!(latest["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["action"] == "replan"
+                && entry["reason"] == "缺失文件，拆分修复并补充复核"
+                && entry["tasks"].as_array().is_some_and(|ts| ts
+                    .iter()
+                    .any(|t| t["id"] == "failed" && t["current"] == true))));
+        drop(requests);
+        let calls = fixture.model_seen.lock().await.len();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        let response = goal_request(
+            &restarted,
+            &fixture.team,
+            "replan",
+            serde_json::json!({"type":"history"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.model_seen.lock().await.len(), calls);
+        let history: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1_000_000).await.unwrap())
+                .unwrap();
+        assert!(history.to_string().contains("拆分修复并补充复核"));
+        goal_send(
+            &restarted,
+            &fixture.team,
+            "replan",
+            "inspect",
+            "查看重规划事实",
+        )
+        .await;
+        let requests = fixture.model_seen.lock().await;
+        let restored = requests[calls..]
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .find_map(|s| {
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .filter(|g| g["phase"] == "paused")
+            })
+            .expect("重载后通过工具读取持久事实");
+        assert_eq!(restored["history"], latest["history"]);
+        assert_eq!(restored["observations"], latest["observations"]);
+        assert_eq!(restored["tasks"], latest["tasks"]);
+    }
+
+    fn replan_tasks(revised: bool) -> serde_json::Value {
+        let task = |id: &str, title: &str, deps: &[&str], replaces: &[&str]| serde_json::json!({"id":id,"title":title,"expected_result":title,"acceptance_criteria":["文件内容可复核"],"dependencies":deps,"replaces":replaces});
+        let mut tasks = vec![
+            task("one", "资料一", &[], &[]),
+            task("two", "资料二", &[], &[]),
+        ];
+        if revised {
+            tasks.extend([
+                task("repair", "修复资料", &[], &["failed"]),
+                task("review", "补充复核", &["repair"], &["failed"]),
+                task("summary", "修订汇总", &["review"], &[]),
+            ]);
+        } else {
+            tasks.extend([
+                task("failed", "原始资料", &[], &[]),
+                task("summary", "原汇总", &["failed"], &[]),
+            ]);
+            for task in &mut tasks {
+                task.as_object_mut().unwrap().remove("replaces");
+            }
+        }
+        serde_json::json!(tasks)
+    }
+
+    fn replan_model_response(messages: &[serde_json::Value]) -> Response {
+        let latest = messages.iter().rposition(|m| m["role"] == "user").unwrap();
+        let tools: Vec<_> = messages[latest..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        let current: serde_json::Value = tools
+            .iter()
+            .rev()
+            .find_map(|m| {
+                m["content"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter(|v| v["id"].is_string())
+            })
+            .unwrap_or_default();
+        let update = |action: &str, task: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"goal_id":current["id"],"expected_version":current["plan_version"],"reason":"核对实际结果","task_id":task});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        if messages[latest]["content"] == "查看重规划事实" {
+            return goal_fixture_chunk(
+                if tools.is_empty() {
+                    Some(("goal_read", serde_json::json!({})))
+                } else {
+                    None
+                },
+                tools.len(),
+            );
+        }
+        if messages[latest]["content"] != "确认执行" {
+            return goal_fixture_chunk(
+                match tools.len() {
+                    0 => Some(("goal_read", serde_json::json!({}))),
+                    1 => update(
+                        "set_plan",
+                        "",
+                        serde_json::json!({"acceptance_criteria":["四份资料一致且完整"],"tasks":replan_tasks(false)}),
+                    ),
+                    _ => None,
+                },
+                tools.len(),
+            );
+        }
+        let evidence = |index: usize| {
+            let id = tools[index]["content"]
+                .as_str()
+                .unwrap()
+                .rsplit("Goal observation: ")
+                .next()
+                .unwrap()
+                .trim();
+            serde_json::json!({"evidence":[{"criterion":0,"observation_id":id,"conclusion":"实际读取内容一致"}]})
+        };
+        let call = match tools.len() {
+            0 => Some(("goal_read", serde_json::json!({}))),
+            1 | 6 => update(
+                "start_task",
+                if tools.len() == 1 { "one" } else { "two" },
+                serde_json::json!({}),
+            ),
+            2 | 7 => Some((
+                "write_file",
+                serde_json::json!({"path":if tools.len()==2 {"one.txt"} else {"two.txt"},"content":"真实资料"}),
+            )),
+            3 | 8 => Some((
+                "read_file",
+                serde_json::json!({"path":if tools.len()==3 {"one.txt"} else {"two.txt"}}),
+            )),
+            4 | 9 => update(
+                "record_result",
+                if tools.len() == 4 { "one" } else { "two" },
+                serde_json::json!({"result":"实际资料已写入"}),
+            ),
+            5 | 10 => update(
+                "accept_task",
+                if tools.len() == 5 { "one" } else { "two" },
+                evidence(if tools.len() == 5 { 3 } else { 8 }),
+            ),
+            11 => update("start_task", "failed", serde_json::json!({})),
+            12 => Some(("read_file", serde_json::json!({"path":"missing.txt"}))),
+            13 => update(
+                "replan",
+                "",
+                serde_json::json!({"reason":"缺失文件，拆分修复并补充复核","tasks":replan_tasks(true)}),
+            ),
+            14 => update("start_task", "summary", serde_json::json!({})),
+            15 => {
+                let mut tasks = replan_tasks(true);
+                tasks[2]["status"] = serde_json::json!("accepted");
+                update("replan", "", serde_json::json!({"tasks":tasks}))
+            }
+            16 => {
+                let mut tasks = replan_tasks(true);
+                let mut clone = tasks[0].clone();
+                clone["id"] = serde_json::json!("clone");
+                clone["replaces"] = serde_json::json!(["one"]);
+                tasks.as_array_mut().unwrap().push(clone);
+                update("replan", "", serde_json::json!({"tasks":tasks}))
+            }
+            17 => {
+                let mut tasks = replan_tasks(true);
+                let mut clone = tasks[0].clone();
+                clone["id"] = serde_json::json!("failed");
+                tasks.as_array_mut().unwrap().push(clone);
+                update("replan", "", serde_json::json!({"tasks":tasks}))
+            }
+            18 => update("start_task", "repair", serde_json::json!({})),
+            19 => Some((
+                "write_file",
+                serde_json::json!({"path":"repair.txt","content":"修复已交付"}),
+            )),
+            20 => update(
+                "replan",
+                "",
+                serde_json::json!({"objective":"放弃原目标","acceptance_criteria":["任意回复即通过"],"tasks":replan_tasks(true)}),
+            ),
+            21 => Some((
+                "write_file",
+                serde_json::json!({"path":"bypass.txt","content":"不得写入"}),
+            )),
+            22 => Some(("goal_read", serde_json::json!({}))),
+            _ => None,
+        };
+        goal_fixture_chunk(call, tools.len())
     }
     fn observed_goal<'a>(
         message: &'a serde_json::Value,
@@ -666,6 +1026,14 @@ mod goal_tests {
     /// 关联：主聊天 HTTP 测试。
     pub(super) fn goal_model_response(body: &serde_json::Value) -> Response {
         let messages = body["messages"].as_array().unwrap();
+        if messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("重规划交付"))
+        }) {
+            return replan_model_response(messages);
+        }
         if let Some(confirm) = messages
             .iter()
             .rposition(|message| message["role"] == "user" && message["content"] == "确认执行")
