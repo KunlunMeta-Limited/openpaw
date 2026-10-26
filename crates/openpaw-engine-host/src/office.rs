@@ -90,11 +90,13 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
     snapshot["tasks"] = Value::Array(tasks.iter().map(|task| {
         let criteria = task["acceptance_criteria"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("；");
         let dependencies = task["dependencies"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("、");
-        let summary = format!("预期结果：{}\n验收条件：{criteria}\n依赖：{}\n实际产出：{}\n验收依据：{}",task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies},task["result"].as_str().unwrap_or("尚未产出"),if task["status"] == "accepted" {"已根据真实工具观察逐项核对，完整依据见聊天"} else {"未验证，不计为通过"});
+        let waiting = task["status"] == "pending" && task["dependencies"].as_array().into_iter().flatten().any(|dep|tasks.iter().any(|task|task["id"] == *dep && task["status"] != "accepted"));
+        let reason = if waiting {format!("等待依赖：{dependencies}")} else {task["block_reason"].as_str().unwrap_or("").into()};
+        let summary = format!("阻塞原因：{reason}\n预期结果：{}\n验收条件：{criteria}\n依赖：{}\n实际产出：{}\n验收依据：{}",task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies},task["result"].as_str().unwrap_or("尚未产出"),if task["status"] == "accepted" {"已根据真实工具观察逐项核对，完整依据见聊天"} else {"未验证，不计为通过"});
         let source = task["manual"]["sources"].as_array().into_iter().flatten().map(|source| format!("用户人工暂停（来源任务 {}）：{}",source["task_id"].as_str().unwrap_or(""),source["user_excerpt"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("；");
         let summary = if source.is_empty() {summary} else {format!("{source}\n{summary}")};
         let summary = if summary.encode_utf16().count() > 1000 { format!("{}…完整条件与依赖见聊天计划。",projection_text(&summary,960)) } else { summary };
-        let status = if ended { "failed" } else { match task["status"].as_str() { Some("accepted")=>"completed",Some("running")=>"running",Some("produced"|"interrupted"|"manual_blocked")=>"blocked",_=>"queued" } };
+        let status = if ended { "failed" } else if waiting { "blocked" } else { match task["status"].as_str() { Some("accepted")=>"completed",Some("running")=>"running",Some("produced"|"interrupted"|"blocked"|"manual_blocked")=>"blocked",_=>"queued" } };
         serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":task.get("child_workspace_id").unwrap_or(&goal["session_id"]),"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {-1},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
     }).collect());
     let status = match phase {
