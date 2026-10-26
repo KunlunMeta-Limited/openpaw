@@ -8,6 +8,7 @@ members = [
     "crates/openpaw-plugins",
     "crates/openpaw-memory",
     "crates/openpaw-goal-ledger",
+    "crates/openpaw-main-goal",
     "crates/openpaw-tools",
     "crates/openpaw-engine",
     "crates/openpaw-reflect-lite",
@@ -116,6 +117,7 @@ openpaw-mcp = { path = "crates/openpaw-mcp", version = "0.1.0" }
 openpaw-plugins = { path = "crates/openpaw-plugins", version = "0.1.0" }
 openpaw-memory = { path = "crates/openpaw-memory", version = "0.1.0" }
 openpaw-goal-ledger = { path = "crates/openpaw-goal-ledger", version = "0.1.0" }
+openpaw-main-goal = { path = "crates/openpaw-main-goal", version = "0.1.0" }
 openpaw-tools = { path = "crates/openpaw-tools", version = "0.1.0" }
 openpaw-sandbox = { path = "crates/openpaw-sandbox", version = "0.1.0" }
 openpaw-engine = { path = "crates/openpaw-engine", version = "0.1.0" }

@@ -18,6 +18,7 @@ engine-host = [
     "dep:openpaw-core",
     "dep:openpaw-engine",
     "dep:openpaw-llm",
+    "dep:openpaw-main-goal",
     "dep:openpaw-store",
     "dep:openpaw-tools",
     "dep:reqwest",
@@ -40,6 +41,7 @@ futures = { workspace = true, optional = true }
 openpaw-core = { workspace = true, optional = true }
 openpaw-engine = { workspace = true, optional = true }
 openpaw-llm = { workspace = true, optional = true }
+openpaw-main-goal = { workspace = true, optional = true }
 openpaw-store = { workspace = true, optional = true }
 openpaw-tools = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

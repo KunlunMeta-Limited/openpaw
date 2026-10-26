@@ -1745,7 +1745,7 @@ impl AppState {
             }),
             desktop_registrations: self.ai_pc.clone(),
         });
-        handle.goal.attach(&handle);
+        handle.goal.attach(crate::goal::runtime_adapter(&handle));
         handle.goal.finish();
         self.main_office.attach_session(&handle);
         handle

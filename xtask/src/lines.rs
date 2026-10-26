@@ -26,6 +26,8 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     // 用户于 2026-10-26 授权按当前实现规模调整 Host 预算，保留约 584 行余量。
     ("openpaw-engine-host", 13_500),
     ("openpaw-goal-ledger", 2_000),
+    // CHG-2026-0050：用户批准完整主聊天 Goal module 提取，单列新增额度，既有上限与算法不变。
+    ("openpaw-main-goal", 2_200),
     // Local sandbox (plan section 3.4 budget lives in the tools domain; the
     // crate is standalone for the crate-level unsafe allowance, D-9).
     ("openpaw-sandbox", 4_500),
