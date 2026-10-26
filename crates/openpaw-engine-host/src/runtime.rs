@@ -237,6 +237,24 @@ impl SessionHandle {
             }
         }
     }
+    /// 功能：停止 Goal 暂停时已登记的子执行并关闭本回合子执行准入。
+    /// 参数：无。
+    /// 返回：无。
+    /// 错误：无；已完成的子回合取消请求被忽略。
+    /// 状态：使用原子回合取消链；父模型只保留说明暂停原因的机会。
+    /// 并发与取消：短锁关闭准入，实际 join 仍由原 finish_foreground_children 承担。
+    /// 权限：仅 Goal 已持久暂停后调用，不创建新的执行许可。
+    /// 关联：CHG-2026-0050、Goal 重规划越界等待用户决定。
+    pub(crate) fn cancel_goal_children(&self) {
+        let mut children = self
+            .foreground_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        children.accepting = false;
+        for child in &children.tasks {
+            child.handle.cancel_main_turn(&child.turn_id);
+        }
+    }
     /// 功能：读取当前执行取消代际，供非阻塞 main 投影丢弃旧动作。
     /// 参数：无。
     /// 返回：当前回合的原取消令牌副本。
