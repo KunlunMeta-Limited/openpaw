@@ -87,6 +87,26 @@ fn pending() -> String {
     "pending".into()
 }
 
+fn dependencies_satisfied(task: &GoalTask, tasks: &[GoalTask]) -> bool {
+    task.dependencies.iter().all(|dependency| {
+        tasks
+            .iter()
+            .any(|task| task.current && task.id == *dependency && task.status == "accepted")
+    })
+}
+
+fn pause_execution(goal: &mut GoalRecord, reason: &str) {
+    if goal.phase == "active" {
+        goal.phase = "paused".into();
+        goal.reason = reason.into();
+    }
+    for task in &mut goal.tasks {
+        if task.current && matches!(task.status.as_str(), "running" | "produced") {
+            task.status = "interrupted".into();
+        }
+    }
+}
+
 fn recheck_block(goal: &mut GoalRecord, input: &Value, reason: &str) -> Result<(), String> {
     let task = goal
         .tasks
@@ -119,12 +139,7 @@ fn refresh_waiting(goal: &mut GoalRecord, executing: bool) {
     let available = tasks.iter().all(|task| task.status == "accepted")
         || tasks.iter().any(|task| {
             matches!(task.status.as_str(), "running" | "produced" | "interrupted")
-                || (task.status == "pending"
-                    && task.dependencies.iter().all(|dep| {
-                        tasks
-                            .iter()
-                            .any(|task| task.id == *dep && task.status == "accepted")
-                    }))
+                || (task.status == "pending" && dependencies_satisfied(task, &goal.tasks))
         });
     if available {
         goal.phase = if executing { "active" } else { "paused" }.into();
@@ -173,6 +188,8 @@ struct Observation {
     verification: bool,
     #[serde(default)]
     whole_goal: bool,
+    #[serde(default)]
+    plan_version: u64,
     #[serde(default)]
     turn_id: String,
     #[serde(default)]
@@ -398,11 +415,7 @@ impl GoalContext {
         if goal.tasks[index].status != "pending" {
             return Err("Goal 任务已被启动或已有产出，不能重复委派".into());
         }
-        if !goal.tasks[index].dependencies.iter().all(|dep| {
-            goal.tasks
-                .iter()
-                .any(|task| task.current && task.id == *dep && task.status == "accepted")
-        }) {
+        if !dependencies_satisfied(&goal.tasks[index], &goal.tasks) {
             return Err("委派任务依赖尚未验收，不能启动".into());
         }
         let task = &mut goal.tasks[index];
@@ -430,7 +443,7 @@ impl GoalContext {
     /// 参数：events 为 Store 读取的完整事件。
     /// 返回：合法快照恢复成功。
     /// 错误：归属或快照损坏时返回脱敏错误。
-    /// 状态：恢复事实，不恢复用户回合许可。
+    /// 状态：保留事实，把失去执行回合的活动状态恢复为暂停及中断，不恢复许可。
     /// 并发与取消：仅冷加载调用。
     /// 权限：拒绝其他会话的 Goal 事件。
     /// 关联：session_goal_state_v1。
@@ -446,6 +459,16 @@ impl GoalContext {
                             .map_err(|_| "Goal 记录损坏")?;
                 }
             }
+        }
+        if let Some(goal) = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .records
+            .last_mut()
+            .filter(|goal| !matches!(goal.phase.as_str(), "draft" | "ended" | "completed"))
+        {
+            pause_execution(goal, "服务重启中断，未完成工作等待原聊天显式继续");
         }
         Ok(())
     }
@@ -869,6 +892,7 @@ impl GoalContext {
                 &goal.acceptance_criteria,
                 &goal.observations,
                 None,
+                goal.plan_version,
             )
             .map_err(|error| format!("整体验收需要任务全部通过后的独立检查：{error}"))?;
             goal.phase = "completed".into();
@@ -938,11 +962,7 @@ impl GoalContext {
                     {
                         return Err("请先复核中断产物或完成当前任务验收，不能重复启动任务".into());
                     }
-                    if !goal.tasks[index].dependencies.iter().all(|dep| {
-                        goal.tasks.iter().any(|task| {
-                            task.current && task.id == *dep && task.status == "accepted"
-                        })
-                    }) {
+                    if !dependencies_satisfied(&goal.tasks[index], &goal.tasks) {
                         return Err("任务依赖尚未验收，不能启动".into());
                     }
                     if goal.tasks[index].status == "pending" {
@@ -974,6 +994,7 @@ impl GoalContext {
                         &goal.tasks[index].acceptance_criteria,
                         &goal.observations,
                         Some(id),
+                        goal.plan_version,
                     )?;
                     goal.tasks[index].status = "accepted".into();
                 }
@@ -1070,6 +1091,7 @@ impl GoalContext {
                     .iter()
                     .filter(|task| task.current)
                     .all(|task| task.status == "accepted"),
+            plan_version: goal.plan_version,
             is_error: outcome.is_error,
             turn_id: user.turn_id.clone(),
         });
@@ -1222,7 +1244,7 @@ impl GoalContext {
     /// 错误：规划中的交付工具返回确认提示。
     /// 状态：只读；结束目标不解除本回合编辑限制。
     /// 并发与取消：每次调用重新检查，不依赖模型工具列表。
-    /// 权限：未知工具同样按交付工具拒绝。
+    /// 权限：产出及整体验收可用 bash 且沿用原审批；其他未知工具仍按交付工具拒绝。
     /// 关联：ToolHostValidator 与 ToolExecutor 双重检查。
     pub(crate) fn allowed(&self, name: &str) -> Result<(), String> {
         let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
@@ -1247,23 +1269,25 @@ impl GoalContext {
             ) {
                 return Ok(());
             }
-            if self
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .records
-                .last()
-                .is_some_and(|goal| {
-                    goal.phase == "active"
-                        && goal.tasks.iter().any(|task| {
-                            task.current
-                                && task.status == "running"
-                                && task.delegation_id.is_none()
-                                && user.as_ref().and_then(|user| user.task_id.as_deref())
-                                    == Some(task.id.as_str())
-                        })
-                })
-            {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let permitted = state.records.last().is_some_and(|goal| {
+                let selected = goal.tasks.iter().find(|task| {
+                    task.current
+                        && user.as_ref().and_then(|user| user.task_id.as_deref())
+                            == Some(task.id.as_str())
+                });
+                goal.phase == "active"
+                    && (selected.is_some_and(|task| {
+                        task.status == "running" && task.delegation_id.is_none()
+                    }) || (name == "bash"
+                        && (selected.is_some_and(|task| task.status == "produced")
+                            || goal
+                                .tasks
+                                .iter()
+                                .filter(|task| task.current)
+                                .all(|task| task.status == "accepted"))))
+            });
+            if permitted {
                 return Ok(());
             }
             return Err("Goal 交付工具必须绑定已满足依赖且正在执行的任务".into());
@@ -1303,15 +1327,7 @@ impl GoalContext {
             .last_mut()
             .filter(|goal| !matches!(goal.phase.as_str(), "draft" | "ended" | "completed"))
         {
-            if goal.phase == "active" {
-                goal.phase = "paused".into();
-                goal.reason = "本次前台执行已结束，未完成工作等待原聊天显式继续".into();
-            }
-            for task in &mut goal.tasks {
-                if task.current && matches!(task.status.as_str(), "running" | "produced") {
-                    task.status = "interrupted".into();
-                }
-            }
+            pause_execution(goal, "本次前台执行已结束，未完成工作等待原聊天显式继续");
             if let Err(error) = self.commit(&next) {
                 tracing::error!(%error,"Goal 暂停事实保存失败");
             } else {
@@ -1328,6 +1344,7 @@ fn validate_evidence(
     criteria: &[String],
     observations: &[Observation],
     task: Option<&str>,
+    plan_version: u64,
 ) -> Result<Vec<Evidence>, String> {
     let evidence: Vec<Evidence> =
         serde_json::from_value(input.clone()).map_err(|_| "必须提供逐项验收依据")?;
@@ -1340,7 +1357,8 @@ fn validate_evidence(
                     observation.id == entry.observation_id
                         && observation.task_id.as_deref() == task
                         && observation.verification
-                        && (task.is_some() || observation.whole_goal)
+                        && (task.is_some()
+                            || (observation.whole_goal && observation.plan_version == plan_version))
                 })
         })
     {
