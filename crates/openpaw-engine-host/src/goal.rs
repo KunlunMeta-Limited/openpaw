@@ -76,6 +76,8 @@ struct Observation {
     verification: bool,
     #[serde(default)]
     whole_goal: bool,
+    #[serde(default)]
+    turn_id: String,
 }
 
 struct UserTurn {
@@ -224,7 +226,30 @@ impl GoalContext {
             self.commit(&next)?;
             *state = next;
             None
-        } else if unfinished && matches!(command, "/goal continue" | "确认执行") {
+        } else if command == "/goal continue" {
+            if current.is_some_and(|goal| {
+                matches!(goal.phase.as_str(), "paused" | "blocked")
+                    && goal.confirmed_version > 0
+                    && goal.displayed_version == goal.plan_version
+            }) {
+                let mut next = state.clone();
+                let goal = next.records.last_mut().unwrap();
+                goal.phase = "active".into();
+                goal.reason = "用户在原聊天显式继续；中断产物必须先复核，已有验收保留".into();
+                self.commit(&next)?;
+                *state = next;
+                None
+            } else {
+                Some(
+                    if !unfinished {
+                        "当前聊天没有可继续的 Goal，不能接管其他聊天的目标。"
+                    } else {
+                        "当前计划尚未确认或最新版本尚未展示，请先核对完整计划。"
+                    }
+                    .into(),
+                )
+            }
+        } else if unfinished && command == "确认执行" {
             Some("当前计划尚未开始执行。请核对最近展示的完整计划。".into())
         } else {
             None
@@ -233,14 +258,14 @@ impl GoalContext {
             && state
                 .records
                 .last()
-                .is_some_and(|goal| goal.phase == "draft");
+                .is_some_and(|goal| matches!(goal.phase.as_str(), "draft" | "paused" | "blocked"));
         *self.user.lock().unwrap_or_else(|e| e.into_inner()) = Some(UserTurn {
             turn_id: turn.into(),
             message_id: message.into(),
             text: text.into(),
             editable,
             executing: reply.is_none()
-                && command == "确认执行"
+                && matches!(command, "确认执行" | "/goal continue")
                 && state
                     .records
                     .last()
@@ -261,19 +286,31 @@ impl GoalContext {
     pub(crate) fn prompt(&self) -> Option<String> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let goal = state.records.last()?;
+        if matches!(goal.phase.as_str(), "paused" | "blocked") {
+            return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",json!(goal)));
+        }
         if goal.phase != "draft" {
-            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read。仅在本次确认授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；record_result(result) 只表示产出未验证；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。执行期间不得修改整体目标或验收条件；遇到普通失败先修复。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。执行期间不得修改整体目标或验收条件；遇到普通失败先修复。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
         }
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
 
     fn read(&self) -> Value {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state
+        let mut value = state
             .records
             .last()
             .map(|goal| json!(goal))
-            .unwrap_or(json!({}))
+            .unwrap_or(json!({}));
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+        {
+            value["execution_attempts"] = handle.goal_execution_facts();
+        }
+        value
     }
 
     /// 功能：读取当前完整 Goal 事实供 Office 只读投影。
@@ -302,7 +339,7 @@ impl GoalContext {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = state.clone();
         let goal = next.records.last_mut().ok_or("当前聊天没有 Goal")?;
-        if goal.phase != "draft" {
+        if !matches!(goal.phase.as_str(), "draft" | "paused" | "blocked") {
             return Err("已结束的 Goal 不可重新修改，请创建新目标".into());
         }
         if input["goal_id"] != goal.id
@@ -335,13 +372,32 @@ impl GoalContext {
                 }) {
                     return Err("待确认任务只能包含计划定义，不得提供执行状态或验收事实".into());
                 }
-                let tasks: Vec<GoalTask> =
+                let mut tasks: Vec<GoalTask> =
                     serde_json::from_value(input["tasks"].clone()).map_err(|_| "任务格式无效")?;
                 validate_tasks(&tasks)?;
                 let criteria: Vec<String> =
                     serde_json::from_value(input["acceptance_criteria"].clone())
                         .map_err(|_| "整体验收条件格式无效")?;
                 validate_criteria(&criteria)?;
+                if goal.confirmed_version > 0 {
+                    input["user_excerpt"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty() && user.text.contains(*s))
+                        .ok_or("停止后修改需求必须引用本轮真实用户输入")?;
+                    for task in &mut tasks {
+                        if let Some(old) = goal.tasks.iter().find(|old| {
+                            old.id == task.id
+                                && old.title == task.title
+                                && old.expected_result == task.expected_result
+                                && old.acceptance_criteria == task.acceptance_criteria
+                                && old.dependencies == task.dependencies
+                        }) {
+                            *task = old.clone();
+                        }
+                    }
+                    goal.phase = "paused".into();
+                    goal.evidence.clear();
+                }
                 if let Some(objective) = input.get("objective") {
                     goal.objective = objective
                         .as_str()
@@ -413,6 +469,35 @@ impl GoalContext {
                 .position(|task| task.id == id)
                 .ok_or("任务不属于当前 Goal")?;
             match action {
+                "recheck_task" => {
+                    if !matches!(
+                        goal.tasks[index].status.as_str(),
+                        "interrupted" | "produced"
+                    ) {
+                        return Err("只有中断或上轮未验收任务可以复核".into());
+                    }
+                    let observation = goal
+                        .observations
+                        .iter_mut()
+                        .find(|observation| {
+                            observation.id == input["observation_id"].as_str().unwrap_or("")
+                                && observation.turn_id == user.turn_id
+                                && observation.verification
+                        })
+                        .ok_or("复核必须先读取真实产物或执行事实，引用本轮成功观察编号")?;
+                    let status = input["status"]
+                        .as_str()
+                        .filter(|s| matches!(*s, "pending" | "produced"))
+                        .ok_or("复核后只能等待补做或记录已有产物")?;
+                    let result = input["result"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or("复核结论不得为空")?;
+                    observation.task_id = Some(id.into());
+                    goal.tasks[index].status = status.into();
+                    goal.tasks[index].result = result.into();
+                    goal.tasks[index].evidence.clear();
+                }
                 "start_task" => {
                     if goal.tasks[index].status != "pending"
                         || goal
@@ -420,7 +505,7 @@ impl GoalContext {
                             .iter()
                             .any(|task| task.status == "running" || task.status == "produced")
                     {
-                        return Err("请先完成当前任务的产出与验收，不能重复启动任务".into());
+                        return Err("请先复核中断产物或完成当前任务验收，不能重复启动任务".into());
                     }
                     if !goal.tasks[index].dependencies.iter().all(|dep| {
                         goal.tasks
@@ -468,7 +553,7 @@ impl GoalContext {
         let result = json!(goal);
         self.commit(&next)?;
         *state = next;
-        if action == "start_task" {
+        if action == "start_task" || (action == "recheck_task" && input["status"] == "produced") {
             user.task_id = input["task_id"].as_str().map(str::to_owned);
         }
         if action == "accept_task" || action == "accept_goal" {
@@ -480,13 +565,12 @@ impl GoalContext {
     }
 
     fn project(&self) {
-        if let (Some(handle), Some(goal)) = (
-            self.handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .upgrade(),
-            self.current(),
-        ) {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let (Some(handle), Some(goal)) = (handle, self.current()) {
             handle.office.project_goal(&self.owner, goal);
         }
     }
@@ -526,6 +610,7 @@ impl GoalContext {
             ),
             whole_goal: user.task_id.is_none()
                 && goal.tasks.iter().all(|task| task.status == "accepted"),
+            turn_id: user.turn_id.clone(),
         });
         self.commit(&next)?;
         *state = next;
@@ -743,10 +828,12 @@ impl GoalContext {
         if let Some(goal) = next
             .records
             .last_mut()
-            .filter(|goal| goal.phase == "active")
+            .filter(|goal| !matches!(goal.phase.as_str(), "draft" | "ended" | "completed"))
         {
-            goal.phase = "paused".into();
-            goal.reason = "本次前台执行已结束，未完成工作等待原聊天显式继续".into();
+            if goal.phase == "active" {
+                goal.phase = "paused".into();
+                goal.reason = "本次前台执行已结束，未完成工作等待原聊天显式继续".into();
+            }
             for task in &mut goal.tasks {
                 if task.status == "running" {
                     task.status = "interrupted".into();
@@ -880,6 +967,8 @@ fn render_plan(goal: &GoalRecord) -> String {
         goal.reason,
         if goal.phase == "ended" {
             "此 Goal 已明确结束，历史保留；未标记为验收完成。"
+        } else if goal.confirmed_version > 0 {
+            "Goal 已停止，修改要求没有恢复交付。核对后请在原聊天发送 /goal continue；中断任务先复核真实产物。"
         } else {
             "计划待确认，尚未开始交付。可以直接用自然语言修改，核对后回复“确认执行”。"
         }
@@ -982,7 +1071,7 @@ pub(crate) fn plan_tools() -> Vec<ToolSpec> {
         spec.input_schema = if name == "goal_read" {
             json!({"type":"object","properties":{},"additionalProperties":false})
         } else {
-            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","start_task","record_result","accept_task","accept_goal"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
+            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","start_task","record_result","accept_task","accept_goal","recheck_task"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"status":{"enum":["pending","produced"]},"observation_id":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
         };
         spec.category = Some(ToolCategory::ReadOnly);
         spec.concurrency = Some(ToolConcurrency::NeverParallel);

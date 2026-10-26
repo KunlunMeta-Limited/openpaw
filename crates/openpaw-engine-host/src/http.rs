@@ -491,16 +491,45 @@ fn main_conversation_context(turns: &[serde_json::Value]) -> Vec<MainChatMessage
     context
 }
 
-// 每次订阅先发当前完整快照；断开只结束观察，不取消原执行。
+struct GoalStreamCancel {
+    handle: Arc<SessionHandle>,
+    turn: String,
+}
+impl Drop for GoalStreamCancel {
+    fn drop(&mut self) {
+        self.handle.cancel_main_turn(&self.turn);
+    }
+}
+
+// 每次订阅先发完整快照；Goal 观察流关闭取消确切原回合，普通聊天只结束观察。
 fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response {
+    let goal = handle.has_unfinished_goal();
+    let goal_command = main_conversation_turns(&handle)
+        .iter()
+        .find(|row| row["id"] == id)
+        .and_then(|row| row["user"].as_str())
+        .is_some_and(|text| text.trim().starts_with("/goal "));
+    let cancel = (goal || goal_command)
+        .then(|| {
+            handle
+                .turn_outcomes()
+                .into_iter()
+                .find(|outcome| outcome.user_message_id == id && !outcome.state.is_terminal())
+                .map(|outcome| GoalStreamCancel {
+                    handle: handle.clone(),
+                    turn: outcome.turn_id,
+                })
+        })
+        .flatten();
     let stream = futures::stream::unfold(
         (
             handle,
             id,
             None::<serde_json::Value>,
             tokio::time::Instant::now() + Duration::from_secs(180),
+            cancel,
         ),
-        |(handle, id, mut previous, deadline)| async move {
+        |(handle, id, mut previous, deadline, cancel)| async move {
             if previous
                 .as_ref()
                 .is_some_and(|value| value["state"] != "pending")
@@ -526,14 +555,14 @@ fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response 
                     previous = Some(event.clone());
                     return Some((
                         Ok::<_, Infallible>(format!("{event}\n")),
-                        (handle, id, previous, deadline),
+                        (handle, id, previous, deadline, cancel),
                     ));
                 }
                 if tokio::time::Instant::now() >= deadline {
                     let event = serde_json::json!({"type":"snapshot","text":row["assistant"],"state":"error","message":"观察连接超时，请重新同步"});
                     return Some((
                         Ok(format!("{event}\n")),
-                        (handle, id, Some(event), deadline),
+                        (handle, id, Some(event), deadline, cancel),
                     ));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -555,7 +584,7 @@ fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response 
 /// 返回：结构化 JSON 或以 snapshot 开始的 NDJSON。
 /// 错误：非法请求400、其他主对话409、未知轮次404、存储/停止失败503。
 /// 状态：send 经原接收事务执行；其余操作不启动模型。
-/// 并发与取消：准入串行；断流不取消，cancel 只取消已验证轮次。
+/// 并发与取消：准入串行；Goal 断流与 cancel 只取消已验证原回合，普通断流只结束观察。
 /// 权限：统一 Basic 鉴权；工作目录、会话与审批来自原登记。
 /// 关联：CHG-2026-0044、原版 chatOperationSchema。
 async fn main_conversation_chat(
@@ -2172,6 +2201,20 @@ mod tests {
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
                 let messages = body["messages"].as_array().unwrap();
+                if scenario.starts_with("goal-resume") || matches!(scenario,"goal-deadline"|"goal-agent-error") {
+                    let latest = messages.iter().rposition(|m| m["role"] == "user" && !m["content"].as_str().unwrap_or("").starts_with("Goal 仍有")).unwrap();
+                    let tools = messages[latest..].iter().filter(|m| m["role"] == "tool").count();
+                    if scenario == "goal-agent-error" && messages[latest]["content"] == "确认执行" && tools == 8 {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if messages[latest]["content"] == "确认执行" && tools == 8 {
+                        gate.notified().await;
+                    }
+                    if scenario == "goal-resume-late" && messages[latest]["content"] == "/goal continue" && tools == 0 {
+                        gate.notified().await;
+                    }
+                    return goal_tests::lifecycle_model_response(&body);
+                }
                 if scenario.starts_with("goal-") {
                     if scenario == "goal-execute" {
                         if let Some(confirm) = messages.iter().rposition(|message|message["role"] == "user" && message["content"] == "确认执行") {

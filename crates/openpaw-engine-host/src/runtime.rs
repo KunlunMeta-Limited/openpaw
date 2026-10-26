@@ -219,6 +219,43 @@ impl SessionHandle {
     pub(crate) fn commit_goal(&self, value: serde_json::Value) -> Result<(), String> {
         append_event(self, &SessionEvent::Unknown(Box::new(value)))
     }
+    /// 功能：向原会话 Goal 复核提供已有持久工具执行事实。
+    /// 参数：无。
+    /// 返回：真实执行记录的只读快照。
+    /// 错误：无。
+    /// 状态：不产生工具动作或模型请求。
+    /// 并发与取消：只持执行记录读锁，不等待 session。
+    /// 权限：仅当前会话 Goal 上下文，不能接管其他聊天。
+    /// 关联：中断后的显式继续及 execution_attempt_v1。
+    pub(crate) fn goal_execution_facts(&self) -> serde_json::Value {
+        let facts = self
+            .execution_attempts
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        serde_json::json!(facts
+            .iter()
+            .filter(
+                |fact| matches!(fact.kind.as_str(), "tool_start" | "tool_result")
+                    && !matches!(
+                        fact.payload["name"].as_str(),
+                        Some("goal_read" | "goal_update")
+                    )
+            )
+            .collect::<Vec<_>>())
+    }
+    /// 功能：判断主聊天观察流是否受未结束 Goal 的停止规则约束。
+    /// 参数：无。
+    /// 返回：当前会话有未结束完整计划时为真。
+    /// 错误：无。
+    /// 状态：只读，不创建执行许可。
+    /// 并发与取消：流仍捕获确切回合身份；此判断不取消其他回合。
+    /// 权限：仅本会话，不观察其他聊天的目标。
+    /// 关联：main_conversation_stream。
+    pub(crate) fn has_unfinished_goal(&self) -> bool {
+        self.goal
+            .current()
+            .is_some_and(|goal| !matches!(goal["phase"].as_str(), Some("ended" | "completed")))
+    }
     async fn finish_foreground_children(&self) {
         let children = {
             let mut registry = self
@@ -1676,6 +1713,7 @@ impl AppState {
             desktop_registrations: self.ai_pc.clone(),
         });
         handle.goal.attach(&handle);
+        handle.goal.finish();
         self.main_office.attach_session(&handle);
         handle
     }
