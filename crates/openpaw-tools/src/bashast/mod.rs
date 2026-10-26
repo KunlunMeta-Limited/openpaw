@@ -80,7 +80,7 @@ where
             for cmd in &commands {
                 let cmd_str = cmd.argv.join(" ");
                 if regex_check(&cmd_str) {
-                    return CommandSafety::Dangerous(format!("subcommand blocked: {}", cmd_str));
+                    return CommandSafety::Dangerous(format!("subcommand blocked: {cmd_str}"));
                 }
             }
 
@@ -210,8 +210,7 @@ mod stage3_tests {
         let result = analyze_command_safety("echo $(whoami)", regex_matches_rm);
         assert!(
             matches!(result, CommandSafety::RequiresApproval(_)),
-            "TooComplex should be RequiresApproval in Stage 3, got: {:?}",
-            result
+            "TooComplex should be RequiresApproval in Stage 3, got: {result:?}"
         );
     }
 
@@ -223,8 +222,7 @@ mod stage3_tests {
         let result = analyze_command_safety("rm -rf $(echo /tmp)", regex_matches_rm);
         assert!(
             matches!(result, CommandSafety::RequiresApproval(_)),
-            "TooComplex should be RequiresApproval even if regex matches, got: {:?}",
-            result
+            "TooComplex should be RequiresApproval even if regex matches, got: {result:?}"
         );
     }
 
@@ -253,8 +251,7 @@ mod stage3_tests {
         let result = analyze_command_safety("dir", regex_matches_rm);
         assert!(
             !matches!(result, CommandSafety::Dangerous(_)),
-            "clean simple command must not be Dangerous, got {:?}",
-            result
+            "clean simple command must not be Dangerous, got {result:?}"
         );
     }
 
@@ -269,22 +266,19 @@ mod stage3_tests {
         let result = decide_parse_unavailable("some unparsable command", regex_matches_rm);
         assert!(
             matches!(result, CommandSafety::RequiresApproval(_)),
-            "fail-closed violated: got {:?}",
-            result
+            "fail-closed violated: got {result:?}"
         );
         // Fully permissive regex → still RequiresApproval (regex is not proof)
         let permissive = decide_parse_unavailable("anything", |_| false);
         assert!(
             matches!(permissive, CommandSafety::RequiresApproval(_)),
-            "fail-closed violated with a permissive regex, got {:?}",
-            permissive
+            "fail-closed violated with a permissive regex, got {permissive:?}"
         );
         // Regex match → Dangerous (fallback detection still fires)
         let blocked = decide_parse_unavailable("rm -rf /", regex_matches_rm);
         assert!(
             matches!(blocked, CommandSafety::Dangerous(_)),
-            "blocked path violated, got {:?}",
-            blocked
+            "blocked path violated, got {blocked:?}"
         );
     }
 

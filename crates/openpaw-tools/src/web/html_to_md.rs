@@ -367,7 +367,7 @@ impl<'a> MarkdownParser<'a> {
                 if !self.list_counter.is_empty() {
                     let n = self.list_counter.last_mut().unwrap();
                     *n += 1;
-                    out.push_str(&format!("{}. ", n));
+                    out.push_str(&format!("{n}. "));
                 } else {
                     out.push_str("- ");
                 }
@@ -590,7 +590,7 @@ mod tests {
     #[test]
     fn test_code_block() {
         let md = html_to_markdown("<pre><code>fn main() {}</code></pre>");
-        assert!(md.contains("```"), "missing triple backtick: {}", md);
+        assert!(md.contains("```"), "missing triple backtick: {md}");
         assert!(md.contains("fn main() {}"));
     }
 
@@ -600,21 +600,18 @@ mod tests {
         let md = html_to_markdown(
             r#"<pre><code class="language-console">$ curl https://sh.rustup.rs</code></pre>"#,
         );
-        assert!(md.contains("```"), "missing triple backtick: {}", md);
+        assert!(md.contains("```"), "missing triple backtick: {md}");
         assert!(
             md.contains("$ curl https://sh.rustup.rs"),
-            "should contain code content, got: {}",
-            md
+            "should contain code content, got: {md}"
         );
         assert!(
             !md.contains("<code"),
-            "should NOT contain raw <code tags: {}",
-            md
+            "should NOT contain raw <code tags: {md}"
         );
         assert!(
             !md.contains("class="),
-            "should NOT contain class attribute: {}",
-            md
+            "should NOT contain class attribute: {md}"
         );
     }
 
@@ -622,8 +619,8 @@ mod tests {
     fn test_code_block_pre_with_class() {
         // Some sites use <pre class="..."> without <code>
         let md = html_to_markdown(r#"<pre class="rust">fn main() { println!("hello"); }</pre>"#);
-        assert!(md.contains("```"), "missing triple backtick: {}", md);
-        assert!(md.contains("fn main()"), "should contain code: {}", md);
+        assert!(md.contains("```"), "missing triple backtick: {md}");
+        assert!(md.contains("fn main()"), "should contain code: {md}");
     }
 
     #[test]
@@ -631,13 +628,11 @@ mod tests {
         let md = html_to_markdown(r#"<p>Use <code class="highlight">println!</code> macro</p>"#);
         assert!(
             md.contains("`println!`"),
-            "should contain inline code: {}",
-            md
+            "should contain inline code: {md}"
         );
         assert!(
             !md.contains("class="),
-            "should NOT contain class attr: {}",
-            md
+            "should NOT contain class attr: {md}"
         );
     }
 

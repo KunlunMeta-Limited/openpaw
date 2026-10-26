@@ -62,7 +62,7 @@ approval lifecycle 只在 turn gate 内由 reserve/abort 进入；异步等待�
    dev 的 subagent/sessionID 与 v1 的 task/task_id 不同，不能混称同一接口。
    v1 的目标查找失败会退回新建，且没有同等的 parentID 校验；本方案不
    照搬这两点。新建子会话只接收委派 prompt，恢复才保留其先前消息和工具
-   输出，见同版本 [task.txt](https://github.com/anomalyco/opencode/blob/31406ccc51b4bd2a4e1e086b2bcaa5f7f804f26d/packages/opencode/src/tool/task.txt#L15)。
+   输出，见同版本的[工具说明目录](https://github.com/anomalyco/opencode/tree/31406ccc51b4bd2a4e1e086b2bcaa5f7f804f26d/packages/opencode/src/tool)。
 3. Codex 官方[子 Agent 文档](https://developers.openai.com/codex/subagents/)
    描述独立 Agent thread、后续指令、状态观察及汇总结果。开源实现固定提交
    `e18a20d6eb6f5ede32a69fb56e3fe276d5e9d914`：

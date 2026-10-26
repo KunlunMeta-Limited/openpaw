@@ -165,22 +165,23 @@ pub fn format_reasoning_memories(memories: &[&LoadedMemory]) -> String {
         } else {
             m.body.lines().next().unwrap_or("")
         };
-        buf.push_str(&format!("### {}\n", title));
-        buf.push_str(&format!("{}\n", m.body));
+        buf.push_str(&format!("### {title}\n"));
+        buf.push_str(&m.body);
+        buf.push('\n');
 
         if let Some(path) = m.frontmatter.extra.get("thinking_path") {
             if let Some(s) = path.as_str() {
-                buf.push_str(&format!("Path: {}\n", s));
+                buf.push_str(&format!("Path: {s}\n"));
             }
         }
         if let Some(instance) = m.frontmatter.extra.get("concrete_instance") {
             if let Some(s) = instance.as_str() {
-                buf.push_str(&format!("Example: {}\n", s));
+                buf.push_str(&format!("Example: {s}\n"));
             }
         }
         if let Some(ptype) = m.frontmatter.extra.get("problem_type") {
             if let Some(s) = ptype.as_str() {
-                buf.push_str(&format!("Applies to: {}\n", s));
+                buf.push_str(&format!("Applies to: {s}\n"));
             }
         }
         buf.push('\n');
@@ -439,9 +440,7 @@ mod tests {
 
     #[test]
     fn drift_defense_constants_nonempty() {
-        assert!(!DRIFT_DEFENSE_SECTION.is_empty());
         assert!(DRIFT_DEFENSE_SECTION.contains("Memory Drift Defense"));
-        assert!(!IGNORE_MEMORY_INSTRUCTION.is_empty());
         assert!(IGNORE_MEMORY_INSTRUCTION.contains("ignored"));
     }
 

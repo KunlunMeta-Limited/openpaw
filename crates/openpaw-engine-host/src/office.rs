@@ -185,7 +185,7 @@ struct MainProjection {
 /// 数据去向：登记成功后转换为持久员工；丢弃时释放临时计数。
 /// 约束：仅适用于新身份，既有 task_id 续办不申请。
 /// 稳定性：Host 内部类型，不改变 Office 或 Session 线协议。
-/// 关联：CHG-2026-0037、T04。
+/// 关联：子会话创建与容量准入。
 pub(crate) struct MainChildReservation {
     office: Arc<MainOffice>,
     parent: String,
@@ -199,7 +199,7 @@ impl MainChildReservation {
     /// 状态：新增员工但不伪造执行状态、任务或交接；预留随后由 Drop 释放。
     /// 并发与取消：共享办公室短锁，不访问网络；登记完成前不接收子回合。
     /// 权限：仅 runtime 的真实子创建路径调用，不授予任何执行权限。
-    /// 关联：CHG-2026-0037、record_main_fact。
+    /// 关联：主会话事实提交。
     pub(crate) fn commit(self, child: &str, employee: &str, name: &str) -> Result<(), String> {
         self.office
             .register_child(&self.parent, employee, name)
@@ -618,7 +618,7 @@ impl MainOffice {
     /// 状态：仅增加暂存计数，既有员工包含主员工，不改变模型/进程额度。
     /// 并发与取消：所有创建使用原 records 锁；失败、取消和 future 丢弃释放 guard。
     /// 权限：不查询远端 Office，不因网络故障放开或拒绝名额。
-    /// 关联：CHG-2026-0037、T04。
+    /// 关联：子会话创建与容量准入。
     pub(crate) fn reserve_child(
         self: &Arc<Self>,
         parent: &str,

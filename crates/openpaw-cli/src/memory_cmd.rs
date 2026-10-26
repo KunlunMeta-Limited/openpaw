@@ -212,7 +212,7 @@ pub fn run_delete(home: &Path, project: Option<&Path>, id: &str) -> i32 {
     };
     match removed {
         Some(scope) => {
-            println!("removed {id} from {:?}", scope);
+            println!("removed {id} from {scope:?}");
             0
         }
         None => {

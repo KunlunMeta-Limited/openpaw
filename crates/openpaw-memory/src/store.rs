@@ -375,8 +375,7 @@ impl MemoryStore for FsMemoryStore {
         let estimated_size = body.len() + 4096; // body + frontmatter overhead estimate
         if estimated_size > MAX_MEMORY_WRITE_SIZE {
             return Err(MemoryStoreError::Config(format!(
-                "memory body too large: {} bytes (max {} bytes)",
-                estimated_size, MAX_MEMORY_WRITE_SIZE
+                "memory body too large: {estimated_size} bytes (max {MAX_MEMORY_WRITE_SIZE} bytes)"
             )));
         }
         let _lock = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -385,8 +384,7 @@ impl MemoryStore for FsMemoryStore {
             let active_count = self.list_active()?.len();
             if active_count >= max {
                 return Err(MemoryStoreError::Config(format!(
-                    "memory limit reached: {} active memories (max {})",
-                    active_count, max
+                    "memory limit reached: {active_count} active memories (max {max})"
                 )));
             }
         }

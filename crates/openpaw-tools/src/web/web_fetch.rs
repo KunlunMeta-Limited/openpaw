@@ -213,8 +213,7 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
     if let Some(len) = resp.content_length() {
         if len > 5 * 1024 * 1024 {
             return Ok(ToolCallOutcome::error(format!(
-                "response too large: Content-Length {} bytes (max 5MB)",
-                len
+                "response too large: Content-Length {len} bytes (max 5MB)"
             )));
         }
     }
@@ -239,7 +238,7 @@ pub async fn run(_workspace: &Path, args: serde_json::Value) -> Result<ToolCallO
 
     let truncated = if text.chars().count() > effective_max_chars {
         let t: String = text.chars().take(effective_max_chars).collect();
-        format!("{t}\n... (truncated at {} chars)", effective_max_chars)
+        format!("{t}\n... (truncated at {effective_max_chars} chars)")
     } else {
         text
     };

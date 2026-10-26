@@ -3337,7 +3337,7 @@ mod tests {
         assert!(continuation["messages"].to_string().contains(&secret));
         assert!(!continuation["messages"].to_string().contains("requestID"));
         eprintln!(
-            "T02 continuation evidence: {}",
+            "continuation evidence: {}",
             serde_json::json!({"parentID":parent,"childID":child,"messages":history,"prior_tool_secret_preserved":true,"original_file_removed":true})
         );
         drop(seen);
@@ -3579,7 +3579,7 @@ Path('exclusive').rmdir()
             serde_json::json!({})
         );
         eprintln!(
-            "T05 concurrency evidence: {}",
+            "concurrency evidence: {}",
             serde_json::json!({"parentID":parent,"children":children,"serializedWrites":sequence,"sameChildTurns":turns,"publicBusy":409,"globalParentLimit":1,"modelLimit":2})
         );
     }
@@ -3704,7 +3704,7 @@ Path('exclusive').rmdir()
             serde_json::json!({})
         );
         eprintln!(
-            "T05 cancellation evidence: {}",
+            "cancellation evidence: {}",
             serde_json::json!({"stoppedParent":parents[0],"stoppedChild":child,"childTerminal":stopped,"unrelatedParent":parents[1],"unrelatedChild":other_child,"otherFinished":true,"cancelledParentCanRunAgain":true})
         );
     }
@@ -3850,7 +3850,7 @@ Path('exclusive').rmdir()
             assert_eq!(stale.status(), StatusCode::NOT_FOUND);
         }
         eprintln!(
-            "T05 single-call evidence: {}",
+            "single-call evidence: {}",
             serde_json::json!({"childID":child,"cards":[first,second,third,fourth,fifth,sixth],"allowed":["first-0.txt","public-0.txt","resumed-0.txt"],"rejected":["first-1.txt","public-1.txt","resumed-1.txt"],"lateReplies":404})
         );
     }
@@ -3989,7 +3989,7 @@ Path('exclusive').rmdir()
                 <= parent_turns[0]["completedAt"].as_i64().unwrap()
         );
         eprintln!(
-            "T05 original timeout evidence: {}",
+            "original timeout evidence: {}",
             serde_json::json!({"elapsedSeconds":started.elapsed().as_secs(),"parentID":parent,"childID":child,"parentTurns":parent_turns,"childTurns":child_turns,"originalDeadlineSeconds":180})
         );
     }
@@ -4107,7 +4107,7 @@ Path('exclusive').rmdir()
             2
         );
         eprintln!(
-            "T04 capacity evidence: {}",
+            "capacity evidence: {}",
             serde_json::json!({"seededMembersIncludingLeader":199,"parallelNewRequests":8,"createdChildren":children,"members":200,"rejectedBeforeChildModel":7,"resumedAtCapacity":child})
         );
     }
@@ -4255,7 +4255,7 @@ Path('exclusive').rmdir()
             "第六员工详情只读"
         );
         eprintln!(
-            "T04 six employee evidence: {}",
+            "six-employee evidence: {}",
             serde_json::json!({"employees":identities,"sessions":children,"sixthTools":tools,"modelLimit":1})
         );
     }
@@ -4474,7 +4474,7 @@ Path('exclusive').rmdir()
         .await
         .expect("旧办公室文件通过已提交父会话事实恢复第三个员工，原协议初始化可见");
         eprintln!(
-            "T04 registration fault evidence: {}",
+            "registration-fault evidence: {}",
             serde_json::json!({"unstartedSession":child,"childModelRequestsAdded":0,"acceptedChildTurns":0,"persistedMemberIdentities":3})
         );
     }
@@ -4568,7 +4568,7 @@ Path('exclusive').rmdir()
             2
         );
         eprintln!(
-            "T02 retry evidence: {}",
+            "retry evidence: {}",
             serde_json::json!({"parentID":parent,"continuedChildID":child,"same_text_new_requests":3,"retried_request_added_turns":0,"same_name_new_identity":list})
         );
     }
@@ -4670,7 +4670,7 @@ Path('exclusive').rmdir()
             "拒绝路径不得调用子模型"
         );
         eprintln!(
-            "T02 rejection evidence: {}",
+            "rejection evidence: {}",
             serde_json::json!({"parentID":parent,"childID":child,"otherParentID":other,"rejected":["unknown","root","cross_parent_and_directory","display_id","archived","deleted"],"child_model_requests":2})
         );
     }
@@ -5044,7 +5044,7 @@ Path('exclusive').rmdir()
             "只读查看不产生模型或工具调用"
         );
         eprintln!(
-            "T06 employee evidence: {}",
+            "employee evidence: {}",
             serde_json::json!({"employeeID":child["id"],"sessionID":session,"tool":"read_file","callID":"call-0","turnState":"failed","toolDisposition":"completed","readonlyModelRequests":0})
         );
     }

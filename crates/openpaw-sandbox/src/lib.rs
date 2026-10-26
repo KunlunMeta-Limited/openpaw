@@ -150,8 +150,7 @@ impl Sandbox {
                 } else {
                     // No callback set — fail closed: do not bypass the sandbox
                     Err(SandboxError::ExecutionFailed(format!(
-                        "sandbox blocked command '{}' and no approval callback is configured",
-                        command
+                        "sandbox blocked command '{command}' and no approval callback is configured"
                     )))
                 }
             }

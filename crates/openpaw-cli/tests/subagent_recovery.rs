@@ -275,7 +275,7 @@ fn killed_host_keeps_child_unknown_once_without_reexecuting_tools_or_replaying_a
         continued
     );
     println!(
-        "T07 crash evidence: {}",
+        "crash recovery evidence: {}",
         serde_json::json!({"parentID":parent,"childID":child,"killSignal":killed.signal(),"restarts":2,"recoveryDisposition":"unknown","providerCallsBeforeRecovery":count,"providerCallsAfterReadonlyRecovery":count,"actionsBeforeRecovery":action_count,"actionsAfterReadonlyRecovery":action_count,"sameChildContinued":true,"parentDeletePreservedChild":true,"effect":"actual-side-effect"})
     );
     stop.store(true, Ordering::Release);

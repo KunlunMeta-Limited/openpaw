@@ -260,23 +260,19 @@ fn set_memory(store: &FsMemoryStore, input: &serde_json::Value) -> ToolCallOutco
                 // Atomic in-place update.
                 match store.update_in_place(existing_id, &fm, content) {
                     Ok(()) => ToolCallOutcome::ok(format!(
-                        "Memory '{}' updated at {}",
-                        existing_id,
+                        "Memory '{existing_id}' updated at {}",
                         existing.source_path.display()
                     )),
                     Err(e) => ToolCallOutcome::error(format!(
-                        "Error updating memory '{}': {e}",
-                        existing_id
+                        "Error updating memory '{existing_id}': {e}"
                     )),
                 }
             }
             Ok(None) => ToolCallOutcome::error(format!(
-                "Error: memory '{}' not found for update. Use action 'set' without an 'id' to create a new memory.",
-                existing_id
+                "Error: memory '{existing_id}' not found for update. Use action 'set' without an 'id' to create a new memory."
             )),
             Err(e) => ToolCallOutcome::error(format!(
-                "Error looking up memory '{}': {e}",
-                existing_id
+                "Error looking up memory '{existing_id}': {e}"
             )),
         }
     } else {
@@ -369,7 +365,7 @@ fn list_categories(store: &FsMemoryStore) -> ToolCallOutcome {
             let mut sorted: Vec<_> = zones.into_iter().collect();
             sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
             for (zone, count) in sorted {
-                content.push_str(&format!("  - {} ({} entries)\n", zone, count));
+                content.push_str(&format!("  - {zone} ({count} entries)\n"));
             }
 
             ToolCallOutcome::ok(content)
