@@ -358,3 +358,64 @@ Office main仍fa6ae1f。OpenPaw main已变为f33d3e2的另一B线Host，当前�
 ## 2026-10-24 D71 最终真实验收登记
 
 准确提交 `7675084713e420df1d86548abf2d3e30a3ee0cb3` 的 Host31/31、完整27/27、Office浏览器74/74及生产真实DeepSeek多人验收通过。五个独立子Run和review/audit正文交接、五次拜访completed、六人物/六侧栏/任务中心/白板/追问/刷新、48项人物菜单均真实验证；菜单零新增Run、账本不变，耗时1.603—3.775秒（平均3.147秒）。证据位于 `/home/cheng/.cache/t6-agent-followup-20261024/{final-c,live-after-d,production-menus-2,closure.json}`。Office源码未改，Windows原生仍按用户决定暂缓；PR #13等待非作者审核/合入，交付验收仍需用户针对准确提交确认。第一次同名会话标签严格选择器报错已由验收脚本修正，不是Office改动。
+
+## r11 本机编译、启动与停止脚本（CHG-2026-0007 §12.78）
+
+脚本统一管理本机的 OpenPaw Host 与 PawOffice Node 服务。Linux 入口是
+`scripts/openpaw-office.sh`，Windows PowerShell 入口是
+`scripts/openpaw-office.ps1`；两者均提供 `build`、`start`、`stop`、`status`。
+脚本只编译和启动已有实现，不增加 Provider、Session、工具或审批逻辑；Office
+工程仍是只读运行依赖，本次没有修改 Office 文件。
+
+### 配置准备
+
+默认读取以下路径，可用环境变量覆盖：
+
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `OPENPAW_ENV_FILE` | `$HOME/.openpaw/.env` | 官方模型配置；不要提交或复制到仓库 |
+| `OPENPAW_HOST_CONFIG` | `$HOME/.openpaw/engine-host-office.toml` | Host 的 home、授权根、Office 地址和槽位 |
+| `OPENPAW_OFFICE_SOURCE` | OpenPaw 同级 `ai-office-react` | 已检出的 Office 工程 |
+| `OPENPAW_RUN_DIR` | Linux `/tmp/openpaw-office-$UID`；Windows `%LOCALAPPDATA%\OpenPaw\office-runtime` | PID、日志、构建日志；不在仓库内 |
+| `OPENPAW_HOST_PORT` / `OPENPAW_OFFICE_PORT` | `32885` / `8765` | 两个 loopback 端口 |
+| `PAWOFFICE_API_KEY` | 无默认值 | 仅注入 Office 子进程，不写文件或日志 |
+
+Host 配置中的 `provider` 为空时由官方 `.env` 的 `OPENPAW_PROVIDER` 装配；有效值必须是已配置的真实 Provider。脚本明确拒绝空 Provider 和 `echo`，避免把演示回显误认为真实模型。模型密钥不进入 `VITE_*`、浏览器、PID 或日志。
+
+### Linux
+
+在 OpenPaw 目录执行：
+
+```bash
+export OPENPAW_ENV_FILE=/home/cheng/.openpaw/.env
+export OPENPAW_HOST_CONFIG=/tmp/openpaw-live-deepseek.toml
+export OPENPAW_OFFICE_SOURCE=/media/cheng/新加卷/workSpace/Office/ai-office-react
+export PAWOFFICE_API_KEY=pawoffice-demo-key
+scripts/openpaw-office.sh build
+scripts/openpaw-office.sh start
+scripts/openpaw-office.sh status
+scripts/openpaw-office.sh stop
+```
+
+`start` 先启动 Office，再启动 Host；两个 `/health` 均返回 200 才返回成功。`stop` 先向 Host 发送正常停止信号并等待 Run、工具、审批和存储清理，再停止 Office。超时默认保留进程并返回非零；确认后才使用 `scripts/openpaw-office.sh stop --force`。重复 `stop` 是安全的。日志和 PID 在 `OPENPAW_RUN_DIR`，不会写入仓库。
+
+### Windows PowerShell
+
+PowerShell 5.1 或更高版本执行：
+
+```powershell
+$env:OPENPAW_ENV_FILE = "$HOME\.openpaw\.env"
+$env:OPENPAW_HOST_CONFIG = "$HOME\.openpaw\engine-host-office.toml"
+$env:OPENPAW_OFFICE_SOURCE = "C:\workspace\Office\ai-office-react"
+$env:PAWOFFICE_API_KEY = "本机服务密钥"
+.\scripts\openpaw-office.ps1 build
+.\scripts\openpaw-office.ps1 start
+.\scripts\openpaw-office.ps1 status
+.\scripts\openpaw-office.ps1 stop
+```
+
+PowerShell 入口与 Linux 使用同一配置字段，日志和 PID 默认位于 `%LOCALAPPDATA%\OpenPaw\office-runtime`。本轮已做脚本静态检查；Windows 10/11 原生 Host、Job Object、cmd 和 Office 浏览器运行仍按项目决定暂缓，不能把脚本存在写成 Windows 运行验收通过。macOS 不在适配范围。
+
+### 失败与回退
+
+缺少配置、密钥、真实 Provider、构建产物或端口占用会在启动前返回非零；任一服务健康检查失败时只停止本次脚本启动的进程，并保留日志。脚本不会使用 `pkill -f`、不会删除 home/会话/工作区，也不会覆盖 `.env`。回退到原手工命令只需删除脚本或直接执行 `cargo run ... engine-host` 与 Office 的既有 `node server/dist/index.js`；运行数据保持不变。
