@@ -1995,6 +1995,7 @@ fn sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("http/goal_tests.rs");
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::response::IntoResponse;
@@ -2117,7 +2118,7 @@ mod tests {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
                 let data = match body["type"].as_str() {
-                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("delegate-conversations") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
+                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("delegate-conversations") || scenario == "goal-isolation" {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
                     Some("office.read") if body["teamId"].is_string() => {
                         let messages = seen.lock().await;
                         let snapshot = messages.iter().rev().find(|message| message["type"] == "office.snapshot" && message["teamId"] == body["teamId"]).unwrap()["snapshot"].clone();
@@ -2171,6 +2172,9 @@ mod tests {
                     return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
                 }
                 let messages = body["messages"].as_array().unwrap();
+                if scenario.starts_with("goal-") {
+                    return goal_tests::goal_model_response(&body);
+                }
                 let latest = messages.iter().rposition(|message|message["role"] == "user").unwrap_or(0);
                 let tools = messages[latest..].iter().filter(|message| message["role"] == "tool").count();
                 let parent = body["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "delegate_task");

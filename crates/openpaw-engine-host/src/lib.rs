@@ -11,6 +11,8 @@ mod delegation;
 #[cfg(feature = "engine-host")]
 mod events;
 #[cfg(feature = "engine-host")]
+mod goal;
+#[cfg(feature = "engine-host")]
 mod http;
 #[cfg(feature = "engine-host")]
 mod office;

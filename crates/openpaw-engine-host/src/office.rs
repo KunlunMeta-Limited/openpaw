@@ -56,6 +56,31 @@ fn default_conversation_title() -> String {
     "主对话".into()
 }
 
+fn projection_text(text: &str, limit: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .take_while(|character| {
+            used += character.len_utf16();
+            used <= limit
+        })
+        .collect()
+}
+
+fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
+    let tasks = goal["tasks"].as_array().cloned().unwrap_or_default();
+    let ended = goal["phase"] == "ended";
+    let count = tasks.len();
+    snapshot["goal"] = serde_json::json!({"id":goal["id"],"phase":goal["phase"],"planVersion":goal["plan_version"],"acceptedTaskCount":0,"taskCount":count,"progress":-1,"reason":goal["reason"]});
+    snapshot["tasks"] = Value::Array(tasks.iter().map(|task| {
+        let criteria = task["acceptance_criteria"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("；");
+        let dependencies = task["dependencies"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("、");
+        let summary = format!("预期结果：{}\n验收条件：{criteria}\n依赖：{}",task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies});
+        let summary = if summary.encode_utf16().count() > 1000 { format!("{}…完整条件与依赖见聊天计划。",projection_text(&summary,960)) } else { summary };
+        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":goal["session_id"],"title":task["title"],"status":if ended {"failed"} else {"queued"},"progress":-1,"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
+    }).collect());
+    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":if ended {"failed"} else {"queued"},"tagline":if ended {"目标已结束"} else {"计划待确认"},"description":"完整任务与验收条件见聊天计划","note":"未确认计划的进度未知","link":{"label":"","url":""},"progressMode":"reported","steps":[{"id":goal["id"],"title":format!("已验收 0/{count} 项"),"progress":-1}]});
+}
+
 // 人物外观的名字属于展示名册；子会话职责和任务名称保留在原执行事实中。
 fn roster_display_snapshot(mut snapshot: Value) -> Value {
     if let Some(conversations) = snapshot
@@ -121,11 +146,11 @@ impl MainOfficeEntry {
         let conversations = self
             .all()
             .filter_map(|record| {
-                Some(
-                    serde_json::json!({"id":record.conversation.as_ref()?,"title":record.title,
+                let mut value = serde_json::json!({"id":record.conversation.as_ref()?,"title":record.title,
                 "employees":record.snapshot["employees"],"tasks":record.snapshot["tasks"],
-                "events":record.snapshot["events"],"whiteboard":record.snapshot["whiteboard"]}),
-                )
+                "events":record.snapshot["events"],"whiteboard":record.snapshot["whiteboard"]});
+                if let Some(goal) = record.snapshot.get("goal") { value["goal"] = goal.clone(); }
+                Some(value)
             })
             .collect::<Vec<_>>();
         // 每个会话的版本独立递增；总和保证任一会话更新都会推进办公室版本。
@@ -377,6 +402,9 @@ impl MainOffice {
                         task["summary"] = Value::from("重启中断，未自动继续执行");
                         task["updatedAt"] = Value::from(chrono::Utc::now().to_rfc3339());
                     }
+                }
+                if let Some(goal) = crate::runtime::latest_goal(home, session)? {
+                    apply_goal_projection(&mut record.snapshot, &goal);
                 }
                 if previous != record.snapshot || revision > previous["seq"].as_u64().unwrap_or(0) {
                     if revision >= 9_007_199_254_740_991 {
@@ -2139,6 +2167,23 @@ impl OfficeDispatcher {
     pub(crate) fn cancel_main(&self, session: &str) {
         if let Some(main) = self.main() {
             main.cancel(session);
+        }
+    }
+
+    /// 功能：把已提交 Goal 事实投影到当前聊天任务列表与白板。
+    /// 参数：session 为所属主会话，goal 为完整事实快照。
+    /// 返回：无。
+    /// 错误：展示失败只记录原投影日志，不改变 Goal 或回合。
+    /// 状态：只写派生 Office 快照。
+    /// 并发与取消：先释放 Goal 锁再调用；沿用原有异步出站队列。
+    /// 权限：不执行或验收任务。
+    /// 关联：CHG-2026-0050。
+    pub(crate) fn project_goal(&self, session: &str, goal: Value) {
+        if let Some(main) = self.main() {
+            main.update(session, |_, record| {
+                apply_goal_projection(&mut record.snapshot, &goal);
+                Vec::new()
+            });
         }
     }
 
