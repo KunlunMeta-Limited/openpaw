@@ -8,6 +8,7 @@ use crate::delegation::{
     remove_persisted_delegation_state, DelegatingToolHost, DelegationContext, DelegationShared,
 };
 use crate::events;
+use crate::goal::{GoalContext, GoalToolHost};
 use crate::office::OfficeDispatcher;
 use crate::protocol::projection as message_projection;
 use crate::protocol::{
@@ -149,6 +150,8 @@ pub struct SessionHandle {
         std::sync::RwLock<Vec<openpaw_store::execution_attempts::ExecutionAttemptV1>>,
     session_path: PathBuf,
     pub agent: AgentLoop,
+    /// 会话私有 Goal 事实；执行权限不从持久状态继承。
+    goal: Arc<GoalContext>,
     pub approvals: Arc<HostApprovalManager>,
     /// 本会话独立的子任务身份、结果缓存和执行审批上下文。
     pub(crate) delegation: Arc<DelegationContext>,
@@ -205,6 +208,17 @@ pub struct SessionActivity {
     pub task: String,
 }
 impl SessionHandle {
+    /// 功能：通过既有唯一 session writer 提交 Goal 事实。
+    /// 参数：value 为 Goal 模块已经校验的完整快照。
+    /// 返回：持久追加成功。
+    /// 错误：journal 失败时返回错误，调用者不得发布内存更新。
+    /// 状态：只追加扩展事件，不直接改写 Session 消息。
+    /// 并发与取消：Goal 锁先于 writer，提交不跨 await。
+    /// 权限：仅本会话 GoalContext 调用。
+    /// 关联：CHG-2026-0050、session_goal_state_v1。
+    pub(crate) fn commit_goal(&self, value: serde_json::Value) -> Result<(), String> {
+        append_event(self, &SessionEvent::Unknown(Box::new(value)))
+    }
     async fn finish_foreground_children(&self) {
         let children = {
             let mut registry = self
@@ -604,6 +618,7 @@ struct SessionHandleInit {
     execution_attempts: Vec<openpaw_store::execution_attempts::ExecutionAttemptV1>,
     session_path: PathBuf,
     agent: AgentLoop,
+    goal: Arc<GoalContext>,
     approvals: Arc<HostApprovalManager>,
     delegation: Arc<DelegationContext>,
     workspace: PathBuf,
@@ -1258,7 +1273,11 @@ impl AppState {
         provider: Arc<dyn LlmProvider>,
         model: &str,
         child: bool,
-    ) -> (Arc<DelegationContext>, Arc<dyn openpaw_core::ToolHost>) {
+    ) -> (
+        Arc<DelegationContext>,
+        Arc<dyn openpaw_core::ToolHost>,
+        Arc<GoalContext>,
+    ) {
         let delegation = DelegationContext::new(
             id.to_string(),
             workspace.to_path_buf(),
@@ -1280,7 +1299,13 @@ impl AppState {
                 self.ai_pc.clone(),
             )
         };
-        (delegation, tool_host)
+        let goal = GoalContext::new(id);
+        let tool_host: Arc<dyn openpaw_core::ToolHost> = if child {
+            tool_host
+        } else {
+            Arc::new(GoalToolHost::new(tool_host, goal.clone()))
+        };
+        (delegation, tool_host, goal)
     }
     async fn load_existing(&self, id: &str) -> Result<Arc<SessionHandle>, SessionLoadError> {
         let path = self
@@ -1337,7 +1362,7 @@ impl AppState {
                 CancellationToken::new(),
             )
         };
-        let (delegation, tool_host) = self.session_tool_host(
+        let (delegation, tool_host, goal) = self.session_tool_host(
             id,
             &workspace,
             approvals.clone(),
@@ -1345,6 +1370,8 @@ impl AppState {
             &session.meta.model,
             child.is_some(),
         );
+        goal.restore(&read.events)
+            .map_err(|_| SessionLoadError::Corrupt)?;
         let tools = tool_host
             .list_tools()
             .await
@@ -1368,6 +1395,7 @@ impl AppState {
             execution_attempts,
             session_path: path,
             agent,
+            goal,
             approvals,
             delegation,
             workspace,
@@ -1505,7 +1533,7 @@ impl AppState {
         } else {
             HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel)
         };
-        let (delegation, tool_host) = self.session_tool_host(
+        let (delegation, tool_host, goal) = self.session_tool_host(
             &id,
             &workspace,
             approvals.clone(),
@@ -1555,6 +1583,7 @@ impl AppState {
             execution_attempts: Vec::new(),
             session_path: path,
             agent,
+            goal,
             approvals,
             delegation,
             workspace,
@@ -1582,6 +1611,7 @@ impl AppState {
             execution_attempts,
             session_path,
             agent,
+            goal,
             approvals,
             delegation,
             workspace,
@@ -1608,6 +1638,7 @@ impl AppState {
             execution_attempts: std::sync::RwLock::new(execution_attempts),
             session_path,
             agent,
+            goal,
             approvals,
             delegation,
             active: AtomicBool::new(false),
@@ -1637,6 +1668,7 @@ impl AppState {
             }),
             desktop_registrations: self.ai_pc.clone(),
         });
+        handle.goal.attach(&handle);
         self.main_office.attach_session(&handle);
         handle
     }
@@ -1855,7 +1887,7 @@ impl AppState {
                 self.global_events.clone(),
                 CancellationToken::new(),
             );
-            let (delegation, tool_host) = self.session_tool_host(
+            let (delegation, tool_host, goal) = self.session_tool_host(
                 &new_id,
                 &source.workspace,
                 approvals.clone(),
@@ -1912,6 +1944,7 @@ impl AppState {
                 execution_attempts: Vec::new(),
                 session_path: final_path,
                 agent,
+                goal,
                 approvals,
                 delegation,
                 workspace: source.workspace.clone(),
@@ -3179,7 +3212,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         turn_id,
         user_message_id,
         text,
-        provider_tools,
+        mut provider_tools,
         provider,
         model,
         admission,
@@ -3313,12 +3346,18 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     }
     handle.set_activity("thinking", None, "正在思考");
     handle.emit(events::session_status(&handle.id, "busy"));
+    let goal_reply = handle.goal.begin(&turn_id, &user_message_id, &text);
+    if handle.goal.prompt().is_some() {
+        provider_tools.extend(crate::goal::plan_tools());
+    }
+    provider_tools.retain(|tool| handle.goal.allowed(&tool.name).is_ok());
     let system_prompt = if handle.child.is_some() {
         Some("你是主 Agent 委派的独立子 Agent。只完成任务及明确提供的背景，必要时使用工作区工具；不得再次委派。最终给出供父 Agent 整合的真实结果。".to_string())
     } else {
         let prompts = [
             handle.office.system_prompt(),
             handle.delegation.context_prompt().await,
+            handle.goal.prompt(),
         ]
         .into_iter()
         .flatten()
@@ -3509,29 +3548,52 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     .into_values()
                     .collect()
             };
-            let execution = turn_execution::run_turn(
-                &handle.agent,
-                &mut session,
-                &provider_tools,
-                &mut sink,
-                TurnOptions {
-                    cancel: turn_cancel.clone(),
-                    provider_and_model: Some((provider, model)),
-                    attachments,
-                    system: system_prompt,
-                    recorder: Some(execution_recorder(handle.clone(), turn_id.clone())),
-                },
-            )
-            .await;
-            cleanup.checkpoint = Some(execution.checkpoint);
-            let result = execution.result;
-            if let Err(error) = &result {
-                tracing::warn!(session_id = %handle.id, turn_id = %turn_id, error = %error, "回合执行失败");
+            if let Ok(Some(reply)) = &goal_reply {
+                let message = openpaw_core::Message::assistant_text(reply);
+                session.messages.push(message.clone());
+                (vec![message], Ok(openpaw_core::StopReason::EndTurn))
+            } else if let Err(error) = &goal_reply {
+                (Vec::new(), Err(openpaw_core::Error::Session(error.clone())))
+            } else {
+                let execution = turn_execution::run_turn(
+                    &handle.agent,
+                    &mut session,
+                    &provider_tools,
+                    &mut sink,
+                    TurnOptions {
+                        cancel: turn_cancel.clone(),
+                        provider_and_model: Some((provider, model)),
+                        attachments,
+                        system: system_prompt,
+                        recorder: Some(execution_recorder(handle.clone(), turn_id.clone())),
+                    },
+                )
+                .await;
+                cleanup.checkpoint = Some(execution.checkpoint);
+                let result = execution.result;
+                if let Err(error) = &result {
+                    tracing::warn!(session_id = %handle.id, turn_id = %turn_id, error = %error, "回合执行失败");
+                }
+                (execution.generated_messages, result)
             }
-            (execution.generated_messages, result)
         }
     };
     handle.finish_foreground_children().await;
+    if result.is_ok() && !turn_cancel.is_cancelled() {
+        if let Some(plan) = handle.goal.presentation() {
+            let mut session = handle.session.lock().await;
+            let block = openpaw_core::ContentBlock::Text { text: plan };
+            if let Some(message) = generated
+                .last_mut()
+                .filter(|message| message.role == openpaw_core::Role::Assistant)
+            {
+                message.content.push(block.clone());
+                if let Some(saved) = session.messages.last_mut() {
+                    saved.content.push(block);
+                }
+            }
+        }
+    }
     let snapshot = {
         let mut session = handle.session.lock().await;
         // terminal commit 与 abort 共用 turn_gate。先取得 gate 的一方决定本轮最终是
@@ -3653,7 +3715,15 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         } else {
             intended_terminal
         };
+        if terminal.state == TurnState::Completed {
+            if let Err(error) = handle.goal.displayed() {
+                tracing::error!(%error, "Goal 展示版本保存失败");
+            }
+        }
         let office_completed = terminal.state == TurnState::Completed && !tool_failed;
+        if let Some(goal) = handle.goal.current() {
+            handle.office.project_goal(&handle.id, goal);
+        }
         if let Some(office) = &child_office {
             office.finish(office_completed);
         } else {
@@ -3722,6 +3792,7 @@ fn next_fork_ordinal(home: &std::path::Path, source_id: &str) -> Result<u64, Ses
         .map_err(|_| SessionMutationError::Persistence("无法扫描会话分支序号".into()))
 }
 fn finish_turn_projection(handle: &SessionHandle) {
+    handle.goal.finish();
     handle.approvals.abort_all();
     if let Some(outcome) = handle
         .turn_outcomes()
@@ -3789,6 +3860,25 @@ fn safe_activity_tool(name: &str) -> Option<&str> {
         _ => None,
     }
 }
+/// 功能：从原 session journal 读取已保存的当前 Goal。
+/// 参数：home 为 Host 数据根，id 为已绑定会话。
+/// 返回：完整 Goal 事实或空值。
+/// 错误：会话或 Goal 损坏时返回脱敏错误。
+/// 状态：只读，不启动模型或恢复执行许可。
+/// 并发与取消：Office 启动恢复时同步读取。
+/// 权限：只读取已绑定会话，不写工作区。
+/// 关联：MainOffice::recover。
+pub(crate) fn latest_goal(
+    home: &std::path::Path,
+    id: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let read = SessionReader::read(home.join("sessions").join(format!("{id}.jsonl")))
+        .map_err(|_| "Goal 会话暂不可用")?;
+    let context = GoalContext::new(id);
+    context.restore(&read.events)?;
+    Ok(context.current())
+}
+
 fn append_event(handle: &SessionHandle, event: &SessionEvent) -> Result<(), String> {
     let mut writer = handle
         .writer
