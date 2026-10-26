@@ -3,6 +3,497 @@ mod goal_tests {
     use super::*;
 
     #[tokio::test]
+    async fn main_goal_block_rechecks_keep_shortage_and_stopped_conditions_need_explicit_continue()
+    {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-blocks", "confirm").await;
+        fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "blocks",
+            "plan",
+            "/goal 执行阻塞方案",
+        )
+        .await;
+        goal_send(&fixture.app, &fixture.team, "blocks", "execute", "确认执行").await;
+        let insufficient = goal_send(
+            &fixture.app,
+            &fixture.team,
+            "blocks",
+            "insufficient",
+            "/goal continue",
+        )
+        .await;
+        assert!(insufficient["text"]
+            .as_str()
+            .unwrap()
+            .contains("仍缺地区资料，请补充地区"));
+        assert!(!fixture.workspace.path().join("data.txt").exists());
+        let edited = goal_send(
+            &fixture.app,
+            &fixture.team,
+            "blocks",
+            "conditions",
+            "地区已补充为华东，请核对条件，暂不启动执行",
+        )
+        .await;
+        assert!(edited["text"].as_str().unwrap().contains("/goal continue"));
+        assert!(!fixture
+            .workspace
+            .path()
+            .join("condition-bypass.txt")
+            .exists());
+        assert!(!fixture.workspace.path().join("data.txt").exists());
+        let requests = fixture.model_seen.lock().await;
+        let condition_request = requests
+            .iter()
+            .rposition(|r| {
+                r["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["content"] == "地区已补充为华东，请核对条件，暂不启动执行")
+            })
+            .unwrap();
+        let edited_fact = requests[condition_request]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .filter(|m| m["role"] == "tool")
+            .find_map(|m| {
+                m["content"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter(|g| g["id"].is_string())
+            })
+            .unwrap();
+        assert_eq!(edited_fact["phase"], "paused");
+        assert_eq!(edited_fact["tasks"][0]["status"], "pending");
+        assert_eq!(edited_fact["tasks"][0]["block_reason"], "");
+        assert_eq!(edited_fact["tasks"][2]["status"], "accepted");
+        assert!(edited_fact["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["reason"] == "条件仍不足，仍缺地区资料，请补充地区"));
+        assert!(requests
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .any(|s| s.contains("只能等待条件或恢复 pending")));
+        drop(requests);
+        let calls = fixture.model_seen.lock().await.len();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        goal_request(
+            &restarted,
+            &fixture.team,
+            "blocks",
+            serde_json::json!({"type":"history"}),
+        )
+        .await;
+        assert_eq!(fixture.model_seen.lock().await.len(), calls);
+        assert!(!fixture.workspace.path().join("data.txt").exists());
+        let completed = goal_send(
+            &restarted,
+            &fixture.team,
+            "blocks",
+            "resume",
+            "/goal continue",
+        )
+        .await;
+        assert!(completed["text"]
+            .as_str()
+            .unwrap()
+            .contains("整体验收已通过"));
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("data.txt")).unwrap(),
+            "地区：华东"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("dependent.txt")).unwrap(),
+            "报告引用地区：华东"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("independent.txt")).unwrap(),
+            "独立资料已交付"
+        );
+        let requests = fixture.model_seen.lock().await;
+        assert!(!requests[calls..]
+            .iter()
+            .flat_map(|r| {
+                let messages = r["messages"].as_array().unwrap();
+                let latest = messages
+                    .iter()
+                    .rposition(|m| m["role"] == "user" && m["content"] == "/goal continue")
+                    .unwrap();
+                &messages[latest..]
+            })
+            .filter(|m| m["role"] == "assistant")
+            .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+            .any(|c| c["function"]["name"] == "write_file"
+                && c["function"]["arguments"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("independent.txt"))));
+    }
+
+    #[tokio::test]
+    async fn main_goal_execution_blocks_wait_dependencies_and_keep_independent_delivery() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-blocks", "confirm").await;
+        fixture
+            .state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "blocks",
+            "plan",
+            "/goal 执行阻塞方案",
+        )
+        .await;
+        let answer = goal_send(&fixture.app, &fixture.team, "blocks", "execute", "确认执行").await;
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("independent.txt")).unwrap(),
+            "独立资料已交付"
+        );
+        assert!(!fixture.workspace.path().join("dependent.txt").exists());
+        assert!(!fixture.workspace.path().join("unbound.txt").exists());
+        assert!(answer["text"]
+            .as_str()
+            .unwrap()
+            .contains("缺少地区资料，请补充地区"));
+        let requests = fixture.model_seen.lock().await;
+        let results: Vec<_> = requests
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        let facts: Vec<serde_json::Value> = results
+            .iter()
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .filter(|g| g["id"].is_string())
+            .collect();
+        let blocked = facts
+            .iter()
+            .find(|g| g["tasks"][0]["status"] == "blocked")
+            .expect("模型可在没有工具尝试门槛时报告阻塞");
+        assert_eq!(blocked["observations"], serde_json::json!([]));
+        let pristine = facts
+            .iter()
+            .find(|g| g["plan_version"] == 1 && g["history"].as_array().unwrap().len() == 1)
+            .unwrap();
+        assert!(pristine["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["status"] == "pending"));
+        for message in ["归属", "任务不属于", "原因", "复核", "依赖尚未验收"] {
+            assert!(
+                results.iter().any(|s| s.contains(message)),
+                "缺少拒绝结果：{message}"
+            );
+        }
+        let final_fact = facts
+            .iter()
+            .rev()
+            .find(|g| g["phase"] == "blocked")
+            .expect("无可执行工作必须保存等待状态")
+            .clone();
+        assert_eq!(
+            final_fact["tasks"][0]["block_reason"],
+            "缺少地区资料，请补充地区"
+        );
+        assert_eq!(final_fact["tasks"][1]["status"], "pending");
+        assert_eq!(final_fact["tasks"][2]["status"], "accepted");
+        assert_eq!(final_fact["tasks"][2]["block_reason"], "");
+        drop(requests);
+        let snapshot = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (_, read) = fixture
+                    .state
+                    .main_office
+                    .message(
+                        serde_json::json!({"type":"office.read","teamId":fixture.team}),
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                if read["snapshot"]["goal"]["phase"] == "blocked" {
+                    break read["snapshot"].clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "等待阻塞投影超时：{:?}",
+                fixture.seen.try_lock().map(|messages| messages
+                    .iter()
+                    .filter(|m| m["type"] == "office.snapshot")
+                    .map(|m| observed_goal(m, "blocks").clone())
+                    .collect::<Vec<_>>())
+            )
+        });
+        assert_eq!(snapshot["goal"]["progress"], 33);
+        assert!(snapshot["goal"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("缺少地区资料"));
+        assert_eq!(snapshot["tasks"][0]["status"], "blocked");
+        assert!(snapshot["tasks"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("缺少地区资料"));
+        assert_eq!(snapshot["tasks"][1]["status"], "blocked");
+        assert!(snapshot["tasks"][1]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("等待依赖"));
+        assert_eq!(snapshot["whiteboard"]["status"], "blocked");
+        assert!(snapshot["whiteboard"]["tagline"]
+            .as_str()
+            .unwrap()
+            .contains("请补充地区"));
+        let calls = fixture.model_seen.lock().await.len();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        let response = goal_request(
+            &restarted,
+            &fixture.team,
+            "blocks",
+            serde_json::json!({"type":"history"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(fixture.model_seen.lock().await.len(), calls);
+        goal_send(
+            &restarted,
+            &fixture.team,
+            "blocks",
+            "inspect",
+            "查看执行阻塞事实",
+        )
+        .await;
+        let requests = fixture.model_seen.lock().await;
+        let restored = requests[calls..]
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .find_map(|m| {
+                m["content"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter(|g| g["phase"] == "blocked")
+            })
+            .unwrap();
+        assert_eq!(restored["tasks"], final_fact["tasks"]);
+        assert_eq!(restored["history"], final_fact["history"]);
+        assert_eq!(restored["reason"], final_fact["reason"]);
+    }
+
+    fn block_model_response(messages: &[serde_json::Value]) -> Response {
+        let latest = messages.iter().rposition(|m| m["role"] == "user").unwrap();
+        let text = messages[latest]["content"].as_str().unwrap();
+        let tools: Vec<_> = messages[latest..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        let current: serde_json::Value = tools
+            .iter()
+            .rev()
+            .find_map(|m| {
+                m["content"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .filter(|g| g["id"].is_string())
+            })
+            .unwrap_or_default();
+        let update = |action: &str, task: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"goal_id":current["id"],"expected_version":current["plan_version"],"task_id":task,"reason":"核对执行阻塞"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        if text == "查看执行阻塞事实" {
+            return goal_fixture_chunk(
+                if tools.is_empty() {
+                    Some(("goal_read", serde_json::json!({})))
+                } else {
+                    None
+                },
+                tools.len(),
+            );
+        }
+        if text == "/goal continue" || text.contains("地区已补充") {
+            let evidence = |index: usize| serde_json::json!({"evidence":[{"criterion":0,"observation_id":tools[index]["content"].as_str().unwrap().rsplit("Goal observation: ").next().unwrap().trim(),"conclusion":"实际交付内容与地区一致"}]});
+            let resolving = text.contains("地区已补充");
+            let blocked = current["tasks"][0]["status"] == "blocked";
+            let call = if resolving {
+                match tools.len() {
+                    0 | 4 => Some(("goal_read", serde_json::json!({}))),
+                    1 => update(
+                        "recheck_task",
+                        "data",
+                        serde_json::json!({"status":"pending","reason":"用户补充华东地区，模型确认条件已满足"}),
+                    ),
+                    2 => update("start_task", "data", serde_json::json!({})),
+                    3 => Some((
+                        "write_file",
+                        serde_json::json!({"path":"condition-bypass.txt","content":"不得自动执行"}),
+                    )),
+                    _ => None,
+                }
+            } else if blocked {
+                match tools.len() {
+                    0 | 4 => Some(("goal_read", serde_json::json!({}))),
+                    1 => update("start_task", "data", serde_json::json!({})),
+                    2 => update(
+                        "recheck_task",
+                        "data",
+                        serde_json::json!({"status":"produced","reason":"不能用阻塞重检伪造产出"}),
+                    ),
+                    3 => update(
+                        "recheck_task",
+                        "data",
+                        serde_json::json!({"status":"blocked","reason":"条件仍不足，仍缺地区资料，请补充地区"}),
+                    ),
+                    _ => None,
+                }
+            } else {
+                match tools.len() {
+                    0 => Some(("goal_read", serde_json::json!({}))),
+                    1 | 7 => update(
+                        "start_task",
+                        if tools.len() == 1 { "data" } else { "report" },
+                        serde_json::json!({}),
+                    ),
+                    2 => Some((
+                        "write_file",
+                        serde_json::json!({"path":"data.txt","content":"地区：华东"}),
+                    )),
+                    3 => Some(("read_file", serde_json::json!({"path":"data.txt"}))),
+                    4 | 10 => update(
+                        "record_result",
+                        if tools.len() == 4 { "data" } else { "report" },
+                        serde_json::json!({"result":"真实资料已交付，待核对"}),
+                    ),
+                    5 => update(
+                        "block_task",
+                        "data",
+                        serde_json::json!({"reason":"不得把未验收产物绕过复核变成待执行"}),
+                    ),
+                    6 | 11 => update(
+                        "accept_task",
+                        if tools.len() == 6 { "data" } else { "report" },
+                        evidence(if tools.len() == 6 { 3 } else { 9 }),
+                    ),
+                    8 => Some((
+                        "write_file",
+                        serde_json::json!({"path":"dependent.txt","content":"报告引用地区：华东"}),
+                    )),
+                    9 | 12 => Some(("read_file", serde_json::json!({"path":"dependent.txt"}))),
+                    13 => update("accept_goal", "", evidence(12)),
+                    _ => None,
+                }
+            };
+            return goal_fixture_chunk(call, tools.len());
+        }
+        let call = if text.starts_with("/goal ") && text != "/goal continue" {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update(
+                    "set_plan",
+                    "",
+                    serde_json::json!({"acceptance_criteria":["地区、依赖报告和独立资料均可核对"],"tasks":[
+                        {"id":"data","title":"地区资料","expected_result":"地区资料文件","acceptance_criteria":["地区字段完整"],"dependencies":[]},
+                        {"id":"report","title":"依赖报告","expected_result":"引用地区的报告","acceptance_criteria":["引用地区资料"],"dependencies":["data"]},
+                        {"id":"independent","title":"独立资料","expected_result":"独立资料文件","acceptance_criteria":["内容完整"],"dependencies":[]}
+                    ]}),
+                ),
+                _ => None,
+            }
+        } else {
+            match tools.len() {
+                0 | 5 | 15 => Some(("goal_read", serde_json::json!({}))),
+                1 => update(
+                    "block_task",
+                    "data",
+                    serde_json::json!({"goal_id":"other-goal","reason":"不得污染当前目标"}),
+                ),
+                2 => update(
+                    "block_task",
+                    "foreign-task",
+                    serde_json::json!({"reason":"其他目标任务"}),
+                ),
+                3 => update("block_task", "data", serde_json::json!({"reason":"  "})),
+                4 => update(
+                    "recheck_task",
+                    "data",
+                    serde_json::json!({"status":"pending","reason":"未阻塞不能假装解除"}),
+                ),
+                6 => update(
+                    "block_task",
+                    "data",
+                    serde_json::json!({"reason":"缺少地区资料，请补充地区"}),
+                ),
+                7 => update("start_task", "report", serde_json::json!({})),
+                8 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"unbound.txt","content":"不得交付"}),
+                )),
+                9 => update("start_task", "independent", serde_json::json!({})),
+                10 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"independent.txt","content":"独立资料已交付"}),
+                )),
+                11 => Some(("read_file", serde_json::json!({"path":"independent.txt"}))),
+                12 => update(
+                    "record_result",
+                    "independent",
+                    serde_json::json!({"result":"独立资料已交付，待核对"}),
+                ),
+                13 => update(
+                    "accept_task",
+                    "independent",
+                    serde_json::json!({"evidence":[{"criterion":0,"observation_id":tools[11]["content"].as_str().unwrap().rsplit("Goal observation: ").next().unwrap().trim(),"conclusion":"实际文件内容完整"}]}),
+                ),
+                14 => update(
+                    "block_task",
+                    "independent",
+                    serde_json::json!({"reason":"不能撤销已验收事实"}),
+                ),
+                _ => None,
+            }
+        };
+        goal_fixture_chunk(call, tools.len())
+    }
+
+    #[tokio::test]
     async fn main_goal_cancel_joins_bound_children_without_late_delivery_or_restart() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
@@ -98,7 +589,8 @@ mod goal_tests {
                     assert_eq!(
                         tasks
                             .iter()
-                            .filter(|task| task["status"] == "blocked")
+                            .filter(|task| task["status"] == "blocked"
+                                && matches!(task["title"].as_str(), Some("甲" | "乙")))
                             .count(),
                         2
                     );
@@ -1658,6 +2150,14 @@ mod goal_tests {
     /// 关联：主聊天 HTTP 测试。
     pub(super) fn goal_model_response(body: &serde_json::Value) -> Response {
         let messages = body["messages"].as_array().unwrap();
+        if messages.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("执行阻塞方案"))
+        }) {
+            return block_model_response(messages);
+        }
         if messages.iter().any(|m| {
             m["role"] == "user"
                 && m["content"]
