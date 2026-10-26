@@ -1,7 +1,7 @@
 //! 功能：保存会话归属的 Goal、计划、执行和验收事实，强制回合与任务权限。
 //! 输入输出边界：真实用户回合和模型工具输入进入，持久事实由 runtime 唯一 writer 提交。
 //! 禁止承担：不直接执行交付工具，不写共享 Todo，不创建后台驱动或独立 writer。
-//! 关联：CHG-2026-0050、goal-command tickets 01–05。
+//! 关联：CHG-2026-0050、goal-command tickets 01–07。
 
 use crate::runtime::SessionHandle;
 use async_trait::async_trait;
@@ -55,6 +55,10 @@ struct GoalTask {
     #[serde(default)]
     result: String,
     #[serde(default)]
+    block_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual: Option<ManualConstraint>,
+    #[serde(default)]
     evidence: Vec<Evidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     assignee_id: Option<String>,
@@ -62,6 +66,21 @@ struct GoalTask {
     child_workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delegation_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ManualConstraint {
+    previous_status: String,
+    previous_block_reason: String,
+    sources: Vec<ManualSource>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ManualSource {
+    task_id: String,
+    turn_id: String,
+    user_message_id: String,
+    user_excerpt: String,
 }
 
 fn pending() -> String {
@@ -502,10 +521,10 @@ impl GoalContext {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let goal = state.records.last()?;
         if matches!(goal.phase.as_str(), "paused" | "blocked") {
-            return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",json!(goal)));
+            return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；人工暂停用manual_pause、明确恢复用manual_resume，携带task_id和user_excerpt引用本轮原文，人工约束来源及后继保留，恢复旧来源任务可解除其替换或拆分任务约束；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",json!(goal)));
         }
         if goal.phase != "draft" {
-            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务可并行 delegate_task(goal_task_id=计划任务编号)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务可并行 delegate_task(goal_task_id=计划任务编号)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。人工manual_blocked及其用户来源不可自动解除，普通continue、recheck、移除依赖或新建等价任务都不能绕过；重规划保留原身份、replaces和人工来源，独立工作仍可推进。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
         }
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
@@ -582,6 +601,61 @@ impl GoalContext {
             .ok_or("必须提供不超过1000字符的变更原因")?;
         let previous = json!({"plan_version":goal.plan_version,"objective":goal.objective,"acceptance_criteria":goal.acceptance_criteria,"tasks":goal.tasks,"phase":goal.phase,"reason":reason,"turn_id":user.turn_id,"user_message_id":user.message_id});
         match input["action"].as_str() {
+            Some(action @ ("manual_pause" | "manual_resume")) => {
+                if goal.confirmed_version == 0
+                    || !matches!(goal.phase.as_str(), "paused" | "blocked")
+                {
+                    return Err("人工暂停或恢复必须先停止已确认 Goal".into());
+                }
+                let excerpt = input["user_excerpt"]
+                    .as_str()
+                    .filter(|s| {
+                        !s.trim().is_empty()
+                            && s.encode_utf16().count() <= 1000
+                            && user.text.contains(*s)
+                    })
+                    .ok_or("人工控制必须引用本轮真实用户要求，不能由执行模型自行授权")?;
+                let id = input["task_id"].as_str().ok_or("必须提供任务身份")?;
+                if action == "manual_pause" {
+                    let task = goal
+                        .tasks
+                        .iter()
+                        .find(|task| task.current && task.id == id)
+                        .ok_or("任务不属于当前 Goal")?;
+                    if matches!(task.status.as_str(), "accepted" | "running") {
+                        return Err("已验收或仍在执行的任务不能人工暂停；先等待停止完成".into());
+                    }
+                    let source = ManualSource {
+                        task_id: id.into(),
+                        turn_id: user.turn_id.clone(),
+                        user_message_id: user.message_id.clone(),
+                        user_excerpt: excerpt.into(),
+                    };
+                    constrain_manual(&mut goal.tasks, &source);
+                } else {
+                    if !goal.tasks.iter().any(|task| {
+                        task.manual.as_ref().is_some_and(|manual| {
+                            manual.sources.iter().any(|source| source.task_id == id)
+                        })
+                    }) {
+                        return Err("该任务没有可由用户恢复的人工暂停来源".into());
+                    }
+                    for task in &mut goal.tasks {
+                        if let Some(mut manual) = task.manual.take() {
+                            manual.sources.retain(|source| source.task_id != id);
+                            if manual.sources.is_empty() {
+                                if task.current {
+                                    task.status = manual.previous_status;
+                                    task.block_reason = manual.previous_block_reason;
+                                }
+                            } else {
+                                task.manual = Some(manual);
+                            }
+                        }
+                    }
+                }
+                goal.phase = "paused".into();
+            }
             Some("set_plan") => {
                 let tasks = parse_plan_definitions(&input["tasks"])?;
                 let criteria: Vec<String> =
@@ -622,6 +696,10 @@ impl GoalContext {
             _ => return Err("未知 Goal 更新操作".into()),
         }
         goal.reason = reason.into();
+        let mut previous = previous;
+        previous["action"] = input["action"].clone();
+        previous["task_id"] = input["task_id"].clone();
+        previous["user_excerpt"] = input["user_excerpt"].clone();
         goal.history.push(previous);
         if render_plan(goal).encode_utf16().count() > 45_000 {
             return Err("完整计划过长，请精简描述后重新提交".into());
@@ -1236,6 +1314,16 @@ fn merge_plan_definitions(
                     "正在执行、已产出或中断任务必须先检查实际结果，不能通过重规划清除执行事实"
                         .into(),
                 );
+            } else if let Some(manual) = &old.manual {
+                if matches!(manual.previous_status.as_str(), "produced" | "interrupted") {
+                    return Err(
+                        "人工暂停保留的产出或中断事实须先由用户恢复并复核，不能通过改写清除".into(),
+                    );
+                }
+                new.manual = Some(manual.clone());
+                new.status = old.status.clone();
+                new.block_reason = old.block_reason.clone();
+                new.result = old.result.clone();
             }
         } else {
             if new.replaces.iter().any(|id| current_ids.contains(id)) {
@@ -1252,6 +1340,33 @@ fn merge_plan_definitions(
                 })
             {
                 return Err("替换来源必须是本计划中未中断的现有任务，且不可重复或自引用".into());
+            }
+            let mut sources = Vec::new();
+            for old in previous.iter().filter(|old| new.replaces.contains(&old.id)) {
+                if let Some(manual) = &old.manual {
+                    if matches!(manual.previous_status.as_str(), "produced" | "interrupted") {
+                        return Err(
+                            "人工暂停保留的产物须先由用户恢复并复核，不能通过替换清除".into()
+                        );
+                    }
+                    for source in &manual.sources {
+                        if !sources
+                            .iter()
+                            .any(|existing: &ManualSource| existing.task_id == source.task_id)
+                        {
+                            sources.push(source.clone());
+                        }
+                    }
+                }
+            }
+            if !sources.is_empty() {
+                new.manual = Some(ManualConstraint {
+                    previous_status: "pending".into(),
+                    previous_block_reason: String::new(),
+                    sources,
+                });
+                new.status = "manual_blocked".into();
+                new.block_reason = "继承原任务的人工暂停，等待用户明确恢复".into();
             }
         }
     }
@@ -1277,11 +1392,19 @@ fn merge_plan_definitions(
         }
     }
     definitions.extend(historical);
+    let sources = definitions
+        .iter()
+        .filter_map(|task| task.manual.as_ref())
+        .flat_map(|manual| manual.sources.clone())
+        .collect::<Vec<_>>();
+    for source in sources {
+        constrain_manual(&mut definitions, &source);
+    }
     Ok(definitions)
 }
 
 fn task_summary(task: &GoalTask) -> String {
-    format!(
+    let mut summary = format!(
         "预期结果：{}\n验收条件：{}\n依赖：{}",
         task.expected_result,
         task.acceptance_criteria.join("；"),
@@ -1290,7 +1413,70 @@ fn task_summary(task: &GoalTask) -> String {
         } else {
             task.dependencies.join("、")
         }
-    )
+    );
+    summary.push_str(&format!("\n状态：{}", task.status));
+    if let Some(manual) = &task.manual {
+        for source in &manual.sources {
+            summary.push_str(&format!(
+                "\n人工暂停（来源任务 {}，用户消息 {}）：{}",
+                source.task_id, source.user_message_id, source.user_excerpt
+            ));
+        }
+    }
+    summary
+}
+
+fn constrain_manual(tasks: &mut [GoalTask], source: &ManualSource) {
+    let mut protected = HashSet::from([source.task_id.clone()]);
+    protected.extend(
+        tasks
+            .iter()
+            .filter(|task| {
+                task.current
+                    && task.manual.as_ref().is_some_and(|manual| {
+                        manual
+                            .sources
+                            .iter()
+                            .any(|existing| existing.task_id == source.task_id)
+                    })
+            })
+            .map(|task| task.id.clone()),
+    );
+    loop {
+        let before = protected.len();
+        for task in tasks.iter().filter(|task| task.current) {
+            if task
+                .dependencies
+                .iter()
+                .chain(&task.replaces)
+                .any(|id| protected.contains(id))
+            {
+                protected.insert(task.id.clone());
+            }
+        }
+        if before == protected.len() {
+            break;
+        }
+    }
+    for task in tasks
+        .iter_mut()
+        .filter(|task| task.current && protected.contains(&task.id) && task.status != "accepted")
+    {
+        let manual = task.manual.get_or_insert_with(|| ManualConstraint {
+            previous_status: task.status.clone(),
+            previous_block_reason: task.block_reason.clone(),
+            sources: Vec::new(),
+        });
+        if !manual
+            .sources
+            .iter()
+            .any(|existing| existing.task_id == source.task_id)
+        {
+            manual.sources.push(source.clone());
+        }
+        task.status = "manual_blocked".into();
+        task.block_reason = format!("人工暂停：{}", source.user_excerpt);
+    }
 }
 
 fn validate_tasks(tasks: &[GoalTask]) -> Result<(), String> {
@@ -1460,13 +1646,13 @@ pub(crate) fn plan_tools() -> Vec<ToolSpec> {
             if name == "goal_read" {
                 "读取当前聊天 Goal 及完整计划版本"
             } else {
-                "规划用 set_plan/end；执行用 replan、start_task、record_result、accept_task；replan仅提交任务定义，replaces记录替换/拆分来源；全任务通过后独立检查 accept_goal。更新携带 goal_id、expected_version、reason；验收 evidence 逐条件引用真实工具观察编号"
+                "规划用 set_plan/end；已停止用户编辑可manual_pause/manual_resume并引用user_excerpt；执行用 replan、start_task、record_result、accept_task；replan仅提交任务定义，replaces记录替换/拆分来源；全任务通过后独立检查 accept_goal。更新携带 goal_id、expected_version、reason；验收 evidence 逐条件引用真实工具观察编号"
             },
         );
         spec.input_schema = if name == "goal_read" {
             json!({"type":"object","properties":{},"additionalProperties":false})
         } else {
-            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","replan","start_task","record_result","accept_task","accept_goal","recheck_task"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}},"replaces":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"status":{"enum":["pending","produced"]},"observation_id":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
+            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","manual_pause","manual_resume","replan","start_task","record_result","accept_task","accept_goal","recheck_task"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}},"replaces":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"status":{"enum":["pending","produced"]},"observation_id":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
         };
         spec.category = Some(ToolCategory::ReadOnly);
         spec.concurrency = Some(ToolConcurrency::NeverParallel);
