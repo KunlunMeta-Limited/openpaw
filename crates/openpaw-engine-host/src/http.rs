@@ -2207,7 +2207,7 @@ mod tests {
                     if scenario == "goal-agent-error" && messages[latest]["content"] == "确认执行" && tools == 8 {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    if messages[latest]["content"] == "确认执行" && tools == 8 {
+                    if messages[latest]["content"] == "确认执行" && tools == if scenario == "goal-resume-produced" {9} else {8} {
                         gate.notified().await;
                     }
                     if scenario == "goal-resume-late" && messages[latest]["content"] == "/goal continue" && tools == 0 {
@@ -2216,6 +2216,9 @@ mod tests {
                     return goal_tests::lifecycle_model_response(&body);
                 }
                 if scenario.starts_with("goal-") {
+                    if scenario == "goal-delegate" {
+                        return goal_tests::delegation_model_response(&body, &gate).await;
+                    }
                     if scenario == "goal-execute" || scenario == "goal-replan" {
                         if let Some(confirm) = messages.iter().rposition(|message|message["role"] == "user" && message["content"] == "确认执行") {
                             let tools = messages[confirm..].iter().filter(|message|message["role"] == "tool").count();
@@ -2310,6 +2313,7 @@ mod tests {
                 if matches!(
                     scenario,
                     "delegate-concurrent"
+                        | "goal-delegate"
                         | "delegate-cancel"
                         | "delegate-conversations"
                         | "delegate-conversations-approval"

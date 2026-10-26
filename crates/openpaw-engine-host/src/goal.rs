@@ -56,6 +56,12 @@ struct GoalTask {
     result: String,
     #[serde(default)]
     evidence: Vec<Evidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignee_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delegation_id: Option<String>,
 }
 
 fn pending() -> String {
@@ -108,6 +114,118 @@ pub(crate) struct GoalContext {
     handle: Mutex<Weak<SessionHandle>>,
 }
 
+/// 功能：把一次真实子执行的终态限定到原 Goal、任务和委派尝试。
+/// 数据边界：仅 runtime 持有；模型和持久状态不能恢复此执行许可。
+pub(crate) struct GoalDelegation {
+    context: Arc<GoalContext>,
+    goal_id: String,
+    task_id: String,
+    turn_id: String,
+    attempt: String,
+    finished: bool,
+}
+
+impl GoalDelegation {
+    /// 功能：在子回合准入前关联真实子会话及其展示身份。
+    /// 参数：child 为真实会话编号，workspace 为既有 Office 子空间身份。
+    /// 返回：绑定已提交时成功。
+    /// 错误：父回合取消、任务已变更或提交失败时拒绝准入。
+    /// 状态：仅更新已预留任务归属。
+    /// 并发与取消：与 Goal 更新共用 user→state 锁顺序，重新检查原许可。
+    /// 权限：不能以其他正在执行的任务代替当前绑定。
+    /// 关联：runtime::run_delegated。
+    pub(crate) fn bind(&self, child: &str, workspace: &str) -> Result<(), String> {
+        let user = self.context.user.lock().unwrap_or_else(|e| e.into_inner());
+        if !user
+            .as_ref()
+            .is_some_and(|user| user.executing && user.turn_id == self.turn_id)
+        {
+            return Err("Goal 原委派回合已结束".into());
+        }
+        self.context.check_cancelled()?;
+        let mut state = self.context.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        let goal = next
+            .records
+            .last_mut()
+            .filter(|goal| goal.id == self.goal_id && goal.phase == "active")
+            .ok_or("Goal 委派已停止")?;
+        let task = goal
+            .tasks
+            .iter_mut()
+            .find(|task| {
+                task.id == self.task_id
+                    && task.current
+                    && task.status == "running"
+                    && task.delegation_id.as_deref() == Some(&self.attempt)
+            })
+            .ok_or("Goal 任务委派绑定已改变")?;
+        task.assignee_id = Some(child.into());
+        task.child_workspace_id = Some(workspace.into());
+        self.context.commit(&next)?;
+        *state = next;
+        drop(state);
+        drop(user);
+        self.context.project();
+        Ok(())
+    }
+
+    /// 功能：保存子 Agent 的真实终态，但不替主 Agent 验收。
+    /// 参数：status 为真实回合终态，result 为本次真实结果或失败原因。
+    /// 返回：持久化成功。
+    /// 错误：journal 失败返回错误；原事实不被覆盖。
+    /// 状态：完成转 produced，失败或取消转 interrupted；保留后续暂停决定。
+    /// 并发与取消：只更新仍匹配本次尝试的任务，迟到结果不改变新执行。
+    /// 权限：无 Goal 控制、重规划或验收权限。
+    /// 关联：父前台子任务 join 与 GoalTask 产出事实。
+    pub(crate) fn finish(&mut self, status: &str, result: &str) -> Result<(), String> {
+        let mut state = self.context.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        if let Some(goal) = next
+            .records
+            .last_mut()
+            .filter(|goal| goal.id == self.goal_id)
+        {
+            if let Some(task) = goal.tasks.iter_mut().find(|task| {
+                task.id == self.task_id
+                    && task.current
+                    && task.delegation_id.as_deref() == Some(&self.attempt)
+                    && matches!(task.status.as_str(), "running" | "interrupted")
+            }) {
+                task.result = result.into();
+                if task.status == "running" {
+                    task.status = if status == "completed" {
+                        "produced"
+                    } else {
+                        "interrupted"
+                    }
+                    .into();
+                }
+                goal.history.push(json!({"action":"child_result","task_id":self.task_id,"child_session_id":task.assignee_id,"status":status,"turn_id":self.turn_id}));
+                self.context.commit(&next)?;
+                *state = next;
+            }
+        }
+        self.finished = true;
+        drop(state);
+        self.context.project();
+        Ok(())
+    }
+}
+
+impl Drop for GoalDelegation {
+    fn drop(&mut self) {
+        if !self.finished {
+            if let Err(error) = self.finish(
+                "interrupted",
+                "子委派中断，需核对实际结果后继续；不自动重跑",
+            ) {
+                tracing::error!(%error, "Goal 子委派中断事实保存失败");
+            }
+        }
+    }
+}
+
 impl GoalContext {
     /// 功能：创建无执行授权的会话 Goal 上下文。
     /// 参数：owner 为会话稳定身份。
@@ -136,6 +254,93 @@ impl GoalContext {
     /// 关联：runtime::build_session_handle。
     pub(crate) fn attach(&self, handle: &Arc<SessionHandle>) {
         *self.handle.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(handle);
+    }
+
+    fn check_cancelled(&self) -> Result<(), String> {
+        if self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade()
+            .is_none_or(|handle| handle.main_cancel_token().is_cancelled())
+        {
+            return Err("当前 Goal 回合已取消，不再启动工作".into());
+        }
+        Ok(())
+    }
+
+    /// 功能：在真实子创建前原子预留一个满足依赖的 Goal 任务。
+    /// 参数：task 为可选 Goal Task 编号，attempt 为本次委派唯一身份。
+    /// 返回：Goal 执行返回独占绑定；普通聊天不绑定。
+    /// 错误：缺少许可、未验收依赖、重复绑定或持久化失败时不启动子执行。
+    /// 状态：先持久标记 running，未准入或 future 丢弃转 interrupted。
+    /// 并发与取消：user→state 锁内核对许可、状态与取消，重复委派只有一项能成功。
+    /// 权限：持久 active 或其他子任务 running 不构成执行许可。
+    /// 关联：runtime::run_delegated、GoalDelegation。
+    pub(crate) fn reserve_delegation(
+        self: &Arc<Self>,
+        task: Option<&str>,
+        attempt: &str,
+    ) -> Result<Option<GoalDelegation>, String> {
+        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if task.is_none()
+            && !user
+                .as_ref()
+                .is_some_and(|user| user.executing || user.editable)
+            && state
+                .records
+                .last()
+                .is_none_or(|goal| matches!(goal.phase.as_str(), "ended" | "completed"))
+        {
+            return Ok(None);
+        }
+        let user = user
+            .as_ref()
+            .filter(|user| user.executing)
+            .ok_or("本回合没有 Goal 委派执行许可")?;
+        self.check_cancelled()?;
+        let id = task.ok_or("Goal 委派必须提供独立的 goal_task_id，task_id 仍表示真实子会话")?;
+        let mut next = state.clone();
+        let goal = next
+            .records
+            .last_mut()
+            .filter(|goal| goal.phase == "active")
+            .ok_or("当前 Goal 未授权执行")?;
+        let index = goal
+            .tasks
+            .iter()
+            .position(|task| task.current && task.id == id)
+            .ok_or("委派任务不属于当前 Goal 计划")?;
+        if goal.tasks[index].status != "pending" {
+            return Err("Goal 任务已被启动或已有产出，不能重复委派".into());
+        }
+        if !goal.tasks[index].dependencies.iter().all(|dep| {
+            goal.tasks
+                .iter()
+                .any(|task| task.current && task.id == *dep && task.status == "accepted")
+        }) {
+            return Err("委派任务依赖尚未验收，不能启动".into());
+        }
+        let task = &mut goal.tasks[index];
+        task.status = "running".into();
+        task.assignee_id = None;
+        task.delegation_id = Some(attempt.into());
+        task.child_workspace_id = Some(attempt.into());
+        let goal_id = goal.id.clone();
+        let turn_id = user.turn_id.clone();
+        self.commit(&next)?;
+        *state = next;
+        drop(state);
+        // 返回后 runtime 负责准入；不在持有 user 锁时投影或等待子执行。
+        Ok(Some(GoalDelegation {
+            context: self.clone(),
+            goal_id,
+            task_id: id.into(),
+            turn_id,
+            attempt: attempt.into(),
+            finished: false,
+        }))
     }
 
     /// 功能：从原会话事件恢复 Goal 历史。
@@ -300,7 +505,7 @@ impl GoalContext {
             return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",json!(goal)));
         }
         if goal.phase != "draft" {
-            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务可并行 delegate_task(goal_task_id=计划任务编号)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。已有原预算、取消及180秒期限不重置。当前事实：{}",goal.id,json!(goal)));
         }
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
@@ -475,6 +680,8 @@ impl GoalContext {
                     .find(|new| new.id == task.id)
                     .is_none_or(|new| !same_task_definition(task, new));
                 if changed
+                    && task.assignee_id.is_none()
+                    && task.delegation_id.is_none()
                     && goal
                         .observations
                         .iter()
@@ -553,12 +760,15 @@ impl GoalContext {
                     goal.tasks[index].status = status.into();
                     goal.tasks[index].result = result.into();
                     goal.tasks[index].evidence.clear();
+                    if status == "pending" {
+                        goal.tasks[index].assignee_id = None;
+                        goal.tasks[index].child_workspace_id = None;
+                        goal.tasks[index].delegation_id = None;
+                    }
                 }
                 "start_task" => {
-                    if goal.tasks[index].status != "pending"
-                        || goal.tasks.iter().any(|task| {
-                            task.current && (task.status == "running" || task.status == "produced")
-                        })
+                    if !matches!(goal.tasks[index].status.as_str(), "pending" | "produced")
+                        || user.task_id.as_deref().is_some_and(|current| current != id)
                     {
                         return Err("请先复核中断产物或完成当前任务验收，不能重复启动任务".into());
                     }
@@ -569,7 +779,12 @@ impl GoalContext {
                     }) {
                         return Err("任务依赖尚未验收，不能启动".into());
                     }
-                    goal.tasks[index].status = "running".into();
+                    if goal.tasks[index].status == "pending" {
+                        goal.tasks[index].status = "running".into();
+                        goal.tasks[index].assignee_id = None;
+                        goal.tasks[index].child_workspace_id = None;
+                        goal.tasks[index].delegation_id = None;
+                    }
                 }
                 "record_result" => {
                     if user.task_id.as_deref() != Some(id) || goal.tasks[index].status != "running"
@@ -612,6 +827,9 @@ impl GoalContext {
         *state = next;
         if action == "start_task" || (action == "recheck_task" && input["status"] == "produced") {
             user.task_id = input["task_id"].as_str().map(str::to_owned);
+        }
+        if action == "recheck_task" && input["status"] == "pending" {
+            user.task_id = None;
         }
         if action == "accept_task" || action == "accept_goal" {
             user.task_id = None;
@@ -832,27 +1050,21 @@ impl GoalContext {
     /// 权限：未知工具同样按交付工具拒绝。
     /// 关联：ToolHostValidator 与 ToolExecutor 双重检查。
     pub(crate) fn allowed(&self, name: &str) -> Result<(), String> {
-        let editing = self
-            .user
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|user| user.editable);
-        let executing = self
-            .user
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .is_some_and(|user| user.executing);
+        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let editing = user.as_ref().is_some_and(|user| user.editable);
+        let executing = user.as_ref().is_some_and(|user| user.executing);
         if executing {
-            if self
-                .handle
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .upgrade()
-                .is_none_or(|handle| handle.main_cancel_token().is_cancelled())
-            {
-                return Err("当前 Goal 回合已取消，不再启动工作".into());
+            self.check_cancelled()?;
+            if name == "delegate_task" {
+                return self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .records
+                    .last()
+                    .filter(|goal| goal.phase == "active")
+                    .map(|_| ())
+                    .ok_or_else(|| "当前 Goal 已停止或完成，本回合不能继续委派".into());
             }
             if matches!(
                 name,
@@ -868,12 +1080,14 @@ impl GoalContext {
                 .last()
                 .is_some_and(|goal| {
                     goal.phase == "active"
-                        && goal
-                            .tasks
-                            .iter()
-                            .any(|task| task.current && task.status == "running")
+                        && goal.tasks.iter().any(|task| {
+                            task.current
+                                && task.status == "running"
+                                && task.delegation_id.is_none()
+                                && user.as_ref().and_then(|user| user.task_id.as_deref())
+                                    == Some(task.id.as_str())
+                        })
                 })
-                && name != "delegate_task"
             {
                 return Ok(());
             }
@@ -901,7 +1115,7 @@ impl GoalContext {
     /// 参数：无。
     /// 返回：无。
     /// 错误：暂停提交失败记安全日志，不授予后续执行权限。
-    /// 状态：已有验收保留，running 转 interrupted；不启动后台执行。
+    /// 状态：已有验收保留，running/produced 转 interrupted 并保留产物事实；不启动后台执行。
     /// 并发与取消：由 runtime 收尾调用。
     /// 权限：下轮必须重新绑定真实用户输入。
     /// 关联：TurnCleanup。
@@ -919,7 +1133,7 @@ impl GoalContext {
                 goal.reason = "本次前台执行已结束，未完成工作等待原聊天显式继续".into();
             }
             for task in &mut goal.tasks {
-                if task.current && task.status == "running" {
+                if task.current && matches!(task.status.as_str(), "running" | "produced") {
                     task.status = "interrupted".into();
                 }
             }
