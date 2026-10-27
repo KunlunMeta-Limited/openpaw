@@ -1702,4 +1702,72 @@ mod context_tests {
             .expect("模型应收到小窗口预览");
         assert!(preview.chars().count() <= 1024 && preview.len() <= 4096);
     }
+
+    #[tokio::test]
+    async fn main_context_record_pages_follow_the_overridden_model_window() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("context-original", "confirm").await;
+        std::fs::write(
+            fixture.workspace.path().join("large.txt"),
+            "分页中文原件".repeat(1500),
+        )
+        .unwrap();
+        assert_eq!(
+            send(
+                &fixture.app,
+                &fixture.team,
+                "page-model",
+                "read",
+                "SMALL_WINDOW_PREVIEW"
+            )
+            .await["state"],
+            "complete"
+        );
+        let reference = {
+            let requests = fixture.model_seen.lock().await;
+            let tool = requests.last().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["role"] == "tool")
+                .unwrap();
+            serde_json::from_str::<serde_json::Value>(tool["content"].as_str().unwrap()).unwrap()
+                ["reference"]
+                .clone()
+        };
+        let id = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "page-model")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        std::env::set_var(
+            "OPENPAW_MODEL_CAPABILITIES",
+            r#"{"openai":{"smaller-model":{"input":["text"],"context_window":16384}}}"#,
+        );
+        fixture.model_seen.lock().await.clear();
+        request(&fixture.app, "POST", &format!("/session/{id}/message"), serde_json::json!({"text":format!("READ_ORIGINAL {}",serde_json::json!({"reference":reference,"start":5,"limit":4096})),"model":{"providerID":"openai","modelID":"smaller-model"}})).await;
+        let requests = fixture.model_seen.lock().await;
+        let page = requests
+            .iter()
+            .filter(|r| r["stream"] == true)
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(m["content"].as_str()?).ok())
+            .find(|v| v["kind"] == "page")
+            .expect("新模型应实际收到原件分页");
+        let chars = page["content"].as_str().unwrap().chars().count();
+        assert!(
+            chars <= 2048,
+            "分页必须跟随本回合模型而非会话创建窗口，实际{chars}"
+        );
+        assert_eq!(page["end"].as_u64().unwrap(), 5 + chars as u64);
+        assert_eq!(page["next_start"], page["end"]);
+        assert_eq!(page["has_more"], true);
+    }
 }

@@ -260,6 +260,27 @@ fn bounded_content(mut value: Value, text: &str, chars: usize, bytes: usize) -> 
     best
 }
 
+fn bounded_page(page: Value, chars: usize, bytes: usize) -> std::result::Result<Value, String> {
+    let start = page["start"].as_u64().ok_or("原件分页缺少start")? as usize;
+    let total = page["total_chars"].as_u64().ok_or("原件分页缺少总量")? as usize;
+    let text: String = page["content"]
+        .as_str()
+        .ok_or("原件分页缺少正文")?
+        .chars()
+        .take(chars)
+        .collect();
+    let bounded = bounded_content(page, &text, usize::MAX, bytes.saturating_sub(128));
+    let mut page: Value = serde_json::from_str(&bounded).map_err(|_| "原件分页编码失败")?;
+    let end = start + page["content"].as_str().unwrap_or("").chars().count();
+    if end == start && start < total {
+        return Err("原件引用元数据无法放入本次读取额度".into());
+    }
+    page["end"] = json!(end);
+    page["next_start"] = json!(end);
+    page["has_more"] = json!(end < total);
+    Ok(page)
+}
+
 /// 功能：只为模型裁剪工具副本，保留原件引用与准确大小。
 /// 参数：blocks为模型副本，owner/turn/response标识已可靠保存的调用，window为实际窗口。
 /// 返回：无。
@@ -287,11 +308,22 @@ pub fn project_results(
             ..
         } = block
         {
+            if name.as_deref() == Some("read_context_record") {
+                if let Ok(page) = serde_json::from_str::<Value>(content) {
+                    if page["kind"] == "page" {
+                        match bounded_page(page, chars.min(4096), bytes.min(16 * 1024)) {
+                            Ok(page) => *content = page.to_string(),
+                            Err(error) => {
+                                *content = error;
+                                *is_error = true;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             if *protected
-                || matches!(
-                    name.as_deref(),
-                    Some("read_context_record" | "goal_read" | "goal_update")
-                )
+                || matches!(name.as_deref(), Some("goal_read" | "goal_update"))
                 || (content.chars().count() <= chars && content.len() <= bytes)
             {
                 continue;
@@ -477,21 +509,11 @@ impl ToolExecutor for ContextToolHost {
                 .skip(start)
                 .take(limit.min(self.page_chars))
                 .collect();
-            let bounded = bounded_content(
-                json!({"kind":"page","reference":reference,"start":start,"end":start,"total_chars":total,"total_bytes":text.len(),"is_error":is_error,"has_more":true,"next_start":start}),
-                &tail,
-                usize::MAX,
-                self.page_bytes.saturating_sub(128),
-            );
-            let mut page: Value = serde_json::from_str(&bounded).map_err(|_| "原件分页编码失败")?;
-            let end = start + page["content"].as_str().unwrap_or("").chars().count();
-            if end == start && start < total {
-                return Err("原件引用元数据无法放入本次读取额度".into());
-            }
-            page["end"] = json!(end);
-            page["next_start"] = json!(end);
-            page["has_more"] = json!(end < total);
-            Ok::<_, String>(page)
+            bounded_page(
+                json!({"kind":"page","reference":reference,"start":start,"content":tail,"total_chars":total,"total_bytes":text.len(),"is_error":is_error}),
+                self.page_chars,
+                self.page_bytes,
+            )
         })();
         Ok(match page {
             Ok(value) => ToolCallOutcome::ok(value.to_string()),

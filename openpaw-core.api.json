@@ -129,6 +129,7 @@
     "struct MemorySearchQuery",
     "struct MemorySearchResult",
     "struct Message",
+    "struct ModelContextCheckpoint",
     "struct NullPolicy",
     "struct NullProvider",
     "struct NullToolHost",

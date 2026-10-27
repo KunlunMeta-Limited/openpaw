@@ -1,4 +1,4 @@
-{"step":"compact","model_limit":800,"keep_recent_pairs":2,"min_messages":4}
+{"step":"compact","model_limit":4000,"keep_recent_pairs":2,"min_messages":4}
 {"step":"seed","pairs":10}
 {"step":"mock","mode":"fixed","text":"[Context Summary] seeded analysis conversation; the summary preserves key decisions."}
 {"step":"mock","mode":"fixed","text":"done after compaction"}

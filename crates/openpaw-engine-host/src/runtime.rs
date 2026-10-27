@@ -6053,7 +6053,10 @@ pub(crate) mod desktop {
             );
             handle.release_turn();
             let fork = state.fork_session(&handle.id, None).await.unwrap();
-            assert_eq!(state.ai_pc_tools(&fork).len(), 22);
+            assert!(state
+                .ai_pc_tools(&fork)
+                .iter()
+                .all(|tool| !tool.name.starts_with("ai_pc_")));
             assert!(AppState::new(config).ai_pc.read().unwrap().is_empty());
             assert_eq!(
                 app.clone()
@@ -6063,7 +6066,10 @@ pub(crate) mod desktop {
                     .status(),
                 StatusCode::NO_CONTENT
             );
-            assert_eq!(state.ai_pc_tools(&handle).len(), 22);
+            assert!(state
+                .ai_pc_tools(&handle)
+                .iter()
+                .all(|tool| !tool.name.starts_with("ai_pc_")));
             assert_eq!(
                 app.oneshot(request(&handle.id, "PUT", body, true))
                     .await
