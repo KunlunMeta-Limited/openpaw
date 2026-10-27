@@ -1060,7 +1060,7 @@ impl MainOffice {
                 return;
             };
             let mut summary = format!(
-                "已验收 {}/{} 项。",
+                "已验收 {}/{} 项。白板为时间动画，Goal整体验收后统一100%。",
                 goal["acceptedTaskCount"], goal["taskCount"]
             );
             let phase = match goal["phase"].as_str() {
@@ -1102,8 +1102,7 @@ impl MainOffice {
             board.remove("progressMode");
             board.insert("summary".into(), projection_text(&summary, 300).into());
             board.insert("detail".into(), projection_text(&detail, 16000).into());
-            // 原版进度条会自行增长且把单项100压成99；文字详情保留真实0/100。
-            board.insert("steps".into(), serde_json::json!([]));
+            // 保留原生三项进度动画；仅整个Goal完成后统一100，任务验收事实不变。
         }
         adapt(&mut snapshot);
         snapshot
@@ -3082,7 +3081,7 @@ mod tests {
     use openpaw_engine::AgentEvent;
 
     #[tokio::test]
-    async fn main_original_goal_details_negotiate_and_preserve_binary_facts() {
+    async fn main_original_goal_activity_negotiate_and_preserve_binary_facts() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3147,8 +3146,10 @@ mod tests {
             }
             let board = &conversation["whiteboard"];
             assert!(board.get("progressMode").is_none());
-            assert!(board["steps"].as_array().unwrap().is_empty());
-            assert!(board["summary"].as_str().unwrap().contains("100%"));
+            assert_eq!(board["steps"], snapshot["whiteboard"]["steps"]);
+            assert_eq!(board["steps"].as_array().unwrap().len(), 3);
+            assert_eq!(board["status"], "running");
+            assert!(board["summary"].as_str().unwrap().contains("时间动画"));
             let detail = board["detail"].as_str().unwrap();
             assert!(detail.contains("任务5 — 0%"));
             assert!(detail.contains("等待整体验收"));
@@ -3158,6 +3159,43 @@ mod tests {
             }
         }
         assert_eq!(office.record(&team).unwrap().snapshot, snapshot);
+        assert_eq!(std::fs::read(&office.path).unwrap(), persisted);
+        for (phase, status) in [
+            ("draft", "queued"),
+            ("active", "running"),
+            ("paused", "blocked"),
+            ("blocked", "blocked"),
+            ("ended", "failed"),
+            ("completed", "completed"),
+        ] {
+            let mut goal = goal.clone();
+            goal["phase"] = phase.into();
+            if phase == "completed" || phase == "draft" {
+                for task in goal["tasks"].as_array_mut().unwrap() {
+                    task["status"] = if phase == "completed" {
+                        "accepted"
+                    } else {
+                        "pending"
+                    }
+                    .into();
+                }
+            }
+            let mut projected = snapshot.clone();
+            apply_goal_projection(&mut projected, &goal);
+            let original = projected.clone();
+            let wire = office.display_snapshot(projected);
+            assert_eq!(wire["whiteboard"]["status"], status);
+            assert_eq!(wire["whiteboard"]["steps"], original["whiteboard"]["steps"]);
+            assert_eq!(wire["tasks"].as_array().unwrap().len(), 5);
+            assert!(wire["whiteboard"].get("progressMode").is_none());
+            if let Ok(path) = std::env::var("GOAL_ACTIVITY_PROJECTION_DIR") {
+                std::fs::write(
+                    PathBuf::from(path).join(format!("{phase}.json")),
+                    serde_json::to_vec(&wire).unwrap(),
+                )
+                .unwrap();
+            }
+        }
         assert_eq!(std::fs::read(&office.path).unwrap(), persisted);
         let long = snapshot["tasks"][0]["summary"]
             .as_str()
