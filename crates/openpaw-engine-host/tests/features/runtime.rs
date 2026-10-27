@@ -967,6 +967,54 @@ impl LlmProvider for ContextProvider {
     }
 }
 #[tokio::test]
+async fn d102_actual_request_matches_whole_file_and_patch_capabilities() {
+    for tools in [
+        vec!["read_file"],
+        vec!["read_file", "write_file"],
+        vec!["read_file", "write_file", "edit_file"],
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = config(tmp.path());
+        cfg.tools = tools.iter().map(|s| (*s).to_owned()).collect();
+        let capture = Arc::new(ContextProvider(std::sync::Mutex::new(Vec::new())));
+        let host = Host::with_provider(cfg, capture.clone()).await.unwrap();
+        let s = scope(1);
+        let b = host.open_session(s.clone()).await.unwrap();
+        host.submit_run(&s, &b.session_id, "继续完善已存在的长报告并保存".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        {
+            let requests = capture.0.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let r = &requests[0];
+            assert_eq!(
+                r.tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<std::collections::BTreeSet<_>>(),
+                tools.iter().copied().collect(),
+                "上下文不能偷偷添加写入/编辑工具"
+            );
+            let context = r.system.as_deref().unwrap();
+            assert_eq!(
+                context.contains("仅有整文件写入能力"),
+                tools.contains(&"write_file") && !tools.contains(&"edit_file")
+            );
+            assert_eq!(
+                context.contains("使用现有edit_file做有界精确替换"),
+                tools.contains(&"edit_file")
+            );
+            if tools.contains(&"write_file") && !tools.contains(&"edit_file") {
+                assert!(context.contains("独立章节文件与入口索引"));
+                assert!(context.contains("不要重写整篇"));
+            }
+        }
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn r7_actual_model_request_has_trusted_time_and_only_configured_web_tools() {
     for enabled in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
