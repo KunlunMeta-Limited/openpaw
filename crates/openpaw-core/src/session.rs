@@ -153,6 +153,9 @@ pub enum SessionEvent {
 /// Stability: stable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// 功能：当前模型替代视图；未提交候选随回合快照一起回滚。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context: Option<crate::ModelContextCheckpoint>,
     pub meta: SessionMeta,
     pub messages: Vec<Message>,
     /// Token accumulators use u32 with saturating_add — saturation, not
@@ -184,6 +187,7 @@ impl Session {
     pub fn new(model: impl Into<String>, provider: impl Into<String>) -> Self {
         Self {
             meta: SessionMeta::new(model, provider),
+            model_context: None,
             messages: Vec::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,

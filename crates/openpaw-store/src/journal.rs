@@ -127,6 +127,25 @@ pub fn finish(
     terminal: TurnOutcome,
     failure: Option<RecordedFailure>,
 ) -> Result<(), String> {
+    finish_with_context(writer, turn_id, messages, terminal, failure, None)
+}
+
+/// 功能：在原件与终态的同一事务发布可选模型检查点。
+/// 参数：前五项沿用finish，context为已校验来源的版本事件。
+/// 返回：同步提交成功返回空值。
+/// 错误：写入失败回滚整个事务。
+/// 状态：检查点只有匹配commit后才可恢复。
+/// 并发与取消：调用方独占writer，事务内无await。
+/// 权限：不执行模型，不输出原件。
+/// 关联：CHG-2026-0051。
+pub fn finish_with_context(
+    writer: &mut Option<SessionWriter>,
+    turn_id: &str,
+    messages: &[Message],
+    terminal: TurnOutcome,
+    failure: Option<RecordedFailure>,
+    context: Option<&SessionEvent>,
+) -> Result<(), String> {
     if messages.len() > MAX_FINISH_TRANSACTION_MESSAGES
         || terminal.turn_id != turn_id
         || !terminal.state.is_terminal()
@@ -165,7 +184,12 @@ pub fn finish(
                 }
                 .to_session_event(),
             )
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        // commit后写入新事件，旧reader仍能恢复原件；写入失败仍回滚整个finish。
+        if let Some(context) = context {
+            current.append(context).map_err(|error| error.to_string())?;
+        }
+        Ok(())
     })
 }
 

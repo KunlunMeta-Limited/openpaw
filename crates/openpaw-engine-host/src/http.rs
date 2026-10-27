@@ -1993,6 +1993,7 @@ fn sse_stream(
 mod tests {
     use super::*;
     include!("http/goal_tests.rs");
+    include!("http/context_tests.rs");
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::response::IntoResponse;
@@ -2168,6 +2169,18 @@ mod tests {
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("context-") {
+                    if scenario.starts_with("context-loop-overflow") && body["stream"] == true && context_tests::completed_step(&body) == 2 && (scenario.ends_with("twice") || !body.to_string().contains("[Context Summary]")) {
+                        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":{"code":"context_length_exceeded","message":"maximum context length"}}))).into_response();
+                    }
+                    if body["stream"] != true {
+                        if matches!(scenario, "context-loop-cancel" | "context-manual-cancel") { gate.notified().await; }
+                        if scenario == "context-loop-invalid" {
+                            return Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]})).into_response();
+                        }
+                    }
+                    return context_tests::model_response(&body);
+                }
                 if body["stream"] != true {
                     return Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":"Compacted fixture conversation."},"finish_reason":"stop"}]})).into_response();
                 }
@@ -2319,6 +2332,19 @@ mod tests {
                 .into(),
             ),
         ];
+        let mut values = Vec::from(values);
+        if scenario.starts_with("context-loop") || scenario == "context-fixed-input" {
+            values.push((
+                "OPENPAW_MODEL_CAPABILITIES",
+                if scenario == "context-fixed-input" {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":4096}}}"#
+                } else {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768}}}"#
+                }
+                .into(),
+            ));
+            values.push(("OPENPAW_MAX_OUTPUT_TOKENS", "1024".into()));
+        }
         let env = values
             .iter()
             .map(|(key, _)| (*key, std::env::var_os(key)))

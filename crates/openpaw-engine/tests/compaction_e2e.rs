@@ -66,7 +66,7 @@ async fn compaction_triggers_and_rewrites_session() {
         MockMode::Fixed("final reply after compaction".into()),
     ]));
     let l = AgentLoop::new(p.clone()).with_compact_options(CompactOptions {
-        model_limit: 800, // tiny limit → threshold crossed immediately
+        model_limit: 4000, // 小于业务输出预留，但可容纳带1024余量的独立摘要请求。
         keep_recent_pairs: 2,
         min_messages_before_compact: 4,
         ..Default::default()
@@ -154,7 +154,7 @@ async fn cancellation_drops_pending_compaction_provider() {
         dropped: Arc::clone(&dropped),
     });
     let loop_ = AgentLoop::new(provider).with_compact_options(CompactOptions {
-        model_limit: 800,
+        model_limit: 4000,
         keep_recent_pairs: 2,
         min_messages_before_compact: 4,
         ..Default::default()
@@ -181,4 +181,52 @@ async fn cancellation_drops_pending_compaction_provider() {
         .iter()
         .flat_map(|message| &message.content)
         .all(|block| !matches!(block, ContentBlock::CompactBoundary { .. })));
+}
+
+struct PartialOverflowProvider;
+#[async_trait::async_trait]
+impl LlmProvider for PartialOverflowProvider {
+    async fn complete(&self, _: CompletionRequest) -> Result<CompletionResponse> {
+        panic!("visible output forbids starting a recovery summary")
+    }
+    async fn stream(
+        &self,
+        _: CompletionRequest,
+    ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent>>> {
+        Ok(Box::pin(futures::stream::iter([
+            Ok(StreamEvent::TextDelta {
+                text: "已经展示的内容".into(),
+                index: 0,
+            }),
+            Err(openpaw_core::Error::context_too_long(
+                "native limit after output",
+            )),
+        ])))
+    }
+    fn capabilities(&self) -> Capabilities {
+        Default::default()
+    }
+    fn name(&self) -> &str {
+        "partial-overflow"
+    }
+    fn default_model(&self) -> &str {
+        "fixture"
+    }
+}
+
+#[tokio::test]
+async fn native_context_error_after_visible_output_never_recovers_or_replays() {
+    let agent =
+        AgentLoop::new(Arc::new(PartialOverflowProvider)).with_compact_options(Default::default());
+    let mut session = big_session(10);
+    let mut visible = String::new();
+    let result = agent
+        .run_turn(&mut session, None, &[], &mut |event| {
+            if let AgentEvent::TextDelta { text } = event {
+                visible.push_str(&text);
+            }
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(visible, "已经展示的内容");
 }

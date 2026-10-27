@@ -13,6 +13,8 @@
 
 pub mod agent_loop;
 pub mod compaction;
+/// 功能：授权原件读取与有界模型上下文；不依赖Store或Host。
+pub mod context;
 pub mod events;
 pub mod fallback;
 pub mod token_budget;

@@ -41,6 +41,12 @@ impl SessionCheckpoint {
 /// 功能：保存一次调用的中立配置，不改变 AgentLoop 默认模型。
 #[derive(Default)]
 pub struct TurnOptions {
+    /// 功能：整理开始时更新入口既有状态，不接收摘要或原件正文。
+    pub context_progress: Option<ContextProgress>,
+    /// 功能：可信入口选择只整理历史，不执行业务模型或工具。
+    pub compact_only: bool,
+    /// 功能：入口提供的可靠回合身份；存在时为工具模型副本生成原件引用。
+    pub context_turn_id: Option<String>,
     /// 本回合使用的可选系统提示。
     pub system: Option<String>,
     /// 调用方拥有的取消令牌，内部清理不反向取消它。
@@ -52,6 +58,9 @@ pub struct TurnOptions {
     /// 可靠执行记录回调；失败立即中止回合，不继续未登记的工具副作用。
     pub recorder: Option<ExecutionRecorder>,
 }
+
+/// 功能：只报告整理开始的中立状态回调，不携带敏感内容。
+pub type ContextProgress = Arc<dyn Fn() + Send + Sync>;
 
 /// 功能：描述与传输、存储无关的真实可见输出和工具执行事实。
 /// 约束：包含授权会话的完整正文，不得发送到诊断日志或 Office 动作。

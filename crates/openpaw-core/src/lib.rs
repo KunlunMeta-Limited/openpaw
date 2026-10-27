@@ -59,6 +59,9 @@ pub use provider::{
 };
 pub use retry::{classify_api_error, ApiErrorClass, RetryPolicy};
 pub use session::{InjectionRecord, Session, SessionEvent, SessionMeta};
+/// 功能：供应商中立的模型上下文检查点数据。
+pub mod context;
+pub use context::ModelContextCheckpoint;
 pub use tool_host::{
     NullToolHost, RegistryToolHost, ToolCallOutcome, ToolExecutor, ToolHost, ToolHostValidator,
 };

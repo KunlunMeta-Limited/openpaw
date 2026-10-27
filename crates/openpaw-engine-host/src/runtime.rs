@@ -1348,6 +1348,7 @@ impl AppState {
         Arc<dyn openpaw_core::ToolHost>,
         Arc<GoalContext>,
     ) {
+        let context_window = provider.model_capabilities(model).context_window as usize;
         let delegation = DelegationContext::new(
             id.to_string(),
             workspace.to_path_buf(),
@@ -1375,7 +1376,11 @@ impl AppState {
         } else {
             Arc::new(GoalToolHost::new(tool_host, goal.clone()))
         };
-        (delegation, tool_host, goal)
+        (
+            delegation,
+            crate::context::wrap(tool_host, &self.config.home, id, context_window),
+            goal,
+        )
     }
     async fn load_existing(&self, id: &str) -> Result<Arc<SessionHandle>, SessionLoadError> {
         let path = self
@@ -1399,6 +1404,7 @@ impl AppState {
             .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
         let projection = restored_session_projection(id, &read.events)?;
+        let model_contexts = projection.model_contexts;
         let mut execution_attempts = projection.execution_attempts;
         let message_presentations = projection.message_presentations;
         let messages = projection.messages;
@@ -1409,7 +1415,7 @@ impl AppState {
         let request_admissions = projection.request_admissions;
         let mutation = projection.mutation;
         let turn_sequence = projection.turn_sequence_high_water;
-        staged_visible_len(id, &messages, mutation.revert_message_id.as_deref())
+        let visible = staged_visible_len(id, &messages, mutation.revert_message_id.as_deref())
             .ok_or(SessionLoadError::Corrupt)?;
         let mut session = Session::new(read.meta.model.clone(), read.meta.provider.clone());
         session.meta = read.meta;
@@ -1456,7 +1462,15 @@ impl AppState {
         .map_err(|_| SessionLoadError::Unavailable)?;
         let title = session_title(&mutation, &messages, &message_presentations);
         let published_messages = messages.clone();
-        session.messages = messages;
+        let (provider_name, model_name) =
+            (session.meta.provider.clone(), session.meta.model.clone());
+        openpaw_engine::context::restore_context(
+            &mut session,
+            &messages[..visible],
+            &model_contexts,
+            &provider_name,
+            &model_name,
+        );
         Ok(self.build_session_handle(SessionHandleInit {
             session,
             child,
@@ -2863,7 +2877,7 @@ fn classify_turn_error(error: &openpaw_core::Error) -> TurnError {
         ),
         openpaw_core::Error::ContextTooLong(_) => turn_error(
             "context_too_long",
-            "当前对话内容超过模型上下文限制，请新建对话或缩短输入。",
+            "上下文整理后仍无法容纳请求，请缩短当前输入或固定提示。",
             false,
         ),
         openpaw_core::Error::ServerError { status, .. } => {
@@ -3148,6 +3162,7 @@ pub(crate) fn append_user_and_turn(
     if mutation_event.is_some() {
         published_messages.truncate(visible_len);
         session.messages = published_messages.clone();
+        session.model_context = None;
     }
     session.messages.push(message.clone());
     published_messages.push(message.clone());
@@ -3455,7 +3470,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     handle.set_activity("thinking", None, "正在思考");
     handle.emit(events::session_status(&handle.id, "busy"));
     // 委派文本不是新的主用户输入，子会话不得解析 /goal 或取得用户控制许可。
-    let goal_reply = if handle.child.is_none() {
+    let compact_only = handle.child.is_none() && text.trim() == "/compact";
+    let goal_reply = if handle.child.is_none() && !compact_only {
         handle.goal.begin(&turn_id, &user_message_id, &text)
     } else {
         Ok(None)
@@ -3481,6 +3497,19 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     };
     let (mut generated, result) = {
         let mut session = handle.session.lock().await;
+        if let Some(context) = session.model_context.clone() {
+            let raw = handle
+                .message_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            openpaw_engine::context::restore_context(
+                &mut session,
+                &raw,
+                &[context],
+                provider.name(),
+                &model,
+            );
+        }
         // AgentLoop 会在 await 期间直接修改 messages、token 计数和压缩状态。
         // Provider、工具或事件投影若 panic，必须恢复整个回合前快照，避免半轮内存
         // 上下文进入下一次请求；生成消息尚未进入 JSONL，因此无需截断持久文件。
@@ -3562,6 +3591,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                         );
                     }
                     openpaw_engine::AgentEvent::MessageStart => {
+                        handle.set_activity("thinking", None, "正在思考");
                         if response_index > 0 {
                             completed_responses.insert(active_response_index);
                         }
@@ -3670,12 +3700,18 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             } else if let Err(error) = &goal_reply {
                 (Vec::new(), Err(openpaw_core::Error::Session(error.clone())))
             } else {
+                let progress_handle = handle.clone();
                 let execution = turn_execution::run_turn(
                     &handle.agent,
                     &mut session,
                     &provider_tools,
                     &mut sink,
                     TurnOptions {
+                        context_progress: Some(Arc::new(move || {
+                            progress_handle.set_activity("thinking", None, "正在整理上下文")
+                        })),
+                        compact_only,
+                        context_turn_id: Some(turn_id.clone()),
                         cancel: turn_cancel.clone(),
                         provider_and_model: Some((provider, model)),
                         attachments,
@@ -3744,11 +3780,18 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                 message_ids.insert(original, message.uuid.clone());
             }
         }
-        for message in &mut session.messages {
-            if let Some(id) = message.uuid.as_ref().and_then(|id| message_ids.get(id)) {
-                message.uuid = id.clone();
-            }
-        }
+        openpaw_engine::context::remap_context(&mut session, &message_ids);
+        let context = if !cancelled && result.is_ok() {
+            let mut raw = handle
+                .message_cache
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            raw.extend(generated.iter().cloned());
+            openpaw_engine::context::seal_context(&mut session, &raw)
+        } else {
+            None
+        };
         if cancelled {
             cleanup.restore_session(&mut session);
         }
@@ -3808,6 +3851,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             &generated,
             intended_terminal.clone(),
             failure.clone(),
+            context.as_ref(),
         ) {
             tracing::error!(session_id = %handle.id, %error, "无法提交回合消息事务");
             cleanup.restore_session(&mut session);
@@ -4083,12 +4127,20 @@ fn persist_finish_transaction(
     messages: &[openpaw_core::Message],
     terminal: TurnOutcome,
     open_code_error: Option<OpenCodeTurnErrorV1>,
+    context: Option<&SessionEvent>,
 ) -> Result<(), String> {
     let mut writer = handle
         .writer
         .lock()
         .map_err(|_| "会话写入器锁状态异常".to_string())?;
-    journal::finish(&mut writer, turn_id, messages, terminal, open_code_error)
+    journal::finish_with_context(
+        &mut writer,
+        turn_id,
+        messages,
+        terminal,
+        open_code_error,
+        context,
+    )
 }
 fn repair_torn_session_tail(path: &std::path::Path) -> Result<(), SessionLoadError> {
     journal::read_repaired(path)
@@ -4869,6 +4921,7 @@ mod tests {
             &turn_id,
             std::slice::from_ref(&assistant),
             terminal.clone(),
+            None,
             None,
         )
         .expect("finish transaction");

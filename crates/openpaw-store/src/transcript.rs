@@ -669,6 +669,8 @@ fn json_value(value: &impl Serialize) -> serde_json::Value {
 
 /// 功能：保存完整已提交历史与附加持久状态。
 pub struct Transcript {
+    /// 功能：仅含已提交来源的模型检查点，适用性由执行入口校验。
+    pub model_contexts: Vec<openpaw_core::ModelContextCheckpoint>,
     /// 实际执行尝试，不作为有效模型上下文；Revert 只影响可见投影。
     pub execution_attempts: Vec<crate::execution_attempts::ExecutionAttemptV1>,
     /// 完整已提交消息，staged revert 仅裁剪显示前缀。
@@ -687,6 +689,7 @@ pub struct Transcript {
     pub turn_sequence_high_water: u64,
 }
 struct PendingFinishTransaction {
+    context: Option<openpaw_core::ModelContextCheckpoint>,
     turn_id: String,
     messages: Vec<openpaw_core::Message>,
 }
@@ -702,6 +705,7 @@ pub const MAX_FINISH_TRANSACTION_MESSAGES: usize = 4096;
 /// 关联：Host 恢复/摘要和 CLI catalog。
 pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, ProjectionError> {
     let mut projection = Transcript {
+        model_contexts: Vec::new(),
         execution_attempts: Vec::new(),
         messages: Vec::new(),
         turn_outcomes: Vec::new(),
@@ -741,12 +745,21 @@ pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, P
         }
         if let Some(prepare) = TurnFinishPrepareV1::from_session_event(event) {
             pending_finish = Some(PendingFinishTransaction {
+                context: None,
                 turn_id: prepare.turn_id,
                 messages: Vec::new(),
             });
             continue;
         }
         if let Some(pending) = pending_finish.as_mut() {
+            if let Some(context) =
+                decode::<openpaw_core::ModelContextCheckpoint>(event, "model_context_checkpoint_v1")
+                    .ok()
+                    .flatten()
+            {
+                pending.context = Some(context);
+                continue;
+            }
             if let SessionEvent::Message(message) = event {
                 if pending.messages.len() >= MAX_FINISH_TRANSACTION_MESSAGES {
                     return Err(ProjectionError);
@@ -755,7 +768,9 @@ pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, P
                 continue;
             }
             if let Some(commit) = TurnFinishCommitV1::from_session_event(event) {
-                let pending = pending_finish.take().ok_or(ProjectionError)?;
+                let mut pending = pending_finish.take().ok_or(ProjectionError)?;
+                let context = pending.context.take();
+                let completed = commit.terminal.state == TurnState::Completed;
                 apply_finish_commit(
                     session_id,
                     &mut projection,
@@ -763,13 +778,22 @@ pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, P
                     pending,
                     commit,
                 )?;
+                if completed {
+                    projection.model_contexts.extend(context);
+                }
                 continue;
             }
             // prepare 后未出现合法 commit 即视为崩溃残留；忽略整批生成消息，
             // 当前事件仍按旧格式或下一事务继续恢复。
             pending_finish = None;
         }
-        if let Some(record) =
+        if let Some(context) =
+            decode::<openpaw_core::ModelContextCheckpoint>(event, "model_context_checkpoint_v1")
+                .ok()
+                .flatten()
+        {
+            projection.model_contexts.push(context);
+        } else if let Some(record) =
             decode::<crate::execution_attempts::ExecutionAttemptV1>(event, "execution_attempt_v1")?
         {
             crate::execution_attempts::apply(&mut projection.execution_attempts, record)?;
@@ -1057,6 +1081,26 @@ pub fn is_turn_assistant_message_id(session_id: &str, turn_id: &str, message_id:
 }
 
 impl Transcript {
+    /// 功能：按可靠执行定位键读取已保存的完整工具结果。
+    /// 参数：turn/response/call标识同一工具调用。
+    /// 返回：实际正文及错误状态；不存在返回None。
+    /// 错误：无，不合成缺失原件。
+    /// 状态：只读。
+    /// 并发与取消：同步快照读取。
+    /// 权限：调用方必须先校验会话及来源回合可见性。
+    /// 关联：Host与CLI的read_context_record。
+    pub fn tool_original(&self, turn: &str, response: u64, call: &str) -> Option<(String, bool)> {
+        let record = self.execution_attempts.iter().find(|r| {
+            r.turn_id == turn
+                && r.kind == "tool_result"
+                && r.response_index as u64 == response
+                && r.payload["call_id"] == call
+        })?;
+        Some((
+            record.payload["outcome"]["content"].as_str()?.to_owned(),
+            record.payload["outcome"]["is_error"].as_bool()?,
+        ))
+    }
     /// 功能：取得当前可见的已提交消息前缀。
     /// 参数：session_id，用于旧消息稳定编号。
     /// 返回：借用的可见切片。

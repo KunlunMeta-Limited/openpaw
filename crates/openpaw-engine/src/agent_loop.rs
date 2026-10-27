@@ -1,7 +1,7 @@
-//! The agent loop — E1 skeleton.
-//!
-//! Semantics mirror the upstream `run_turn` (see `docs/spikes/S1-agent-loop.md`
-//! for the call-tree outline and the E1/E2 split line).
+//! 功能：驱动模型请求、工具执行与安全的上下文整理。
+//! 输入输出边界：接收中立会话、模型和工具，发布事件并独立收集完整产出。
+//! 禁止承担：不写会话文件，不创建入口权限或重置压缩过程中的预算。
+//! 关联：docs/spikes/S1-agent-loop.md、CHG-2026-0051。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -20,6 +20,27 @@ use crate::events::{AgentEvent, ClassifierStatus};
 
 /// One model tool invocation extracted from a `ToolUse` block.
 type ToolUseCall = (String, String, serde_json::Value);
+
+// 完整产出与模型投影分开收集；入口上下文只服务本回合，不进入执行器共享状态。
+struct TurnCollection<'a> {
+    generated: &'a mut Vec<Message>,
+    attachments: Vec<openpaw_core::InlineMedia>,
+    recorder: Option<crate::turn_execution::ExecutionRecorder>,
+    context_turn_id: Option<String>,
+    context_progress: Option<crate::turn_execution::ContextProgress>,
+}
+
+impl<'a> TurnCollection<'a> {
+    fn new(generated: &'a mut Vec<Message>) -> Self {
+        Self {
+            generated,
+            attachments: Vec::new(),
+            recorder: None,
+            context_turn_id: None,
+            context_progress: None,
+        }
+    }
+}
 
 #[derive(Default)]
 struct TurnRuntime {
@@ -304,6 +325,15 @@ impl AgentLoop {
         Ok(guard)
     }
 
+    fn record_summary_cost(&self, session: &openpaw_core::Session, before: (u32, u32)) {
+        if let Some(tracker) = self.token_budget_mut().as_mut() {
+            tracker.record_turn(
+                u64::from(session.total_input_tokens.saturating_sub(before.0))
+                    + u64::from(session.total_output_tokens.saturating_sub(before.1)),
+            );
+        }
+    }
+
     fn is_cancelled(&self) -> bool {
         self.current_cancel_token().is_cancelled()
     }
@@ -313,10 +343,14 @@ impl AgentLoop {
         self.current_cancel_token().cancel();
     }
 
-    /// Run one conversation turn: stream a model response, execute any
-    /// requested tools, backfill the session, repeat until the model stops
-    /// or the budget/cancel budget ends the turn. Returns the stop reason
-    /// of the last model response.
+    /// 功能：执行一个完整回合，按需调用工具、整理上下文并接续模型。
+    /// 参数：session为独占模型视图，system/tools为实际请求配置，event_sink接收执行事件。
+    /// 返回：最后模型响应的停止原因。
+    /// 错误：模型、工具、上下文和预算错误向调用方传播。
+    /// 状态：更新会话消息和用量；不自行提交原始记录。
+    /// 并发与取消：同一执行器仅允许一个活动回合，cancel可中断请求。
+    /// 权限：工具调用沿用已配置护栏和审批。
+    /// 关联：turn_execution::run_turn及持久入口。
     pub async fn run_turn(
         &self,
         session: &mut openpaw_core::Session,
@@ -333,7 +367,7 @@ impl AgentLoop {
             event_sink,
             CancellationToken::new(),
             (provider, model),
-            (&mut Vec::new(), Vec::new(), None),
+            TurnCollection::new(&mut Vec::new()),
         )
         .await
     }
@@ -363,7 +397,7 @@ impl AgentLoop {
             event_sink,
             token,
             (provider, model),
-            (&mut Vec::new(), Vec::new(), None),
+            TurnCollection::new(&mut Vec::new()),
         )
         .await
     }
@@ -392,7 +426,7 @@ impl AgentLoop {
             event_sink,
             token,
             provider_and_model,
-            (&mut Vec::new(), Vec::new(), None),
+            TurnCollection::new(&mut Vec::new()),
         )
         .await
     }
@@ -416,6 +450,46 @@ impl AgentLoop {
         let selection = options
             .provider_and_model
             .unwrap_or_else(|| (self.provider.clone(), self.model.clone()));
+        if options.compact_only {
+            let _active_turn = self.begin_turn(options.cancel.child_token())?;
+            if let Some(progress) = &options.context_progress {
+                progress();
+            }
+            let mut opts = self.compact_options.clone().unwrap_or_default();
+            opts.model_limit = opts
+                .model_limit
+                .min(selection.0.model_capabilities(&selection.1).context_window as usize);
+            opts.protect_head_pairs = 0;
+            opts.keep_recent_pairs = 1;
+            let intent = session.messages.last().cloned();
+            let before = (session.total_input_tokens, session.total_output_tokens);
+            let summary_result = cancel_or(
+                &options.cancel,
+                crate::compaction::compact_session_for_turn(
+                    &*selection.0,
+                    &selection.1,
+                    session,
+                    &opts,
+                    intent.as_ref(),
+                    &Default::default(),
+                ),
+            )
+            .await;
+            self.record_summary_cost(session, before);
+            let count = match summary_result {
+                Some(result) => result?,
+                None => return Ok(StopReason::EndTurn),
+            };
+            let message = Message::assistant_text(if count == 0 {
+                "无需整理：当前没有足够的旧历史。"
+            } else {
+                "已整理上下文，原始聊天和工具记录继续保留。"
+            })
+            .identified();
+            session.messages.push(message.clone());
+            generated.push(message);
+            return Ok(StopReason::EndTurn);
+        }
         self.run_turn_inner(
             session,
             options.system,
@@ -423,7 +497,13 @@ impl AgentLoop {
             sink,
             options.cancel,
             selection,
-            (generated, options.attachments, options.recorder),
+            TurnCollection {
+                generated,
+                attachments: options.attachments,
+                recorder: options.recorder,
+                context_turn_id: options.context_turn_id,
+                context_progress: options.context_progress,
+            },
         )
         .await
     }
@@ -437,13 +517,24 @@ impl AgentLoop {
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         token: CancellationToken,
         provider_and_model: (Arc<dyn LlmProvider>, String),
-        collection: (
-            &mut Vec<Message>,
-            Vec<openpaw_core::InlineMedia>,
-            Option<crate::turn_execution::ExecutionRecorder>,
-        ),
+        collection: TurnCollection<'_>,
     ) -> Result<StopReason> {
-        let (generated, attachments, recorder) = collection;
+        let TurnCollection {
+            generated,
+            attachments,
+            recorder,
+            context_turn_id,
+            context_progress,
+        } = collection;
+        if context_turn_id.is_some() {
+            crate::context::project_history(&mut session.messages, &session.meta.id);
+        }
+        let current_intent = session
+            .messages
+            .last()
+            .filter(|m| m.role == openpaw_core::Role::User)
+            .cloned();
+        let mut original_references = std::collections::HashMap::<String, String>::new();
         let mut response_index = 0usize;
         let mut known_media = std::collections::HashMap::<String, openpaw_core::InlineMedia>::new();
         for media in attachments
@@ -511,21 +602,28 @@ impl AgentLoop {
                 opts.model_limit = opts
                     .model_limit
                     .min(provider.model_capabilities(&model).context_window as usize);
-                opts.keep_recent_pairs = opts
-                    .keep_recent_pairs
-                    .max((generated.len() + 2).div_ceil(2));
-                let tools_json_approx: usize =
-                    tools.iter().map(|t| t.input_schema.to_string().len()).sum();
+                let tools_json_approx = crate::context::tools_tokens(tools);
                 let estimated = crate::compaction::estimate_session_tokens(
                     system.as_deref().unwrap_or(""),
                     session,
                     tools_json_approx,
                 );
-                let trigger = crate::compaction::should_compact_with_options_estimated(
-                    session,
-                    &opts,
-                    estimated.saturating_add(self.max_tokens as usize),
-                );
+                let trigger = if opts.use_context_aware_buffer {
+                    let available = crate::context::input_limit(opts.model_limit, self.max_tokens);
+                    if estimated > available {
+                        crate::compaction::CompactTrigger::HardLimit
+                    } else if opts.trigger_proactive && estimated > available * 4 / 5 {
+                        crate::compaction::CompactTrigger::Proactive
+                    } else {
+                        crate::compaction::CompactTrigger::None
+                    }
+                } else {
+                    crate::compaction::should_compact_with_options_estimated(
+                        session,
+                        &opts,
+                        estimated.saturating_add(self.max_tokens as usize),
+                    )
+                };
                 let media_bytes: usize = openpaw_core::media::message_media(&session.messages)
                     .iter()
                     .map(|item| item.data.len())
@@ -533,14 +631,24 @@ impl AgentLoop {
                 if trigger != crate::compaction::CompactTrigger::None
                     || media_bytes > 24 * 1024 * 1024
                 {
-                    let compacted = match cancel_or(
+                    let before_usage = (session.total_input_tokens, session.total_output_tokens);
+                    if let Some(progress) = &context_progress {
+                        progress();
+                    }
+                    let summary_result = cancel_or(
                         &token,
-                        crate::compaction::compact_session_for_model(
-                            &*provider, &model, session, &opts,
+                        crate::compaction::compact_session_for_turn(
+                            &*provider,
+                            &model,
+                            session,
+                            &opts,
+                            current_intent.as_ref(),
+                            &original_references,
                         ),
                     )
-                    .await
-                    {
+                    .await;
+                    self.record_summary_cost(session, before_usage);
+                    let compacted = match summary_result {
                         Some(result) => result?,
                         None => return Ok(StopReason::EndTurn),
                     };
@@ -559,23 +667,6 @@ impl AgentLoop {
             }
 
             // ⑤ 构造模型请求
-            if self.compact_options.is_some() {
-                let estimated = crate::compaction::estimate_session_tokens(
-                    system.as_deref().unwrap_or(""),
-                    session,
-                    tools
-                        .iter()
-                        .map(|tool| tool.input_schema.to_string().len())
-                        .sum(),
-                );
-                if estimated.saturating_add(self.max_tokens as usize)
-                    > provider.model_capabilities(&model).context_window as usize
-                {
-                    return Err(Error::context_too_long(
-                        "current input cannot fit the model context budget",
-                    ));
-                }
-            }
             let req = CompletionRequest {
                 model: model.clone(),
                 system: system.clone(),
@@ -584,14 +675,24 @@ impl AgentLoop {
                 max_tokens: self.max_tokens,
                 ..Default::default()
             };
+            crate::context::validate_request(
+                &req,
+                provider.model_capabilities(&model).context_window as usize,
+            )?;
 
             // ⑥ 带重试地读取模型流
             let resp = match self
-                .stream_with_retry(
+                .stream_with_context(
                     &provider,
                     req,
+                    session,
                     event_sink,
                     (recorder.as_ref(), response_index),
+                    (
+                        current_intent.as_ref(),
+                        &original_references,
+                        context_progress.as_ref(),
+                    ),
                 )
                 .await
             {
@@ -725,8 +826,35 @@ impl AgentLoop {
                 ..Default::default()
             };
             let tool_message = tool_message.identified();
+            if let Some(turn) = &context_turn_id {
+                for block in &tool_message.content {
+                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                        original_references.insert(
+                            format!(
+                                "{}:{tool_use_id}",
+                                tool_message.uuid.as_deref().unwrap_or("")
+                            ),
+                            crate::context::record_reference(
+                                &session.meta.id,
+                                turn,
+                                response_index - 1,
+                                tool_use_id,
+                            ),
+                        );
+                    }
+                }
+            }
             generated.push(tool_message.clone());
-            session.messages.push(tool_message);
+            let mut model_message = tool_message;
+            if let Some(turn) = &context_turn_id {
+                crate::context::project_results(
+                    &mut model_message.content,
+                    &session.meta.id,
+                    turn,
+                    response_index - 1,
+                );
+            }
+            session.messages.push(model_message);
         }
     }
 
@@ -753,14 +881,25 @@ impl AgentLoop {
             max_tokens: self.max_tokens,
             ..Default::default()
         };
+        crate::context::validate_request(
+            &req,
+            provider.model_capabilities(model).context_window as usize,
+        )?;
         // 预算耗尽后的候选答复先缓冲，校验通过后才发布给 Host。部分 OpenAI
         // 兼容模型会把工具调用退化为 DSML 正文；若边生成边转发，协议标记会被
         // UI 当成最终答复永久保存。
         let mut buffered_events = Vec::new();
         let mut resp = {
             let mut buffered_sink = |event| buffered_events.push(event);
-            self.stream_with_retry(provider, req.clone(), &mut buffered_sink, (None, 0))
-                .await?
+            self.stream_with_context(
+                provider,
+                req.clone(),
+                session,
+                &mut buffered_sink,
+                (None, 0),
+                (None, &Default::default(), None),
+            )
+            .await?
         };
         let mut total_usage = resp.usage;
 
@@ -778,11 +917,22 @@ impl AgentLoop {
                 messages: repair_messages,
                 ..req
             };
+            crate::context::validate_request(
+                &repair_req,
+                provider.model_capabilities(model).context_window as usize,
+            )?;
             buffered_events.clear();
             resp = {
                 let mut buffered_sink = |event| buffered_events.push(event);
-                self.stream_with_retry(provider, repair_req, &mut buffered_sink, (None, 0))
-                    .await?
+                self.stream_with_context(
+                    provider,
+                    repair_req,
+                    session,
+                    &mut buffered_sink,
+                    (None, 0),
+                    (None, &Default::default(), None),
+                )
+                .await?
             };
             total_usage = add_usage(total_usage, resp.usage);
         }
@@ -843,6 +993,72 @@ impl AgentLoop {
 
     /// 功能：以分类重试策略读取一次 completion 流。
     /// 状态：文本增量实时转发到回调，在 `Final` 到达时返回完整响应。
+    #[allow(clippy::too_many_arguments)] // 模型重试沿用同一会话、记录器和当前回合原件引用。
+    async fn stream_with_context(
+        &self,
+        provider: &Arc<dyn LlmProvider>,
+        mut request: CompletionRequest,
+        session: &mut openpaw_core::Session,
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
+        recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+        continuation: (
+            Option<&Message>,
+            &std::collections::HashMap<String, String>,
+            Option<&crate::turn_execution::ContextProgress>,
+        ),
+    ) -> Result<openpaw_core::CompletionResponse> {
+        match self
+            .stream_with_retry(provider, request.clone(), sink, recording)
+            .await
+        {
+            Err(error) if error.is_context_too_long() => {
+                let Some(mut options) = self.compact_options.clone() else {
+                    return Err(error);
+                };
+                options.model_limit = options
+                    .model_limit
+                    .min(provider.model_capabilities(&request.model).context_window as usize);
+                let suffix = request
+                    .messages
+                    .get(session.messages.len()..)
+                    .unwrap_or_default()
+                    .to_vec();
+                let before = (session.total_input_tokens, session.total_output_tokens);
+                if let Some(progress) = continuation.2 {
+                    progress();
+                }
+                let token = self.current_cancel_token();
+                let summary_result = cancel_or(
+                    &token,
+                    crate::compaction::compact_session_for_turn(
+                        &**provider,
+                        &request.model,
+                        session,
+                        &options,
+                        continuation.0,
+                        continuation.1,
+                    ),
+                )
+                .await;
+                self.record_summary_cost(session, before);
+                let count = match summary_result {
+                    Some(result) => result?,
+                    None => return Err(Error::Provider("整理期间已取消".into())),
+                };
+                if count == 0 {
+                    return Err(error);
+                }
+                request.messages = session.messages.clone();
+                request.messages.extend(suffix);
+                crate::context::validate_request(&request, options.model_limit)?;
+                // 只对同一逻辑模型请求恢复一次；内部网络退避不能重新进入此分支。
+                self.stream_with_retry(provider, request, sink, recording)
+                    .await
+            }
+            result => result,
+        }
+    }
+
     async fn stream_with_retry(
         &self,
         provider: &Arc<dyn LlmProvider>,
@@ -928,6 +1144,11 @@ impl AgentLoop {
                         } else {
                             error
                         };
+                        if emitted_visible_output && error.is_context_too_long() {
+                            return Err(Error::Provider(
+                                "已输出部分内容后发生上下文超限，拒绝重放请求".into(),
+                            ));
+                        }
                         let class = classify_api_error(&error);
                         let retry_limit = retry_limit_for_error(
                             &error,

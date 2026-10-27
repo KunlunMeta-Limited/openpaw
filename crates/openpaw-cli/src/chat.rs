@@ -51,6 +51,32 @@ pub fn run(args: ChatArgs) -> i32 {
     let tool_host = openpaw_tools::arc_registry(&workspace);
 
     let mut session = Session::new(&config.model, provider.name());
+    let home = args.home.clone().unwrap_or_else(openpaw_core::openpaw_home);
+    let original_path = home
+        .join("sessions")
+        .join(format!("{}.jsonl", session.meta.id));
+    let owner = session.meta.id.clone();
+    let reader: openpaw_engine::context::OriginalReader = Arc::new(move |reference| {
+        let key = openpaw_engine::context::parse_reference(reference, &owner)?;
+        let read =
+            openpaw_store::SessionReader::read(&original_path).map_err(|_| "原件记录不可读")?;
+        let history =
+            openpaw_store::transcript::replay(&owner, &read.events).map_err(|_| "原件历史无效")?;
+        if key.turn.starts_with("message/") {
+            return openpaw_engine::context::message_original(
+                &key,
+                history.visible_messages(&owner),
+            );
+        }
+        history
+            .tool_original(&key.turn, key.response, &key.call)
+            .ok_or_else(|| "原件不存在或未保存".into())
+    });
+    let tool_host = openpaw_engine::context::wrap_tools(
+        tool_host,
+        reader,
+        provider.model_capabilities(&config.model).context_window as usize,
+    );
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -109,7 +135,6 @@ pub fn run(args: ChatArgs) -> i32 {
         openpaw_engine::approval::configure(agent, args.permissions == "manual", approvals.clone());
 
     // Session transcript: <home>/sessions/<id>.jsonl (plain files).
-    let home = args.home.clone().unwrap_or_else(openpaw_core::openpaw_home);
     let sessions_dir = home.join("sessions");
     let transcript_path = sessions_dir.join(format!("{}.jsonl", session.meta.id));
     let mut writer = Some(
@@ -223,6 +248,7 @@ pub fn run(args: ChatArgs) -> i32 {
         turn_number += 1;
         let recorder_writer = writer.clone();
         let turn_id = format!("turn_{turn_number}");
+        let context_turn_id = turn_id.clone();
         let sequence = std::sync::atomic::AtomicU64::new(0);
         let recorder: turn_execution::ExecutionRecorder = Arc::new(move |observation| {
             let record = openpaw_store::execution_attempts::ExecutionAttemptV1 {
@@ -248,7 +274,7 @@ pub fn run(args: ChatArgs) -> i32 {
         approvals.begin_turn();
         let execution = rt.block_on(async {
             let attachments = openpaw_store::media::attachment_snapshot(&original_history).into_values().collect();
-            let turn = turn_execution::run_turn(&agent, &mut session, &specs, &mut sink, TurnOptions { attachments, recorder:Some(recorder), ..Default::default() });
+            let turn = turn_execution::run_turn(&agent, &mut session, &specs, &mut sink, TurnOptions { context_turn_id: Some(context_turn_id), attachments, recorder:Some(recorder), ..Default::default() });
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -278,10 +304,15 @@ pub fn run(args: ChatArgs) -> i32 {
 
         // 原始输入已提交；产出可以包含 User 角色的工具结果，必须完整保存。
         let events = log.lock().unwrap_or_else(|e| e.into_inner());
+        let mut committed = original_history.clone();
+        committed.extend(execution.generated_messages.iter().cloned());
+        let context: Vec<_> = openpaw_engine::context::seal_context(&mut session, &committed)
+            .into_iter()
+            .collect();
         let persisted = journal::append_messages(
             &mut writer.lock().unwrap_or_else(|e| e.into_inner()),
             &execution.generated_messages,
-            &[],
+            &context,
         );
         if let Err(error) = persisted {
             checkpoint.restore(&mut session);

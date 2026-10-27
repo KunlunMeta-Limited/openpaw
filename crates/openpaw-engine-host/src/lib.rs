@@ -7,6 +7,8 @@
 #[cfg(feature = "engine-host")]
 mod approval;
 #[cfg(feature = "engine-host")]
+mod context;
+#[cfg(feature = "engine-host")]
 mod delegation;
 #[cfg(feature = "engine-host")]
 mod events;

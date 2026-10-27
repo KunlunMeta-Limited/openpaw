@@ -385,6 +385,52 @@ impl Drop for GoalDelegation {
 }
 
 impl GoalContext {
+    /// 功能：从已保存Goal事件定位完整观察及其来源回合。
+    /// 参数：events为会话记录，owner/goal/id为可信归属和观察定位键。
+    /// 返回：来源回合、原始正文及错误状态。
+    /// 错误：归属、观察或正文缺失时明确失败。
+    /// 状态：只读，不恢复执行许可。
+    /// 并发与取消：同步快照读取。
+    /// 权限：调用方仍须验证来源回合当前可见。
+    /// 关联：read_context_record。
+    pub fn original_observation(
+        events: &[openpaw_core::SessionEvent],
+        owner: &str,
+        goal: &str,
+        id: &str,
+    ) -> Result<(String, String, bool), String> {
+        let value = events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                openpaw_core::SessionEvent::Unknown(v)
+                    if v["type"] == "session_goal_state_v1" && v["owner"] == owner =>
+                {
+                    Some(v)
+                }
+                _ => None,
+            })
+            .ok_or("Goal原件不存在")?;
+        let observation = value["state"]["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|g| g["id"] == goal)
+            .flat_map(|g| g["observations"].as_array().into_iter().flatten())
+            .find(|o| o["id"] == id)
+            .ok_or("Goal原件不存在")?;
+        Ok((
+            observation["turn_id"]
+                .as_str()
+                .ok_or("Goal原件来源缺失")?
+                .into(),
+            observation["output"]
+                .as_str()
+                .ok_or("Goal原件正文缺失")?
+                .into(),
+            observation["is_error"].as_bool().unwrap_or(false),
+        ))
+    }
     /// 功能：创建无执行授权的会话 Goal 上下文。
     /// 参数：owner 为会话稳定身份。
     /// 返回：空上下文的共享引用。
@@ -657,10 +703,10 @@ impl GoalContext {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let goal = state.records.last()?;
         if matches!(goal.phase.as_str(), "paused" | "blocked") {
-            return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；人工暂停用manual_pause、明确恢复用manual_resume，携带task_id和user_excerpt引用本轮原文；恢复旧来源任务可解除其替换或拆分任务约束；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。补充条件时可用 recheck_task(task_id,status=pending或blocked,reason) 重检执行阻塞，条件不足仍保持 blocked；这由模型判断，无阻塞证据门槛。人工阻塞不可由普通重检解除。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",json!(goal)));
+            return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；人工暂停用manual_pause、明确恢复用manual_resume，携带task_id和user_excerpt引用本轮原文；恢复旧来源任务可解除其替换或拆分任务约束；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。补充条件时可用 recheck_task(task_id,status=pending或blocked,reason) 重检执行阻塞，条件不足仍保持 blocked；这由模型判断，无阻塞证据门槛。人工阻塞不可由普通重检解除。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",self.model_view(json!(goal))));
         }
         if goal.phase != "draft" {
-            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务可并行 delegate_task(goal_task_id=计划任务编号)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。人工manual_blocked及其用户来源不可自动解除，continue、重检、移除依赖或新建等价任务均不能绕过；重规划保留原身份、replaces和人工来源，独立工作仍可推进。确实无法推进可 block_task(task_id,reason)，说明原因和所需条件，无工具尝试次数或阻塞证据门槛；受阻依赖等待，独立工作继续。continue 后先重检 blocked 任务，用 recheck_task(task_id,status=pending或blocked,reason) 提交模型判断，仍缺条件保持 blocked，满足才回 pending；人工阻塞不能由普通重检解除。已有原预算和取消约束保持。当前事实：{}",goal.id,json!(goal)));
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务可并行 delegate_task(goal_task_id=计划任务编号)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。人工manual_blocked及其用户来源不可自动解除，continue、重检、移除依赖或新建等价任务均不能绕过；重规划保留原身份、replaces和人工来源，独立工作仍可推进。确实无法推进可 block_task(task_id,reason)，说明原因和所需条件，无工具尝试次数或阻塞证据门槛；受阻依赖等待，独立工作继续。continue 后先重检 blocked 任务，用 recheck_task(task_id,status=pending或blocked,reason) 提交模型判断，仍缺条件保持 blocked，满足才回 pending；人工阻塞不能由普通重检解除。已有原预算和取消约束保持。当前事实：{}",goal.id,self.model_view(json!(goal))));
         }
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
@@ -674,6 +720,124 @@ impl GoalContext {
             .unwrap_or(json!({}));
         if let Some(facts) = self.runtime().and_then(|runtime| runtime.execution_facts()) {
             value["execution_attempts"] = facts;
+        }
+        value
+    }
+
+    // 模型只使用当前计划和可回读事实；完整read/current继续供持久化和Office。
+    fn model_view(&self, mut value: Value) -> Value {
+        if !value["id"].is_string() {
+            return value;
+        }
+        let goal_id = value["id"].clone();
+        if let Some(tasks) = value["tasks"].as_array_mut() {
+            let retired = tasks.iter().filter(|t| t["current"] == false).count();
+            let mut index = 0;
+            tasks.retain_mut(|task| {
+                if task["current"] != false {
+                    return true;
+                }
+                index += 1;
+                if let Some(object) = task.as_object_mut() {
+                    object.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "id" | "title" | "status" | "current" | "replaces"
+                        )
+                    });
+                }
+                index + 32 > retired
+            });
+            value["retired_task_count"] = json!(retired);
+        }
+        let required: HashSet<String> = value["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|t| t["evidence"].as_array().into_iter().flatten())
+            .filter_map(|e| e["observation_id"].as_str().map(str::to_owned))
+            .collect();
+        if let Some(observations) = value["observations"].as_array_mut() {
+            let total = observations.len();
+            let mut index = 0;
+            observations.retain(|o| {
+                let keep =
+                    index + 32 >= total || o["id"].as_str().is_some_and(|id| required.contains(id));
+                index += 1;
+                keep
+            });
+            for observation in observations.iter_mut() {
+                let id = observation["id"].clone();
+                if let Some(object) = observation.as_object_mut() {
+                    if object
+                        .get("input")
+                        .is_some_and(|v| v.to_string().len() > 1024)
+                    {
+                        object.remove("input");
+                    }
+                    object.remove("output");
+                }
+                observation["reference"] = json!(format!(
+                    "ctx:v1:{}",
+                    json!([
+                        self.owner,
+                        format!("goal/{}", goal_id.as_str().unwrap()),
+                        0,
+                        id
+                    ])
+                ));
+            }
+            value["observation_count"] = json!(total);
+        }
+        if let Some(history) = value["history"].as_array_mut() {
+            let total = history.len();
+            if total > 16 {
+                history.drain(..total - 16);
+            }
+            for entry in history {
+                if let Some(object) = entry.as_object_mut() {
+                    object.retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "action"
+                                | "task_id"
+                                | "turn_id"
+                                | "version"
+                                | "plan_version"
+                                | "reason"
+                                | "user_message_id"
+                                | "user_excerpt"
+                                | "tasks"
+                        )
+                    });
+                    if let Some(tasks) = object.get_mut("tasks").and_then(Value::as_array_mut) {
+                        tasks.truncate(32);
+                        for task in tasks {
+                            if let Some(task) = task.as_object_mut() {
+                                task.retain(|key, _| {
+                                    matches!(
+                                        key.as_str(),
+                                        "id" | "title" | "expected_result" | "current" | "status"
+                                    )
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            value["history_count"] = json!(total);
+        }
+        if let Some(facts) = value["execution_attempts"].as_array_mut() {
+            let total = facts.len();
+            if total > 32 {
+                facts.drain(..total - 32);
+            }
+            for fact in facts {
+                let payload = &fact["payload"];
+                *fact = json!({"kind":fact["kind"],"turn_id":fact["turn_id"],"name":payload["name"],"disposition":payload["disposition"],
+                    "reference":format!("ctx:v1:{}",json!([self.owner,fact["turn_id"],fact["response_index"],payload["call_id"]]))});
+            }
+            value["execution_attempt_count"] = json!(total);
         }
         value
     }
@@ -1299,7 +1463,13 @@ impl GoalContext {
             }
             if matches!(
                 name,
-                "goal_read" | "goal_update" | "read_file" | "read_attachment" | "grep" | "glob"
+                "goal_read"
+                    | "goal_update"
+                    | "read_file"
+                    | "read_attachment"
+                    | "read_context_record"
+                    | "grep"
+                    | "glob"
             ) {
                 return Ok(());
             }
@@ -1336,7 +1506,13 @@ impl GoalContext {
                 .is_none_or(|goal| goal.phase == "ended" || goal.phase == "completed"))
             || matches!(
                 name,
-                "goal_read" | "goal_update" | "read_file" | "read_attachment" | "grep" | "glob"
+                "goal_read"
+                    | "goal_update"
+                    | "read_file"
+                    | "read_attachment"
+                    | "read_context_record"
+                    | "grep"
+                    | "glob"
             )
         {
             return Ok(());
@@ -1746,7 +1922,7 @@ impl ToolExecutor for GoalToolHost {
             return Ok(ToolCallOutcome::error(error));
         }
         let value = match name {
-            "goal_read" => Ok(self.context.read()),
+            "goal_read" => Ok(self.context.model_view(self.context.read())),
             "goal_update" => self.context.update(args),
             _ => {
                 let mut outcome = self.inner.call(name, args.clone()).await?;
@@ -1757,12 +1933,15 @@ impl ToolExecutor for GoalToolHost {
             }
         };
         Ok(match value {
-            Ok(value) => ToolCallOutcome {
-                content: value.to_string(),
-                is_error: false,
-                structured: Some(value),
-                media: Vec::new(),
-            },
+            Ok(value) => {
+                let value = self.context.model_view(value);
+                ToolCallOutcome {
+                    content: value.to_string(),
+                    is_error: false,
+                    structured: Some(value),
+                    media: Vec::new(),
+                }
+            }
             Err(error) => ToolCallOutcome::error(error),
         })
     }
