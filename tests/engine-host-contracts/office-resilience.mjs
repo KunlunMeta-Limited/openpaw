@@ -225,7 +225,8 @@ export async function storageProduct({page,report,output,fresh,waitFor}) {
       globalThis.t6RestoreStorage=()=>{IDBDatabase.prototype.transaction=original}
     })
     await box.fill('中止事务后的新草稿，只在内存中保留')
-    const alert=page.getByRole('alert').filter({hasText:/保存失败/})
+    // ff9f6b7 将工作区写入告警改为“暂未完成”；故障与存档不变断言仍须真实满足。
+    const alert=page.getByRole('alert').filter({hasText:'会话保存暂未完成，内容仍保留在本页；请稍后重试，刷新前保留重要内容。'})
     await alert.waitFor()
     const aborts=await page.evaluate(()=>globalThis.t6StorageAborts)
     assert.ok(aborts.length>0,'必须实际中止浏览器事务，不能仅伪造错误消息')

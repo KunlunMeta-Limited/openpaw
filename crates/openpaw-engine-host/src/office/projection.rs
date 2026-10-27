@@ -596,7 +596,7 @@ fn compact_business_conversation(conversation: &mut Value) -> bool {
 }
 
 /// 受保护是指身份/状态不可删，不是可选详情无限占用封套。
-/// 每次只缩一个最旧会话的说明字段；不碰任务/成员绑定、交接事件身份或白板步骤。
+/// 每次只缩最旧会话的说明或已被新事实取代的动态；保留任务/成员、分派身份与最新动态。
 fn compact_protected_details(
     conversations: &mut [Value],
     priorities: &BTreeMap<String, u64>,
@@ -645,7 +645,7 @@ fn compact_protected_details(
             }
         }
         if let Some(events) = conversation["events"].as_array_mut() {
-            for event in events {
+            for event in events.iter_mut() {
                 // summary 是事件Schema必填字段；保留短说明而非移除字段。
                 if let Some(text) = event["summary"].as_str() {
                     if text.encode_utf16().count() > 40 {
@@ -653,6 +653,36 @@ fn compact_protected_details(
                         return Ok(Some(edit));
                     }
                 }
+            }
+            // 同一任务的旧 started/blocked/note 已有更晚状态，完整事实在账本。
+            // 分派身份用于去重交接、每任务最新动态用于当前展示，两者绝不裁剪。
+            let obsolete = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event["kind"] != "task.assigned")
+                .filter(|(_, event)| {
+                    let Some(task) = event["taskId"].as_str() else {
+                        return false;
+                    };
+                    let Some(time) = event["occurredAt"].as_str() else {
+                        return false;
+                    };
+                    let Some(id) = event["id"].as_str() else {
+                        return false;
+                    };
+                    events.iter().any(|newer| {
+                        newer["taskId"].as_str() == Some(task)
+                            && newer["occurredAt"]
+                                .as_str()
+                                .zip(newer["id"].as_str())
+                                .is_some_and(|newer| newer > (time, id))
+                    })
+                })
+                .min_by_key(|(_, event)| (event["occurredAt"].as_str(), event["id"].as_str()))
+                .map(|(index, _)| index);
+            if let Some(index) = obsolete {
+                events.remove(index);
+                return Ok(Some(edit));
             }
         }
     }
@@ -1966,6 +1996,58 @@ mod tests {
                 assert!(steps < 1000);
             }
         }
+    }
+
+    #[test]
+    fn d104_protected_catalogue_keeps_latest_and_assignment_events_under_pressure() {
+        let conversations: Vec<_> = (0..4).map(|c| {
+            let tasks: Vec<_> = (0..24).map(|i| json!({
+                "id":format!("task-{c}-{i}"),"title":format!("第{i}项真实目标：{}","核验多人分工并保存交付文档".repeat(4)),
+                "status":"completed","progress":100,"assigneeId":"code-agent"
+            })).collect();
+            let events: Vec<_> = (0..24).flat_map(|i| {
+                ["task.assigned", "task.started", "task.blocked", "task.completed"].into_iter().enumerate().map(move |(phase, kind)| json!({
+                    "id":format!("event-{c}-{i}-{phase}"),"taskId":format!("task-{c}-{i}"),
+                    "kind":kind,"employeeId":"code-agent","fromEmployeeId":"office-lead",
+                    "occurredAt":format!("2026-10-27T00:00:0{phase}Z"),"summary":"真实任务动态"
+                }))
+            }).collect();
+            json!({"id":format!("c-{c}"),"title":"多轮真实任务","employees":[],"tasks":tasks,"events":events,
+                "whiteboard":{"status":"completed","steps":[{"id":"goal","title":"本轮已交付","progress":100}]}})
+        }).collect();
+        let mut snapshot = json!({"schemaVersion":"1.0","seq":1,"workspace":{"id":"office-1"},"conversations":conversations});
+        let original = snapshot.clone();
+        let priorities = (0..4).map(|i| (format!("c-{i}"), i)).collect();
+        assert!(!snapshot_fits_office_message("office-1", &snapshot));
+        assert!(
+            fit_protected_snapshot_details("office-1", &mut snapshot, &priorities).unwrap(),
+            "已被新事实取代的动态不能阻断受保护会话审批"
+        );
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+        for (index, conversation) in snapshot["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let old = &original["conversations"][index];
+            assert_eq!(conversation["tasks"], old["tasks"]);
+            assert_eq!(conversation["employees"], old["employees"]);
+            assert_eq!(conversation["whiteboard"], old["whiteboard"]);
+            for event in
+                old["events"].as_array().unwrap().iter().filter(|e| {
+                    matches!(e["kind"].as_str(), Some("task.assigned" | "task.completed"))
+                })
+            {
+                assert!(
+                    conversation["events"].as_array().unwrap().contains(event),
+                    "分派身份和每项最新事实必须保留"
+                );
+            }
+        }
+        let fitted = snapshot.clone();
+        assert!(fit_protected_snapshot_details("office-1", &mut snapshot, &priorities).unwrap());
+        assert_eq!(snapshot, fitted, "已符合预算不能继续丢弃动态");
     }
 
     #[test]
