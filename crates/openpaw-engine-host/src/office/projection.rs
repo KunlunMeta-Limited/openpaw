@@ -2605,9 +2605,13 @@ mod tests {
                 "controlled-projection-wait"
             }
         }
-        for (second_evidence, expected_cards) in [("grouped", 4), ("call_2_1", 3), ("call_2_0", 5)]
-        {
-            let grouped = second_evidence == "grouped";
+        for (second_evidence, expected_cards) in [
+            ("grouped", 4),
+            ("grouped-incremental", 4),
+            ("call_2_1", 3),
+            ("call_2_0", 5),
+        ] {
+            let grouped = second_evidence.starts_with("grouped");
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("root");
             std::fs::create_dir(&root).unwrap();
@@ -2646,11 +2650,11 @@ mod tests {
                 MockMode::Fixed("周理实际读取完成".into()),
                 call(
                     "report_progress",
-                    json!({"type":"update","stepId":"research","state":"completed","evidenceCallIds":if grouped {json!(["call_2_0","call_2_1"])}else{json!(["call_2_0"])}}),
+                    json!({"type":"update","stepId":"research","state":"completed","evidenceCallIds":if second_evidence=="grouped" {json!(["call_2_0","call_2_1"])}else{json!(["call_2_0"])}}),
                 ),
                 call(
                     "report_progress",
-                    json!({"type":"update","stepId":if grouped {"research"}else{"organize"},"state":"completed","evidenceCallIds":if grouped {json!(["call_2_0","call_2_1"])}else{json!([second_evidence])}}),
+                    json!({"type":"update","stepId":if grouped {"research"}else{"organize"},"state":"completed","evidenceCallIds":if second_evidence=="grouped" {json!(["call_2_0","call_2_1"])}else if grouped {json!(["call_2_1"])}else{json!([second_evidence])}}),
                 ),
                 MockMode::Fixed("王明核验两个子任务完成".into()),
                 MockMode::Fixed("普通追问已回复".into()),

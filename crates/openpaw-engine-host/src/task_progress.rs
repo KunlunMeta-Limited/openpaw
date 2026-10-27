@@ -123,7 +123,7 @@ fn is_coordination_step(title: &str, run: &RunView) -> bool {
 /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
 pub(crate) fn spec() -> ToolSpec {
     let definition = json!({"type":"object","additionalProperties":false,"required":["id","title"],"properties":{"id":{"type":"string","minLength":1,"maxLength":80},"title":{"type":"string","minLength":1,"maxLength":160}}});
-    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。多步骤任务先create固定计划，再update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；文件步骤须引用write_file/edit_file；真实协作也可引用父delegate_task调用ID，Host再核验该成功子Run的实际写入和相同产物路径。不能把子调用ID当父Run证据。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
+    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。多步骤任务先create固定计划，再update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；同一步后续核验可补报新的真实证据，Host保留旧证据并合并，不能回退已完成状态；文件步骤须引用write_file/edit_file；真实协作也可引用父delegate_task调用ID，Host再核验该成功子Run的实际写入和相同产物路径。不能把子调用ID当父Run证据。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
 }
 
 /// 功能：校验报告的结构，实际证据在Store序列内再次校验。
@@ -178,9 +178,9 @@ pub(crate) fn accepted_plan_hint(value: Option<Value>) -> HostResult<String> {
     let steps = plan
         .steps
         .iter()
-        .map(|s| json!({"id":s.id,"title":s.title,"state":s.state}))
+        .map(|s| json!({"id":s.id,"title":s.title,"state":s.state,"evidenceCallIds":s.evidence}))
         .collect::<Vec<_>>();
-    Ok(format!("业务步骤已记录；真实操作和文件仍须通过原工具及审批执行。当前步骤：{}。in_progress尚未完成；核验真实操作结果后，用对应Host执行回执的callId报告completed，再处理下一步。最终答复前核对清单，无工具的整理答复由最终可靠结束确认。",json!(steps)))
+    Ok(format!("业务步骤已记录；真实操作和文件仍须通过原工具及审批执行。当前步骤：{}。in_progress尚未完成；核验真实操作结果后，用对应Host执行回执的callId报告completed，再处理下一步。同一步后续同事的核验可用completed补报准确证据，Host只追加保留旧证据；每个实际委派均须核验，不能因计划中已有completed而漏报额外同事。最终答复前核对清单，无工具的整理答复由最终可靠结束确认。",json!(steps)))
 }
 
 /// 功能：为无效进度报告提供本轮真实成功调用的有界恢复提示。
@@ -325,7 +325,7 @@ pub(crate) fn update_with_delegations(
         Report::Update {
             step_id,
             state,
-            evidence,
+            mut evidence,
         } => {
             let plan = plan
                 .as_mut()
@@ -340,8 +340,25 @@ pub(crate) fn update_with_delegations(
                 .iter_mut()
                 .find(|s| s.id == step_id)
                 .ok_or_else(|| invalid("步骤不属于本轮计划"))?;
-            if step.state == "completed" && (state != step.state || evidence != step.evidence) {
-                return Err(invalid("已确认步骤不能回退或替换证据"));
+            if step.state == "completed" {
+                if state != "completed" {
+                    return Err(invalid("已确认步骤不能回退"));
+                }
+                if evidence.iter().collect::<BTreeSet<_>>().len() != evidence.len() {
+                    return Err(invalid("证据调用ID不能重复"));
+                }
+                // 同一步可由多位同事先后核验：只追加证据，绝不删除先前确认。
+                // 合并后仍逐项走原成功/started/作用域/写路径校验，不自动接纳子Run。
+                let mut merged = step.evidence.clone();
+                for id in evidence {
+                    if !merged.contains(&id) {
+                        merged.push(id);
+                    }
+                }
+                if merged.len() > 32 {
+                    return Err(invalid("步骤合并证据超过32项"));
+                }
+                evidence = merged;
             }
             let mut unique = BTreeSet::new();
             let mut write = false;
@@ -479,6 +496,113 @@ mod tests {
         assert_eq!(steps[1]["status"], "failed");
         assert!(percent < 100, "真实失败不能被隐藏或伪报完成");
     }
+    #[test]
+    fn d100_completed_step_keeps_old_evidence_when_another_colleague_is_confirmed() {
+        let mut r = run();
+        let mut started = Vec::new();
+        for index in 0..34 {
+            let id = format!("review_{index}");
+            r.tools.push(ToolView {
+                call_id: id.clone(),
+                tool_name: "delegate_task".into(),
+                state: "completed".into(),
+            });
+            started.push(ToolCallBinding {
+                run_id: r.run_id.clone(),
+                call_id: id,
+                tool_name: "delegate_task".into(),
+                input: json!({}),
+            });
+        }
+        let p = update(
+            None,
+            &json!({"type":"create","steps":[{"id":"check","title":"质量和来源复核"}]}),
+            &r,
+            &started,
+        )
+        .unwrap();
+        let report = |evidence: Value| json!({"type":"update","stepId":"check","state":"completed","evidenceCallIds":evidence});
+        let first = update(Some(p), &report(json!(["review_0"])), &r, &started).unwrap();
+        let both = update(
+            Some(first.clone()),
+            &report(json!(["review_1"])),
+            &r,
+            &started,
+        )
+        .unwrap();
+        assert_eq!(
+            both["steps"][0]["evidenceCallIds"],
+            json!(["review_0", "review_1"])
+        );
+        assert_eq!(
+            update(
+                Some(both.clone()),
+                &report(json!(["review_1"])),
+                &r,
+                &started
+            )
+            .unwrap(),
+            both
+        );
+        assert!(update(
+            Some(both.clone()),
+            &json!({"type":"update","stepId":"check","state":"in_progress"}),
+            &r,
+            &started
+        )
+        .is_err());
+        assert!(update(
+            Some(both.clone()),
+            &report(json!(["invented"])),
+            &r,
+            &started
+        )
+        .is_err());
+        assert!(update(
+            Some(both.clone()),
+            &report(json!(["review_2", "review_2"])),
+            &r,
+            &started
+        )
+        .is_err());
+        let mut foreign = started.clone();
+        foreign[2].run_id = "other".into();
+        assert!(update(
+            Some(both.clone()),
+            &report(json!(["review_2"])),
+            &r,
+            &foreign
+        )
+        .is_err());
+        r.tools[2].state = "failed".into();
+        assert!(update(
+            Some(both.clone()),
+            &report(json!(["review_2"])),
+            &r,
+            &started
+        )
+        .is_err());
+        r.tools[2].state = "completed".into();
+        let full = update(
+            Some(both),
+            &report(json!((2..32)
+                .map(|i| format!("review_{i}"))
+                .collect::<Vec<_>>())),
+            &r,
+            &started,
+        )
+        .unwrap();
+        assert_eq!(
+            full["steps"][0]["evidenceCallIds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            32
+        );
+        assert!(update(Some(full), &report(json!(["review_32"])), &r, &started).is_err());
+        assert_eq!(first["steps"][0]["evidenceCallIds"], json!(["review_0"]));
+    }
+
     #[test]
     fn false_file_completion_and_cross_run_evidence_are_rejected() {
         let mut r = run();
