@@ -60,6 +60,7 @@ pub struct TurnOptions {
 }
 
 /// 功能：只报告整理开始的中立状态回调，不携带敏感内容。
+/// Stability: experimental；仅供执行入口复用现有状态通道。
 pub type ContextProgress = Arc<dyn Fn() + Send + Sync>;
 
 /// 功能：描述与传输、存储无关的真实可见输出和工具执行事实。
@@ -262,7 +263,7 @@ mod tests {
         let baseline = serde_json::to_value(&session).unwrap();
         let agent = AgentLoop::new(Arc::new(openpaw_llm::MockProvider::fixed("summary")))
             .with_compact_options(crate::compaction::CompactOptions {
-                model_limit: 10,
+                model_limit: 4000, // 可容纳摘要和1024余量，仍由业务输出预留触发整理。
                 keep_recent_pairs: 1,
                 protect_head_pairs: 0,
                 min_messages_before_compact: 0,

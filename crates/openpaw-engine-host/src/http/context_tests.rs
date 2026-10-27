@@ -69,7 +69,7 @@ mod context_tests {
             } else {
                 Some(("read_file", serde_json::json!({"path":"large.txt"})))
             }
-        } else if requested.is_some() {
+        } else if requested.is_some() || body.to_string().contains("SMALL_WINDOW_PREVIEW") {
             None
         } else {
             let last: serde_json::Value =
@@ -482,7 +482,7 @@ mod context_tests {
             .await["state"],
             "complete"
         );
-        let reference = {
+        let (reference, execution_reference) = {
             let requests = fixture.model_seen.lock().await;
             let last = requests.last().unwrap();
             let system = last["messages"]
@@ -503,26 +503,38 @@ mod context_tests {
             assert_eq!(goal["tasks"][0]["status"], "blocked");
             assert_eq!(goal["tasks"][0]["acceptance_criteria"][0], "原件完整");
             assert!(goal["observations"][0].get("output").is_none());
-            goal["observations"][0]["reference"].clone()
+            let fact = goal["execution_attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["kind"] == "tool_result" && f["name"] == "read_file")
+                .expect("精简执行事实必须保留名称和可回读引用");
+            (
+                goal["observations"][0]["reference"].clone(),
+                fact["reference"].clone(),
+            )
         };
         assert!(reference.is_string());
-        let reply = send(
-            &fixture.app,
-            &fixture.team,
-            "goal",
-            "original",
-            &format!(
-                "READ_ORIGINAL {}",
-                serde_json::json!({"reference":reference,"start":6,"limit":21})
-            ),
-        )
-        .await;
-        let page: serde_json::Value =
-            serde_json::from_str(reply["text"].as_str().unwrap().lines().next().unwrap()).unwrap();
-        assert!(page["content"]
-            .as_str()
-            .unwrap()
-            .starts_with("EXACT_ORIGINAL_MARKER"));
+        for (index, reference) in [reference, execution_reference].into_iter().enumerate() {
+            let reply = send(
+                &fixture.app,
+                &fixture.team,
+                "goal",
+                &format!("original-{index}"),
+                &format!(
+                    "READ_ORIGINAL {}",
+                    serde_json::json!({"reference":reference,"start":6,"limit":21})
+                ),
+            )
+            .await;
+            let page: serde_json::Value =
+                serde_json::from_str(reply["text"].as_str().unwrap().lines().next().unwrap())
+                    .unwrap();
+            assert!(page["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("EXACT_ORIGINAL_MARKER"));
+        }
     }
 
     #[tokio::test]
@@ -1545,5 +1557,149 @@ mod context_tests {
         assert!(fixture.model_seen.lock().await.last().unwrap()["messages"]
             .to_string()
             .contains("tool_result_preview"));
+    }
+
+    #[tokio::test]
+    async fn main_context_unrevert_after_restart_restores_uncompacted_history_to_model() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let mut fixture = main_fixture("context-original", "confirm").await;
+        std::fs::write(
+            fixture.workspace.path().join("large.txt"),
+            "ordinary result",
+        )
+        .unwrap();
+        assert_eq!(
+            send(
+                &fixture.app,
+                &fixture.team,
+                "unrevert",
+                "first",
+                "HISTORY_BEFORE_RESTART_FIRST"
+            )
+            .await["state"],
+            "complete"
+        );
+        assert_eq!(
+            send(
+                &fixture.app,
+                &fixture.team,
+                "unrevert",
+                "second",
+                "HISTORY_BEFORE_RESTART_SECOND"
+            )
+            .await["state"],
+            "complete"
+        );
+        let id = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "unrevert")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let history = request(
+            &fixture.app,
+            "GET",
+            &format!("/session/{id}/message"),
+            serde_json::json!({}),
+        )
+        .await;
+        request(
+            &fixture.app,
+            "POST",
+            &format!("/session/{id}/revert"),
+            serde_json::json!({"messageID":history[0]["info"]["id"]}),
+        )
+        .await;
+        let config = fixture.state.config.clone();
+        fixture.app = Router::new();
+        fixture.state = AppState::new(config);
+        let restarted = build_router(fixture.state.clone());
+        request(
+            &restarted,
+            "POST",
+            &format!("/session/{id}/unrevert"),
+            serde_json::json!({}),
+        )
+        .await;
+        fixture.model_seen.lock().await.clear();
+        assert_eq!(
+            send(
+                &restarted,
+                &fixture.team,
+                "unrevert",
+                "next",
+                "继续读取此前历史"
+            )
+            .await["state"],
+            "complete"
+        );
+        let requests = fixture.model_seen.lock().await;
+        let actual = requests.first().unwrap()["messages"].to_string();
+        assert!(
+            actual.contains("HISTORY_BEFORE_RESTART_FIRST")
+                && actual.contains("HISTORY_BEFORE_RESTART_SECOND"),
+            "取消回退后的模型应收到恢复的可见原历史：{actual}"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_context_large_result_preview_shrinks_for_an_actual_small_window() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("context-small-window", "confirm").await;
+        std::fs::write(
+            fixture.workspace.path().join("large.txt"),
+            "小窗口完整证据".repeat(2000),
+        )
+        .unwrap();
+        let answer = send(
+            &fixture.app,
+            &fixture.team,
+            "small-window",
+            "read",
+            "SMALL_WINDOW_PREVIEW",
+        )
+        .await;
+        let id = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "small-window")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let turns = request(
+            &fixture.app,
+            "GET",
+            &format!("/session/{id}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            answer["state"],
+            "complete",
+            "首次结果也应按实际窗口缩小：{answer}, turns={turns}, requests={}",
+            fixture.model_seen.lock().await.len()
+        );
+        let requests = fixture.model_seen.lock().await;
+        let preview = requests
+            .iter()
+            .filter(|r| r["stream"] == true)
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .find_map(|m| {
+                let content = m["content"].as_str()?;
+                let value: serde_json::Value = serde_json::from_str(content).ok()?;
+                (value["kind"] == "tool_result_preview").then_some(content)
+            })
+            .expect("模型应收到小窗口预览");
+        assert!(preview.chars().count() <= 1024 && preview.len() <= 4096);
     }
 }

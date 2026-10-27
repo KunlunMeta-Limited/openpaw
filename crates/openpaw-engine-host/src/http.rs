@@ -2333,11 +2333,15 @@ mod tests {
             ),
         ];
         let mut values = Vec::from(values);
-        if scenario.starts_with("context-loop") || scenario == "context-fixed-input" {
+        if scenario.starts_with("context-loop")
+            || matches!(scenario, "context-fixed-input" | "context-small-window")
+        {
             values.push((
                 "OPENPAW_MODEL_CAPABILITIES",
                 if scenario == "context-fixed-input" {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":4096}}}"#
+                } else if scenario == "context-small-window" {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":8192}}}"#
                 } else {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768}}}"#
                 }

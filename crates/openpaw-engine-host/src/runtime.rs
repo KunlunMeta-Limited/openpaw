@@ -3497,7 +3497,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     };
     let (mut generated, result) = {
         let mut session = handle.session.lock().await;
-        if let Some(context) = session.model_context.clone() {
+        {
+            let context = session.model_context.clone();
             let raw = handle
                 .message_cache
                 .read()
@@ -3505,7 +3506,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             openpaw_engine::context::restore_context(
                 &mut session,
                 &raw,
-                &[context],
+                context.as_slice(),
                 provider.name(),
                 &model,
             );

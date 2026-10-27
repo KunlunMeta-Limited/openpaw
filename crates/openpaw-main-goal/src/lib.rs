@@ -834,8 +834,21 @@ impl GoalContext {
             }
             for fact in facts {
                 let payload = &fact["payload"];
-                *fact = json!({"kind":fact["kind"],"turn_id":fact["turn_id"],"name":payload["name"],"disposition":payload["disposition"],
-                    "reference":format!("ctx:v1:{}",json!([self.owner,fact["turn_id"],fact["response_index"],payload["call_id"]]))});
+                let reference = (fact["kind"] == "tool_result").then(|| {
+                    format!(
+                        "ctx:v1:{}",
+                        json!([
+                            self.owner,
+                            fact["turn_id"],
+                            fact["response_index"],
+                            payload["call_id"]
+                        ])
+                    )
+                });
+                *fact = json!({"kind":fact["kind"],"turn_id":fact["turn_id"],"name":payload["name"],"disposition":payload["disposition"]});
+                if let Some(reference) = reference {
+                    fact["reference"] = json!(reference);
+                }
             }
             value["execution_attempt_count"] = json!(total);
         }
@@ -1922,7 +1935,7 @@ impl ToolExecutor for GoalToolHost {
             return Ok(ToolCallOutcome::error(error));
         }
         let value = match name {
-            "goal_read" => Ok(self.context.model_view(self.context.read())),
+            "goal_read" => Ok(self.context.read()),
             "goal_update" => self.context.update(args),
             _ => {
                 let mut outcome = self.inner.call(name, args.clone()).await?;

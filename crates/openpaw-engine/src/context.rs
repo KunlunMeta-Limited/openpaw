@@ -78,7 +78,7 @@ pub fn restore_context(
         raw.to_vec()
     };
     session.model_context = applicable.map(|(c, _)| c.clone());
-    project_history(&mut session.messages, &session.meta.id);
+    project_history(&mut session.messages, &session.meta.id, usize::MAX);
 }
 
 /// 功能：在稳定消息身份映射后封装本次可发布检查点。
@@ -135,6 +135,7 @@ pub fn remap_context(
 }
 
 /// 功能：入口校验可见性后返回的完整原始文本与成功状态。
+/// Stability: experimental；读取权限仍由入口负责。
 pub type OriginalReader =
     Arc<dyn Fn(&str) -> std::result::Result<(String, bool), String> + Send + Sync>;
 
@@ -151,6 +152,7 @@ pub fn record_reference(owner: &str, turn: &str, response: usize, call: &str) ->
 }
 
 /// 功能：保存已验证版本和会话归属的原件定位键，不包含读取许可。
+/// Stability: experimental；随版本化原件引用演进。
 pub struct OriginalRecordKey {
     /// 功能：可靠执行回合或消息、Goal命名空间。
     pub turn: String,
@@ -259,14 +261,22 @@ fn bounded_content(mut value: Value, text: &str, chars: usize, bytes: usize) -> 
 }
 
 /// 功能：只为模型裁剪工具副本，保留原件引用与准确大小。
-/// 参数：blocks为模型副本，owner/turn/response标识已可靠保存的调用。
+/// 参数：blocks为模型副本，owner/turn/response标识已可靠保存的调用，window为实际窗口。
 /// 返回：无。
 /// 错误：无；读取原件由入口独立校验。
 /// 状态：不修改真实generated和执行事实。
 /// 并发与取消：同步；必须在可靠记录成功后调用。
 /// 权限：只生成当前会话引用，不授权其他会话。
 /// 关联：AgentLoop工具批次续轮。
-pub fn project_results(blocks: &mut [ContentBlock], owner: &str, turn: &str, response: usize) {
+pub fn project_results(
+    blocks: &mut [ContentBlock],
+    owner: &str,
+    turn: &str,
+    response: usize,
+    window: usize,
+) {
+    let chars = (window / 8).clamp(128, 6000);
+    let bytes = (window / 2).clamp(1024, 24 * 1024);
     for block in blocks {
         if let ContentBlock::ToolResult {
             tool_use_id,
@@ -282,37 +292,55 @@ pub fn project_results(blocks: &mut [ContentBlock], owner: &str, turn: &str, res
                     name.as_deref(),
                     Some("read_context_record" | "goal_read" | "goal_update")
                 )
-                || (content.chars().count() <= 6000 && content.len() <= 24 * 1024)
+                || (content.chars().count() <= chars && content.len() <= bytes)
             {
                 continue;
             }
-            *content = bounded_content(
-                json!({"kind":"tool_result_preview","reference":record_reference(owner,turn,response,tool_use_id),
+            // 已投影的检查点再次缩小时保留原件定位与总量，不把预览当成新原件。
+            // 引用只供模型定位；实际读取仍须由入口验证归属及可见性。
+            let previous = serde_json::from_str::<Value>(content).ok().filter(|v| {
+                v["kind"] == "tool_result_preview"
+                    && v["reference"]
+                        .as_str()
+                        .is_some_and(|r| parse_reference(r, owner).is_ok())
+            });
+            let (metadata, text) = if let Some(previous) = previous {
+                let text = previous["content"].as_str().unwrap_or("").to_owned();
+                (previous, text)
+            } else {
+                (
+                    json!({"kind":"tool_result_preview","reference":record_reference(owner,turn,response,tool_use_id),
                 "total_chars":content.chars().count(),"total_bytes":content.len(),
                 "is_error":is_error,"truncated":true,"read":"read_context_record(reference,start=0,limit<=4096)"}),
-                content,
-                6000,
-                24 * 1024,
-            );
+                    content.clone(),
+                )
+            };
+            *content = bounded_content(metadata, &text, chars, bytes);
         }
     }
 }
 
 /// 功能：按稳定消息身份为旧完整历史建立有界模型副本。
-/// 参数：messages为模型消息，owner为授权会话。
+/// 参数：messages为模型消息，owner为授权会话，window为当前实际窗口。
 /// 返回：无。
 /// 错误：无；无UUID旧消息使用当前可见前缀位置建立稳定模型定位键。
 /// 状态：只更新副本，不重写transcript。
 /// 并发与取消：同步，调用方独占模型视图。
 /// 权限：读取时仍须验证消息当前可见。
 /// 关联：旧会话加载及检查点恢复。
-pub fn project_history(messages: &mut [Message], owner: &str) {
+pub fn project_history(messages: &mut [Message], owner: &str, window: usize) {
     for (index, message) in messages.iter_mut().enumerate() {
         if message.uuid.is_none() {
             message.uuid = Some(format!("legacy/{index}"));
         }
         if let Some(id) = &message.uuid {
-            project_results(&mut message.content, owner, &format!("message/{id}"), 0);
+            project_results(
+                &mut message.content,
+                owner,
+                &format!("message/{id}"),
+                0,
+                window,
+            );
         }
     }
 }

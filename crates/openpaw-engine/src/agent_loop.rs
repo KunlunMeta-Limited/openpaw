@@ -527,7 +527,14 @@ impl AgentLoop {
             context_progress,
         } = collection;
         if context_turn_id.is_some() {
-            crate::context::project_history(&mut session.messages, &session.meta.id);
+            crate::context::project_history(
+                &mut session.messages,
+                &session.meta.id,
+                provider_and_model
+                    .0
+                    .model_capabilities(&provider_and_model.1)
+                    .context_window as usize,
+            );
         }
         let current_intent = session
             .messages
@@ -852,6 +859,7 @@ impl AgentLoop {
                     &session.meta.id,
                     turn,
                     response_index - 1,
+                    provider.model_capabilities(&model).context_window as usize,
                 );
             }
             session.messages.push(model_message);

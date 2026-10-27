@@ -184,6 +184,14 @@ fn default_dirty() -> bool {
 }
 
 impl Session {
+    /// 功能：创建尚无消息、模型检查点或执行授权的独立会话。
+    /// 参数：model和provider为初始模型身份。
+    /// 返回：具有新会话身份及默认状态的Session。
+    /// 错误：无。
+    /// 状态：仅创建内存值，不写入会话记录。
+    /// 并发与取消：同步，不访问共享状态。
+    /// 权限：创建不表示允许执行工具或继续Goal。
+    /// 关联：CLI和Host的会话初始化。
     pub fn new(model: impl Into<String>, provider: impl Into<String>) -> Self {
         Self {
             meta: SessionMeta::new(model, provider),
