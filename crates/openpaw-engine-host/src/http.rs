@@ -522,14 +522,8 @@ fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response 
         })
         .flatten();
     let stream = futures::stream::unfold(
-        (
-            handle,
-            id,
-            None::<serde_json::Value>,
-            tokio::time::Instant::now() + Duration::from_secs(180),
-            cancel,
-        ),
-        |(handle, id, mut previous, deadline, cancel)| async move {
+        (handle, id, None::<serde_json::Value>, cancel),
+        |(handle, id, mut previous, cancel)| async move {
             if previous
                 .as_ref()
                 .is_some_and(|value| value["state"] != "pending")
@@ -555,14 +549,7 @@ fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response 
                     previous = Some(event.clone());
                     return Some((
                         Ok::<_, Infallible>(format!("{event}\n")),
-                        (handle, id, previous, deadline, cancel),
-                    ));
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    let event = serde_json::json!({"type":"snapshot","text":row["assistant"],"state":"error","message":"观察连接超时，请重新同步"});
-                    return Some((
-                        Ok(format!("{event}\n")),
-                        (handle, id, Some(event), deadline, cancel),
+                        (handle, id, previous, cancel),
                     ));
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -792,17 +779,12 @@ async fn main_conversation_chat(
     );
     let execution = handle.clone();
     tokio::spawn(async move {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
         loop {
             if execution
                 .turn_outcomes()
                 .iter()
                 .any(|outcome| outcome.turn_id == turn && outcome.state.is_terminal())
             {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                execution.cancel_main_turn(&turn);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -923,19 +905,10 @@ async fn main_chat(
         permissions,
         stop.clone(),
     );
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    let (timer_handle, timer_turn, timer_stop) = (handle.clone(), turn.clone(), stop.clone());
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = timer_stop.cancelled() => {},
-            _ = tokio::time::sleep_until(deadline) => {timer_handle.cancel_main_turn(&timer_turn);timer_stop.cancel();}
-        }
-    });
     let stream = MainChatStream {
         receiver,
         handle,
         turn,
-        deadline,
         stop,
         pending: std::collections::VecDeque::from([
             serde_json::json!({"type":"status","phase":"thinking"}),
@@ -952,11 +925,8 @@ async fn main_chat(
             if stream.terminal {
                 return None;
             }
-            let received = tokio::time::timeout_at(stream.deadline, stream.receiver.recv()).await;
-            match received {
-                Ok(Ok(event))
-                    if event.properties["sessionID"].as_str() == Some(&stream.handle.id) =>
-                {
+            match stream.receiver.recv().await {
+                Ok(event) if event.properties["sessionID"].as_str() == Some(&stream.handle.id) => {
                     let prefix = format!("prt_{}_{}_text", stream.handle.id, stream.turn);
                     if event.event_type == "message.part.delta"
                         && event.properties["partID"]
@@ -1005,9 +975,8 @@ async fn main_chat(
                         }
                     }
                 }
-                Ok(Ok(_)) => {}
-                Ok(Err(_)) => stream.fail("聊天事件连接中断"),
-                Err(_) => stream.fail("聊天超过 180 秒，已取消"),
+                Ok(_) => {}
+                Err(_) => stream.fail("聊天事件连接中断"),
             }
         }
     });
@@ -1025,7 +994,6 @@ struct MainChatStream {
     receiver: broadcast::Receiver<OpenCodeEvent>,
     handle: Arc<SessionHandle>,
     turn: String,
-    deadline: tokio::time::Instant,
     pending: std::collections::VecDeque<serde_json::Value>,
     terminal: bool,
     characters: usize,
@@ -2436,6 +2404,67 @@ mod tests {
         assert_eq!(
             std::fs::read(home.path().join("offices/registry.json")).unwrap(),
             b"broken registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_goal_unregistered_attempt_projection_recovers_without_losing_offices() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-isolation", "confirm").await;
+        let body = serde_json::json!({"version":"1.0","type":"send","teamId":fixture.team,"conversationId":"recovery","turnId":"plan","messages":[{"role":"user","content":"/goal 冷恢复投影"}]});
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pawoffice/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), 500_000).await.unwrap();
+        let record = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "recovery")
+            .unwrap()
+            .unwrap();
+        let handle = fixture
+            .state
+            .get_typed(record.session.as_ref().unwrap())
+            .await
+            .unwrap();
+        let registry = fixture.home.path().join("offices/registry.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        saved[&fixture.team]["snapshot"]["tasks"][0]["assigneeId"] =
+            "attempt-without-employee".into();
+        let snapshot = &saved[&fixture.team]["snapshot"];
+        crate::runtime::record_main_fact(&handle, serde_json::json!({"seq":snapshot["seq"],"employees":snapshot["employees"],"tasks":snapshot["tasks"]})).unwrap();
+        std::fs::write(&registry, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let recovered = AppState::new(fixture.state.config.clone());
+        let directory = recovered
+            .main_office
+            .directory()
+            .expect("真实Goal应修复派生投影而不是拒绝全部办公室");
+        assert_eq!(directory.len(), 1);
+        let tasks = directory[0]["tasks"].as_array().unwrap();
+        assert!(!tasks.is_empty());
+        assert!(tasks
+            .iter()
+            .all(|task| task["assigneeId"] != "attempt-without-employee"));
+        assert_eq!(
+            crate::runtime::latest_goal(fixture.home.path(), &handle.id)
+                .unwrap()
+                .unwrap()["phase"],
+            "draft"
         );
     }
 
@@ -4065,8 +4094,8 @@ Path('exclusive').rmdir()
     }
 
     #[tokio::test]
-    #[ignore = "实际等待 main 既有 180 秒期限；独立集成验收运行"]
-    async fn original_main_deadline_cancels_sleeping_child_and_joins_durable_terminal() {
+    #[ignore = "实际运行185秒后显式取消；独立集成验收运行"]
+    async fn main_chat_survives_180_seconds_and_explicit_cancel_joins_child() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
@@ -4076,18 +4105,42 @@ Path('exclusive').rmdir()
         let response = fixture
             .app
             .clone()
-            .oneshot(fixture.chat("安排子 Agent 等待，验证原始超时取消"))
+            .oneshot(fixture.chat("安排子 Agent 等待，验证长回合及显式取消"))
             .await
             .unwrap();
-        let body = tokio::time::timeout(
-            Duration::from_secs(185),
-            to_bytes(response.into_body(), 200_000),
+        let reader = tokio::spawn(to_bytes(response.into_body(), 200_000));
+        tokio::time::sleep(Duration::from_secs(185)).await;
+        assert!(!reader.is_finished(), "不能因180秒自动停止");
+        let parent = fixture
+            .state
+            .main_office
+            .record(&fixture.team)
+            .unwrap()
+            .session
+            .unwrap();
+        let status = child_test_json(
+            &fixture.app,
+            "GET",
+            "/session/status",
+            serde_json::json!({}),
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await;
+        assert!(status.get(&parent).is_some(), "父回合应仍在运行");
+        let cancelled = child_test_json(
+            &fixture.app,
+            "POST",
+            &format!("/session/{parent}/abort"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(cancelled, serde_json::json!(true));
+        let body = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(std::str::from_utf8(&body).unwrap().contains("error"));
-        assert!(started.elapsed() >= Duration::from_secs(179));
+        assert!(started.elapsed() >= Duration::from_secs(185));
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let status = child_test_json(
@@ -4105,13 +4158,6 @@ Path('exclusive').rmdir()
         })
         .await
         .unwrap();
-        let parent = fixture
-            .state
-            .main_office
-            .record(&fixture.team)
-            .unwrap()
-            .session
-            .unwrap();
         let sessions =
             child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
         let child = sessions
@@ -4143,8 +4189,8 @@ Path('exclusive').rmdir()
                 <= parent_turns[0]["completedAt"].as_i64().unwrap()
         );
         eprintln!(
-            "original timeout evidence: {}",
-            serde_json::json!({"elapsedSeconds":started.elapsed().as_secs(),"parentID":parent,"childID":child,"parentTurns":parent_turns,"childTurns":child_turns,"originalDeadlineSeconds":180})
+            "long main chat cancellation evidence: {}",
+            serde_json::json!({"elapsedSeconds":started.elapsed().as_secs(),"parentID":parent,"childID":child,"parentTurns":parent_turns,"childTurns":child_turns,"survivedPreviousDeadline":true,"explicitCancel":true})
         );
     }
 

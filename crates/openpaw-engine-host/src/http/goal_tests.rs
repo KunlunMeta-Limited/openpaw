@@ -2645,8 +2645,8 @@ mod goal_tests {
     }
 
     #[tokio::test]
-    #[ignore = "真实等待原 main 180 秒执行期限，独立运行"]
-    async fn main_goal_original_180_second_deadline_saves_pause_and_prevents_later_delivery() {
+    #[ignore = "真实运行185秒后显式取消，独立运行"]
+    async fn main_goal_survives_180_seconds_and_explicit_cancel_saves_pause() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
@@ -2662,14 +2662,24 @@ mod goal_tests {
         .await;
         let started = std::time::Instant::now();
         let response = lifecycle_start(&fixture, "execute").await;
-        let bytes = tokio::time::timeout(
-            Duration::from_secs(185),
-            to_bytes(response.into_body(), 1_000_000),
+        let reader = tokio::spawn(to_bytes(response.into_body(), 1_000_000));
+        wait_report(&fixture).await;
+        tokio::time::sleep(Duration::from_secs(185)).await;
+        assert!(!reader.is_finished(), "Goal执行及观察连接不能因180秒结束");
+        let cancelled = goal_request(
+            &fixture.app,
+            &fixture.team,
+            "resume",
+            serde_json::json!({"type":"cancel","turnId":"execute"}),
         )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(started.elapsed() >= Duration::from_secs(179));
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        let bytes = tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(185));
         let final_line = std::str::from_utf8(&bytes).unwrap().lines().last().unwrap();
         let final_snapshot: serde_json::Value = serde_json::from_str(final_line).unwrap();
         assert_ne!(final_snapshot["state"], "pending");
@@ -2698,8 +2708,8 @@ mod goal_tests {
         assert_eq!(history.status(), StatusCode::OK);
         assert_eq!(fixture.model_seen.lock().await.len(), calls);
         eprintln!(
-            "Goal original deadline evidence: {}",
-            serde_json::json!({"elapsedSeconds":started.elapsed().as_secs(),"originalDeadlineSeconds":180,"terminal":final_snapshot,"acceptedDataKept":true,"interruptedReportKept":true,"lateDeliveryAbsent":true,"reloadModelCalls":0})
+            "Goal long execution cancellation evidence: {}",
+            serde_json::json!({"elapsedSeconds":started.elapsed().as_secs(),"survivedPreviousDeadline":true,"explicitCancel":true,"terminal":final_snapshot,"acceptedDataKept":true,"interruptedReportKept":true,"lateDeliveryAbsent":true,"reloadModelCalls":0})
         );
     }
 

@@ -97,7 +97,8 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
         let summary = if source.is_empty() {summary} else {format!("{source}\n{summary}")};
         let summary = if summary.encode_utf16().count() > 1000 { format!("{}…完整条件与依赖见聊天计划。",projection_text(&summary,960)) } else { summary };
         let status = if ended { "failed" } else if waiting { "blocked" } else { match task["status"].as_str() { Some("accepted")=>"completed",Some("running")=>"running",Some("produced"|"interrupted"|"blocked"|"manual_blocked")=>"blocked",_=>"queued" } };
-        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":task.get("child_workspace_id").unwrap_or(&goal["session_id"]),"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {0},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
+        let assignee = task.get("child_workspace_id").unwrap_or(&goal["session_id"]).as_str().filter(|id| snapshot["employees"].as_array().into_iter().flatten().any(|employee| employee["id"] == *id)).unwrap_or("");
+        serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"goalId":goal["id"],"assigneeId":assignee,"title":task["title"],"status":status,"progress":if task["status"] == "accepted" {100} else {0},"updatedAt":chrono::Utc::now().to_rfc3339(),"summary":summary})
     }).collect());
     let status = match phase {
         "completed" => "completed",
@@ -373,16 +374,29 @@ impl MainOffice {
             for record in entry.all_mut() {
                 if record.snapshot["workspace"]["id"] != *team
                     || record.conversation.is_some() != record.session.is_some()
-                    || !Self::valid_facts(&record.snapshot)
                 {
+                    return Err("办公室记录结构损坏".into());
+                }
+                let previous = record.snapshot.clone();
+                let goal = match &record.session {
+                    Some(session) => crate::runtime::latest_goal(home, session)?,
+                    None => None,
+                };
+                // Goal日志是任务事实来源，先重建旧版可能引用未登记尝试的派生投影。
+                if let Some(goal) = &goal {
+                    apply_goal_projection(&mut record.snapshot, goal);
+                }
+                if !Self::valid_facts(&record.snapshot) {
                     return Err("办公室记录结构损坏".into());
                 }
                 let Some(session) = &record.session else {
                     continue;
                 };
-                let previous = record.snapshot.clone();
                 let mut revision = record.snapshot["seq"].as_u64().ok_or("办公室版本损坏")?;
-                if let Some(fact) = crate::runtime::latest_main_fact(home, session)? {
+                if let Some(mut fact) = crate::runtime::latest_main_fact(home, session)? {
+                    if let Some(goal) = &goal {
+                        apply_goal_projection(&mut fact, goal);
+                    }
                     if !Self::valid_facts(&fact) {
                         return Err("办公室执行事实损坏".into());
                     }
@@ -435,8 +449,8 @@ impl MainOffice {
                         task["updatedAt"] = Value::from(chrono::Utc::now().to_rfc3339());
                     }
                 }
-                if let Some(goal) = crate::runtime::latest_goal(home, session)? {
-                    apply_goal_projection(&mut record.snapshot, &goal);
+                if let Some(goal) = &goal {
+                    apply_goal_projection(&mut record.snapshot, goal);
                 }
                 if previous != record.snapshot || revision > previous["seq"].as_u64().unwrap_or(0) {
                     if revision >= 9_007_199_254_740_991 {
@@ -3201,6 +3215,18 @@ mod tests {
             office.record(&team).unwrap().snapshot["goal"]["id"],
             "old-goal"
         );
+    }
+
+    #[test]
+    fn goal_projection_assigns_only_registered_employees() {
+        let mut snapshot = serde_json::json!({"seq":1,"employees":[{"id":"owner","sceneActorId":"office-lead","name":"主Agent","online":false},{"id":"registered-child","sceneActorId":"","name":"子Agent","online":false}],"tasks":[]});
+        let goal = serde_json::json!({"id":"goal","session_id":"owner","phase":"active","tasks":[{"id":"local","title":"主任务"},{"id":"failed-attempt","title":"未登记尝试","child_workspace_id":"missing-child"},{"id":"delegated","title":"真实子任务","child_workspace_id":"registered-child"}]});
+        apply_goal_projection(&mut snapshot, &goal);
+        assert_eq!(snapshot["tasks"][0]["assigneeId"], "owner");
+        assert_eq!(snapshot["tasks"][1]["assigneeId"], "");
+        assert_eq!(snapshot["tasks"][2]["assigneeId"], "registered-child");
+        assert_eq!(goal["tasks"][1]["child_workspace_id"], "missing-child");
+        assert!(MainOffice::valid_facts(&snapshot));
     }
 
     #[tokio::test]
