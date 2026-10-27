@@ -665,16 +665,22 @@ impl MainOffice {
         let wire = self
             .conversation_wire
             .load(std::sync::atomic::Ordering::Acquire);
-        serde_json::to_vec(&serde_json::json!({"type":"offices.initialize",
-            "offices":records.values().map(|entry|self.display_snapshot(entry.snapshot(wire))).collect::<Vec<_>>()}))
-        .map(|bytes| bytes.len())
-        .map_err(|_| "办公室目录编码失败".into())
+        records
+            .values()
+            .map(|entry| {
+                serde_json::to_vec(&serde_json::json!({"type":"offices.initialize",
+                "offices":[self.display_snapshot(entry.snapshot(wire))]}))
+                .map(|bytes| bytes.len())
+                .map_err(|_| "办公室目录编码失败".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|sizes| sizes.into_iter().max().unwrap_or(0))
     }
 
     /// 功能：在创建子会话前原子预留已绑定办公室的成员容量。
     /// 参数：parent 为可信父会话身份。
     /// 返回：main 绑定父返回预留 guard；原 feature/OpenWork 独立父返回 None。
-    /// 错误：记录不可读、成员已达200或完整目录无法保留64KiB发布预算时明确拒绝。
+    /// 错误：记录不可读、成员已达200或单办公室无法保留64KiB发布预算时明确拒绝。
     /// 状态：仅增加暂存计数，既有员工包含主员工，不改变模型/进程额度。
     /// 并发与取消：所有创建使用原 records 锁；失败、取消和 future 丢弃释放 guard。
     /// 权限：不查询远端 Office，不因网络故障放开或拒绝名额。
@@ -708,7 +714,7 @@ impl MainOffice {
         if employees.len() + leader + record.child_reservations >= 200 {
             return Err("办公室成员容量已达200人（包含主员工），未创建或执行新子 Agent".into());
         }
-        // 协议同时限制成员数和整个请求字节数；预留新成员/任务及最多四个在途子回合的状态开销。
+        // 目录逐办公室发布；预留单帧新成员/任务及在途子回合的状态开销。
         // 不裁剪身份、清除业务事实或放大 main 的64KiB合同。
         if directory_bytes + (pending + 1) * 1000 + 4096 > 65536 {
             return Err("办公室快照发布容量不足（64 KiB），未创建或执行新子 Agent".into());
@@ -894,6 +900,11 @@ impl MainOffice {
             for field in ["employees", "tasks", "events"] {
                 record.snapshot[field] = serde_json::json!([]);
             }
+            record
+                .snapshot
+                .as_object_mut()
+                .expect("owned office snapshot")
+                .remove("goal");
             record.snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":"","status":"queued","tagline":"","description":"","note":"","link":{"label":"","url":""},"steps":[]});
             record.child_tasks.clear();
             record.child_reservations = 0;
@@ -1617,12 +1628,20 @@ impl MainOffice {
                     let status = if ready && (chat.is_none() || chat_registered) {
                         200
                     } else {
-                        let mut message =
-                            serde_json::json!({"type":"offices.initialize","offices":snapshots});
-                        if let Some(url) = chat {
-                            message["chat"] = serde_json::json!({"url":url.as_str()});
+                        // 原版Gateway和浏览器均增量合并目录；每个办公室独立满足单请求64KiB合同。
+                        let mut status = 200;
+                        for snapshot in snapshots {
+                            let mut message = serde_json::json!({"type":"offices.initialize","offices":[snapshot]});
+                            if let Some(url) = chat {
+                                message["chat"] = serde_json::json!({"url":url.as_str()});
+                            }
+                            let result = office.message(message, Duration::from_secs(3)).await?.0;
+                            if !matches!(result, 200 | 202) {
+                                return Err("main 初始化被拒绝".into());
+                            }
+                            status = status.max(result);
                         }
-                        office.message(message, Duration::from_secs(3)).await?.0
+                        status
                     };
                     if !matches!(status, 200 | 202) {
                         return Err("main 初始化被拒绝".into());
@@ -3079,6 +3098,110 @@ fn compact_topic(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use openpaw_engine::AgentEvent;
+
+    #[tokio::test]
+    async fn main_large_directory_publishes_all_offices_within_each_request_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(Mutex::new(
+            std::collections::BTreeMap::<String, Value>::new(),
+        ));
+        let captured = received.clone();
+        let server = tokio::spawn(async move {
+            let router = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    let data = match body["type"].as_str() {
+                        Some("office.capabilities") => serde_json::json!({"scene":{},"ui":{},"requests":{"properties":{"conversations":{}}},"responses":{"success":{},"error":{}}}),
+                        Some("ui.next") => { tokio::time::sleep(Duration::from_millis(20)).await; serde_json::json!({"actions":[]}) },
+                        _ => {
+                            if body["type"] == "offices.initialize" {
+                                assert!(serde_json::to_vec(&body).unwrap().len() <= 65536);
+                                for snapshot in body["offices"].as_array().unwrap() {
+                                    captured.lock().unwrap().insert(snapshot["workspace"]["id"].as_str().unwrap().into(), snapshot.clone());
+                                }
+                            }
+                            serde_json::json!({"offices":captured.lock().unwrap().values().map(|snapshot|serde_json::json!({"id":snapshot["workspace"]["id"],"name":snapshot["workspace"]["name"],"seq":snapshot["seq"],"runtimeReady":true,"taskCount":snapshot["conversations"][0]["tasks"].as_array().map_or(0,Vec::len)})).collect::<Vec<_>>(),"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}})
+                        }
+                    };
+                    axum::Json(serde_json::json!({"code":200,"msg":"OK","data":data}))
+                }
+            })).layer(axum::extract::DefaultBodyLimit::max(65536));
+            axum::serve(listener, router).await.unwrap();
+        });
+        let home = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let office = MainOffice::new(home.path(), first.path(), Some(format!("http://{address}")));
+        office.register(second.path()).unwrap();
+        {
+            let mut guard = office.records.lock().unwrap();
+            let records = guard.as_mut().unwrap();
+            for (index, record) in records.values_mut().enumerate() {
+                record.conversation = Some(format!("existing-{index}"));
+                record.session = Some(format!("owner-{index}"));
+                record.snapshot["tasks"] = serde_json::json!((0..20).map(|task|serde_json::json!({"id":format!("task-{task}"),"assigneeId":format!("owner-{index}"),"title":"保留历史任务","status":"blocked","progress":0,"updatedAt":"2026-10-27T00:00:00Z","summary":"s".repeat(1000)})).collect::<Vec<_>>());
+                record.snapshot["whiteboard"]["detail"] = "d".repeat(16000).into();
+            }
+            office.save(records).unwrap();
+        }
+        let original = office.directory().unwrap();
+        assert!(serde_json::to_vec(&original).unwrap().len() > 65536);
+        for snapshot in &original {
+            assert!(serde_json::to_vec(snapshot).unwrap().len() + 4096 < 65536);
+        }
+        let stop = tokio_util::sync::CancellationToken::new();
+        office.start(stop.clone());
+        let synchronized = tokio::time::timeout(Duration::from_secs(3), async {
+            while received.lock().unwrap().len() != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        stop.cancel();
+        server.abort();
+        synchronized.expect("目录累计超过64KiB时仍须逐办公室发布全部事实");
+        for snapshot in office.directory().unwrap() {
+            assert_eq!(
+                received.lock().unwrap()[snapshot["workspace"]["id"].as_str().unwrap()],
+                snapshot
+            );
+        }
+    }
+
+    #[test]
+    fn main_large_directory_binding_does_not_inherit_another_conversations_goal() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let office = MainOffice::new(
+            home.path(),
+            workspace.path(),
+            Some("http://127.0.0.1:1".into()),
+        );
+        let team = office.directory().unwrap()[0]["workspace"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        office.bind(&team, "old", "owner").unwrap();
+        {
+            let mut guard = office.records.lock().unwrap();
+            let records = guard.as_mut().unwrap();
+            records.get_mut(&team).unwrap().snapshot["goal"] =
+                serde_json::json!({"id":"old-goal","phase":"paused"});
+            office.save(records).unwrap();
+        }
+        office.bind(&team, "new", "new-owner").unwrap();
+        let record = office.conversation_record(&team, "new").unwrap().unwrap();
+        assert!(
+            record.snapshot.get("goal").is_none(),
+            "新会话不能继承旧Goal"
+        );
+        assert!(record.snapshot["tasks"].as_array().unwrap().is_empty());
+        assert_eq!(
+            office.record(&team).unwrap().snapshot["goal"]["id"],
+            "old-goal"
+        );
+    }
 
     #[tokio::test]
     async fn main_original_goal_activity_negotiate_and_preserve_binary_facts() {

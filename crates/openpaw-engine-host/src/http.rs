@@ -2440,6 +2440,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_large_directory_allows_first_chat_in_existing_and_new_workspaces() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("emoji", "confirm").await;
+        let another = tempdir().unwrap();
+        fixture.state.main_office.register(another.path()).unwrap();
+        let registry = fixture.home.path().join("offices/registry.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        for entry in saved.as_object_mut().unwrap().values_mut() {
+            entry["snapshot"]["tasks"] = serde_json::json!((0..20).map(|task|serde_json::json!({"id":format!("old-{task}"),"assigneeId":"","title":"既有任务","status":"blocked","progress":0,"updatedAt":"2026-10-27T00:00:00Z","summary":"s".repeat(1000)})).collect::<Vec<_>>());
+            entry["snapshot"]["whiteboard"]["detail"] = "d".repeat(16000).into();
+        }
+        std::fs::write(&registry, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut state = AppState::new(fixture.state.config.clone());
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            fixture.home.path(),
+            fixture.workspace.path(),
+            Some(
+                std::env::var("OPENPAW_OPENAI_BASE_URL")
+                    .unwrap()
+                    .trim_end_matches("/v1")
+                    .into(),
+            ),
+        );
+        state.office.attach_main(&state.main_office);
+        let app = build_router(state.clone());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pawoffice/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"fresh-workspace"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let _ = to_bytes(created.into_body(), 65536).await.unwrap();
+        let directory = state.main_office.directory().unwrap();
+        assert!(serde_json::to_vec(&directory).unwrap().len() > 65536);
+        for snapshot in directory {
+            let team = snapshot["workspace"]["id"].as_str().unwrap();
+            let body = serde_json::json!({"version":"1.0","type":"send","teamId":team,"conversationId":"fresh","turnId":"first","messages":[{"role":"user","content":"/goal continue"}]});
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/pawoffice/chat")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "大目录不能阻止新会话首次发送"
+            );
+            let bytes = to_bytes(response.into_body(), 500_000).await.unwrap();
+            let events = std::str::from_utf8(&bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(events.last().unwrap()["state"], "complete");
+            let record = state
+                .main_office
+                .conversation_record(team, "fresh")
+                .unwrap()
+                .unwrap();
+            assert!(record.session.is_some());
+        }
+        assert!(fixture.model_seen.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn main_conversation_chat_supports_history_replay_pagination_and_resume() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
