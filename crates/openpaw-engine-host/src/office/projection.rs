@@ -923,15 +923,17 @@ async fn prepare_internal(
                 else if confirmed.len()>1 {assignments.remove(&d.call_id);}
             }
             let mut recovered=std::collections::BTreeSet::new();
-            // 只合并被主角色用准确成功证据替代的失败尝试；相似标题不构成重试关系。
+            // 只合并被准确后续验收替代的终态尝试，包括未获验收的初稿。
+            // 已分别验收的成果不能互相覆盖；相似标题不构成修订关系。
             // 同角色、同父、同步骤缺一不可，旧Run/JSONL/派发事件仍保留。
-            for d in &delegations {
+            for (attempt_index,d) in delegations.iter().enumerate() {
                 let Some(index)=assignments.get(&d.call_id).copied() else {continue;};
                 let Some(step)=plan.as_ref().and_then(|p|p["steps"].get(index)) else {continue;};
                 if step["state"]!="completed" {continue;}
-                let failed=match read_run(&d.child_run) {Ok(c)=>c.state.is_terminal()&&c.state!=RunState::Completed,Err(e) if e.kind=="not_found"=>false,Err(e)=>return Err(e)};
-                if !failed {continue;}
-                for replacement in &delegations {
+                if step["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id)) {continue;}
+                let ended=match read_run(&d.child_run) {Ok(c)=>c.state.is_terminal(),Err(e) if e.kind=="not_found"=>false,Err(e)=>return Err(e)};
+                if !ended {continue;}
+                for replacement in delegations.iter().skip(attempt_index+1) {
                     if replacement.role_id!=d.role_id || assignments.get(&replacement.call_id)!=Some(&index) || !step["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&replacement.call_id)) {continue;}
                     if read_run(&replacement.child_run)?.state==RunState::Completed {
                         recovered.insert(d.call_id.clone());break;
@@ -948,23 +950,11 @@ async fn prepare_internal(
             let mut child_tasks=Vec::new();
             let mut child_events=Vec::new();
             let mut completed_children=0u64;
-            // 重试记录仍保留在账本和动态事件中，但一个Office人物只能有一张
-            // 当前任务卡。优先展示该角色最近的活动或成功尝试，全部失败时
-            // 才展示最近一次失败，避免一个人物被投影成多个Agent。
-            let mut display_calls=BTreeSet::new();
-            for role_id in delegations.iter().map(|d|d.role_id.as_str()).collect::<BTreeSet<_>>() {
-                let mut chosen=None;
-                for d in delegations.iter().rev().filter(|d|d.role_id==role_id) {
-                    let state=match read_run(&d.child_run) {
-                        Ok(child)=>child.state,
-                        Err(e) if e.kind=="not_found"=>continue,
-                        Err(e)=>return Err(e),
-                    };
-                    if state==RunState::Completed || !state.is_terminal() { chosen=Some(d.call_id.clone()); break; }
-                    chosen.get_or_insert_with(||d.call_id.clone());
-                }
-                if let Some(call_id)=chosen { display_calls.insert(call_id); }
-            }
+            // 人物身份唯一不代表任务身份唯一。同一角色顺序完成不同章节时，
+            // 原成功成果必须保留；只有准确证据替代的失败尝试才不再占卡片。
+            let display_calls:BTreeSet<_>=delegations.iter()
+                .filter(|d|!recovered.contains(&d.call_id))
+                .map(|d|d.call_id.clone()).collect();
             // Office 的 visit 动画是一次一个动作。若同一快照同时暴露多个
             // task.assigned，前端会在忙状态下拒绝后续动作，却已经把后续任务
             // 显示出来。按真实投影版本逐个放行：上一交接事件至少已经在一个
@@ -978,7 +968,7 @@ async fn prepare_internal(
             let pending_window = db.office_projection_handoff_until.contains_key(&team)
                 && prior_conv.and_then(|c| c["tasks"].as_array()).is_some_and(|tasks| {
                     tasks.iter().any(|task| task["id"] == main_id
-                        && task["summary"] == "回复已结束；正在依次展示后续成员交接")
+                        )
                 });
             let history_revision = previous_source_revision.or_else(|| prior.map(|_| source_revision));
             let resume_completed_handoff = r.state.is_terminal() && !pending_window
@@ -1024,21 +1014,32 @@ async fn prepare_internal(
                 let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
                 let superseded=recovered.contains(&d.call_id);
                 let done=state=="completed";
+                // 正式业务卡以父计划的准确委派验收为准；子执行计划是未验收时的阶段展示。
+                // 文件验收仍由原Store核验实际子写入/路径，不能凭正文或终态跳过。
+                let (child_steps_view, child_percent)=match &child {
+                    Some(c)=>crate::task_progress::project(db.progress(&c.run_id)?,c)?,
+                    None=>(Vec::new(),0),
+                };
                 let verified=done && plan.as_ref().map(|p|p["steps"].as_array().into_iter().flatten().any(|s|
                     s["state"]=="completed" && s["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id))
-                )).unwrap_or(r.state==RunState::Completed);
-                // 子Run可能已经完成，但在Office交接窗口中尚未公开给浏览器。
-                // 主卡进度必须按“已展示且已完成”的成员计算；否则所有子Run
-                // 会在第一张人物卡出现时把主卡直接推到83%，与人物动画和
-                // 白板步骤不一致。最终一项交接公开后由delivered补齐100%。
-                if show_card && handoff_visible {
-                    completed_children += u64::from(done);
-                }
+                )).unwrap_or(r.state==RunState::Completed && child_percent==100);
+                // 进度统计业务核验，不统计动画排队；无证据不按时间虚增。
+                if show_card { completed_children += u64::from(verified); }
                 let summary=if let Some(c)=&child {
-                    if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {"子任务未完成，已保存真实结果".into()}
-                    else if state=="blocked" {"等待确认、资源或清理".into()} else {"正在独立处理此任务".into()}
+                    if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {super::turns::message(c)}
+                    else if state=="blocked" {"等待确认、资源或清理".into()}
+                    else if let Some(step)=child_steps_view.iter().find(|s|s["status"]=="running") {
+                        format!("正在{}；已核验进度{child_percent}%",step["title"].as_str().unwrap_or("处理任务"))
+                    } else if let Some(tool)=c.tools.iter().rev().find(|t|t.state=="running") {
+                        match tool.tool_name.as_str() {
+                            "web_search"=>"正在检索公开资料", "web_fetch"=>"正在核对来源正文",
+                            "read_file"|"glob"|"grep"=>"正在读取工作区资料",
+                            "write_file"|"edit_file"=>"正在保存文档", "think"=>"正在分析整理",
+                            _=>"正在执行已授权操作",
+                        }.into()
+                    } else {"正在分析并组织下一步；尚无新增核验进度".into()}
                 } else if r.state.is_terminal() {"委派中断，未接受执行；不会自动重放".into()} else {"已登记委派，等待接受执行".into()};
-                let mut item=task(d.task_id.clone(),d.title.clone(),if done&&!verified{"blocked"}else{state},if done&&!verified{"独立执行已结束，结果待主角色核验".into()}else{summary},&old,&now,if done{100}else{0});
+                let mut item=task(d.task_id.clone(),d.title.clone(),if done&&!verified{"blocked"}else{state},if done&&!verified{"独立执行已结束，结果待主角色核验".into()}else{summary},&old,&now,if verified{100}else{child_percent});
                 item["assigneeId"]=json!(role.employee);
                 // 开始关联只是待核验提示；只有确认后的一对一证据才复用业务卡片。
                 let linked=assignments.get(&d.call_id).copied().filter(|i| {
@@ -1107,10 +1108,9 @@ async fn prepare_internal(
             if !delegations.is_empty() {
                 let required_children=display_calls.len() as u64;
                 let handoff_pending=display_calls.iter().any(|call| !handoff_ready.contains(call));
-                let delivered=r.state==RunState::Completed && !handoff_pending && completed_children==required_children;
+                let delivered=r.state==RunState::Completed && completed_children==required_children;
                 let child_percent=(completed_children+u64::from(delivered))*100/(required_children+1);
                 percent=if steps.is_empty() {child_percent}else{percent.min(child_percent)};
-                if handoff_pending { percent=percent.min(99); }
                 handoff_pending_any |= handoff_pending;
             }
             let child_blocked=all_child_blocked || child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="blocked");
@@ -1123,15 +1123,18 @@ async fn prepare_internal(
                 RunState::TimedOut|RunState::Failed=>super::turns::message(&r),
                 RunState::Cancelling=>"正在停止，等待实际操作清理".to_owned(),
                 RunState::Completed if child_failed=>"回复已结束；仍有未恢复的子任务失败，已完成部分保留".to_owned(),
-                RunState::Completed if handoff_pending=>"回复已结束；正在依次展示后续成员交接".to_owned(),
                 RunState::Completed if percent<100=>"回复已结束；已完成部分保留，其余待核验或继续处理".to_owned(),
                 RunState::Completed=>"本次目标已完成".to_owned(),
                 _ if child_blocked=>"子任务等待确认、核验或可用资源".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
-                _=>"正在处理你的请求".to_owned(),
+                _=>steps.iter().find(|s|s["status"]=="running").map(|s|
+                    format!("正在{}；已核验进度{percent}%",s["title"].as_str().unwrap_or("处理任务")))
+                    .or_else(||child_tasks.iter().chain(child_steps.values()).find(|t|t["status"]=="running")
+                        .map(|t|format!("{}；已核验总进度{percent}%",t["summary"].as_str().unwrap_or("团队正在处理"))))
+                    .unwrap_or_else(||"正在分析并组织下一步；尚无新增核验进度".to_owned()),
             };
-            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && (percent<100 || handoff_pending) || !r.state.is_terminal() && (child_blocked || handoff_pending || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
             let mut tasks=vec![task(main_id,dto::bounded(&input,80),main_state,summary.clone(),&old,&now,percent)];
             for (index,step) in steps.into_iter().enumerate() {
                 if let Some(child)=child_steps.remove(&index) {tasks.push(child);continue;}
@@ -1991,6 +1994,433 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sequential_member_work_keeps_real_progress_results_and_terminal_independent_of_animation(
+    ) {
+        use openpaw_llm::{MockMode, MockProvider};
+        struct Gate {
+            inner: MockProvider,
+            requests: std::sync::atomic::AtomicUsize,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl openpaw_core::LlmProvider for Gate {
+            async fn complete(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+                self.inner.complete(request).await
+            }
+            async fn stream(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    openpaw_core::Result<openpaw_core::StreamEvent>,
+                >,
+            > {
+                if self
+                    .requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 5
+                {
+                    self.entered.notify_one();
+                    self.release.acquire().await.unwrap().forget();
+                }
+                self.inner.stream(request).await
+            }
+            fn capabilities(&self) -> openpaw_core::Capabilities {
+                self.inner.capabilities()
+            }
+            fn default_model(&self) -> &str {
+                self.inner.default_model()
+            }
+            fn name(&self) -> &str {
+                "sequential-member-fixture"
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("brief.md"), "真实工作区资料").unwrap();
+        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+        let call = |name: &str, input| MockMode::ToolUse {
+            tool_name: name.into(),
+            input,
+            text: String::new(),
+        };
+        let provider = std::sync::Arc::new(Gate {
+            inner: MockProvider::scripted(vec![
+                call(
+                    "delegate_task",
+                    json!({"role_id":"research","title":"核验第一部分","instructions":"读取brief.md并整理","acceptance":"真实读取"}),
+                ),
+                call(
+                    "report_progress",
+                    json!({"type":"create","steps":[{"id":"read","title":"读取资料"},{"id":"summary","title":"整理第一部分"}]}),
+                ),
+                call("read_file", json!({"path":"brief.md"})),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"read","state":"completed","evidenceCallIds":["call_2"]}),
+                ),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"summary","state":"in_progress"}),
+                ),
+                MockMode::Fixed("第一部分已核验完成".into()),
+                call(
+                    "delegate_task",
+                    json!({"role_id":"research","title":"整理第二部分","instructions":"独立整理下一部分，不重复前项","acceptance":"实际正文"}),
+                ),
+                MockMode::Fixed("第二部分真实成果".into()),
+                MockMode::Fixed("两个部分均已取得".into()),
+            ]),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let host = Host::with_provider(config, provider.clone()).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "sequential-member".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        host.submit_run(
+            &scope,
+            &binding.session_id,
+            "请同一成员依次处理两个部分".into(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+            .await
+            .unwrap();
+        let office = OfficeConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "PAWOFFICE_TEST_KEY".into(),
+            allowed_origins: vec!["http://127.0.0.1:8765".into()],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        let pending = prepare(&host, &office, "office-1").await.unwrap();
+        let tasks = pending["conversations"][0]["tasks"].as_array().unwrap();
+        let child = tasks
+            .iter()
+            .find(|t| t["assigneeId"] == "code-agent")
+            .unwrap();
+        assert_eq!(
+            child["progress"], 33,
+            "一项真实读取完成、整理尚在途，不能只报0或随时间增长"
+        );
+        assert!(child["summary"].as_str().unwrap().contains("整理第一部分"));
+        provider.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+            .await
+            .unwrap();
+        let ended = prepare(&host, &office, "office-1").await.unwrap();
+        assert_eq!(
+            ended["conversations"][0]["tasks"][0]["status"], "completed",
+            "业务全部核验后不因视觉队列标为blocked"
+        );
+        assert_eq!(ended["conversations"][0]["tasks"][0]["progress"], 100);
+        let final_snapshot = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                let s = prepare(&host, &office, "office-1").await.unwrap();
+                if s["conversations"][0]["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|t| t["assigneeId"] == "code-agent")
+                    .count()
+                    == 2
+                {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for task in final_snapshot["conversations"][0]["tasks"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(task["status"], "completed");
+            assert_eq!(task["progress"], 100);
+        }
+        assert_eq!(
+            final_snapshot["conversations"][0]["whiteboard"]["status"],
+            "completed"
+        );
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_parent_acceptance_converges_internal_child_plan_but_cannot_fake_file_or_missing_acceptance(
+    ) {
+        use openpaw_llm::{MockMode, MockProvider};
+        for (title, confirm, accepted) in [
+            ("核对给定正文", true, true),
+            ("核对给定正文", false, false),
+            ("保存notes.md", true, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+            let call = |name: &str, input| MockMode::ToolUse {
+                tool_name: name.into(),
+                input,
+                text: String::new(),
+            };
+            let mut script = vec![
+                call(
+                    "report_progress",
+                    json!({"type":"create","steps":[{"id":"accept","title":title}]}),
+                ),
+                call(
+                    "delegate_task",
+                    json!({"role_id":"organize","title":"检查给定正文","instructions":"对提供正文进行有边界的逻辑核验","acceptance":"返回实际核验结论","context":"给定正文及目标"}),
+                ),
+                call(
+                    "report_progress",
+                    json!({"type":"create","steps":[{"id":"internal","title":"核定给定材料的约束"}]}),
+                ),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"internal","state":"in_progress"}),
+                ),
+                MockMode::Fixed("实际正文核验结果与限制".into()),
+            ];
+            if confirm {
+                script.push(call("report_progress",json!({"type":"update","stepId":"accept","state":"completed","evidenceCallIds":["call_1"]})));
+            }
+            script.push(MockMode::Fixed("父任务已收到核验结果；文件未写入".into()));
+            let host =
+                Host::with_provider(config, std::sync::Arc::new(MockProvider::scripted(script)))
+                    .await
+                    .unwrap();
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "accept-internal".into(),
+            };
+            let binding = host.open_session(scope.clone()).await.unwrap();
+            host.submit_run(
+                &scope,
+                &binding.session_id,
+                "安排核验后按真实成果验收".into(),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+                .await
+                .unwrap();
+            let office = OfficeConfig {
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "PAWOFFICE_TEST_KEY".into(),
+                allowed_origins: vec!["http://127.0.0.1:8765".into()],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            let conv = &snapshot["conversations"][0];
+            assert_eq!(
+                conv["tasks"][0]["status"],
+                if accepted { "completed" } else { "blocked" },
+                "{title}; confirm={confirm}"
+            );
+            assert_eq!(conv["tasks"][0]["progress"] == 100, accepted);
+            let child = conv["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["assigneeId"] == "file-agent")
+                .unwrap();
+            assert_eq!(
+                child["status"],
+                if accepted { "completed" } else { "blocked" }
+            );
+            assert_eq!(child["progress"] == 100, accepted);
+            assert!(!root.join("notes.md").exists());
+            host.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_revision_replaces_only_the_same_step_unaccepted_draft() {
+        use openpaw_llm::{MockMode, MockProvider};
+        for accept_both in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+            let call = |name: &str, input| MockMode::ToolUse {
+                tool_name: name.into(),
+                input,
+                text: String::new(),
+            };
+            let provider = MockProvider::scripted(vec![
+                call(
+                    "report_progress",
+                    json!({"type":"create","steps":[{"id":"draft","title":"输出短文"}]}),
+                ),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"draft","state":"in_progress"}),
+                ),
+                call(
+                    "delegate_task",
+                    json!({"role_id":"draft","title":"输出初稿","instructions":"独立撰写短文","acceptance":"有界正文"}),
+                ),
+                MockMode::Fixed("实际初稿，等待父角色核验".into()),
+                call(
+                    "delegate_task",
+                    json!({"role_id":"draft","title":"压缩初稿","instructions":"缩短已返回的初稿","context":"实际初稿，等待父角色核验","acceptance":"有界修订正文"}),
+                ),
+                MockMode::Fixed("实际压缩后的修订正文".into()),
+                call(
+                    "report_progress",
+                    json!({"type":"update","stepId":"draft","state":"completed","evidenceCallIds":if accept_both {json!(["call_2","call_4"])}else{json!(["call_4"])}}),
+                ),
+                MockMode::Fixed("已核验实际交付".into()),
+            ]);
+            let host = Host::with_provider(config, std::sync::Arc::new(provider))
+                .await
+                .unwrap();
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "revised-draft".into(),
+            };
+            let binding = host.open_session(scope.clone()).await.unwrap();
+            let run = host
+                .submit_run(&scope, &binding.session_id, "先审初稿，再验收修订".into())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+                .await
+                .unwrap();
+            let office = OfficeConfig {
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "PAWOFFICE_TEST_KEY".into(),
+                allowed_origins: vec!["http://127.0.0.1:8765".into()],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let snapshot = tokio::time::timeout(Duration::from_secs(6), async {
+                loop {
+                    let s = prepare(&host, &office, "office-1").await.unwrap();
+                    let count = s["conversations"][0]["tasks"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|t| t["assigneeId"] == "app-agent")
+                        .count();
+                    if count == if accept_both { 2 } else { 1 } {
+                        break s;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let conv = &snapshot["conversations"][0];
+            assert_eq!(
+                conv["tasks"][0]["status"], "completed",
+                "accept_both={accept_both}; {snapshot}"
+            );
+            assert_eq!(conv["tasks"][0]["progress"], 100);
+            assert_eq!(conv["whiteboard"]["status"], "completed");
+            assert!(conv["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|t| t["status"] == "completed" && t["progress"] == 100));
+            assert_eq!(
+                conv["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["kind"] == "task.assigned")
+                    .count(),
+                2,
+                "原派发事实不删除"
+            );
+            host.inner
+                .store
+                .call(move |db| {
+                    let ds = db.delegations(&run.run_id)?;
+                    assert_eq!(ds.len(), 2, "不修改原委派账本");
+                    for d in ds {
+                        assert_eq!(db.get_run(&d.child_run)?.state, RunState::Completed);
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            host.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn child_generated_text_does_not_complete_an_unwritten_file_plan() {
+        use openpaw_llm::{MockMode, MockProvider};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+        let provider = MockProvider::scripted(vec![
+            MockMode::ToolUse {
+                tool_name: "delegate_task".into(),
+                input: json!({"role_id":"draft","title":"整理记录","instructions":"生成有界记录","acceptance":"真实文件"}),
+                text: String::new(),
+            },
+            MockMode::ToolUse {
+                tool_name: "report_progress".into(),
+                input: json!({"type":"create","steps":[{"id":"save","title":"保存notes.md"}]}),
+                text: String::new(),
+            },
+            MockMode::Fixed("已生成正文，但没有写文件权限".into()),
+            MockMode::Fixed("已收到正文".into()),
+        ]);
+        let host = Host::with_provider(config, std::sync::Arc::new(provider))
+            .await
+            .unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "unwritten".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        host.submit_run(&scope, &binding.session_id, "整理并保存".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+            .await
+            .unwrap();
+        let office = OfficeConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "PAWOFFICE_TEST_KEY".into(),
+            allowed_origins: vec!["http://127.0.0.1:8765".into()],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        let s = prepare(&host, &office, "office-1").await.unwrap();
+        let tasks = s["conversations"][0]["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 2);
+        for task in tasks {
+            assert_eq!(task["status"], "blocked");
+            assert!(task["progress"].as_u64().unwrap() < 100);
+        }
+        assert_ne!(s["conversations"][0]["whiteboard"]["status"], "completed");
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn consecutive_delegations_use_their_precise_completed_step_without_duplicate_cards() {
         use openpaw_llm::{MockMode, MockProvider};
         // 在真实Provider等待边界冻结运行，避免只测终态而遗漏用户可见的临时重置。
@@ -2490,7 +2920,25 @@ mod tests {
                 names: Default::default(),
                 creation_slots: vec![],
             };
-            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            // 未核验重试保留原失败尝试；等待独立成功卡按既有展示窗口出现。
+            let snapshot = tokio::time::timeout(Duration::from_secs(6), async {
+                loop {
+                    let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+                    if snapshot["conversations"][0]["events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e["kind"] == "task.assigned")
+                        .count()
+                        >= if retry && !confirm { 2 } else { 1 }
+                    {
+                        break snapshot;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap();
             let conv = &snapshot["conversations"][0];
             // 动态按观察时间排序，首条不再必然是最近派工；用持久委派ID精确对账。
             let session_id = session.session_id.clone();
@@ -2521,7 +2969,13 @@ mod tests {
             assert_eq!(latest_assignment["kind"], "task.assigned");
             assert_eq!(
                 conv["tasks"].as_array().unwrap().len(),
-                if confirm { 3 } else { 4 },
+                if confirm {
+                    3
+                } else if retry {
+                    5
+                } else {
+                    4
+                },
                 "有准确证据才合并；不能按相似任务标题猜测关联"
             );
             if confirm {
@@ -2533,7 +2987,10 @@ mod tests {
                 assert_eq!(conv["tasks"][1]["assigneeId"], "code-agent");
                 assert_eq!(latest_assignment["taskId"], conv["tasks"][1]["id"]);
             } else {
-                assert_eq!(conv["tasks"][0]["status"], "blocked");
+                assert_eq!(
+                    conv["tasks"][0]["status"],
+                    if retry { "failed" } else { "blocked" }
+                );
                 assert!(conv["tasks"][0]["progress"].as_u64().unwrap() < 100);
                 assert_eq!(
                     conv["tasks"][1]["status"], "blocked",
@@ -2546,10 +3003,18 @@ mod tests {
                         .iter()
                         .filter(|t| t["assigneeId"] == "code-agent")
                         .collect();
-                    assert_eq!(attempts.len(), 1, "同一人物的重试不能投影为第二个Agent");
                     assert_eq!(
-                        attempts[0]["status"], "blocked",
+                        attempts.len(),
+                        2,
+                        "无准确替代证据时保留两次真实任务，不抹去失败尝试"
+                    );
+                    assert!(
+                        attempts.iter().any(|t| t["status"] == "blocked"),
                         "后次真实执行结束仍待业务核验"
+                    );
+                    assert!(
+                        attempts.iter().any(|t| t["status"] == "failed"),
+                        "未明确替代的真实失败不能被抹去"
                     );
                     assert!(
                         conv["events"].as_array().unwrap().iter().any(|event| {
@@ -2562,7 +3027,9 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .position(|task| task["assigneeId"] == "code-agent")
+                    .position(|task| {
+                        task["assigneeId"] == "code-agent" && task["status"] == "blocked"
+                    })
                     .unwrap();
                 assert_eq!(
                     latest_assignment["taskId"],

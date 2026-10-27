@@ -246,7 +246,7 @@ impl Db {
     /// 错误：范围、取消、假完成、容量或存储失败明确拒绝。
     /// 状态：每Run最多256次有效报告，原host_events保留固定分母和证据。
     /// 并发与取消：状态检查和追加处于原Store单写命令，不等待审批或工作区锁。
-    /// 权限：仅Office绑定的同Run report_progress，不批准其他工具。
+    /// 权限：仅Office或其持久委派子Run的report_progress，不批准其他工具。
     /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn report_progress(
         &mut self,
@@ -254,10 +254,11 @@ impl Db {
         value: &serde_json::Value,
     ) -> HostResult<()> {
         let run = self.get_run(&binding.run_id)?;
-        if self.binding(&run.session_id)?.scope.namespace != "office"
-            || binding.tool_name != "report_progress"
-            || binding.input != *value
-        {
+        let owner = self.binding(&run.session_id)?;
+        let office_run = owner.scope.namespace == "office"
+            || owner.scope.namespace == "host-agent"
+                && self.delegation_for_child(&run.run_id)?.is_some();
+        if !office_run || binding.tool_name != "report_progress" || binding.input != *value {
             return Err(HostError::new(
                 "scope_denied",
                 "步骤报告不属于当前Office运行",

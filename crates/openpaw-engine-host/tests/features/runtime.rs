@@ -1305,7 +1305,7 @@ async fn d90_empty_child_fails_and_explicit_retry_preserves_role_and_budget_rule
             } else if lead {
                 (
                     vec![ContentBlock::Text {
-                        text: "已取得赵审真实复核正文；重复成功委派被拒".into(),
+                        text: "已取得赵审两次真实复核正文".into(),
                     }],
                     StopReason::EndTurn,
                 )
@@ -1318,7 +1318,10 @@ async fn d90_empty_child_fails_and_explicit_retry_preserves_role_and_budget_rule
             } else {
                 (
                     vec![ContentBlock::Text {
-                        text: "明确给出实际核验结果".into(),
+                        text: format!(
+                            "明确给出实际核验结果{}尾部完整标记",
+                            "可核验正文".repeat(1500)
+                        ),
                     }],
                     StopReason::EndTurn,
                 )
@@ -1370,8 +1373,8 @@ async fn d90_empty_child_fails_and_explicit_retry_preserves_role_and_budget_rule
     let delegations = delegated(&cfg.home, &parent.run_id);
     assert_eq!(
         delegations.len(),
-        2,
-        "只允许失败后的显式重试，成功后不重复创建"
+        3,
+        "失败可显式重试，成功后可顺序分配不同任务"
     );
     for (i, d) in delegations.iter().enumerate() {
         let run = host
@@ -1422,14 +1425,15 @@ async fn d90_empty_child_fails_and_explicit_retry_preserves_role_and_budget_rule
             vec![
                 ("audit-attempt-0", true),
                 ("audit-attempt-1", false),
-                ("audit-attempt-2", true)
+                ("audit-attempt-2", false)
             ]
         );
         assert!(results[0].2.contains("输出额度"));
-        assert!(results[2].2.contains("已被分配"));
+        assert!(results[1].2.contains("尾部完整标记"));
+        assert!(results[2].2.contains("尾部完整标记"));
         assert_eq!(
             provider.children.load(std::sync::atomic::Ordering::SeqCst),
-            2
+            3
         );
     }
     host.shutdown().await.unwrap();

@@ -194,14 +194,24 @@ async fn dispatch(
         // 业务删除不随UI60秒期限回滚；成功响应必须在服务端最新快照移除后。
         host.delete_session(&scope).await?;
         let sync = projection::sync_for_ui(host, config, &scope.slot_id, client, address);
-        tokio::select! {_=cancel.cancelled()=>return Err(HostError::new("ui_expired","已删除，UI未确认")),r=sync=>{r?;}}
-        let (_, read) = client
-            .post(json!({"type":"office.read","teamId":scope.slot_id}))
+        let accepted = tokio::select! {_=cancel.cancelled()=>return Err(HostError::new("ui_expired","已删除，UI未确认")),r=sync=>r?};
+        // snapshot的缓存/应用回执已经确认服务端接收该持久版本；额外office.read
+        // 要再等待浏览器场景回执，页面切换或断线可让真实删除无故超时。
+        // 只核对已接受版本中确实没有目标，不把cached宣称为页面已应用。
+        let team = scope.slot_id.clone();
+        let conversation = scope.conversation_id.clone();
+        let removed = host
+            .inner
+            .store
+            .call(move |db| {
+                Ok(db.office_projection(&team)?.is_some_and(|(snapshot, _)| {
+                    snapshot["conversations"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(|item| item["id"] != conversation))
+                }))
+            })
             .await?;
-        if read["snapshot"]["conversations"]
-            .as_array()
-            .is_none_or(|v| v.iter().any(|c| c["id"] == scope.conversation_id))
-        {
+        if !matches!(accepted.as_str(), "applied" | "cached" | "ignored") || !removed {
             return Err(HostError::new(
                 "snapshot_required",
                 "已删除，等待服务端完整快照移除",
