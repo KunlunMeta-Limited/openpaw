@@ -1,5 +1,12 @@
 # OpenPaw 接入 Office：协议约束、交互设计与 T0—T8 实施计划
 
+2026-10-27 当前入口：Office 已原样更新并部署 `ff9f6b7d6447665be459f077109c6224789e5f3c`；两份用户架构文档保留，无自定义 Office 修改。OpenPaw 主开发目录和分支不变，候选 `724836175d08d4ab637f32c33dc0437ab3ebda9a` 已部署真实 DeepSeek；运行端口 8765/32885，PID/健康以 `scripts/openpaw-office.sh status` 为准。原 CHG-2026-0007 §12.82—12.83 为本轮范围和真实发现 D97—D100。
+
+真实网页首验复现主/五子 completed、文件落盘但 66%：已定位并修复同一步追加第二位同事核验证据被拒绝。修复后第一轮真实五角色/保存/任务中心与白板详情 100% 已通过，原失败不删除。真实地图册续问、刷新、完整 27 项与原始失败/重验统一查 `/home/cheng/.cache/openpaw-office-upstream-20261027/closure.json` 及其指向的 report/截图/trace；报告未形成或非通过不得计通过。Office R22（人物/墙面曲线）、R19（首页完成卡）、R24（忙色）、R16（严格到达 ACK）仍未批准、未实施，不以 Host 终态一致代替这些行为已修复。T7 未开始，Windows 原生继续暂缓。
+
+下方旧日期、提交和进程均是历史记录，不能用作当前部署或新候选通过证据。
+
+
 2026-10-26 当前补修入口：PR #13已合入`a26fa85a`，当前分支`fix/engine-host-t6-followup`继续D81—D91修复；T7未开始。D89绑定交接生命周期和准确父任务并修复64KiB历史阻塞；D90拒绝空/截断结果冒充完成，并在原共享硬预算内复用Provider声明的单次上限；D91修复删除动作被自身UI优先规则阻止确认。最新真实DeepSeek一主五子及六成员详情已取证，但本轮100单+100多及完整产品74条已通过，完整27项25通过、2治理项待r10准确审核，准确证据见原0007，不能沿用下方旧版本通过。原CHG0007 §12.57—12.61保存原因、方案、失败及范围归并；Office未修改，R21已由Host D91修复且真实UI通过，Office申请撤回；其他Rx仍暂缓，Windows原生未验证。
 
 当前演示仍在`http://127.0.0.1:8765/office/`；Host为32885、PID2908616、冻结D91程序hash `f80229f1…`。已无活动任务时停写备份升级，同一真实DeepSeek原会话只读复访passed，六成员113—158ms；没有重发收费任务。部署/备份见`/home/cheng/.cache/openpaw-d91-live-20261026/runtime.json`，复访及41个REQUEST_CLOSED/410的准确分类见`/home/cheng/.cache/openpaw-d91-live-revisit-b-20261026/`。不得沿用下文历史41949进程；全部测试与准确候选状态仍见原0007。
@@ -86,8 +93,8 @@ sequenceDiagram
 | 对象 | 固定基线 | 用途与状态 |
 |---|---|---|
 | OpenPaw 初始审核 | 60a531a51172d14fc3db1a8e7eb6762c2c8369d8 | 引擎、Provider、工具、存储可复用；Host 当时只有占位说明 |
-| OpenPaw 当前集成基线 | 37f0a35729fb64639f0e1a8b8a8a4799e1dca9d3 | T0—T4已合入（T4 #10）；T5独立分支复用此基线，Windows暂缓；当前状态见14.1 |
-| Office | d150b96ff0fff59ece869da7e3dc6067c1b066e3 | 文档、公共 Schema、示例和实现的冻结来源；不得浮动拉 main 自动适配 |
+| OpenPaw 当前集成基线 | a26fa85af0db82a9160136db73cab5148577cc63 | PR #13已合入；T6补修继续原0007，当前候选见首页，Windows暂缓 |
+| Office | ff9f6b7d6447665be459f077109c6224789e5f3c | 用户指定更新后冻结；26资料hash见sources.json，上游原样更新不等于自定义Rx批准 |
 | OpenCode SDK | @opencode-ai/sdk 1.18.15 | 精确版本、integrity、lockfile 和真实 v1 类型 |
 | 集成分支 | merge/ai-ofice-react-overagent | OpenPaw Tx PR 的目标分支，保留现有 ofice 拼写 |
 

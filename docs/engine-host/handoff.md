@@ -1,3 +1,9 @@
+2026-10-27 当前入口：Office 已原样更新并部署 `ff9f6b7d6447665be459f077109c6224789e5f3c`；两份用户架构文档保留，无自定义 Office 修改。OpenPaw 主开发目录和分支不变，候选 `724836175d08d4ab637f32c33dc0437ab3ebda9a` 已部署真实 DeepSeek；运行端口 8765/32885，PID/健康以 `scripts/openpaw-office.sh status` 为准。原 CHG-2026-0007 §12.82—12.83 为本轮范围和真实发现 D97—D100。
+
+真实网页首验复现主/五子 completed、文件落盘但 66%：已定位并修复同一步追加第二位同事核验证据被拒绝。修复后第一轮真实五角色/保存/任务中心与白板详情 100% 已通过，原失败不删除。真实地图册续问、刷新、完整 27 项与原始失败/重验统一查 `/home/cheng/.cache/openpaw-office-upstream-20261027/closure.json` 及其指向的 report/截图/trace；报告未形成或非通过不得计通过。Office R22（人物/墙面曲线）、R19（首页完成卡）、R24（忙色）、R16（严格到达 ACK）仍未批准、未实施，不以 Host 终态一致代替这些行为已修复。T7 未开始，Windows 原生继续暂缓。
+
+下方旧日期、提交和进程均是历史记录，不能用作当前部署或新候选通过证据。
+
 
 
 2026-10-27 新建办公室现场修复：原本机仅有一个预留槽，已被验收占用，网页再次创建必定capacity_exceeded。现已保留原两空间及数据，按现有配置机制增加office-3—office-8的独立持久工作目录；真实网页创建office-3“新建办公室验收-1027”、DeepSeek对话、六成员详情、切换、刷新及Host重启恢复通过，当前总8个空间名额，已发布3个，还可新建5个。配置仍为`/home/cheng/.openpaw/engine-host-office.toml`，统一脚本直接读取；Office工程和原运行进程未改。准确红绿、失败脚本及备份用途见原0007 §12.81和`/home/cheng/.cache/openpaw-office-capacity-20261027/{before,after,continued}`，不能把其中旧的脚本超时当已通过。
