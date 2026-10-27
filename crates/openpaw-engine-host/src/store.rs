@@ -666,6 +666,46 @@ impl Db {
         }
         Ok(run)
     }
+    /// 功能：读取同Run当前实际执行工具的最近开始事实。
+    /// 参数：run为已校验作用域的运行视图。
+    /// 返回：最近仍执行的工具绑定；没有执行中的工具时为None。
+    /// 错误：SQLite或持久事实损坏时明确上报。
+    /// 状态：只读，不以模型计划、获批或排队替代真正开始。
+    /// 并发与取消：在原Store序列内读取；终态和清理态不返回活动。
+    /// 权限：调用方须已验证会话作用域；绑定输入仅供可信适配器脱敏。
+    /// 关联：CHG-2026-0007第12.82节D98；DES-OP-007/011。
+    pub(crate) fn office_tool_activity(
+        &self,
+        run: &RunView,
+    ) -> HostResult<Option<openpaw_core::ToolCallBinding>> {
+        if run.state.is_terminal()
+            || run.state == RunState::Cancelling
+            || !run
+                .tools
+                .iter()
+                .any(|t| t.state == "running" && t.tool_name != "report_progress")
+        {
+            return Ok(None);
+        }
+        let mut statement = self.conn.prepare("SELECT reference FROM host_events WHERE kind='tool_started' AND json_valid(reference) AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC").map_err(HostError::storage)?;
+        let rows = statement
+            .query_map([&run.run_id], |row| row.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        for row in rows {
+            let binding: openpaw_core::ToolCallBinding =
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+            if run.tools.iter().any(|t| {
+                t.call_id == binding.call_id
+                    && t.tool_name != "report_progress"
+                    && t.state == "running"
+            }) {
+                return Ok(Some(binding));
+            }
+        }
+        Ok(None)
+    }
+
     /// 功能：读取Office投影所需的轻量Run视图，不解析完整JSONL正文。
     /// 参数：id为已持久化Run标识。
     /// 返回：状态、工具阶段和错误；回复正文由详情/历史查询按需读取。
@@ -2683,6 +2723,30 @@ mod office_regressions {
     use crate::{ClientScope, Host, HostConfig};
     use openpaw_core::{Message, Role};
     use serde_json::json;
+    #[tokio::test]
+    async fn d98_activity_reads_only_current_started_call_and_never_other_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        host.inner.store.call(|db| {
+            for (run, call) in [("r", "older"), ("r", "current"), ("other", "foreign")] {
+                db.bump("tool_started", &json!({"run_id":run,"call_id":call,"tool_name":"web_fetch","input":{"url":"https://example.org"}}).to_string())?;
+            }
+            let mut run = RunView { run_id:"r".into(), session_id:"s".into(), state:RunState::Running, revision:1, text:String::new(), error:None, text_truncated:false,
+                tools:vec![ToolView {call_id:"older".into(),tool_name:"web_fetch".into(),state:"completed".into()},ToolView {call_id:"current".into(),tool_name:"web_fetch".into(),state:"running".into()}] };
+            let revision = db.revision()?;
+            assert_eq!(db.office_tool_activity(&run)?.unwrap().call_id, "current");
+            run.tools[1].state = "awaiting_approval".into();
+            assert!(db.office_tool_activity(&run)?.is_none());
+            run.tools[1].state = "running".into(); run.state = RunState::Completed;
+            assert!(db.office_tool_activity(&run)?.is_none());
+            assert_eq!(db.revision()?, revision);
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn binding_lookup_targets_one_row_and_preserves_corruption_and_deletion_errors() {
         let temp = tempfile::tempdir().unwrap();

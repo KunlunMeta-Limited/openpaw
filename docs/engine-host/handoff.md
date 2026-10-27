@@ -424,3 +424,7 @@ PowerShell 入口与 Linux 使用同一配置字段，日志和 PID 默认位于
 ### 失败与回退
 
 缺少配置、密钥、真实 Provider、构建产物或端口占用会在启动前返回非零；任一服务健康检查失败时只停止本次脚本启动的进程，并保留日志。脚本不会使用 `pkill -f`、不会删除 home/会话/工作区，也不会覆盖 `.env`。回退到原手工命令只需删除脚本或直接执行 `cargo run ... engine-host` 与 Office 的既有 `node server/dist/index.js`；运行数据保持不变。
+
+## 2026-10-27 r13当前工作
+
+主开发目录仍/Office/openpaw。Office原样更新ff9f6b7并已在8765运行，用户两文档不变；Host D97—D99候选实施中，具体方案0007 §12.82。修复参数装配、无输出有界恢复、真实活动摘要及新版白板详情；不改自定义Office源码、不扩权限。证据与备份在/home/cheng/.cache/openpaw-office-upstream-20261027/。成员忙碌色R24、数值曲线R22、到达ACK R16仍待审；不能将上游FIFO当严格Agent执行门禁。交付/PR仍pending。

@@ -1,7 +1,7 @@
 {
   "office": {
     "repository": "https://github.com/KunlunMeta-Limited/ai-office-react",
-    "commit": "fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518",
+    "commit": "ff9f6b7d6447665be459f077109c6224789e5f3c",
     "files": [
       {
         "path": "integration/README.md",
@@ -10,7 +10,7 @@
       },
       {
         "path": "integration/docs/office-integration.md",
-        "sha256": "64f684be14ffb79188a52ad7e7f9745d0bfbfdb48e08ebe75b0548c11ea5501f",
+        "sha256": "4168edb90531f0bf13fa08a02c5e77e9f6f4a8fd4574c13eb33def975709a534",
         "testSnapshot": false
       },
       {
@@ -20,12 +20,12 @@
       },
       {
         "path": "integration/docs/chat-integration.md",
-        "sha256": "6cc69b2530f9716ca632f1bc52fb21fdd6dda10ea5829f8a7604a0248b555bb1",
+        "sha256": "8596f98de40e7fa6c5a96e3892721b70a3c4ad683feec22e769d8ec73dcb40d4",
         "testSnapshot": false
       },
       {
         "path": "integration/docs/message-relay.md",
-        "sha256": "07c5e0391ae62e96bd7d2ab126fe71936311f1f6d573b28f449a6a5f849e3622",
+        "sha256": "ca8693072e22e1f6f6c79db22fa8f854aff867ba680bad95828097c42094fc99",
         "testSnapshot": false
       },
       {
@@ -50,7 +50,7 @@
       },
       {
         "path": "packages/protocol/src/office-ui.ts",
-        "sha256": "83b6ae5274aa347c76e2fcd78253a9e216400754b249771aa102c815469a3539",
+        "sha256": "73fbbb624f476c4df81890d6c0d887afdee8f3a57916b7a1be61a0cee9a007aa",
         "testSnapshot": true
       },
       {
@@ -70,7 +70,7 @@
       },
       {
         "path": "docs/plugin-runtime.md",
-        "sha256": "426fc9b4de161062f253d4f80740b04cd2a934e467508f0ec53f1d66662b63d5",
+        "sha256": "44f27e75c07b17cdf6de9dcdd950a6fbdb626cd44056782dd4c3c8dcd4c53361",
         "testSnapshot": false
       },
       {
@@ -85,7 +85,7 @@
       },
       {
         "path": "apps/web/src/chat/ChatSession.ts",
-        "sha256": "8868884ed848883fc3c009336e45cd40d4327ac8e412858510df0f7ef80a0611",
+        "sha256": "d7cf4e309d50961d786f1ffdea3cad50f69ea9a37dcfe85344d955ef0d5d8522",
         "testSnapshot": false
       },
       {
@@ -130,7 +130,7 @@
       },
       {
         "path": "tests/officeIntegration.test.mjs",
-        "sha256": "5bf7457f7cbbafc351e2042e638d23bd920073514627844319683d66de530985",
+        "sha256": "ee16da09c436ec7d985d0005ec951c80722b347eb3a2324d076d47b947c42251",
         "testSnapshot": false
       }
     ]

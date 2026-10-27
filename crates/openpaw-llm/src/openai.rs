@@ -228,8 +228,14 @@ impl LlmProvider for OpenAiProvider {
                 content.push(ContentBlock::Text { text: text.into() });
             }
         }
-        if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
-            for tc in tool_calls {
+        let stop_reason =
+            Self::map_finish_reason(choice.get("finish_reason").and_then(|f| f.as_str()));
+        if let Some(tool_calls) = message
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .filter(|_| stop_reason == StopReason::ToolUse)
+        {
+            for (index, tc) in tool_calls.iter().enumerate() {
                 let id = tc
                     .get("id")
                     .and_then(|i| i.as_str())
@@ -245,15 +251,13 @@ impl LlmProvider for OpenAiProvider {
                     .get("arguments")
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}");
-                let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let input = parse_tool_arguments(args_str, index, &name)?;
                 content.push(ContentBlock::ToolUse { id, name, input });
             }
         }
         Ok(CompletionResponse {
             content,
-            stop_reason: Self::map_finish_reason(
-                choice.get("finish_reason").and_then(|f| f.as_str()),
-            ),
+            stop_reason,
             usage: Self::parse_usage(v.get("usage")),
         })
     }
@@ -345,6 +349,17 @@ impl LlmProvider for OpenAiProvider {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+}
+
+// 参数正文可能包含文件、密钥或个人资料；诊断只保留安全结构信息。
+fn parse_tool_arguments(args: &str, index: usize, name: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(args).map_err(|error| {
+        let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(64).collect();
+        Error::Provider(format!(
+            "invalid OpenAI streamed tool arguments: tool_index={index} name={name} bytes={} json={:?} line={} column={}",
+            args.len(), error.classify(), error.line(), error.column()
+        ))
+    })
 }
 
 /// Accumulates OpenAI stream chunks: text deltas flow through; tool_calls
@@ -451,13 +466,16 @@ impl OpenAiStreamState {
                 text: self.text.clone(),
             });
         }
-        for (idx, id, name, args) in &calls {
-            let input: serde_json::Value = match serde_json::from_str(args) {
+        // length等停止原因不能把截断的JSON误报为参数错误，也不能执行它。
+        // 整批校验成功后才发布任何工具事件，避免半批事件阻止安全恢复。
+        for (idx, id, name, args) in calls
+            .iter()
+            .filter(|_| self.stop_reason == Some(StopReason::ToolUse))
+        {
+            let input = match parse_tool_arguments(args, *idx, name) {
                 Ok(input) => input,
-                Err(_) => {
-                    queue.push_back(Err(Error::Provider(
-                        "invalid OpenAI streamed tool arguments".into(),
-                    )));
+                Err(error) => {
+                    queue.push_back(Err(error));
                     return;
                 }
             };
@@ -466,6 +484,11 @@ impl OpenAiStreamState {
                 name: name.clone(),
                 input,
             });
+        }
+        for (idx, id, name, _) in calls
+            .iter()
+            .filter(|_| self.stop_reason == Some(StopReason::ToolUse))
+        {
             queue.push_back(Ok(StreamEvent::ToolUseStart {
                 index: *idx,
                 id: id.clone(),

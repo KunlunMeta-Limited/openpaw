@@ -480,6 +480,116 @@ async fn stream_retry_recovers_from_overloaded() {
     assert_eq!(session.messages.last().unwrap().text(), "recovered");
 }
 
+#[tokio::test]
+async fn d97_argument_recovery_is_bounded_and_never_replays_completed_tools() {
+    struct ArgumentsProvider {
+        calls: AtomicUsize,
+        partial: bool,
+        always_invalid: bool,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for ArgumentsProvider {
+        async fn complete(&self, _: CompletionRequest) -> Result<openpaw_core::CompletionResponse> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent>>> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut events = Vec::new();
+            if attempt == 0 {
+                events.push(Ok(StreamEvent::Final(Box::new(
+                    openpaw_core::CompletionResponse {
+                        content: vec![ContentBlock::ToolUse {
+                            id: "once".into(),
+                            name: "echo_tool".into(),
+                            input: serde_json::json!({"text":"one effect"}),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Default::default(),
+                    },
+                ))));
+            } else {
+                assert_eq!(
+                    req.messages
+                        .iter()
+                        .flat_map(|m| &m.content)
+                        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                        .count(),
+                    1
+                );
+                if attempt == 1 || self.always_invalid {
+                    if self.partial {
+                        events.push(Ok(StreamEvent::TextDelta {
+                            index: 0,
+                            text: "visible prefix".into(),
+                        }));
+                    }
+                    events.push(Err(Error::Provider(
+                        "invalid OpenAI streamed tool arguments: tool_index=0 json=Eof".into(),
+                    )));
+                } else {
+                    events.push(Ok(StreamEvent::Final(Box::new(
+                        openpaw_core::CompletionResponse {
+                            content: vec![ContentBlock::Text {
+                                text: "recovered".into(),
+                            }],
+                            stop_reason: StopReason::EndTurn,
+                            usage: Default::default(),
+                        },
+                    ))));
+                }
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+        fn capabilities(&self) -> openpaw_core::Capabilities {
+            Default::default()
+        }
+        fn name(&self) -> &str {
+            "arguments"
+        }
+        fn default_model(&self) -> &str {
+            "arguments"
+        }
+    }
+    for (partial, always_invalid, succeeds, calls) in [
+        (false, false, true, 3),
+        (true, false, false, 2),
+        (false, true, false, 3),
+    ] {
+        let provider = Arc::new(ArgumentsProvider {
+            calls: AtomicUsize::new(0),
+            partial,
+            always_invalid,
+        });
+        let engine = AgentLoop::new(provider.clone())
+            .with_tool_host(echo_tool_host())
+            .with_retry_policy(RetryPolicy::new(5, 1, 5, 2.0));
+        let mut session = Session::new("arguments", "arguments");
+        session
+            .messages
+            .push(Message::user_text("one effect then answer"));
+        let (result, _) =
+            run_simple(&engine, &mut session, &[ToolSpec::new("echo_tool", "echo")]).await;
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .count(),
+            1,
+            "already executed tool must never replay"
+        );
+        if partial {
+            assert_eq!(session.messages.last().unwrap().text(), "visible prefix");
+        }
+    }
+}
+
 /// Provider whose stream lingers long enough to be cancelled mid-flight.
 struct SlowProvider {
     delay_ms: u64,

@@ -44,6 +44,21 @@ test('snapshot default normalization is stable and full replacement clears omiss
   assertProtocolValue(minimal)
 })
 
+test('new upstream whiteboard separates short summary and Markdown detail without altering progress', () => {
+  const value = structuredClone(f.snapshot)
+  value.conversations[0].whiteboard = { title: '制作图册', status: 'running', summary: '完成核查后保存图册',
+    detail: '# 任务详情\n\n- 已核验资料\n- 正在保存文件', steps: [{ id: 'verified', title: '核查', progress: 100 }] }
+  const board = officeSnapshotSchema.parse(value).conversations[0].whiteboard
+  assert.equal(board.steps[0].progress, 100)
+  assert.match(board.detail, /任务详情/)
+  assert.equal(board.summary, '完成核查后保存图册')
+  for (const [key, length] of [['summary', 301], ['detail', 16001]]) {
+    const invalid = structuredClone(value)
+    invalid.conversations[0].whiteboard[key] = '字'.repeat(length)
+    assert.equal(officeSnapshotSchema.safeParse(invalid).success, false)
+  }
+})
+
 test('upstream rejects invalid seq, mismatched team, dangling assignee and unknown fields', () => {
   for (const seq of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
     assert.equal(officeSnapshotSchema.safeParse({ ...f.snapshot, seq }).success, false)

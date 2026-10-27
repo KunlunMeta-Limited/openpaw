@@ -334,3 +334,15 @@ Office已安全快进到fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518，用户两份�
 只读fetch确认远端main已由fa6ae1f推进至306698ebeb6ce2638fbe09808facc38325b15c01，11文件变化；主Office工作区/运行仍fa6ae1f，原两份用户架构修改保留，未checkout/构建主工程，不改变26份冻结资料。此前“无新提交”为2026-10-24时点。d73fa14在ChatTranscript.tsx移除按expanded禁用虚拟列表，修复收起清空行后同范围不重绘；新增多宽度反复展开/草稿/切会话测试。882a7bb/fb68790在OfficeChat.tsx/CSS与OfficeDecisionPanel.css保留展开聊天时的审批面板并修菜单裁剪/手机层级。006a635补Demo等待chat.ready、恢复preview main与删除后停止，不引入真实后端任务操作。
 
 “已有历史但重新展开空白”有此独立前端原因；现场不同Host home导致旧会话不存在是另一问题。当前旧版五次真实展开测试均显示2气泡/1336字，未重现漏绘，不能据源码差异断言用户现场已复现或修好。新上游可能覆盖R18部分手机样式，须新版原手机旅程实测后再定，不提前撤回申请。本次差异没有修改actorTasks/TaskBadge/whiteboardProgress或远端ACK/任务控制，R16/R17/R19/R22/R23均继续未批准、未实施。后续先审新基线、隔离副本完整验证与运行切换，再决定升级；不得夹带自定义Office修改。外部完整diff及研究记录位于`/home/cheng/.cache/openpaw-user-closure-20261026/office-upstream.diff`和`office-upstream-review.md`。
+
+### 2026-10-27上游ff9f6b7复审（自定义Office修改仍未批准）
+
+主目录已按用户要求原样快进上游，891原测试、构建与集成类型通过；聊天多页合并/恢复和展开修复已更新，R18相关审批样式需真实页面复验，不据源码提前关闭。新增白板summary/detail由Host适配，改善点击后阅读完整业务清单；不改变R22人物12秒/白板90秒活动曲线，也不解决R19首页过滤完成卡。R16部分基础已具备：2a3db3b让远端单条消息FIFO等待前一动作结束，避免后到远端工作态抢先；但DashboardSceneBridge直接提交working与visit不进入该远端FIFO，Host子Run也不等待浏览器，HTTP明确不含播放结果。严格“走到再执行”仍需ACK/页面所有者/取消/离线协议设计，不能撤销R16。
+
+### R24：左侧成员在线色与忙碌色分离（候选，未实施）
+
+**场景与原因。**ff9f6b7的OfficeShell.tsx仍只用employee.online选runtime-presence.online，CSS固定绿色；不表示空闲，Host不能把忙碌人员伪设离线。用户要求有任务时黄色。
+
+**最小方案与位置。**复用dashboard员工/任务负责人关联，OfficeShell根据当前活动任务派生busy/waiting，并在RuntimeWorkspace.css增加黄色及可读说明；在线/离线保留原语义。优先真实running/blocked任务，旧失败和已完成不使人员永久忙碌；切换会话后的当前任务与人物卡同源。若需要跨会话总忙碌应另明确目录数据范围，不凭当前会话猜整个团队。无需新增后端字段或协议；测试扩原界面/选择器及真实浏览器，覆盖无任务、运行、审批、终态、多任务、切换、离线和色盲可访问说明。
+
+**影响与回退。**只改左侧显示，不改Agent执行或工具权限；回退原两前端文件，无数据迁移。准确基线ff9f6b7；当前仅候选、未批准，OpenPaw D98不冒充此项已经实现。

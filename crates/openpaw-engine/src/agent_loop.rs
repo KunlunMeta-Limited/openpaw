@@ -597,7 +597,7 @@ impl AgentLoop {
         partial: &mut String,
     ) -> Result<openpaw_core::CompletionResponse> {
         let mut attempts = 0;
-        loop {
+        'attempt: loop {
             let stream = match control
                 .wait(tokio::time::timeout(
                     self.stream_timeout,
@@ -645,7 +645,26 @@ impl AgentLoop {
                     .await?
                     .map_err(|_| Error::Timeout("provider stream idle".into()))?;
                 let Some(ev) = ev else { break };
-                match ev? {
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    Err(Error::Provider(ref reason))
+                        if reason.starts_with("invalid OpenAI streamed tool arguments")
+                            && !emitted
+                            && attempts < self.retry_policy.max_retries.min(1) =>
+                    {
+                        // 本次调用尚未发布文字/工具且未执行，重发相同上下文至多一次。
+                        // 已完成工具保留在请求历史里；取消、期限与真实请求预算仍生效。
+                        attempts += 1;
+                        control
+                            .wait(tokio::time::sleep(
+                                self.retry_policy.delay_for_attempt(attempts),
+                            ))
+                            .await?;
+                        continue 'attempt;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match ev {
                     openpaw_core::StreamEvent::MessageStart => event_sink(AgentEvent::MessageStart),
                     openpaw_core::StreamEvent::TextDelta { text, .. } => {
                         emitted |= !text.is_empty();

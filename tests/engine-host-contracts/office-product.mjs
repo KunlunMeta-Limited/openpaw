@@ -740,6 +740,24 @@ try {
   assert.ok(progressComplete.tasks.every(t=>t.status==='completed'));
   assert.ok(progressComplete.whiteboard.description.includes('3/3'));
   assert.equal(progressComplete.whiteboard.note,'');assert.equal(progressComplete.whiteboard.tagline,'');
+  assert.equal(progressComplete.whiteboard.summary,progressComplete.whiteboard.description);
+  assert.ok(progressComplete.whiteboard.detail.includes('## 任务进度'));
+  for(const task of progressComplete.tasks) assert.ok(progressComplete.whiteboard.detail.includes(task.title));
+  // Read the actual Pixi board by mouse; the new upstream detail must show Host facts.
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  const sceneDownload=page.waitForEvent('download');await page.getByRole('button',{name:'导出快照',exact:true}).click();
+  const sceneFile=await sceneDownload;await sceneFile.saveAs(join(output,'d99-scene.json'));
+  const sceneData=JSON.parse(await readFile(join(output,'d99-scene.json'),'utf8'));
+  const boardProp=sceneData.world.props.find(prop=>prop.templateId==='office.wall-whiteboard');
+  const canvasBox=await page.locator('canvas').first().boundingBox();
+  const boardScale=Math.min(canvasBox.width/1100,canvasBox.height/850);
+  await page.mouse.click(canvasBox.x+(canvasBox.width-1100*boardScale)/2+(boardProp.position.x*50+290)*boardScale,
+    canvasBox.y+(canvasBox.height-850*boardScale)/2+(boardProp.position.y*50-70)*boardScale);
+  const boardDialog=page.getByRole('dialog',{name:'白板详情',exact:true});await boardDialog.waitFor();
+  assert.ok((await boardDialog.innerText()).includes('已完成 · 100%'));
+  await page.screenshot({path:join(output,'d99-real-whiteboard-details.png'),fullPage:true});
+  await boardDialog.getByRole('button',{name:'关闭白板',exact:true}).click();await expand(page);
+  report.assertions.push('D99: actual Pixi mouse click opens new upstream Markdown whiteboard details; same task titles and completed 100% as Host snapshot');
   const recorded=await readFile(join(workspace,'reports/天气.md'),'utf8');assert.ok(recorded.includes('WEB-HTTP-MARKER'));
   await page.screenshot({path:join(output,'31-business-plan-completed.png'),fullPage:true});
   report.t5.progress={request:progressRequest,pending:progressPending,completed:progressComplete,file:{path:'reports/天气.md',sha256:createHash('sha256').update(recorded).digest('hex')}};

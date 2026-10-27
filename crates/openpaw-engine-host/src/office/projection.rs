@@ -426,6 +426,85 @@ fn task(
     task
 }
 
+// 活动文字只使用已开始的调用；URL仅保留域名，文件仅保留basename。
+fn public_tool_activity(binding: &openpaw_core::ToolCallBinding) -> String {
+    let file = || {
+        binding
+            .input
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| path.rsplit(['/', '\\']).next())
+            .map(|name| {
+                dto::bounded(
+                    &name.chars().filter(|c| !c.is_control()).collect::<String>(),
+                    60,
+                )
+            })
+            .filter(|name| !name.is_empty())
+    };
+    let (label, target) = match binding.tool_name.as_str() {
+        "web_fetch" => (
+            "正在读取来源",
+            binding
+                .input
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| reqwest::Url::parse(url).ok())
+                .and_then(|url| url.host_str().map(str::to_owned)),
+        ),
+        "web_search" => ("正在检索公开资料", None),
+        "read_file" => ("正在读取", file()),
+        "write_file" | "edit_file" => ("正在保存", file()),
+        "glob" | "grep" => ("正在查找工作区资料", None),
+        "delegate_task" => ("正在协调同事完成分工", None),
+        "think" => ("正在分析整理", None),
+        _ => ("正在执行已授权操作", None),
+    };
+    target
+        .map(|target| format!("{label} {target}"))
+        .unwrap_or_else(|| label.into())
+}
+
+// 与任务数组同源；长文本不承担消息事实存储，预算不足可去掉可选详情。
+fn whiteboard_detail(title: &str, tasks: &[Value]) -> String {
+    let mut text = format!(
+        "# {}\n\n## 当前目标\n\n{}\n\n## 任务进度\n\n以下百分比表示后端已核验进度。\n",
+        dto::bounded(title, 100),
+        tasks
+            .first()
+            .and_then(|t| t["summary"].as_str())
+            .unwrap_or("")
+    );
+    for task in tasks.iter().take(25) {
+        let state = match task["status"].as_str() {
+            Some("completed") => "已完成",
+            Some("failed") => "未完成",
+            Some("blocked") => "等待确认或核验",
+            Some("running") => "进行中",
+            _ => "待开始",
+        };
+        let employee = task["assigneeId"]
+            .as_str()
+            .and_then(|id| crate::agents::ROLES.iter().find(|r| r.employee == id))
+            .map(|r| r.name)
+            .unwrap_or("待分配");
+        text.push_str(&format!(
+            "\n- **{}**：{} · {} · {}%\n",
+            dto::bounded(task["title"].as_str().unwrap_or(""), 160),
+            employee,
+            state,
+            task["progress"].as_u64().unwrap_or(0)
+        ));
+        if let Some(summary) = task["summary"].as_str() {
+            text.push_str(&format!(
+                "  {}\n",
+                dto::bounded(summary, 140).replace('\n', " ")
+            ));
+        }
+    }
+    dto::bounded(&text, 4000)
+}
+
 /// 压缩旧业务会话的可选展示字段。
 ///
 /// 任务、进度、白板状态和成员 ID 是历史回看的核心事实，不能因 Office
@@ -456,6 +535,12 @@ fn compact_business_conversation(conversation: &mut Value) -> bool {
         }
     }
     if let Some(whiteboard) = conversation["whiteboard"].as_object_mut() {
+        for key in ["detail", "summary"] {
+            if whiteboard.get(key).is_some_and(|value| value != "") {
+                whiteboard[key] = json!("");
+                return true;
+            }
+        }
         // members 布局把这些字段列为必填；用合法空值压缩内容，不能删除
         // 字段后再把不符合 Schema 的快照交给 Office。
         for key in ["tagline", "note", "description"] {
@@ -643,11 +728,13 @@ fn apply_handoff_item(conversation: &mut Value, item: &HandoffItem, final_item: 
             main["summary"].as_str().unwrap_or("正在处理你的请求")
         )
     };
+    let detail = whiteboard_detail(main["title"].as_str().unwrap_or(""), tasks);
     conversation["whiteboard"] = json!({
         "template": "task-board-v1",
         "title": dto::bounded(main["title"].as_str().unwrap_or(""), 32),
         "status": main["status"], "tagline": "",
-        "description": dto::bounded(&description, 500), "note": "",
+        "description": dto::bounded(&description, 300), "summary": dto::bounded(&description, 300),
+        "detail": detail, "note": "",
         "link": {"label": "", "url": ""}, "steps": steps,
     });
 }
@@ -1028,6 +1115,9 @@ async fn prepare_internal(
                 let summary=if let Some(c)=&child {
                     if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {super::turns::message(c)}
                     else if state=="blocked" {"等待确认、资源或清理".into()}
+                    else if let Some(binding)=db.office_tool_activity(c)? {
+                        format!("{}；已核验进度{child_percent}%",public_tool_activity(&binding))
+                    }
                     else if let Some(step)=child_steps_view.iter().find(|s|s["status"]=="running") {
                         format!("正在{}；已核验进度{child_percent}%",step["title"].as_str().unwrap_or("处理任务"))
                     } else if let Some(tool)=c.tools.iter().rev().find(|t|t.state=="running") {
@@ -1117,6 +1207,7 @@ async fn prepare_internal(
             let child_failed=all_child_failed || child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="failed");
             if r.state==RunState::Completed && child_blocked {percent=percent.min(99);}
             let handoff_pending = display_calls.iter().any(|call| !handoff_ready.contains(call));
+            let active_tool_summary = db.office_tool_activity(&r)?.map(|binding| public_tool_activity(&binding));
             let summary=match r.state {
                 RunState::Cancelled=>"已停止，实际操作已清理".to_owned(),
                 RunState::Interrupted=>"处理被中断，已完成事项保留".to_owned(),
@@ -1128,10 +1219,11 @@ async fn prepare_internal(
                 _ if child_blocked=>"子任务等待确认、核验或可用资源".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
-                _=>steps.iter().find(|s|s["status"]=="running").map(|s|
-                    format!("正在{}；已核验进度{percent}%",s["title"].as_str().unwrap_or("处理任务")))
-                    .or_else(||child_tasks.iter().chain(child_steps.values()).find(|t|t["status"]=="running")
-                        .map(|t|format!("{}；已核验总进度{percent}%",t["summary"].as_str().unwrap_or("团队正在处理"))))
+                _=>child_tasks.iter().chain(child_steps.values()).find(|t|t["status"]=="running")
+                    .map(|t|format!("{}；已核验总进度{percent}%",t["summary"].as_str().unwrap_or("团队正在处理")))
+                    .or_else(||active_tool_summary.map(|summary|format!("{summary}；已核验进度{percent}%")))
+                    .or_else(||steps.iter().find(|s|s["status"]=="running").map(|s|
+                        format!("正在{}；已核验进度{percent}%",s["title"].as_str().unwrap_or("处理任务"))))
                     .unwrap_or_else(||"正在分析并组织下一步；尚无新增核验进度".to_owned()),
             };
             let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
@@ -1186,7 +1278,7 @@ async fn prepare_internal(
             } else if tasks.len()>1 {
                 format!("已确认完成 {completed}/{} 步；{summary}",tasks.len()-1)
             } else {summary};
-            let whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,500),"note":"","link":{"label":"","url":""},"steps":board_steps});
+            let whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,300),"summary":dto::bounded(&description,300),"detail":whiteboard_detail(selected["title"].as_str().unwrap_or(""),&tasks),"note":"","link":{"label":"","url":""},"steps":board_steps});
             if run_id==board_id {retained_whiteboard=whiteboard;}
             retained_tasks.extend(tasks);
             retained_events.extend(events);
@@ -1686,6 +1778,51 @@ async fn sync_internal(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn d98_activity_targets_do_not_expose_urls_credentials_or_parent_paths() {
+        let binding = |name: &str, input| openpaw_core::ToolCallBinding {
+            run_id: "r".into(),
+            call_id: "c".into(),
+            tool_name: name.into(),
+            input,
+        };
+        let text = super::public_tool_activity(&binding(
+            "web_fetch",
+            serde_json::json!({"url":"https://user:secret@example.org/private?token=DO_NOT_LOG"}),
+        ));
+        assert_eq!(text, "正在读取来源 example.org");
+        for path in [
+            "/private/person/report.md",
+            "C:\\private\\person\\report.md",
+        ] {
+            assert_eq!(
+                super::public_tool_activity(&binding(
+                    "write_file",
+                    serde_json::json!({"path":path,"content":"DO_NOT_LOG"})
+                )),
+                "正在保存 report.md"
+            );
+        }
+    }
+
+    #[test]
+    fn d99_whiteboard_detail_preserves_actual_task_states_and_completed_child_progress() {
+        let tasks = vec![
+            serde_json::json!({"title":"制作图册","status":"failed","progress":60,"summary":"保存未完成","assigneeId":"office-lead"}),
+            serde_json::json!({"title":"审稿","status":"completed","progress":100,"summary":"已核验","assigneeId":"review-agent"}),
+            serde_json::json!({"title":"保存文件","status":"failed","progress":0,"summary":"尚未执行","assigneeId":"office-lead"}),
+        ];
+        let detail = super::whiteboard_detail("制作图册", &tasks);
+        assert!(detail.contains("王明 · 未完成 · 60%"));
+        assert!(detail.contains("刘市 · 已完成 · 100%"));
+        assert!(detail.contains("王明 · 未完成 · 0%"));
+        let mut conversation =
+            serde_json::json!({"tasks":tasks,"whiteboard":{"summary":"简要目标","detail":detail}});
+        let before = conversation["tasks"].clone();
+        assert!(super::compact_business_conversation(&mut conversation));
+        assert_eq!(conversation["tasks"], before);
+        assert_eq!(conversation["whiteboard"]["detail"], "");
+    }
     use super::*;
     use crate::{ClientScope, HostConfig};
 
