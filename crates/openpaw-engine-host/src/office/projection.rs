@@ -667,15 +667,11 @@ fn compact_protected_details(
                     let Some(time) = event["occurredAt"].as_str() else {
                         return false;
                     };
-                    let Some(id) = event["id"].as_str() else {
-                        return false;
-                    };
                     events.iter().any(|newer| {
                         newer["taskId"].as_str() == Some(task)
                             && newer["occurredAt"]
                                 .as_str()
-                                .zip(newer["id"].as_str())
-                                .is_some_and(|newer| newer > (time, id))
+                                .is_some_and(|newer| newer > time)
                     })
                 })
                 .min_by_key(|(_, event)| (event["occurredAt"].as_str(), event["id"].as_str()))
@@ -1996,6 +1992,27 @@ mod tests {
                 assert!(steps < 1000);
             }
         }
+    }
+
+    #[test]
+    fn d104_equal_time_events_cannot_use_random_ids_as_causal_order() {
+        let events = json!([
+            {"id":"a-final","kind":"task.completed","taskId":"t","occurredAt":"2026-10-27T00:00:00Z","summary":"已完成"},
+            {"id":"z-start","kind":"task.started","taskId":"t","occurredAt":"2026-10-27T00:00:00Z","summary":"执行中"},
+            {"id":"other","kind":"task.completed","taskId":"other","occurredAt":"2026-10-27T00:00:01Z","summary":"另一任务"}
+        ]);
+        let mut conversations =
+            vec![json!({"id":"c","events":events,"employees":[],"tasks":[],"whiteboard":null})];
+        let before = conversations.clone();
+        assert!(
+            compact_protected_details(&mut conversations, &BTreeMap::new())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            conversations, before,
+            "同毫秒事件无先后证明，随机ID不能证明过时；其他任务也不提供证明"
+        );
     }
 
     #[test]
