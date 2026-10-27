@@ -216,6 +216,8 @@ pub(crate) struct MainOffice {
     started: std::sync::atomic::AtomicBool,
     // 由原版 gateway 的能力响应协商；仅控制出站协议形状。
     conversation_wire: std::sync::atomic::AtomicBool,
+    // 原版 main 的原生详情模式；只改变出站副本，不改变 Goal 执行事实。
+    native_goal_details: std::sync::atomic::AtomicBool,
     projection_tx: mpsc::Sender<MainProjection>,
     projection_rx: Mutex<Option<mpsc::Receiver<MainProjection>>>,
     sessions: Mutex<HashMap<String, std::sync::Weak<crate::runtime::SessionHandle>>>,
@@ -314,6 +316,7 @@ impl MainOffice {
                 .expect("HTTP client"),
             started: std::sync::atomic::AtomicBool::new(false),
             conversation_wire: std::sync::atomic::AtomicBool::new(false),
+            native_goal_details: std::sync::atomic::AtomicBool::new(false),
             projection_tx,
             projection_rx: Mutex::new(Some(projection_rx)),
             sessions: Mutex::new(HashMap::new()),
@@ -663,7 +666,7 @@ impl MainOffice {
             .conversation_wire
             .load(std::sync::atomic::Ordering::Acquire);
         serde_json::to_vec(&serde_json::json!({"type":"offices.initialize",
-            "offices":records.values().map(|entry|entry.snapshot(wire)).collect::<Vec<_>>()}))
+            "offices":records.values().map(|entry|self.display_snapshot(entry.snapshot(wire))).collect::<Vec<_>>()}))
         .map(|bytes| bytes.len())
         .map_err(|_| "办公室目录编码失败".into())
     }
@@ -804,9 +807,11 @@ impl MainOffice {
                 records
                     .values()
                     .map(|entry| {
-                        entry.snapshot(
-                            self.conversation_wire
-                                .load(std::sync::atomic::Ordering::Acquire),
+                        self.display_snapshot(
+                            entry.snapshot(
+                                self.conversation_wire
+                                    .load(std::sync::atomic::Ordering::Acquire),
+                            ),
                         )
                     })
                     .collect()
@@ -1010,7 +1015,7 @@ impl MainOffice {
 
     /// 功能：按已协商的原版 main 协议生成出站快照。
     /// 参数：snapshot 为 Host 原有内部快照。
-    /// 返回：保留原人物名的旧协议或 conversations 形式快照。
+    /// 返回：保留原人物名的旧协议或 conversations 快照；按能力适配原生Goal详情。
     /// 错误：无；未绑定时输出空会话目录。
     /// 状态：只读，不迁移持久记录。
     /// 并发与取消：同步短锁，不等待网络。
@@ -1021,14 +1026,87 @@ impl MainOffice {
             .conversation_wire
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return roster_display_snapshot(snapshot.clone());
+            return self.display_snapshot(roster_display_snapshot(snapshot.clone()));
         }
         let guard = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        snapshot["workspace"]["id"]
+        let snapshot = snapshot["workspace"]["id"]
             .as_str()
             .and_then(|team| guard.as_ref().ok()?.get(team))
             .map(|entry| entry.snapshot(true))
-            .unwrap_or_else(|| roster_display_snapshot(snapshot.clone()))
+            .unwrap_or_else(|| roster_display_snapshot(snapshot.clone()));
+        self.display_snapshot(snapshot)
+    }
+
+    fn display_snapshot(&self, mut snapshot: Value) -> Value {
+        if !self
+            .native_goal_details
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return snapshot;
+        }
+        fn adapt(snapshot: &mut Value) {
+            if let Some(conversations) = snapshot
+                .get_mut("conversations")
+                .and_then(Value::as_array_mut)
+            {
+                for conversation in conversations {
+                    adapt(conversation);
+                }
+            }
+            let Some(goal) = snapshot
+                .as_object_mut()
+                .and_then(|fields| fields.remove("goal"))
+            else {
+                return;
+            };
+            let mut summary = format!(
+                "已验收 {}/{} 项。",
+                goal["acceptedTaskCount"], goal["taskCount"]
+            );
+            let phase = match goal["phase"].as_str() {
+                Some("active") => "执行中",
+                Some("paused") => "已暂停",
+                Some("blocked") => "等待条件",
+                Some("completed") => "整体验收通过",
+                Some("ended") => "已终止",
+                _ => "计划待确认",
+            };
+            let mut detail = format!("# {}\n\n目标状态：{phase}；已验收 {}/{} 项。\n\n{}\n\n任务全部完成后仍需独立整体验收。\n\n", snapshot["whiteboard"]["title"].as_str().unwrap_or("目标"), goal["acceptedTaskCount"], goal["taskCount"], goal["reason"].as_str().unwrap_or(""));
+            let tasks = snapshot["tasks"].as_array_mut().expect("owned Goal tasks");
+            for (index, task) in tasks.iter_mut().enumerate() {
+                task.as_object_mut()
+                    .expect("owned Goal task")
+                    .remove("goalId");
+                let title = task["title"]
+                    .as_str()
+                    .unwrap_or("")
+                    .replace(['\n', '\r'], " ");
+                let progress = task["progress"].as_u64().unwrap_or(0);
+                if index < 3 {
+                    summary.push_str(&format!(
+                        " {}. {}：{progress}%。",
+                        index + 1,
+                        projection_text(&title, 48)
+                    ));
+                }
+                detail.push_str(&format!(
+                    "## {}. {title} — {progress}%\n\n{}\n\n",
+                    index + 1,
+                    task["summary"].as_str().unwrap_or("")
+                ));
+            }
+            detail.push_str("完整任务与验收依据见任务列表和聊天计划。");
+            let board = snapshot["whiteboard"]
+                .as_object_mut()
+                .expect("owned Goal board");
+            board.remove("progressMode");
+            board.insert("summary".into(), projection_text(&summary, 300).into());
+            board.insert("detail".into(), projection_text(&detail, 16000).into());
+            // 原版进度条会自行增长且把单项100压成99；文字详情保留真实0/100。
+            board.insert("steps".into(), serde_json::json!([]));
+        }
+        adapt(&mut snapshot);
+        snapshot
     }
 
     fn wire_message(&self, mut message: Value) -> Value {
@@ -1147,6 +1225,13 @@ impl MainOffice {
             }
             self.conversation_wire.store(
                 has_conversations(&data["requests"]),
+                std::sync::atomic::Ordering::Release,
+            );
+            self.native_goal_details.store(
+                data["ui"]["whiteboardSchema"]["properties"]["detail"].is_object()
+                    && data["ui"]["whiteboardSchema"]["properties"]
+                        .get("progressMode")
+                        .is_none(),
                 std::sync::atomic::Ordering::Release,
             );
         }
@@ -2995,6 +3080,101 @@ fn compact_topic(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use openpaw_engine::AgentEvent;
+
+    #[tokio::test]
+    async fn main_original_goal_details_negotiate_and_preserve_binary_facts() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let router = axum::Router::new().fallback(axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"code":200,"msg":"OK","data":{
+                    "scene":{},"ui":{"whiteboardSchema":{"properties":{"summary":{},"detail":{}}}},
+                    "requests":{"snapshot":{"properties":{"conversations":{}}}},"responses":{"success":{},"error":{}}
+                }}))
+            }));
+            axum::serve(listener, router).await.unwrap();
+        });
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let office = MainOffice::new(
+            home.path(),
+            workspace.path(),
+            Some(format!("http://{address}")),
+        );
+        let team = office.directory().unwrap()[0]["workspace"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        office.bind(&team, "native-goal", "owner").unwrap();
+        let mut snapshot = office.record(&team).unwrap().snapshot;
+        snapshot["employees"] = serde_json::json!([{"id":"owner","sceneActorId":"office-lead","name":"王明","online":false}]);
+        let goal = serde_json::json!({"id":"goal-fixture","session_id":"owner","objective":"原版前端兼容验证","phase":"active","plan_version":1,"confirmed_version":1,"reason":"等待整体验收","tasks":(0..5).map(|i| serde_json::json!({"id":format!("task-{i}"),"title":format!("任务{}",i+1),"current":true,"status":if i==0 {"accepted"} else {"pending"},"dependencies":[],"expected_result":"实际结果","acceptance_criteria":["实际检查"]})).collect::<Vec<_>>()});
+        apply_goal_projection(&mut snapshot, &goal);
+        {
+            let mut records = office.records.lock().unwrap();
+            let records = records.as_mut().unwrap();
+            records.get_mut(&team).unwrap().snapshot = snapshot.clone();
+            office.save(records).unwrap();
+        }
+        let persisted = std::fs::read(&office.path).unwrap();
+        assert_eq!(office.wire_snapshot(&snapshot), snapshot);
+        office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        let directory = office.directory().unwrap();
+        let message = office.wire_message(
+            serde_json::json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot}),
+        );
+        let initialized = office
+            .wire_message(serde_json::json!({"type":"offices.initialize","offices":[snapshot]}));
+        for wire in [
+            &directory[0],
+            &message["snapshot"],
+            &initialized["offices"][0],
+        ] {
+            let conversation = &wire["conversations"][0];
+            assert!(conversation.get("goal").is_none());
+            let tasks = conversation["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 5);
+            for (i, task) in tasks.iter().enumerate() {
+                assert!(task.get("goalId").is_none());
+                assert_eq!(task["progress"], if i == 0 { 100 } else { 0 });
+                assert_eq!(task["summary"], snapshot["tasks"][i]["summary"]);
+            }
+            let board = &conversation["whiteboard"];
+            assert!(board.get("progressMode").is_none());
+            assert!(board["steps"].as_array().unwrap().is_empty());
+            assert!(board["summary"].as_str().unwrap().contains("100%"));
+            let detail = board["detail"].as_str().unwrap();
+            assert!(detail.contains("任务5 — 0%"));
+            assert!(detail.contains("等待整体验收"));
+            assert!(detail.contains("实际检查"));
+            if let Ok(path) = std::env::var("GOAL_NATIVE_PROJECTION_FILE") {
+                std::fs::write(path, serde_json::to_vec(wire).unwrap()).unwrap();
+            }
+        }
+        assert_eq!(office.record(&team).unwrap().snapshot, snapshot);
+        assert_eq!(std::fs::read(&office.path).unwrap(), persisted);
+        let long = snapshot["tasks"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .repeat(1000);
+        let mut large = snapshot.clone();
+        large["tasks"][0]["summary"] = long.into();
+        assert!(
+            office.display_snapshot(large)["whiteboard"]["detail"]
+                .as_str()
+                .unwrap()
+                .encode_utf16()
+                .count()
+                <= 16000
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn main_employee_display_keeps_roster_names_and_original_work_facts() {
