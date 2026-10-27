@@ -54,6 +54,20 @@ fn parse(value: &Value) -> HostResult<Report> {
     }
     serde_json::from_value(value.clone()).map_err(|_| invalid("步骤报告字段不符合约定。更新必须包含type=update、stepId、state；例如{\"type\":\"update\",\"stepId\":\"原步骤ID\",\"state\":\"in_progress\"}。completed还须提供evidenceCallIds，不能用工具名、路径或时间戳代替真实调用ID。"))
 }
+// 这里只检查计划是否给出可匹配目标的外形，不授予路径权限；完成仍需原精确证据。
+fn has_file_target(title: &str) -> bool {
+    title.contains('/')
+        || title.contains('\\')
+        || title
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0] == b'.' && pair[1].is_ascii_alphanumeric())
+        || title
+            .split('`')
+            .enumerate()
+            .any(|(i, token)| i % 2 == 1 && !token.trim().is_empty())
+}
+
 fn needs_write(title: &str) -> bool {
     // “查看已保存的记录文件位置”是读取事实；不能把过去动作或名词当成新写入。
     // 显式“核对后保存/并记录到…”仍命中，新产物仍须相符的真实写入证据。
@@ -282,6 +296,11 @@ pub(crate) fn update_with_delegations(
             }
             let mut ids = BTreeSet::new();
             for step in &steps {
+                // 完成时仍严格比对真实路径；这里提前拒绝没有目标的固定写计划，
+                // 避免副作用已发生后才发现标题永远无法匹配任何验收证据。
+                if plan.is_none() && needs_write(&step.title) && !has_file_target(&step.title) {
+                    return Err(invalid("保存/写入步骤须在标题中写明实际产物路径，不能只写保存为章节文件。先确定每章路径，再重新create完整计划；无扩展名目标用反引号标出。当前计划尚未保存，不能先执行后补标题。"));
+                }
                 if step.id.is_empty()
                     || step.id.len() > 80
                     || !step
@@ -479,6 +498,46 @@ mod tests {
     fn plan(run: &RunView) -> Value {
         update(None,&json!({"type":"create","steps":[{"id":"lookup","title":"查询当天资料"},{"id":"record","title":"保存 weather.md"},{"id":"answer","title":"整理答复"}]}),run,&[]).unwrap()
     }
+    #[test]
+    fn d103_rejects_unverifiable_file_plan_before_any_effect_and_allows_corrected_create() {
+        let r = run();
+        for title in [
+            "绘制图0至图6并保存为章节文件",
+            "保存最终报告",
+            "写入汇总文档",
+        ] {
+            let result = update(
+                None,
+                &json!({"type":"create","steps":[{"id":"chapter","title":title}]}),
+                &r,
+                &[],
+            );
+            let error = result.expect_err("泛化写步骤必须在create时拒绝，不能持久不可验收计划");
+            assert!(error.message.contains("实际产物路径"));
+        }
+        for title in [
+            "保存 chapters/part01",
+            "保存 chapter.md",
+            "写入 `README`",
+            "保存 C:\\work\\chapter.md",
+        ] {
+            let p = update(
+                None,
+                &json!({"type":"create","steps":[{"id":"chapter","title":title}]}),
+                &r,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(p["steps"][0]["state"], "pending");
+            assert!(update(Some(p),&json!({"type":"update","stepId":"chapter","state":"completed","evidenceCallIds":[]}),&r,&[]).is_err(),"路径外形检查不代替真实成功证据");
+        }
+        let legacy = json!({"run_id":"r","steps":[{"id":"chapter","title":"保存章节文件","state":"pending","evidenceCallIds":[]}]});
+        assert!(
+            project(Some(legacy), &r).is_ok(),
+            "旧已存计划保持可读，不自动补写成功"
+        );
+    }
+
     #[test]
     fn normal_reply_with_unverified_work_is_blocked_without_false_failure_or_completion() {
         let mut r = run();
