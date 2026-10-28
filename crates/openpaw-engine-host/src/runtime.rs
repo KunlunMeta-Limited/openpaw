@@ -255,9 +255,9 @@ impl SessionHandle {
         let _gate = self.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
         let active = self.current_turn.lock().unwrap_or_else(|e| e.into_inner());
         if record.scope.asking_session_id != self.id
-            || !active
+            || active
                 .as_ref()
-                .is_some_and(|turn| turn.outcome.turn_id == record.turn_id)
+                .is_none_or(|turn| turn.outcome.turn_id != record.turn_id)
         {
             return Err("问题执行归属已失效".into());
         }
