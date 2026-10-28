@@ -20,6 +20,8 @@ pub mod coordination;
 pub mod events;
 pub mod fallback;
 pub mod token_budget;
+/// 功能：中立用户问答协调及可信执行暂停，不依赖具体展示入口。
+pub mod user_input;
 
 pub use agent_loop::AgentLoop;
 pub use compaction::{CompactOptions, CompactTrigger};

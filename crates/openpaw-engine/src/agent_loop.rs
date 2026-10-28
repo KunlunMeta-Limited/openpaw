@@ -29,6 +29,7 @@ struct TurnCollection<'a> {
     context_turn_id: Option<String>,
     context_progress: Option<crate::turn_execution::ContextProgress>,
     end_turn_coordination: Option<crate::turn_execution::EndTurnCoordination>,
+    pause_check: Option<crate::user_input::PauseCheck>,
 }
 
 impl<'a> TurnCollection<'a> {
@@ -40,6 +41,7 @@ impl<'a> TurnCollection<'a> {
             context_turn_id: None,
             context_progress: None,
             end_turn_coordination: None,
+            pause_check: None,
         }
     }
 }
@@ -506,6 +508,7 @@ impl AgentLoop {
                 context_turn_id: options.context_turn_id,
                 context_progress: options.context_progress,
                 end_turn_coordination: options.end_turn_coordination,
+                pause_check: options.pause_check,
             },
         )
         .await
@@ -529,6 +532,7 @@ impl AgentLoop {
             context_turn_id,
             context_progress,
             end_turn_coordination,
+            pause_check,
         } = collection;
         if context_turn_id.is_some() {
             crate::context::project_history(
@@ -815,7 +819,12 @@ impl AgentLoop {
                 });
             }
             let results = self
-                .execute_tools(tool_uses, event_sink, (recorder.as_ref(), response_index))
+                .execute_tools(
+                    tool_uses,
+                    event_sink,
+                    (recorder.as_ref(), response_index),
+                    context_turn_id.as_deref(),
+                )
                 .await?;
             response_index += 1;
             let media: Vec<_> = results
@@ -903,6 +912,16 @@ impl AgentLoop {
                 }
             }
             session.messages.push(model_message);
+            if let Some(reason) = pause_check.as_ref().and_then(|check| check()) {
+                let message =
+                    Message::assistant_text(format!("执行已暂停：{reason}。请在原聊天明确继续。"));
+                event_sink(AgentEvent::TextDelta {
+                    text: message.text(),
+                });
+                generated.push(message.clone());
+                session.messages.push(message);
+                return Ok(StopReason::EndTurn);
+            }
         }
     }
 
@@ -1424,15 +1443,16 @@ impl AgentLoop {
         tool_uses: Vec<ToolUseCall>,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+        turn_id: Option<&str>,
     ) -> Result<Vec<ContentBlock>> {
         if tool_uses.is_empty() {
             return Ok(Vec::new());
         }
         if self.parallel_tools && tool_uses.len() > 1 {
-            self.execute_tools_phased(tool_uses, event_sink, recording)
+            self.execute_tools_phased(tool_uses, event_sink, recording, turn_id)
                 .await
         } else {
-            self.execute_tools_sequential(tool_uses, event_sink, recording)
+            self.execute_tools_sequential(tool_uses, event_sink, recording, turn_id)
                 .await
         }
     }
@@ -1450,6 +1470,7 @@ impl AgentLoop {
         tool_uses: Vec<ToolUseCall>,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+        turn_id: Option<&str>,
     ) -> Result<Vec<ContentBlock>> {
         let ctx = self.check_context();
         let cancel = self.current_cancel_token();
@@ -1522,7 +1543,6 @@ impl AgentLoop {
             // tokio::spawn per call: real concurrency even for tools whose
             // hosts block their executor thread (upstream parity).
             let host = Arc::clone(&self.tool_host);
-            let ctx = ctx.clone();
             let hook_chain = self.hook_chain.clone();
             let mut tasks = tokio::task::JoinSet::new();
             let mut metadata = Vec::with_capacity(safe.len());
@@ -1541,7 +1561,11 @@ impl AgentLoop {
                 let started = Instant::now();
                 metadata.push((id.clone(), name.clone(), started));
                 let host = Arc::clone(&host);
-                let ctx = ctx.clone();
+                let invocation = openpaw_core::ToolInvocationContext {
+                    turn_id: turn_id.map(str::to_owned),
+                    response_index: recording.1,
+                    tool_call_id: id.clone(),
+                };
                 let hooks = hook_chain.clone();
                 let cancel = cancel.clone();
                 tasks.spawn(async move {
@@ -1551,7 +1575,7 @@ impl AgentLoop {
                         &*host,
                         &name,
                         input,
-                        &ctx,
+                        &invocation,
                         &cancel,
                         &mut interrupted,
                     ))
@@ -1631,6 +1655,11 @@ impl AgentLoop {
 
         // ── 阶段 3：在审批门后串行执行确认调用 ─────────────────────────
         for (id, name, input, reason) in confirm {
+            let invocation = openpaw_core::ToolInvocationContext {
+                turn_id: turn_id.map(str::to_owned),
+                response_index: recording.1,
+                tool_call_id: id.clone(),
+            };
             let started = Instant::now();
             let mut authorized = false;
             let mut interrupted = false;
@@ -1663,7 +1692,7 @@ impl AgentLoop {
                         &*self.tool_host,
                         &name,
                         input,
-                        &ctx,
+                        &invocation,
                         &cancel,
                         &mut interrupted,
                     )
@@ -1712,12 +1741,18 @@ impl AgentLoop {
         tool_uses: Vec<ToolUseCall>,
         event_sink: &mut (dyn FnMut(AgentEvent) + Send),
         recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+        turn_id: Option<&str>,
     ) -> Result<Vec<ContentBlock>> {
         let ctx = self.check_context();
         let cancel = self.current_cancel_token();
         let mut results = Vec::with_capacity(tool_uses.len());
 
         for (id, name, input) in tool_uses {
+            let invocation = openpaw_core::ToolInvocationContext {
+                turn_id: turn_id.map(str::to_owned),
+                response_index: recording.1,
+                tool_call_id: id.clone(),
+            };
             let started = Instant::now();
             let mut authorized = false;
             let mut interrupted = false;
@@ -1792,7 +1827,7 @@ impl AgentLoop {
                                 &*self.tool_host,
                                 &name,
                                 input,
-                                &ctx,
+                                &invocation,
                                 &cancel,
                                 &mut interrupted,
                             )
@@ -1827,7 +1862,7 @@ impl AgentLoop {
                         &*self.tool_host,
                         &name,
                         input,
-                        &ctx,
+                        &invocation,
                         &cancel,
                         &mut interrupted,
                     )
@@ -2031,14 +2066,14 @@ async fn execute_prepared_cancelled(
     host: &dyn ToolHost,
     name: &str,
     input: serde_json::Value,
-    ctx: &CheckContext,
+    invocation: &openpaw_core::ToolInvocationContext,
     cancel: &CancellationToken,
     interrupted: &mut bool,
 ) -> ToolCallOutcome {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => { *interrupted = true; ToolCallOutcome::error("cancelled by user") },
-        outcome = execute_prepared(hooks, host, name, input, ctx) => outcome,
+        outcome = execute_prepared(hooks, host, name, input, invocation) => outcome,
     }
 }
 
@@ -2049,13 +2084,13 @@ async fn execute_prepared(
     host: &dyn ToolHost,
     name: &str,
     input: serde_json::Value,
-    ctx: &CheckContext,
+    invocation: &openpaw_core::ToolInvocationContext,
 ) -> ToolCallOutcome {
     let Some(chain) = hook_chain else {
-        return sanitize_outcome(execute_one(host, name, input, ctx).await);
+        return sanitize_outcome(execute_one(host, name, input, invocation).await);
     };
 
-    let mut outcome = execute_one(host, name, input.clone(), ctx).await;
+    let mut outcome = execute_one(host, name, input.clone(), invocation).await;
 
     // AfterToolCall：观察者可以改写工具结果。
     if chain.hook_count(HookPoint::AfterToolCall) > 0 {
@@ -2104,10 +2139,9 @@ async fn execute_one(
     host: &dyn ToolHost,
     name: &str,
     input: serde_json::Value,
-    ctx: &CheckContext,
+    invocation: &openpaw_core::ToolInvocationContext,
 ) -> ToolCallOutcome {
-    let _ = ctx; // 支持上下文的 ToolHost 在 E2 阶段接入更深的检查。
-    match host.call(name, input).await {
+    match host.call_with_context(name, input, invocation).await {
         Ok(outcome) => outcome,
         Err(e) => ToolCallOutcome::error(e.to_string()),
     }
@@ -2147,7 +2181,7 @@ mod tests {
                 &host,
                 "read_file",
                 serde_json::json!({"path":"media.gif"}),
-                &CheckContext::default(),
+                &openpaw_core::ToolInvocationContext::default(),
             )
             .await;
             assert!(outcome.media.is_empty());

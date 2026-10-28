@@ -21,6 +21,8 @@ mod office;
 #[cfg(feature = "engine-host")]
 mod protocol;
 #[cfg(feature = "engine-host")]
+mod question;
+#[cfg(feature = "engine-host")]
 mod runtime;
 
 #[cfg(feature = "engine-host")]

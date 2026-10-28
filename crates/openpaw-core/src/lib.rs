@@ -31,6 +31,8 @@ pub mod provider;
 pub mod retry;
 pub mod session;
 pub mod tool_host;
+/// 功能：导出中立单题问答值类型。Stability: unstable.
+pub mod user_input;
 pub mod workspace;
 
 pub use approval::{
@@ -64,6 +66,7 @@ pub mod context;
 pub use context::ModelContextCheckpoint;
 pub use tool_host::{
     NullToolHost, RegistryToolHost, ToolCallOutcome, ToolExecutor, ToolHost, ToolHostValidator,
+    ToolInvocationContext,
 };
 pub use workspace::{init_workspace_dirs, openpaw_home, validate_workspace_name};
 

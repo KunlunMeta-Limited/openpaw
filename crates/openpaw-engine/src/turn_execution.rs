@@ -43,6 +43,8 @@ impl SessionCheckpoint {
 pub struct TurnOptions {
     /// 功能：原回合正常结束前可取消地等待可靠协作事实；默认不安装。
     pub end_turn_coordination: Option<EndTurnCoordination>,
+    /// 功能：工具批次可靠结算后读取可信入口暂停事实，默认关闭。
+    pub pause_check: Option<crate::user_input::PauseCheck>,
     /// 功能：整理开始时更新入口既有状态，不接收摘要或原件正文。
     pub context_progress: Option<ContextProgress>,
     /// 功能：可信入口选择只整理历史，不执行业务模型或工具。
@@ -112,6 +114,8 @@ pub(crate) fn observe(
 
 /// 功能：返回执行结果及可用于后续存储提交失败恢复的检查点。
 pub struct TurnExecution {
+    /// 功能：受控暂停原因；已结算事实保留，错误或取消时为空。
+    pub paused: Option<String>,
     /// 模型回合的结果；panic 转换为既有 session 错误。
     pub result: openpaw_core::Result<StopReason>,
     /// 已接收输入之后的检查点；成功执行不等于持久化提交。
@@ -153,6 +157,7 @@ pub async fn run_turn(
         checkpoint: Some(checkpoint),
     };
     let cancel = options.cancel.clone();
+    let pause_check = options.pause_check.clone();
     let mut generated_messages = Vec::new();
     let execution = agent.run_turn_collect(
         guard.session,
@@ -174,6 +179,11 @@ pub async fn run_turn(
         generated_messages.clear();
     }
     TurnExecution {
+        paused: if result.is_ok() && !cancel.is_cancelled() {
+            pause_check.and_then(|check| check())
+        } else {
+            None
+        },
         result,
         checkpoint,
         generated_messages,
