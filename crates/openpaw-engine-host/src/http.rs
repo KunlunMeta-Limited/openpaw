@@ -2223,6 +2223,9 @@ mod tests {
                     }
                     return goal_tests::goal_model_response(&body);
                 }
+                if scenario.starts_with("delegate-conversations-async") {
+                    return async_delegation_tests::model_response(&body, &gate).await;
+                }
                 let latest = messages.iter().rposition(|message|message["role"] == "user").unwrap_or(0);
                 let tools = messages[latest..].iter().filter(|message| message["role"] == "tool").count();
                 let parent = body["tools"].as_array().unwrap().iter().any(|tool| tool["function"]["name"] == "delegate_task");
@@ -2305,9 +2308,12 @@ mod tests {
             ("OPENPAW_MAIN_API_KEY", "fixture-gateway-key".into()),
             (
                 "OPENPAW_ENGINE_MAX_MODEL_REQUESTS",
-                if matches!(
+                if scenario == "delegate-conversations-async-capacity" {
+                    "5"
+                } else if matches!(
                     scenario,
                     "delegate-concurrent"
+                        | "delegate-conversations-async"
                         | "goal-delegate"
                         | "delegate-cancel"
                         | "delegate-conversations"

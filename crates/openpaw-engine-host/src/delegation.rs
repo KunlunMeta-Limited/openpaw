@@ -121,6 +121,7 @@ pub(crate) struct DelegationContext {
     state_file: PathBuf,
     slots: Arc<Semaphore>,
     shared: Arc<DelegationShared>,
+    executions: Arc<openpaw_engine::coordination::ExecutionRegistry>,
     #[cfg(test)]
     _runtime_keeper: Option<Arc<crate::runtime::AppState>>,
     enabled: bool,
@@ -194,6 +195,7 @@ impl DelegationContext {
             state_file,
             slots: Arc::new(Semaphore::new(MAX_PARALLEL_SUBAGENTS)),
             shared,
+            executions: Arc::default(),
             #[cfg(test)]
             _runtime_keeper: None,
             enabled,
@@ -214,6 +216,7 @@ impl DelegationContext {
         model: String,
         cancel: CancellationToken,
     ) {
+        self.executions.begin_turn();
         *self
             .provider_model
             .write()
@@ -251,7 +254,11 @@ impl DelegationContext {
         ))
     }
 
-    async fn run(&self, input: DelegateTaskInput) -> openpaw_core::Result<ToolCallOutcome> {
+    async fn run(
+        &self,
+        input: DelegateTaskInput,
+        synchronous: bool,
+    ) -> openpaw_core::Result<ToolCallOutcome> {
         let task = input.task.trim();
         if task.is_empty() || task.chars().count() > MAX_DELEGATE_TASK_CHARS {
             return Ok(ToolCallOutcome::error(format!(
@@ -277,11 +284,13 @@ impl DelegationContext {
                 current.cancel.clone(),
             )
         };
-        let permit = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Ok(cancelled_outcome(&workspace_id, &name, &self.parent_session_id)),
-            permit = self.slots.clone().acquire_owned() => permit.map_err(|_| Error::ToolHost("子 Agent 调度器已关闭".into()))?,
-        };
+        if cancel.is_cancelled() {
+            return Ok(cancelled_outcome(
+                &workspace_id,
+                &name,
+                &self.parent_session_id,
+            ));
+        }
         let runtime = self
             .shared
             .runtime
@@ -289,7 +298,7 @@ impl DelegationContext {
             .unwrap_or_else(|e| e.into_inner())
             .upgrade()
             .ok_or_else(|| Error::ToolHost("委派运行时不可用，未启动子任务".into()))?;
-        runtime
+        let execution = runtime
             .start_delegated(
                 input.task_id,
                 input.goal_task_id,
@@ -305,13 +314,33 @@ impl DelegationContext {
                 model,
                 cancel,
                 self.approvals.clone(),
-                permit,
+                self.slots.clone(),
             )
             .await
-            .map_err(Error::ToolHost)?
-            .wait()
-            .await
-            .map_err(Error::ToolHost)
+            .map_err(Error::ToolHost)?;
+        if synchronous {
+            execution.wait().await.map_err(Error::ToolHost)
+        } else {
+            Ok(self.executions.register(execution))
+        }
+    }
+
+    /// 功能：组装本回合正常结束前的可信子结果协调。
+    /// 参数：无。
+    /// 返回：只等待本轮登记执行的异步回调。
+    /// 错误：子失败作为实际结果交付。
+    /// 状态：结果仍由原AgentLoop提交历史。
+    /// 并发与取消：等待不持有父会话锁之外的执行资源；Engine沿原令牌取消。
+    /// 权限：不读取其他父回合或会话。
+    /// 关联：TurnOptions。Stability: experimental。
+    pub(crate) fn end_turn_coordination(
+        &self,
+    ) -> openpaw_engine::turn_execution::EndTurnCoordination {
+        let executions = self.executions.clone();
+        Arc::new(move || {
+            let executions = executions.clone();
+            Box::pin(async move { executions.coordinate().await })
+        })
     }
 
     /// 功能：可靠清除已完成结果，保留逻辑子空间。
@@ -542,7 +571,7 @@ fn save_delegations(
 fn delegate_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate_task".into(),
-        description: "把清晰独立的子任务交给真实子 Agent 并等待结果。Goal 执行必须用 goal_task_id 绑定当前可执行计划任务，子结果只算产出，主 Agent 检查验收。继续已有员工必须传上次结果或员工清单中的真实 task_id，保留其自己的工作历史；不传 task_id 始终创建新身份，即使 name 或 task 相同。name 仅用于新员工显示，优先中文；不能传 workspaceId 或 Goal 任务编号代替 task_id。简单任务不要调用。".into(),
+        description: "同步兼容入口：启动独立子Agent并等真实结果。优先使用start_agent。task_id续办真实子会话，不传则新建；Goal必须传goal_task_id，产出仍需主Agent验收。".into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -624,6 +653,11 @@ impl ToolExecutor for DelegatingToolHost {
         let mut tools = self.builtin.list_tools().await?;
         if self.context.enabled {
             tools.push(delegate_spec());
+            let mut start = delegate_spec();
+            start.name = "start_agent".into();
+            start.description = "优先派发独立子Agent，受理后返回session_id、turn_id，父继续独立工作，需结果时wait_agent。不传task_id新建；续办须用真实子会话task_id，name仅展示。Goal须传goal_task_id，产出仍需主验收。".into();
+            tools.push(start);
+            tools.extend(openpaw_engine::coordination::execution_tool_specs());
             tools.push(artifact_spec());
         }
         Ok(tools)
@@ -673,7 +707,21 @@ impl ToolExecutor for DelegatingToolHost {
                 ),
             });
         }
-        if name != "delegate_task" {
+        if matches!(name, "get_agent_status" | "wait_agent") && self.context.enabled {
+            let cancel = self
+                .context
+                .provider_model
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel
+                .clone();
+            return Ok(self
+                .context
+                .executions
+                .inspect(args, name == "wait_agent", cancel)
+                .await);
+        }
+        if !matches!(name, "delegate_task" | "start_agent") {
             return self.builtin.call(name, args).await;
         }
         if !self.context.enabled {
@@ -689,7 +737,7 @@ impl ToolExecutor for DelegatingToolHost {
                 )))
             }
         };
-        self.context.run(input).await
+        self.context.run(input, name == "delegate_task").await
     }
 }
 
@@ -706,7 +754,10 @@ impl ToolHostValidator for DelegatingToolHost {
             }
             return artifact_path(input).map(|_| ());
         }
-        if name == "delegate_task" {
+        if matches!(name, "get_agent_status" | "wait_agent") && self.context.enabled {
+            return openpaw_engine::coordination::ExecutionRegistry::validate(input);
+        }
+        if matches!(name, "delegate_task" | "start_agent") {
             if !self.context.enabled {
                 return Err("当前 Host 未启用 AI Office 子 Agent 委派".into());
             }
@@ -719,7 +770,10 @@ impl ToolHostValidator for DelegatingToolHost {
     }
 
     fn should_cascade_on_error(&self, name: &str, outcome: &ToolCallOutcome) -> bool {
-        name != "delegate_task" && self.builtin.should_cascade_on_error(name, outcome)
+        !matches!(
+            name,
+            "delegate_task" | "start_agent" | "get_agent_status" | "wait_agent"
+        ) && self.builtin.should_cascade_on_error(name, outcome)
     }
 }
 
@@ -956,6 +1010,7 @@ mod tests {
         let shared = DelegationShared::with_slots(DEFAULT_GLOBAL_SUBAGENTS);
         shared.bind_runtime(&runtime);
         Arc::new(DelegationContext {
+            executions: Arc::default(),
             parent_session_id: parent_session_id.into(),
             workspace,
             office,
@@ -980,7 +1035,7 @@ mod tests {
         let host = test_host();
         let tools = host.list_tools().await.unwrap();
         let builtin = host.builtin.list_tools().await.unwrap();
-        assert_eq!(tools.len(), builtin.len() + 2);
+        assert_eq!(tools.len(), builtin.len() + 5);
         assert_eq!(
             tools
                 .iter()

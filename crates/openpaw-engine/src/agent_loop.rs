@@ -28,6 +28,7 @@ struct TurnCollection<'a> {
     recorder: Option<crate::turn_execution::ExecutionRecorder>,
     context_turn_id: Option<String>,
     context_progress: Option<crate::turn_execution::ContextProgress>,
+    end_turn_coordination: Option<crate::turn_execution::EndTurnCoordination>,
 }
 
 impl<'a> TurnCollection<'a> {
@@ -38,6 +39,7 @@ impl<'a> TurnCollection<'a> {
             recorder: None,
             context_turn_id: None,
             context_progress: None,
+            end_turn_coordination: None,
         }
     }
 }
@@ -503,6 +505,7 @@ impl AgentLoop {
                 recorder: options.recorder,
                 context_turn_id: options.context_turn_id,
                 context_progress: options.context_progress,
+                end_turn_coordination: options.end_turn_coordination,
             },
         )
         .await
@@ -525,6 +528,7 @@ impl AgentLoop {
             recorder,
             context_turn_id,
             context_progress,
+            end_turn_coordination,
         } = collection;
         if context_turn_id.is_some() {
             crate::context::project_history(
@@ -746,6 +750,21 @@ impl AgentLoop {
             session.messages.push(assistant);
 
             if resp.stop_reason != StopReason::ToolUse {
+                if resp.stop_reason == StopReason::EndTurn && !self.is_cancelled() {
+                    if let Some(coordinate) = &end_turn_coordination {
+                        match cancel_or(&token, coordinate()).await {
+                            Some(Some(fact)) => {
+                                let fact = Message::user_text(fact).identified();
+                                generated.push(fact.clone());
+                                session.messages.push(fact);
+                                response_index += 1;
+                                continue;
+                            }
+                            None => return Ok(StopReason::EndTurn),
+                            Some(None) => {}
+                        }
+                    }
+                }
                 // Token 预算继续：模型已停止，但仍有有效预算且收益未递减时，提示其继续工作。
                 let nudge = if resp.stop_reason == StopReason::EndTurn
                     && !self.is_cancelled()
@@ -854,13 +873,34 @@ impl AgentLoop {
             generated.push(tool_message.clone());
             let mut model_message = tool_message;
             if let Some(turn) = &context_turn_id {
-                crate::context::project_results(
-                    &mut model_message.content,
-                    &session.meta.id,
-                    turn,
-                    response_index - 1,
-                    provider.model_capabilities(&model).context_window as usize,
+                let window = provider.model_capabilities(&model).context_window as usize;
+                let fixed = crate::compaction::estimate_messages_tokens(
+                    system.as_deref().unwrap_or(""),
+                    &session.messages,
+                    crate::context::tools_tokens(tools),
                 );
+                let available =
+                    crate::context::input_limit(window, self.max_tokens).saturating_sub(fixed);
+                let mut preview_window = window;
+                loop {
+                    // 新增协作声明也占固定输入；只缩小模型副本，原件与引用保持完整。
+                    crate::context::project_results(
+                        &mut model_message.content,
+                        &session.meta.id,
+                        turn,
+                        response_index - 1,
+                        preview_window,
+                    );
+                    let cost = crate::compaction::estimate_messages_tokens(
+                        "",
+                        std::slice::from_ref(&model_message),
+                        0,
+                    );
+                    if cost <= available || preview_window <= 1024 {
+                        break;
+                    }
+                    preview_window = (preview_window / 2).max(1024);
+                }
             }
             session.messages.push(model_message);
         }

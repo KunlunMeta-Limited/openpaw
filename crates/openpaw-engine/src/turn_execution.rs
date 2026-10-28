@@ -41,6 +41,8 @@ impl SessionCheckpoint {
 /// 功能：保存一次调用的中立配置，不改变 AgentLoop 默认模型。
 #[derive(Default)]
 pub struct TurnOptions {
+    /// 功能：原回合正常结束前可取消地等待可靠协作事实；默认不安装。
+    pub end_turn_coordination: Option<EndTurnCoordination>,
     /// 功能：整理开始时更新入口既有状态，不接收摘要或原件正文。
     pub context_progress: Option<ContextProgress>,
     /// 功能：可信入口选择只整理历史，不执行业务模型或工具。
@@ -62,6 +64,11 @@ pub struct TurnOptions {
 /// 功能：只报告整理开始的中立状态回调，不携带敏感内容。
 /// Stability: experimental；仅供执行入口复用现有状态通道。
 pub type ContextProgress = Arc<dyn Fn() + Send + Sync>;
+
+/// 功能：可信入口提供的异步正常结束协调；只返回新事实，不创建回合或扩充预算。
+/// Stability: experimental。
+pub type EndTurnCoordination =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Option<String>> + Send + Sync>;
 
 /// 功能：描述与传输、存储无关的真实可见输出和工具执行事实。
 /// 约束：包含授权会话的完整正文，不得发送到诊断日志或 Office 动作。

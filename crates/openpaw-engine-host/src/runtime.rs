@@ -700,13 +700,13 @@ impl AppState {
     }
 
     /// 功能：通过普通接收及登记启动一次前台子委派，结果等待与实际执行分开。
-    /// 参数：task_id 为可选真实子身份，goal_task_id 为 Goal Task 绑定，其余为可信父关系、目录、任务、模型、取消、审批及需移交的子并发名额。
+    /// 参数：task_id为可选真实子身份，goal_task_id为Goal Task绑定，其余为可信父关系、目录、任务、模型、取消、审批及子并发调度器。
     /// 返回：真实子会话及回合身份，和只等待本次可靠结果的执行引用。
     /// 错误：登记或持久化失败返回错误，未登记不执行。
     /// 状态：明确 ID 续用自己的历史，否则建立普通子会话；只返回本轮结果。
     /// 并发与取消：真实子任务持有名额至终态清理；父取消传播，丢弃结果等待不释放名额。
     /// 权限：子仅使用工作区工具和自己的审批，不继承桌面或父上下文。
-    /// 关联：CHG-2026-0034、ADR-003、ADR-006。
+    /// 关联：CHG-2026-0054、ADR-003、ADR-006。Stability: experimental。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_delegated(
         self: &Arc<Self>,
@@ -719,7 +719,7 @@ impl AppState {
         model: String,
         parent_cancel: CancellationToken,
         parent_approvals: Arc<HostApprovalManager>,
-        permit: tokio::sync::OwnedSemaphorePermit,
+        slots: Arc<tokio::sync::Semaphore>,
     ) -> futures::future::BoxFuture<
         'static,
         Result<openpaw_engine::coordination::StartedExecution, String>,
@@ -783,6 +783,8 @@ impl AppState {
             let parent = state.get_typed(&child.parent_id).await.ok();
             let turn_id = format!("turn_{}", Uuid::new_v4().simple());
             let user_message_id = format!("msg_{}_{}_user", handle.id, turn_id);
+            let permit = slots.clone().try_acquire_owned().ok();
+            let (running, running_state) = tokio::sync::watch::channel(false);
             let mut message = openpaw_core::Message::user_text(&task);
             message.uuid = Some(user_message_id.clone());
             let (completed, standalone) = {
@@ -844,7 +846,20 @@ impl AppState {
                 let (done, completed) = tokio::sync::oneshot::channel();
                 let child_turn_id = turn_id.clone();
                 let task = tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = if permit.is_some() {
+                        permit
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => None,
+                            permit = slots.acquire_owned() => permit.ok(),
+                        }
+                    };
+                    if _permit.is_none() {
+                        cancel.cancel();
+                    } else {
+                        running.send_replace(true);
+                    }
                     let _approvals = _approvals;
                     run_turn(child_handle.clone(), scheduled).await;
                     if let Some(binding) = goal_binding.as_mut() {
@@ -884,6 +899,7 @@ impl AppState {
             Ok(openpaw_engine::coordination::StartedExecution::new(
                 handle.id.clone(),
                 turn_id.clone(),
+                running_state,
                 Box::pin(async move {
                     // 结果等待不拥有执行名额；父登记表仍负责实际任务的取消与join。
                     if let Some(task) = standalone {
@@ -3072,7 +3088,7 @@ fn accept_turn_with_policy(
             }
         }
     };
-    let queued = admission.as_ref().is_some_and(TurnAdmission::is_queued);
+    let queued = inherited || admission.as_ref().is_some_and(TurnAdmission::is_queued);
     let now = chrono::Utc::now().timestamp_millis();
     let outcome = TurnOutcome {
         turn_id: turn_id.clone(),
@@ -3378,7 +3394,9 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         .unwrap_or_else(|error| error.into_inner())
         .as_ref()
         .and_then(|active| active.outcome.queued_at);
-    let permit = if let Some(admission) = admission {
+    let permit = if turn_cancel.is_cancelled() {
+        None
+    } else if let Some(admission) = admission {
         admission.wait(turn_cancel.clone()).await.map(Some)
     } else {
         Some(None)
@@ -3719,6 +3737,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     &provider_tools,
                     &mut sink,
                     TurnOptions {
+                        end_turn_coordination: Some(handle.delegation.end_turn_coordination()),
                         context_progress: Some(Arc::new(move || {
                             progress_handle.set_activity("thinking", None, "正在整理上下文")
                         })),
