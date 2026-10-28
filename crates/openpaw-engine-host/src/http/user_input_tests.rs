@@ -534,7 +534,10 @@ mod async_delegation_tests {
             .find(|m| m["role"] == "user")
             .and_then(|m| m["content"].as_str())
             .unwrap_or("");
-        let terminal_case = matches!(first_user, "父预算耗尽" | "父模型截断" | "父模型失败");
+        let terminal_case = matches!(
+            first_user,
+            "父预算耗尽" | "父最后预算结束" | "父模型截断" | "父模型失败"
+        );
         let parent = body["tools"].to_string().contains("delegate_task") || terminal_case;
         let tools = messages.iter().filter(|m| m["role"] == "tool").count();
         if !parent && first_user == "失败子任务" {
@@ -544,7 +547,8 @@ mod async_delegation_tests {
             if first_user == "父模型失败" {
                 return StatusCode::UNAUTHORIZED.into_response();
             }
-            let chunk = if first_user == "父预算耗尽"
+            let chunk = if (first_user == "父预算耗尽"
+                || (first_user == "父最后预算结束" && tools < 25))
                 && !body["tools"].as_array().unwrap().is_empty()
             {
                 serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("budget-{tools}"),"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]})
@@ -924,7 +928,8 @@ mod async_delegation_tests {
             .get_or_init(|| tokio::sync::Mutex::new(()))
             .lock()
             .await;
-        for input in ["父预算耗尽", "父模型截断", "父模型失败"] {
+        for input in ["父预算耗尽", "父最后预算结束", "父模型截断", "父模型失败"]
+        {
             let fixture = main_fixture("delegate-conversations-async", "confirm").await;
             let response = fixture
                 .app

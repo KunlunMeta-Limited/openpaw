@@ -592,10 +592,10 @@ impl AgentLoop {
             // ③ 先消费当前预算，再按需扩展；耗尽后仅允许一次禁用工具的最终答复。
             // 固定预算不能调用 expand，因此必须先 try_consume，否则 `new(n)` 实际只会
             // 运行 grace 那一次。最终答复不占工具迭代预算，也不能再次请求工具。
-            if !(self.budget.try_consume()
-                || (self.budget.expand(1) && self.budget.try_consume())
-                || self.budget.try_grace())
-            {
+            let normal_iteration =
+                self.budget.try_consume() || (self.budget.expand(1) && self.budget.try_consume());
+            let grace_iteration = !normal_iteration && self.budget.try_grace();
+            if !(normal_iteration || grace_iteration) {
                 return self
                     .finish_after_iteration_budget(
                         session,
@@ -754,7 +754,10 @@ impl AgentLoop {
             session.messages.push(assistant);
 
             if resp.stop_reason != StopReason::ToolUse {
-                if resp.stop_reason == StopReason::EndTurn && !self.is_cancelled() {
+                if resp.stop_reason == StopReason::EndTurn
+                    && !self.is_cancelled()
+                    && !grace_iteration
+                {
                     if let Some(coordinate) = &end_turn_coordination {
                         match cancel_or(&token, coordinate()).await {
                             Some(Some(fact)) => {
