@@ -1515,10 +1515,10 @@ impl MainOffice {
     /// 参数：shutdown 为 Host 关闭令牌。
     /// 返回：无。
     /// 错误：仅安全日志，离线不改变模型回合结果。
-    /// 状态：有限间隔重试目录、可选聊天地址与当前快照，不恢复执行或历史动画。
+    /// 状态：首个成功初始化选择成员布局；后续只同步目录、聊天地址与快照，保留手动布局。
     /// 并发与取消：两个独立任务，UI 长轮询不阻塞快照；关闭时丢弃 HTTP future。
     /// 权限：创建仅使用服务端根目录；聊天地址仅来自可信环境，不附浏览器凭据。
-    /// 关联：T1-01、T1-08、T1-10、CHG-2026-0047、CHG-2026-0048。
+    /// 关联：T1-01、T1-08、T1-10、CHG-2026-0047、CHG-2026-0048、CHG-2026-0053。
     pub(crate) fn start(self: &Arc<Self>, shutdown: tokio_util::sync::CancellationToken) {
         use std::sync::atomic::Ordering;
         if self.url.is_none() || self.started.swap(true, Ordering::AcqRel) {
@@ -1553,7 +1553,7 @@ impl MainOffice {
             .expect("single main worker");
         tokio::spawn(async move {
             // 即使页面已经就绪，Host 首轮仍须登记本次配置；Gateway 丢失目录后再次登记。
-            let mut chat_registered = false;
+            let mut initialized = false;
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1639,13 +1639,16 @@ impl MainOffice {
                             })
                         })
                     });
-                    let status = if ready && (chat.is_none() || chat_registered) {
+                    let status = if ready && initialized {
                         200
                     } else {
                         // 原版Gateway和浏览器均增量合并目录；每个办公室独立满足单请求64KiB合同。
                         let mut status = 200;
                         for snapshot in snapshots {
                             let mut message = serde_json::json!({"type":"offices.initialize","offices":[snapshot]});
+                            if !initialized {
+                                message["layoutId"] = serde_json::json!("members");
+                            }
                             if let Some(url) = chat {
                                 message["chat"] = serde_json::json!({"url":url.as_str()});
                             }
@@ -1653,6 +1656,7 @@ impl MainOffice {
                             if !matches!(result, 200 | 202) {
                                 return Err("main 初始化被拒绝".into());
                             }
+                            initialized = true;
                             status = status.max(result);
                         }
                         status
@@ -1660,7 +1664,6 @@ impl MainOffice {
                     if !matches!(status, 200 | 202) {
                         return Err("main 初始化被拒绝".into());
                     }
-                    chat_registered = true;
                     if status == 200 {
                         // 完整快照会按任务重算人物状态。对仍真实活动的回合重新提交
                         // 当前思考/工具状态；只恢复状态，不重播交接或重新启动执行。
@@ -3114,6 +3117,111 @@ mod tests {
     use openpaw_engine::AgentEvent;
 
     #[tokio::test]
+    async fn main_members_layout_retries_initialization_and_preserves_manual_selection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let office = MainOffice::new(
+            home.path(),
+            workspace.path(),
+            Some(format!("http://{address}")),
+        );
+        let snapshot = office.directory().unwrap().remove(0);
+        let state = Arc::new(Mutex::new((
+            Vec::<Value>::new(),
+            "classic".to_string(),
+            true,
+        )));
+        let captured = state.clone();
+        let server = tokio::spawn(async move {
+            let router = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let captured = captured.clone();
+                let snapshot = snapshot.clone();
+                async move {
+                    if body["type"] == "ui.next" {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        return (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"code":200,"msg":"OK","data":{"actions":[]}})));
+                    }
+                    let mut state = captured.lock().unwrap();
+                    let mut code = 200;
+                    let data = match body["type"].as_str() {
+                        Some("office.capabilities") => serde_json::json!({"scene":{},"ui":{},"requests":{},"responses":{"success":{},"error":{}}}),
+                        Some("office.layout.set") => {
+                            state.1 = body["layoutId"].as_str().unwrap().into();
+                            state.2 = false;
+                            serde_json::json!({"currentLayoutId":state.1})
+                        }
+                        _ => {
+                            if body["type"] == "offices.initialize" {
+                                state.0.push(body.clone());
+                                if state.0.len() == 1 {
+                                    return (axum::http::StatusCode::SERVICE_UNAVAILABLE, axum::Json(serde_json::json!({"code":503,"msg":"retry","data":{"reasonCode":"NOT_READY","details":{},"issues":[]}})));
+                                }
+                                if let Some(layout) = body["layoutId"].as_str() { state.1 = layout.into(); }
+                                state.2 = true;
+                                code = 202;
+                            }
+                            serde_json::json!({"offices":[{"id":snapshot["workspace"]["id"],"name":snapshot["workspace"]["name"],"seq":snapshot["seq"],"runtimeReady":state.2,"taskCount":0}],"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}})
+                        }
+                    };
+                    (axum::http::StatusCode::from_u16(code).unwrap(), axum::Json(serde_json::json!({"code":code,"msg":"OK","data":data})))
+                }
+            }));
+            axum::serve(listener, router).await.unwrap();
+        });
+        office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        let (_, ready) = office
+            .message(
+                serde_json::json!({"type":"office.read"}),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready["offices"][0]["runtimeReady"], true);
+        let stop = tokio_util::sync::CancellationToken::new();
+        office.start(stop.clone());
+        let initialized = tokio::time::timeout(Duration::from_secs(8), async {
+            while state.lock().unwrap().0.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if initialized.is_ok() {
+            assert_eq!(state.lock().unwrap().1, "members");
+            reqwest::Client::new()
+                .post(format!("http://{address}"))
+                .json(&serde_json::json!({"type":"office.layout.set","layoutId":"classic"}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        }
+        let synchronized = tokio::time::timeout(Duration::from_secs(8), async {
+            while initialized.is_ok() && state.lock().unwrap().0.len() < 3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        stop.cancel();
+        server.abort();
+        initialized.expect("已有ready目录也须首次初始化，失败后重试成员布局");
+        synchronized.expect("手动切换后重新同步目录");
+        let state = state.lock().unwrap();
+        assert_eq!(state.0[0]["layoutId"], "members");
+        assert_eq!(state.0[1]["layoutId"], "members");
+        assert!(state.0[2].get("layoutId").is_none());
+        assert_eq!(state.1, "classic");
+    }
+
+    #[tokio::test]
     async fn main_large_directory_publishes_all_offices_within_each_request_limit() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3121,15 +3229,19 @@ mod tests {
             std::collections::BTreeMap::<String, Value>::new(),
         ));
         let captured = received.clone();
+        let initializations = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let messages = initializations.clone();
         let server = tokio::spawn(async move {
             let router = axum::Router::new().fallback(axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
                 let captured = captured.clone();
+                let messages = messages.clone();
                 async move {
                     let data = match body["type"].as_str() {
                         Some("office.capabilities") => serde_json::json!({"scene":{},"ui":{},"requests":{"properties":{"conversations":{}}},"responses":{"success":{},"error":{}}}),
                         Some("ui.next") => { tokio::time::sleep(Duration::from_millis(20)).await; serde_json::json!({"actions":[]}) },
                         _ => {
                             if body["type"] == "offices.initialize" {
+                                messages.lock().unwrap().push(body.clone());
                                 assert!(serde_json::to_vec(&body).unwrap().len() <= 65536);
                                 for snapshot in body["offices"].as_array().unwrap() {
                                     captured.lock().unwrap().insert(snapshot["workspace"]["id"].as_str().unwrap().into(), snapshot.clone());
@@ -3175,6 +3287,9 @@ mod tests {
         stop.cancel();
         server.abort();
         synchronized.expect("目录累计超过64KiB时仍须逐办公室发布全部事实");
+        let messages = initializations.lock().unwrap();
+        assert_eq!(messages[0]["layoutId"], "members");
+        assert!(messages[1].get("layoutId").is_none());
         for snapshot in office.directory().unwrap() {
             assert_eq!(
                 received.lock().unwrap()[snapshot["workspace"]["id"].as_str().unwrap()],
