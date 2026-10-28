@@ -24,7 +24,8 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-cli", 4_500),
     ("openpaw-reflect-lite", 3_000),
     // 用户于 2026-10-26 授权按当前实现规模调整 Host 预算，保留约 584 行余量。
-    ("openpaw-engine-host", 13_500),
+    // CHG-2026-0054：2026-10-28用户批准问答与非阻塞委派的Host上限15000，其余额度及计数不变。
+    ("openpaw-engine-host", 15_000),
     ("openpaw-goal-ledger", 2_000),
     // CHG-2026-0050：用户批准完整主聊天 Goal module 提取，单列新增额度，既有上限与算法不变。
     ("openpaw-main-goal", 2_200),
