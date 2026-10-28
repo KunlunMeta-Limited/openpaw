@@ -173,7 +173,7 @@ mod tests {
         }
         // Intervals should be monotonically non-decreasing
         for w in intervals.windows(2) {
-            assert!(w[1] >= w[0], "interval did not grow: {:?}", intervals);
+            assert!(w[1] >= w[0], "interval did not grow: {intervals:?}");
         }
     }
 

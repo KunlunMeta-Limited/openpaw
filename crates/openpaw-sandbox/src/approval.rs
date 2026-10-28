@@ -273,7 +273,7 @@ fn compile_anchored_regex(pattern: &str) -> Option<regex::Regex> {
     let anchored = if regex_pattern.starts_with('^') && regex_pattern.ends_with('$') {
         regex_pattern
     } else {
-        format!("^({})$", regex_pattern)
+        format!("^({regex_pattern})$")
     };
     regex::Regex::new(&anchored).ok()
 }

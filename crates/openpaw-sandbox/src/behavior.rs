@@ -235,8 +235,7 @@ impl BehaviorMonitor {
                     kind: AnomalyKind::NewCommandCategory,
                     severity: AnomalySeverity::Info,
                     description: format!(
-                        "New command category detected: {:?} (command: '{}')",
-                        category, command
+                        "New command category detected: {category:?} (command: '{command}')"
                     ),
                     command: command.to_string(),
                     recommendation: "Verify this command type is expected for the current task."
@@ -260,8 +259,7 @@ impl BehaviorMonitor {
                         kind: AnomalyKind::PathScopeViolation,
                         severity: AnomalySeverity::Warning,
                         description: format!(
-                            "Command executed outside workspace scope: {:?}",
-                            cwd_path
+                            "Command executed outside workspace scope: {cwd_path:?}"
                         ),
                         command: command.to_string(),
                         recommendation:
@@ -281,7 +279,7 @@ impl BehaviorMonitor {
                     timestamp: now,
                     kind: AnomalyKind::UnexpectedNetworkAccess,
                     severity: AnomalySeverity::Critical,
-                    description: format!("Network access to unexpected domain: {}", domain),
+                    description: format!("Network access to unexpected domain: {domain}"),
                     command: command.to_string(),
                     recommendation: "Block this domain or add it to the allowed list if legitimate.".to_string(),
                 });
@@ -316,10 +314,7 @@ impl BehaviorMonitor {
                 timestamp: now,
                 kind: AnomalyKind::SuspiciousCommandSequence,
                 severity: AnomalySeverity::Critical,
-                description: format!(
-                    "Suspicious command sequence detected involving: {}",
-                    command
-                ),
+                description: format!("Suspicious command sequence detected involving: {command}"),
                 command: command.to_string(),
                 recommendation: "Review recent command history for malicious patterns.".to_string(),
             });

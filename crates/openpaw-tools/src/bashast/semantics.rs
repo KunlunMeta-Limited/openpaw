@@ -199,7 +199,7 @@ fn check_proc_environ(commands: &[SimpleCommand]) -> Option<String> {
     for cmd in commands {
         for arg in &cmd.argv {
             if arg.contains("/proc/") && arg.contains("environ") {
-                return Some(format!("access to /proc/*/environ detected: {}", arg));
+                return Some(format!("access to /proc/*/environ detected: {arg}"));
             }
         }
     }
@@ -212,11 +212,11 @@ fn check_jq_system(commands: &[SimpleCommand]) -> Option<String> {
         if cmd.argv.first().map(|s| s == "jq").unwrap_or(false) {
             for arg in &cmd.argv {
                 if arg.contains("system(") || arg.contains("system (") {
-                    return Some(format!("jq system() call detected: {}", arg));
+                    return Some(format!("jq system() call detected: {arg}"));
                 }
                 // Dangerous flags: -e (exit code), --rawfile (read file into variable)
                 if arg == "-e" || arg.starts_with("--rawfile") {
-                    return Some(format!("jq dangerous flag: {}", arg));
+                    return Some(format!("jq dangerous flag: {arg}"));
                 }
             }
         }
@@ -313,27 +313,25 @@ pub fn check_semantics(commands: &[SimpleCommand]) -> SemanticResult {
             // Eval-like builtins check
             if EVAL_LIKE_BUILTINS.contains(&lower.as_str()) {
                 return SemanticResult::Dangerous(format!(
-                    "dangerous command (eval-like): {}",
-                    first
+                    "dangerous command (eval-like): {first}"
                 ));
             }
 
             // Zsh dangerous builtins check
             if ZSH_DANGEROUS_BUILTINS.contains(&lower.as_str()) {
-                return SemanticResult::Dangerous(format!("dangerous zsh builtin: {}", first));
+                return SemanticResult::Dangerous(format!("dangerous zsh builtin: {first}"));
             }
 
             // Shell escape commands check
             if SHELL_ESCAPE_COMMANDS.contains(&lower.as_str()) {
                 return SemanticResult::Dangerous(format!(
-                    "dangerous command (shell escape): {}",
-                    first
+                    "dangerous command (shell escape): {first}"
                 ));
             }
 
             // Shell reserved word as command name — parse anomaly
             if is_shell_keyword(&lower) {
-                return SemanticResult::Dangerous(format!("shell keyword as command: {}", first));
+                return SemanticResult::Dangerous(format!("shell keyword as command: {first}"));
             }
 
             // Interpreter inline-code check: `env python3 -c '...'`

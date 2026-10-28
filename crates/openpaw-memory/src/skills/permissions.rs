@@ -70,7 +70,7 @@ pub fn check_skill_permission(
     for rule in deny_rules {
         if matches_rule(rule, name) {
             return SkillPermissionDecision::Deny {
-                reason: format!("Skill '{}' blocked by deny rule '{}'", name, rule),
+                reason: format!("Skill '{name}' blocked by deny rule '{rule}'"),
             };
         }
     }
@@ -90,8 +90,7 @@ pub fn check_skill_permission(
     // 4. 默认 ask
     SkillPermissionDecision::Ask {
         reason: format!(
-            "Skill '{}' has advanced properties (allowed_tools/context/agent/paths). Confirm execution?",
-            name
+            "Skill '{name}' has advanced properties (allowed_tools/context/agent/paths). Confirm execution?"
         ),
     }
 }

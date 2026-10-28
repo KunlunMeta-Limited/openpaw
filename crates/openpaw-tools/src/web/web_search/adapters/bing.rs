@@ -213,7 +213,7 @@ mod tests {
     fn resolve_bing_redirect_https() {
         // a1 + base64url("https://example.com")
         let encoded = URL_SAFE_NO_PAD.encode(b"https://example.com");
-        let redirect = format!("https://www.bing.com/ck/a?...&u=a1{}", encoded);
+        let redirect = format!("https://www.bing.com/ck/a?...&u=a1{encoded}");
         assert_eq!(
             resolve_bing_url(&redirect),
             Some("https://example.com".to_string())
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn resolve_bing_redirect_http() {
         let encoded = URL_SAFE_NO_PAD.encode(b"http://example.org");
-        let redirect = format!("https://www.bing.com/ck/a?u=a0{}", encoded);
+        let redirect = format!("https://www.bing.com/ck/a?u=a0{encoded}");
         assert_eq!(
             resolve_bing_url(&redirect),
             Some("http://example.org".to_string())

@@ -250,7 +250,7 @@ fn walk_node(
     *node_count += 1;
     if *node_count > MAX_NODES {
         return WalkResult::TooComplex(
-            format!("exceeded max node budget ({})", MAX_NODES),
+            format!("exceeded max node budget ({MAX_NODES})"),
             "node_budget".into(),
         );
     }
@@ -265,7 +265,7 @@ fn walk_node(
     // Check for TooComplex node types first
     if is_too_complex_node(node_type) {
         return WalkResult::TooComplex(
-            format!("contains complex structure: {}", node_type),
+            format!("contains complex structure: {node_type}"),
             node_type.to_string(),
         );
     }
@@ -369,7 +369,7 @@ fn walk_node(
                 WalkResult::Ok
             } else {
                 WalkResult::TooComplex(
-                    format!("unhandled node type: {}", node_type),
+                    format!("unhandled node type: {node_type}"),
                     node_type.to_string(),
                 )
             }
@@ -454,7 +454,7 @@ fn parse_command_node(
                         // Check if bare expansion is safe (no spaces/globs)
                         if is_bare_var_unsafe(v) {
                             return Err(WalkResult::TooComplex(
-                                format!("variable value unsafe for bare expansion: ${}", var_name),
+                                format!("variable value unsafe for bare expansion: ${var_name}"),
                                 "simple_expansion".into(),
                             ));
                         }
@@ -484,7 +484,7 @@ fn parse_command_node(
                 // Check if it's a too-complex child
                 if is_too_complex_node(child_type) {
                     return Err(WalkResult::TooComplex(
-                        format!("contains complex structure: {}", child_type),
+                        format!("contains complex structure: {child_type}"),
                         child_type.to_string(),
                     ));
                 }
@@ -496,7 +496,7 @@ fn parse_command_node(
                     }
                 } else {
                     return Err(WalkResult::TooComplex(
-                        format!("unhandled child node: {}", child_type),
+                        format!("unhandled child node: {child_type}"),
                         child_type.to_string(),
                     ));
                 }
@@ -709,7 +709,7 @@ mod tests {
                 assert_eq!(commands.len(), 1);
                 assert_eq!(commands[0].argv, vec!["ls", "-la"]);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -722,7 +722,7 @@ mod tests {
                 assert_eq!(commands[0].argv, vec!["ls"]);
                 assert_eq!(commands[1].argv, vec!["git", "push"]);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -733,7 +733,7 @@ mod tests {
             ParseResult::Simple { commands } => {
                 assert_eq!(commands.len(), 3);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -744,7 +744,7 @@ mod tests {
             ParseResult::Simple { commands } => {
                 assert_eq!(commands.len(), 2);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -761,7 +761,7 @@ mod tests {
             ParseResult::TooComplex { node_type, .. } => {
                 assert_eq!(node_type, "command_substitution");
             }
-            _ => panic!("expected TooComplex, got {:?}", r),
+            _ => panic!("expected TooComplex, got {r:?}"),
         }
     }
 
@@ -777,7 +777,7 @@ mod tests {
                     vec![("FOO".to_string(), "bar".to_string())]
                 );
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -789,7 +789,7 @@ mod tests {
                 assert_eq!(commands.len(), 1);
                 assert!(!commands[0].redirects.is_empty());
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -833,7 +833,7 @@ mod tests {
                 assert_eq!(commands[1].argv[0], "grep");
                 assert_eq!(commands[2].argv[0], "head");
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -845,7 +845,7 @@ mod tests {
                 assert_eq!(commands.len(), 1);
                 assert_eq!(commands[0].argv, vec!["echo", "hello world"]);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -857,7 +857,7 @@ mod tests {
                 assert_eq!(commands.len(), 1);
                 assert_eq!(commands[0].argv, vec!["echo", "hello world"]);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -869,8 +869,7 @@ mod tests {
         let r = parse_for_security(&long_cmd);
         assert!(
             matches!(r, ParseResult::ParseAborted { .. }),
-            "expected ParseAborted, got {:?}",
-            r
+            "expected ParseAborted, got {r:?}"
         );
     }
 
@@ -882,7 +881,7 @@ mod tests {
             ParseResult::TooComplex { node_type, .. } => {
                 assert_eq!(node_type, "control_char");
             }
-            _ => panic!("expected TooComplex, got {:?}", r),
+            _ => panic!("expected TooComplex, got {r:?}"),
         }
     }
 
@@ -894,7 +893,7 @@ mod tests {
             ParseResult::TooComplex { node_type, .. } => {
                 assert_eq!(node_type, "unicode_whitespace");
             }
-            _ => panic!("expected TooComplex, got {:?}", r),
+            _ => panic!("expected TooComplex, got {r:?}"),
         }
     }
 
@@ -909,7 +908,7 @@ mod tests {
                 // $FOO should resolve to the literal "bar"
                 assert_eq!(commands[1].argv, vec!["echo", "bar"]);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -922,7 +921,7 @@ mod tests {
                 // && inherits scope — $X should resolve to "hello"
                 assert_eq!(commands[1].argv, vec!["echo", "hello"]);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 
@@ -935,7 +934,7 @@ mod tests {
                 // X was set in a pipe subshell — should NOT be visible after ;
                 assert_eq!(commands[2].argv, vec!["echo", "$X"]);
             }
-            _ => panic!("expected Simple, got {:?}", r),
+            _ => panic!("expected Simple, got {r:?}"),
         }
     }
 }

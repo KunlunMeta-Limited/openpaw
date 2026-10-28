@@ -93,7 +93,7 @@ pub fn record_event(memory_id: &str, event: MemoryEvent, memory_type: MemoryType
             .append(true)
             .open(&path)
         {
-            let _ = writeln!(f, "{}", line);
+            let _ = writeln!(f, "{line}");
         }
     }
 }

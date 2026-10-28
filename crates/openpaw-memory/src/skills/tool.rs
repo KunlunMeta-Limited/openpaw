@@ -299,7 +299,7 @@ fn list_skills(store: &FsSkillStore, input: &serde_json::Value) -> ToolCallOutco
             ));
         }
         if let Some(ref wtu) = s.frontmatter.when_to_use {
-            content.push_str(&format!("\n   When to use: {}", wtu));
+            content.push_str(&format!("\n   When to use: {wtu}"));
         }
         if !s.frontmatter.paths.is_empty() {
             content.push_str(&format!("\n   Paths: {}", s.frontmatter.paths.join(", ")));
@@ -338,7 +338,7 @@ fn get_skill(store: &FsSkillStore, input: &serde_json::Value) -> ToolCallOutcome
                 content.push_str(&format!("Superseded by: {superseded}\n"));
             }
             if let Some(ref wtu) = s.frontmatter.when_to_use {
-                content.push_str(&format!("When to use: {}\n", wtu));
+                content.push_str(&format!("When to use: {wtu}\n"));
             }
             if !s.frontmatter.paths.is_empty() {
                 content.push_str(&format!("Paths: {}\n", s.frontmatter.paths.join(", ")));

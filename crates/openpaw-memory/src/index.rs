@@ -253,8 +253,7 @@ mod tests {
         let line_count = index.lines().count();
         assert!(
             line_count <= MAX_ENTRYPOINT_LINES + 1,
-            "expected ≤ {}+1 lines, got {line_count}",
-            MAX_ENTRYPOINT_LINES
+            "expected ≤ {MAX_ENTRYPOINT_LINES}+1 lines, got {line_count}"
         );
     }
 

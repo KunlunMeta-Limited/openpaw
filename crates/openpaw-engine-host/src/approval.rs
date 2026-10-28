@@ -20,6 +20,7 @@ pub struct HostApprovalManager {
     session_id: String,
     gate: Arc<ApprovalGate>,
     metadata: serde_json::Value,
+    #[cfg(test)]
     events: broadcast::Sender<OpenCodeEvent>,
     children: Mutex<ChildApprovalScopes>,
 }
@@ -44,6 +45,78 @@ fn info(
     }
 }
 impl HostApprovalManager {
+    /// 功能：为实际子会话创建独立工具审批身份。
+    /// 参数：id、可信父关系、旧空间显示身份、事件通道和取消令牌。
+    /// 返回：独立审批管理器。
+    /// 错误：无。
+    /// 状态：不复制父授权或历史。
+    /// 并发与取消：本次执行登记后受父取消范围管理。
+    /// 权限：公开 owner 是真实子会话。
+    /// 关联：ADR-006、CHG-2026-0034。
+    pub(crate) fn new_child(
+        id: String,
+        parent: &str,
+        workspace: &str,
+        name: &str,
+        events: broadcast::Sender<OpenCodeEvent>,
+        cancel: CancellationToken,
+    ) -> Arc<Self> {
+        Self::with_metadata(
+            id,
+            events,
+            cancel,
+            serde_json::json!({"parentSessionID":parent,"workspaceID":workspace,"workspaceName":name}),
+        )
+    }
+
+    /// 功能：把既有真实子会话审批纳入父本轮取消范围。
+    /// 参数：manager 为实际子 owner，cancel 为父回合令牌。
+    /// 返回：本轮范围 guard；父已停止或关系不符时无。
+    /// 错误：无。
+    /// 状态：仅登记引用，不共享授权。
+    /// 并发与取消：父 abort 与登记共用短锁。
+    /// 权限：校验内部保存的父关系，不接受浏览器关系声明。
+    /// 关联：CHG-2026-0034。
+    pub(crate) fn attach_child(
+        self: &Arc<Self>,
+        manager: Arc<Self>,
+        cancel: &CancellationToken,
+    ) -> Option<ChildApprovals> {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if !children.accepting
+            || cancel.is_cancelled()
+            || manager.metadata["parentSessionID"] != self.session_id
+        {
+            return None;
+        }
+        let id = Uuid::new_v4().simple().to_string();
+        children.scopes.insert(id.clone(), manager.clone());
+        Some(ChildApprovals {
+            parent: self.clone(),
+            manager,
+            id,
+        })
+    }
+
+    /// 功能：核对公开审批事件是否属于本父回合的实际 owner。
+    /// 参数：session 为事件的实际会话编号。
+    /// 返回：自身或已登记子 owner 为 true。
+    /// 错误：无。
+    /// 状态：只读。
+    /// 并发与取消：短锁；取消后子身份不再接受新事件。
+    /// 权限：不根据前端 metadata 授权。
+    /// 关联：main 单次审批桥。
+    pub(crate) fn owns_session(&self, session: &str) -> bool {
+        self.session_id == session
+            || self
+                .children
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .scopes
+                .values()
+                .any(|child| child.session_id == session)
+    }
+
     /// 功能：构造 Host permission 协议 adapter。
     /// 参数：session_id、事件广播和当前取消令牌。
     /// 返回：Arc<HostApprovalManager>。
@@ -73,6 +146,7 @@ impl HostApprovalManager {
     ) -> Arc<Self> {
         let notify_session = session_id.clone();
         let notify_metadata = metadata.clone();
+        #[cfg(test)]
         let events = global_events.clone();
         let gate = ApprovalGate::new(
             cancelled,
@@ -95,6 +169,7 @@ impl HostApprovalManager {
             session_id,
             gate,
             metadata,
+            #[cfg(test)]
             events,
             children: Mutex::new(ChildApprovalScopes {
                 accepting: true,
@@ -173,9 +248,9 @@ impl HostApprovalManager {
     /// 参数：id、决定、session 授权开关、安全原因。
     /// 返回：成功交付为 true，失效为 false。
     /// 错误：无。
-    /// 状态：同工具授权可跨当前 session 回合；重启失效。
+    /// 状态：根会话同工具授权可跨回合；真实子会话始终仅批准本次调用。
     /// 并发与取消：委托 gate 线性化。
-    /// 权限：不扩大到其他 session 或工具。
+    /// 权限：不扩大到其他 session 或工具；子身份不因持久化而延长授权寿命。
     /// 关联：原 once/always/reject 协议。
     pub async fn reply_with_scope(
         &self,
@@ -189,6 +264,7 @@ impl HostApprovalManager {
 
     fn reply_scoped(&self, id: &str, approved: bool, remember: bool, reason: String) -> bool {
         let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let remember = remember && !self.metadata["parentSessionID"].is_string();
         self.gate.reply(id, approved, remember, reason.clone())
             || children
                 .scopes
@@ -204,6 +280,7 @@ impl HostApprovalManager {
     /// 并发与取消：与父 abort 单锁线性化，不允许迟到登记。
     /// 权限：子 always 只在本次执行内有效。
     /// 关联：ADR-006、GET/POST permission。
+    #[cfg(test)]
     pub(crate) fn child(
         self: &Arc<Self>,
         workspace: &str,

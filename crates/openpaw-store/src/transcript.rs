@@ -58,6 +58,7 @@ pub fn decode<T: DeserializeOwned>(
         .map_err(|_| ProjectionError)
 }
 fn validate_record(event: &SessionEvent) -> Result<(), ProjectionError> {
+    decode::<crate::execution_attempts::ExecutionAttemptV1>(event, "execution_attempt_v1")?;
     decode::<TurnAcceptV1>(event, "turn_accept_v1")?;
     decode::<MessagePresentationRecordV1>(event, "message_presentation_v1")?;
     decode::<TurnFinishPrepareV1>(event, "turn_finish_prepare_v1")?;
@@ -668,6 +669,8 @@ fn json_value(value: &impl Serialize) -> serde_json::Value {
 
 /// 功能：保存完整已提交历史与附加持久状态。
 pub struct Transcript {
+    /// 实际执行尝试，不作为有效模型上下文；Revert 只影响可见投影。
+    pub execution_attempts: Vec<crate::execution_attempts::ExecutionAttemptV1>,
     /// 完整已提交消息，staged revert 仅裁剪显示前缀。
     pub messages: Vec<openpaw_core::Message>,
     /// 按首次出现顺序保存的持久回合最新状态。
@@ -699,6 +702,7 @@ pub const MAX_FINISH_TRANSACTION_MESSAGES: usize = 4096;
 /// 关联：Host 恢复/摘要和 CLI catalog。
 pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, ProjectionError> {
     let mut projection = Transcript {
+        execution_attempts: Vec::new(),
         messages: Vec::new(),
         turn_outcomes: Vec::new(),
         turn_errors: HashMap::new(),
@@ -765,7 +769,11 @@ pub fn replay(session_id: &str, events: &[SessionEvent]) -> Result<Transcript, P
             // 当前事件仍按旧格式或下一事务继续恢复。
             pending_finish = None;
         }
-        if let Some(accept) = TurnAcceptV1::from_session_event(event) {
+        if let Some(record) =
+            decode::<crate::execution_attempts::ExecutionAttemptV1>(event, "execution_attempt_v1")?
+        {
+            crate::execution_attempts::apply(&mut projection.execution_attempts, record)?;
+        } else if let Some(accept) = TurnAcceptV1::from_session_event(event) {
             apply_turn_accept(&mut projection, &mut message_ids, accept)?;
         } else if let Some(outcome) = TurnOutcome::from_session_event(event) {
             projection.turn_sequence_high_water = projection
@@ -867,6 +875,12 @@ fn apply_revert_commit(
         &mut projection.request_admissions,
         &mut projection.turn_errors,
     );
+    projection.execution_attempts.retain(|record| {
+        projection
+            .turn_outcomes
+            .iter()
+            .any(|turn| turn.turn_id == record.turn_id)
+    });
     apply_turn_accept(projection, message_ids, commit.accept)
 }
 fn apply_finish_commit(
@@ -1155,7 +1169,7 @@ pub fn session_title_with_presentation(
 
 /// 功能：把可见 assistant 回退边界规范化为触发同一回合的 user 消息边界。
 /// 参数：session、可见消息、回合结果和客户端请求的消息编号。
-/// 返回：权威游标及前缀；真实或已验证失败 assistant 归到触发输入，未知边界返回 None。
+/// 返回：权威游标及前缀；真实或已验证失败、取消 assistant 归到触发输入，未知边界返回 None。
 /// 错误：无；无有效回合关联且找不到此前真实用户输入时保留原 assistant 边界。
 /// 状态：纯读取，不修改消息、回合结果或持久化投影。
 /// 并发与取消：调用方提供稳定快照，同步无锁，不可取消。
@@ -1172,7 +1186,7 @@ pub fn normalize_revert_boundary(
         return turn_outcomes
             .iter()
             .find(|turn| {
-                turn.state == TurnState::Failed
+                matches!(turn.state, TurnState::Failed | TurnState::Cancelled)
                     && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
             })
             .and_then(|turn| {
@@ -1213,7 +1227,7 @@ pub fn normalize_revert_boundary(
         .or(Some(original))
 }
 
-/// 功能：将已经验证存在的失败占位边界映射为真实历史前缀。
+/// 功能：将已经验证存在的失败或取消尝试边界映射为真实历史前缀。
 /// 参数：session_id、messages、outcomes 为稳定快照，message_id 为公共错误消息编号。
 /// 返回：该失败回合真实消息之后、下一用户回合之前的位置；不可验证时返回 None。
 /// 错误：无。
@@ -1228,7 +1242,7 @@ pub fn failed_message_prefix_len(
     message_id: &str,
 ) -> Option<usize> {
     let turn = outcomes.iter().find(|turn| {
-        turn.state == TurnState::Failed
+        matches!(turn.state, TurnState::Failed | TurnState::Cancelled)
             && is_turn_assistant_message_id(session_id, &turn.turn_id, message_id)
     })?;
     let start = visible_prefix_len(session_id, messages, &turn.user_message_id)?;
