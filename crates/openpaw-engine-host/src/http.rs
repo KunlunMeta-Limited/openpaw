@@ -2175,7 +2175,7 @@ mod tests {
                     }
                     if body["stream"] != true {
                         if matches!(scenario, "context-loop-cancel" | "context-manual-cancel") { gate.notified().await; }
-                        if scenario == "context-loop-invalid" {
+                        if scenario == "context-loop-invalid" || (scenario == "context-loop-provider-default" && body.get("max_tokens").is_some()) {
                             return Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":""},"finish_reason":"length"}]})).into_response();
                         }
                     }
@@ -2342,12 +2342,24 @@ mod tests {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":4096}}}"#
                 } else if scenario == "context-small-window" {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":8192}}}"#
+                } else if scenario == "context-loop-provider-default" {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768,"default_output_tokens":4096}}}"#
+                } else if scenario == "context-loop-default-too-large" {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768,"default_output_tokens":65536}}}"#
+                } else if scenario == "context-loop-default-tight" {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768,"default_output_tokens":28000}}}"#
+                } else if scenario == "context-loop-default-minimum-too-large" {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768,"default_output_tokens":31000}}}"#
+                } else if matches!(scenario, "context-loop-goal" | "context-loop-child" | "context-loop-cancel" | "context-loop-invalid") {
+                    r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768,"default_output_tokens":4096}}}"#
                 } else {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768}}}"#
                 }
                 .into(),
             ));
             values.push(("OPENPAW_MAX_OUTPUT_TOKENS", "1024".into()));
+        } else if matches!(scenario, "context-goal" | "context-manual-cancel") {
+            values.push(("OPENPAW_MODEL_CAPABILITIES", r#"{"openai":{"fixture-model":{"input":["text"],"context_window":128000,"default_output_tokens":65536}}}"#.into()));
         }
         let env = values
             .iter()

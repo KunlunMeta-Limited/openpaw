@@ -597,6 +597,74 @@ mod context_tests {
         }
     }
 
+    #[tokio::test]
+    async fn main_context_provider_default_summary_continues_without_changing_business_output() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for (scenario, use_default) in [
+            ("context-loop-provider-default", true),
+            ("context-loop-default-too-large", false),
+            ("context-loop-default-tight", true),
+            ("context-loop-default-minimum-too-large", false),
+        ] {
+            let fixture = main_fixture(scenario, "confirm").await;
+            loop_script(&fixture);
+            let answer = send(
+                &fixture.app,
+                &fixture.team,
+                "loop",
+                "six",
+                "LOOP_PROBE 严格顺序执行六步，不重复已完成工具",
+            )
+            .await;
+            let requests = fixture.model_seen.lock().await;
+            assert!(
+                requests.iter().any(|r| r["stream"] != true),
+                "必须实际触发摘要"
+            );
+            assert_eq!(
+                answer["state"], "complete",
+                "{scenario}摘要不能中止：{answer}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fixture.workspace.path().join("counter.txt")).unwrap(),
+                "6"
+            );
+            for request in requests.iter() {
+                if request["stream"] == true {
+                    assert_eq!(request["max_tokens"], 1024, "业务请求保留其输出配置");
+                } else {
+                    assert_eq!(
+                        request.get("max_tokens").is_none(),
+                        use_default,
+                        "{scenario}"
+                    );
+                    if !use_default {
+                        assert_eq!(request["max_tokens"], 2048, "小窗口沿用显式回退");
+                    }
+                    if scenario == "context-loop-default-tight" {
+                        let input = request["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|m| {
+                                openpaw_engine::compaction::estimate_tokens(
+                                    m["content"].as_str().unwrap(),
+                                )
+                            })
+                            .sum::<usize>();
+                        assert!(
+                            input + 32 <= 3130,
+                            "必须预留28000输出及1638误差，实际输入{input}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn loop_script(fixture: &MainFixture) {
         std::fs::write(fixture.workspace.path().join("loop_step.py"),"from pathlib import Path\nimport sys\np=Path('counter.txt')\nn=int(p.read_text())+1 if p.exists() else 1\np.write_text(str(n))\nassert n==int(sys.argv[1])\nprint('STEP_DONE_'+str(n))\nprint('证据'*2000)\n").unwrap();
     }
@@ -632,6 +700,10 @@ mod context_tests {
         );
         let requests = fixture.model_seen.lock().await;
         assert!(requests.iter().any(|r| r["stream"] != true));
+        assert!(requests
+            .iter()
+            .filter(|r| r["stream"] != true)
+            .all(|r| r.get("max_tokens").is_none()));
         assert!(requests.last().unwrap().to_string().contains("blocked"));
         drop(requests);
         let binding = fixture
@@ -957,6 +1029,10 @@ mod context_tests {
         let requests = fixture.model_seen.lock().await;
         assert!(requests.iter().any(|r| r["stream"] != true));
         let parent_request = requests.last().unwrap().to_string();
+        assert!(requests
+            .iter()
+            .filter(|r| r["stream"] != true)
+            .all(|r| r.get("max_tokens").is_none()));
         assert!(
             !parent_request.contains("STEP_DONE_1"),
             "子会话内部工具正文不能逐条进入父模型"
@@ -1037,7 +1113,9 @@ mod context_tests {
                 .lock()
                 .await
                 .iter()
-                .all(|r| r["stream"] != true && r["tools"].as_array().is_none_or(|a| a.is_empty())),
+                .all(|r| r["stream"] != true
+                    && r.get("max_tokens").is_none()
+                    && r["tools"].as_array().is_none_or(|a| a.is_empty())),
             "命令只能请求无工具摘要"
         );
         fixture.model_seen.lock().await.clear();
@@ -1151,6 +1229,12 @@ mod context_tests {
         assert!((1..6).contains(&count));
         let requests = fixture.model_seen.lock().await;
         assert_eq!(requests.iter().filter(|r| r["stream"] != true).count(), 1);
+        assert!(requests
+            .iter()
+            .find(|r| r["stream"] != true)
+            .unwrap()
+            .get("max_tokens")
+            .is_none());
         assert_ne!(
             requests.last().unwrap()["stream"],
             true,
@@ -1351,6 +1435,13 @@ mod context_tests {
             .unwrap()
             .unwrap();
         assert_eq!(answer["state"], "stopped");
+        assert!(fixture
+            .model_seen
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r["stream"] != true)
+            .all(|r| r.get("max_tokens").is_none()));
         fixture.release_model.notify_waiters();
         assert_eq!(
             std::fs::read_to_string(fixture.workspace.path().join("counter.txt")).unwrap(),

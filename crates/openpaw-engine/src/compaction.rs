@@ -448,31 +448,45 @@ pub(crate) async fn compact_session_for_turn(
     let compacted_count = old_messages.len();
     let pre_compact_tokens = estimate_session_tokens("", session, 0);
 
-    let window = opts
-        .model_limit
-        .min(provider.model_capabilities(model).context_window as usize);
-    let output = 2048.min((window / 8).max(1)) as u32;
-    let allowance = crate::context::input_limit(window, output)
-        .saturating_sub(estimate_tokens(COMPACTION_SYSTEM) + 32)
-        .min(32000);
-    let mut transcript =
-        format_for_summary(&old_messages, &session.meta.id, usize::MAX, references);
-    for detail in [2000, 500, 120] {
-        if estimate_tokens(&transcript) <= allowance {
+    let capabilities = provider.model_capabilities(model);
+    let window = opts.model_limit.min(capabilities.context_window as usize);
+    let explicit_output = 2048.min((window / 8).max(1)) as u32;
+    let default_output = capabilities
+        .default_output_tokens
+        .filter(|value| *value > 0);
+    let mut selected = None;
+    // 默认输出必须真实预留；不适配时仅在本地回退，实际仍只发送一次摘要请求。
+    for (output, use_default) in default_output
+        .map(|output| (output, true))
+        .into_iter()
+        .chain(std::iter::once((explicit_output, false)))
+    {
+        let allowance = crate::context::input_limit(window, output)
+            .saturating_sub(estimate_tokens(COMPACTION_SYSTEM) + 32)
+            .min(32000);
+        for detail in [usize::MAX, 2000, 500, 120] {
+            let transcript =
+                format_for_summary(&old_messages, &session.meta.id, detail, references);
+            if estimate_tokens(&transcript) <= allowance {
+                selected = Some((transcript, output, use_default));
+                break;
+            }
+        }
+        if selected.is_some() {
             break;
         }
-        transcript = format_for_summary(&old_messages, &session.meta.id, detail, references);
     }
-    if estimate_tokens(&transcript) > allowance {
+    let Some((transcript, output, use_provider_default_output)) = selected else {
         return Err(Error::context_too_long(
             "摘要输入无法在有限降载后放入模型窗口",
         ));
-    }
+    };
     let req = CompletionRequest {
         model: model.to_string(),
         system: Some(COMPACTION_SYSTEM.to_string()),
         messages: vec![Message::user_text(transcript)],
         max_tokens: output,
+        use_provider_default_output,
         temperature: Some(0.1),
         ..Default::default()
     };

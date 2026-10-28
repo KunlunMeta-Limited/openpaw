@@ -342,6 +342,7 @@ impl LlmProvider for AnthropicProvider {
             extended_thinking: true,
             context_window: 200_000,
             max_output_tokens: 64_000,
+            default_output_tokens: None,
         }
     }
 

@@ -601,6 +601,189 @@ fn capture_request(response: String) -> (String, std::sync::mpsc::Receiver<serde
 }
 
 #[tokio::test]
+async fn declared_default_output_is_omitted_and_explicit_http_budgets_are_preserved() {
+    use futures::StreamExt;
+    for streaming in [false, true] {
+        for (use_default, output, expected) in [
+            (true, 65536, None),
+            (false, 16384, Some(16384)),
+            (false, 0, Some(4096)),
+        ] {
+            let response = if streaming {
+                http_sse(&[
+                    r#"data: {"choices":[{"delta":{"content":"summary"},"finish_reason":"stop"}]}"#,
+                    "data: [DONE]",
+                ])
+            } else {
+                http_json(
+                    &json!({"choices":[{"message":{"role":"assistant","content":"summary"},"finish_reason":"stop"}]}),
+                )
+            };
+            let (address, rx) = capture_request(response);
+            let provider = OpenAiProvider::new("fixture", "known-proxy")
+                .with_base_url(format!("http://{address}/v1"))
+                .with_model_capabilities(std::collections::HashMap::from([(
+                    "known-proxy".into(),
+                    openpaw_core::Capabilities {
+                        default_output_tokens: Some(65536),
+                        ..Default::default()
+                    },
+                )]));
+            let request = CompletionRequest {
+                model: "known-proxy".into(),
+                messages: vec![Message::user_text("summarize")],
+                max_tokens: output,
+                use_provider_default_output: use_default,
+                ..Default::default()
+            };
+            if streaming {
+                let events: Vec<_> = provider.stream(request).await.unwrap().collect().await;
+                assert!(events.iter().all(Result::is_ok));
+                assert!(events
+                    .iter()
+                    .any(|e| matches!(e, Ok(StreamEvent::Final(_)))));
+            } else {
+                assert_eq!(provider.complete(request).await.unwrap().text(), "summary");
+            }
+            let body = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(body["stream"], streaming);
+            assert_eq!(body.get("max_tokens").and_then(|v| v.as_u64()), expected);
+            assert_eq!(body.get("max_tokens").is_none(), use_default);
+            assert!(body.get("use_provider_default_output").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn undeclared_or_underreserved_provider_defaults_fail_before_http() {
+    for (declared, model, reserve) in [
+        (None, "known", 65536),
+        (Some(0), "known", 65536),
+        (Some(65536), "known", 2048),
+        (Some(65536), "other-model", 65536),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let provider = OpenAiProvider::new("fixture", "known")
+            .with_base_url(format!("http://{}/v1", listener.local_addr().unwrap()))
+            .with_model_capabilities(std::collections::HashMap::from([(
+                "known".into(),
+                openpaw_core::Capabilities {
+                    default_output_tokens: declared,
+                    ..Default::default()
+                },
+            )]));
+        let request = CompletionRequest {
+            model: model.into(),
+            max_tokens: reserve,
+            use_provider_default_output: true,
+            ..Default::default()
+        };
+        let error = provider.complete(request.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("默认输出额度"));
+        assert!(provider.stream(request).await.is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
+fn provider_default_output_is_scoped_to_the_official_endpoint_and_exact_model() {
+    for (url, expected) in [
+        ("https://api.deepseek.com", Some(65536)),
+        ("https://api.deepseek.com/v1/", Some(65536)),
+        ("https://api.deepseek.com:443/v1", Some(65536)),
+        ("http://api.deepseek.com/v1", None),
+        ("https://api.deepseek.com:444/v1", None),
+        ("https://api.deepseek.com/other", None),
+        ("https://api.deepseek.com.example/v1", None),
+        ("https://proxy.example/deepseek", None),
+    ] {
+        let provider = OpenAiProvider::new("fixture", "deepseek-flash").with_base_url(url);
+        assert_eq!(
+            provider
+                .model_capabilities("deepseek-flash")
+                .default_output_tokens,
+            expected,
+            "{url}"
+        );
+        assert_eq!(
+            provider
+                .model_capabilities("deepseek-chat")
+                .default_output_tokens,
+            None
+        );
+    }
+    let provider = OpenAiProvider::new("fixture", "deepseek-flash")
+        .with_base_url("https://api.deepseek.com/v1");
+    let declared = openpaw_core::Capabilities {
+        context_window: 128000,
+        ..Default::default()
+    };
+    let provider = provider.with_model_capabilities(std::collections::HashMap::from([(
+        "deepseek-flash".into(),
+        declared,
+    )]));
+    let caps = provider.model_capabilities("deepseek-flash");
+    assert_eq!(caps.context_window, 128000);
+    assert_eq!(caps.default_output_tokens, Some(65536));
+    let provider = provider.with_model_capabilities(std::collections::HashMap::from([(
+        "deepseek-flash".into(),
+        openpaw_core::Capabilities {
+            default_output_tokens: Some(8192),
+            ..declared
+        },
+    )]));
+    assert_eq!(
+        provider
+            .model_capabilities("deepseek-flash")
+            .default_output_tokens,
+        Some(8192)
+    );
+}
+
+#[test]
+fn configured_default_output_requires_a_positive_openai_declaration() {
+    use openpaw_llm::config::ConfigSnapshot;
+    for value in ["0", "-1", "4294967296", "\"invalid\"", "1.5"] {
+        let snapshot = ConfigSnapshot::from_pairs([(
+            "OPENPAW_MODEL_CAPABILITIES".into(),
+            format!(
+                r#"{{"openai":{{"fixture":{{"input":["text"],"default_output_tokens":{value}}}}}}}"#
+            ),
+        )]);
+        assert!(snapshot.capabilities("openai", "fixture").is_err());
+    }
+    for protocol in ["anthropic", "echo", "mock"] {
+        let snapshot = ConfigSnapshot::from_pairs([(
+            "OPENPAW_MODEL_CAPABILITIES".into(),
+            format!(
+                r#"{{"{protocol}":{{"fixture":{{"input":["text"],"default_output_tokens":8192}}}}}}"#
+            ),
+        )]);
+        assert!(snapshot.capabilities(protocol, "fixture").is_err());
+    }
+    let snapshot = ConfigSnapshot::from_pairs([
+        ("OPENAI_API_KEY".into(), "fixture".into()),
+        ("OPENPAW_OPENAI_BASE_URL".into(), "https://proxy.example/v1".into()),
+        ("OPENPAW_OPENAI_MODEL".into(), "fixture".into()),
+        ("OPENPAW_MAX_OUTPUT_TOKENS".into(), "16384".into()),
+        ("OPENPAW_MODEL_CAPABILITIES".into(), r#"{"openai":{"fixture":{"input":["text"],"context_window":128000,"default_output_tokens":65536}}}"#.into()),
+    ]);
+    let config = snapshot.resolve("openai", Default::default()).unwrap();
+    assert_eq!(config.max_output_tokens, 16384);
+    assert_eq!(
+        config
+            .build()
+            .model_capabilities("fixture")
+            .default_output_tokens,
+        Some(65536)
+    );
+}
+
+#[tokio::test]
 async fn images_and_tool_media_are_encoded_in_actual_http_requests() {
     let media = openpaw_core::InlineMedia::from_bytes(
         b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;",

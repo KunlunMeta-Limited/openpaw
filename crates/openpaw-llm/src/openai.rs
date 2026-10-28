@@ -188,9 +188,20 @@ impl OpenAiProvider {
         let mut body = json!({
             "model": model,
             "messages": self.build_messages(req, deepseek_dialect)?,
-            "max_tokens": if req.max_tokens > 0 { req.max_tokens } else { 4096 },
             "stream": stream,
         });
+        if req.use_provider_default_output {
+            let reserved = self.model_capabilities(&model).default_output_tokens;
+            if !reserved.is_some_and(|value| value > 0 && req.max_tokens >= value) {
+                return Err(Error::session("服务商默认输出额度未声明或本地预留不足"));
+            }
+        } else {
+            body["max_tokens"] = json!(if req.max_tokens > 0 {
+                req.max_tokens
+            } else {
+                4096
+            });
+        }
         if let Some(t) = req.temperature {
             body["temperature"] = json!(t);
         }
@@ -482,10 +493,24 @@ impl LlmProvider for OpenAiProvider {
 
     fn model_capabilities(&self, model: &str) -> Capabilities {
         let mut caps = self.capabilities();
+        // 仅已核官方端点和模型声明默认值，兼容代理不能由名称或URL子串推断。
+        if model == "deepseek-flash"
+            && reqwest::Url::parse(&self.base_url).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && url.host_str() == Some("api.deepseek.com")
+                    && url.port_or_known_default() == Some(443)
+                    && matches!(url.path().trim_end_matches('/'), "" | "/v1")
+            })
+        {
+            caps.default_output_tokens = Some(65_536);
+        }
         if let Some(declared) = self.model_capabilities.get(model) {
             caps.image_input = declared.image_input;
             caps.audio_input = declared.audio_input;
             caps.context_window = declared.context_window;
+            if declared.default_output_tokens.is_some() {
+                caps.default_output_tokens = declared.default_output_tokens;
+            }
         }
         caps
     }

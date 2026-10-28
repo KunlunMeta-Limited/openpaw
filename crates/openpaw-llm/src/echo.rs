@@ -64,6 +64,7 @@ impl LlmProvider for EchoProvider {
             extended_thinking: false,
             context_window: 128_000,
             max_output_tokens: 4096,
+            default_output_tokens: None,
         }
     }
 

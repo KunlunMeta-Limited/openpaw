@@ -44,8 +44,12 @@ impl SystemPromptBlocks {
 /// Stability: stable.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// A chat-completion request. The serde shape is the provider wire contract.
-///
+fn provider_output_default_disabled(value: &bool) -> bool {
+    !value
+}
+
+/// 功能：统一模型请求，可选择显式额度或已知服务商默认输出。
+/// 约束：新增字段保留serde缺省兼容；请求策略不改变会话原件。
 /// Stability: stable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionRequest {
@@ -60,7 +64,12 @@ pub struct CompletionRequest {
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolSpec>,
+    /// 功能：显式输出额度；采用服务商默认时表示本地输出预留，不作为上游参数。
     pub max_tokens: u32,
+    /// 功能：本次请求采用已声明的服务商默认输出额度；缺省false保持显式请求兼容。
+    /// 约束：必须同时取得当前模型的default_output_tokens并预留容量。Stability: unstable.
+    #[serde(default, skip_serializing_if = "provider_output_default_disabled")]
+    pub use_provider_default_output: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     /// If true, providers that support prompt caching should attempt to
@@ -83,6 +92,7 @@ impl Default for CompletionRequest {
             messages: Vec::new(),
             tools: Vec::new(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            use_provider_default_output: false,
             temperature: None,
             enable_caching: false,
             enable_extended_thinking: false,
@@ -341,7 +351,7 @@ impl Usage {
     }
 }
 
-/// 功能：报告工具、流式和模型输入模态能力；媒体默认关闭。
+/// 功能：报告工具、流式、输入模态及默认输出能力；媒体和默认输出声明缺省关闭。
 ///
 /// Stability: stable.
 #[derive(Debug, Clone, Copy)]
@@ -358,6 +368,9 @@ pub struct Capabilities {
     /// Maximum output tokens per response. Used by max_tokens escalation
     /// after a `MaxTokens` stop reason.
     pub max_output_tokens: u32,
+    /// 功能：声明可省略输出参数及已核默认预留；None表示继续显式设置。
+    /// 约束：由可信provider/model配置提供，不等于模型最大输出。Stability: unstable.
+    pub default_output_tokens: Option<u32>,
 }
 
 impl Default for Capabilities {
@@ -371,6 +384,7 @@ impl Default for Capabilities {
             extended_thinking: false,
             context_window: 128_000,
             max_output_tokens: 8192,
+            default_output_tokens: None,
         }
     }
 }
@@ -526,6 +540,21 @@ impl LlmProvider for NullProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_requests_keep_explicit_output_and_omit_the_disabled_flag() {
+        let legacy = serde_json::json!({"model":"fixture","messages":[],"max_tokens":16384});
+        let mut request: CompletionRequest = serde_json::from_value(legacy).unwrap();
+        assert!(!request.use_provider_default_output);
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded.get("use_provider_default_output").is_none());
+        assert_eq!(encoded["max_tokens"], 16384);
+        request.use_provider_default_output = true;
+        let restored: CompletionRequest =
+            serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+        assert!(restored.use_provider_default_output);
+        assert_eq!(restored.max_tokens, 16384);
+    }
 
     #[test]
     fn requires_approval_is_skipped_in_serde() {

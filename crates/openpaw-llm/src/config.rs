@@ -15,6 +15,7 @@ use std::{collections::HashMap, sync::Arc};
 struct ModelInput {
     input: Vec<String>,
     context_window: Option<std::num::NonZeroU32>,
+    default_output_tokens: Option<std::num::NonZeroU32>,
 }
 
 /// 功能：提供支持协议、默认模型和显示名称的唯一目录。
@@ -245,6 +246,11 @@ impl ConfigSnapshot {
                 return Err("OPENPAW_MODEL_CAPABILITIES has an unknown provider".into());
             }
             for (model, input) in models {
+                if provider != "openai" && input.default_output_tokens.is_some() {
+                    return Err(
+                        "OPENPAW_MODEL_CAPABILITIES declares unsupported default output".into(),
+                    );
+                }
                 if model.trim().is_empty()
                     || input
                         .input
@@ -271,6 +277,9 @@ impl ConfigSnapshot {
                                 .context_window
                                 .map(|value| value.get())
                                 .unwrap_or(128_000),
+                            default_output_tokens: input
+                                .default_output_tokens
+                                .map(|value| value.get()),
                             ..Default::default()
                         },
                     );

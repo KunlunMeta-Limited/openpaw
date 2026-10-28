@@ -1,5 +1,7 @@
 # CHG 索引
 
+- [CHG-2026-0052：摘要采用服务商默认输出额度](CHG-2026-0052-摘要输出预算与失败提示.md)：approved，本地实施完成，ready-for-human。摘要按已知默认预留后省略max_tokens，普通请求额度保持；workspace993、Host串行246、CLI26及可执行门禁通过。包含2处None编译兼容接线，失败提示优化不纳入本期；cargo-deny不可用，CODEOWNER/CI独立。未部署15180。
+
 - [CHG-2026-0051：持久上下文压缩与原件回读](CHG-2026-0051-持久上下文压缩与原件回读.md)：approved，本地实施完成；workspace988、Host245（含context21）、CLI26及前端契约2项通过，两种feature严格静态检查与可用仓库门禁通过，Standards/Spec各0遗留。cargo-deny不可用、CODEOWNER/CI/真实模型独立；前端/依赖/额度未改，未推送或部署15180。
 
 - CHG-2026-0050 第19节：已取消Host固定180秒执行/观察期限并修复Goal孤立归属/冷恢复，f4db95a通过全部可执行门禁及两项实际185秒长测；旧数据副本恢复和当前15180 Host替换验证通过，前端/用户事实/128k保持。
