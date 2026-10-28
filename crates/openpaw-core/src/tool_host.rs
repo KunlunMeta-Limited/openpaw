@@ -7,6 +7,17 @@ use async_trait::async_trait;
 use crate::provider::ToolSpec;
 use crate::Result;
 
+/// 功能：关联引擎已经接受的实际工具调用，不包含传输地址或授权。Stability: unstable.
+#[derive(Debug, Clone, Default)]
+pub struct ToolInvocationContext {
+    /// 功能：入口提供的原回合身份；旧入口可以没有。
+    pub turn_id: Option<String>,
+    /// 功能：该回合中的模型响应序号。
+    pub response_index: usize,
+    /// 功能：本次调用在模型响应中的确切身份。
+    pub tool_call_id: String,
+}
+
 /// 功能：保存单次工具执行的文字、结构化结果及内联媒体，供模型续轮使用。
 ///
 /// Stability: stable.
@@ -70,6 +81,23 @@ use serde::{Deserialize, Serialize};
 pub trait ToolExecutor: Send + Sync {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>>;
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolCallOutcome>;
+
+    /// 功能：携带引擎确定的身份调用工具，旧宿主默认沿用原入口。
+    /// 参数：name、args为已校验调用；context为可信执行身份。
+    /// 返回：原工具结果。
+    /// 错误：沿用call的错误。
+    /// 状态：默认实现不保存上下文。
+    /// 并发与取消：沿用原工具语义。
+    /// 权限：上下文不授予权限，不接受模型伪造身份。
+    /// 关联：用户提问及实际调用记录。Stability: unstable.
+    async fn call_with_context(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        _context: &ToolInvocationContext,
+    ) -> Result<ToolCallOutcome> {
+        self.call(name, args).await
+    }
 
     /// 功能：安装当前回合可见附件。
     /// 参数：经过有效历史边界裁剪的原件。

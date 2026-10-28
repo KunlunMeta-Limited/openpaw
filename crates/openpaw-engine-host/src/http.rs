@@ -1994,6 +1994,7 @@ mod tests {
     use super::*;
     include!("http/goal_tests.rs");
     include!("http/context_tests.rs");
+    include!("http/user_input_tests.rs");
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::response::IntoResponse;
@@ -2107,16 +2108,22 @@ mod tests {
         let models = model_seen.clone();
         let release_model = Arc::new(tokio::sync::Notify::new());
         let model_gate = release_model.clone();
+        let question_gate = release_model.clone();
         let ui_actions = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
         let gateway_actions = ui_actions.clone();
         let server = Router::new().route("/api/pawoffice/messages",post(move |headers:HeaderMap,Json(body):Json<serde_json::Value>| {
             let seen = gateway_seen.clone();
             let actions = gateway_actions.clone();
+            let question_gate = question_gate.clone();
             async move {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("question-") && body["type"] == "decision.request" {
+                    if choice == "held-answer" { question_gate.notified().await; }
+                    return user_input_tests::decision_response(&body, choice);
+                }
                 let data = match body["type"].as_str() {
-                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute"|"goal-replan") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
+                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("question-") || scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute"|"goal-replan") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
                     Some("office.read") if body["teamId"].is_string() => {
                         let messages = seen.lock().await;
                         let snapshot = if scenario.starts_with("goal-") {
@@ -2137,7 +2144,7 @@ mod tests {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                         let seen = seen.lock().await;
                         if let Some(action) = actions.lock().await.pop_front() {
-                            return Json(serde_json::json!({"code":200,"msg":"OK","data":{"actions":[action]}}));
+                            return Json(serde_json::json!({"code":200,"msg":"OK","data":{"actions":[action]}})).into_response();
                         }
                         let employee = seen.iter().rev().find_map(|message| {
                             message["snapshot"]["employees"].as_array().and_then(|employees|employees.get(1)).map(|employee|(message["teamId"].clone(),employee["id"].clone()))
@@ -2162,13 +2169,16 @@ mod tests {
                     },
                     _ => serde_json::json!({"forwarded":1}),
                 };
-                Json(serde_json::json!({"code":if choice=="child-timeout" && body["type"]=="decision.request" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") {408}else{200},"msg":"OK","data":data}))
+                Json(serde_json::json!({"code":if choice=="child-timeout" && body["type"]=="decision.request" && !body["decision"]["title"].as_str().unwrap_or("").contains("delegate_task") {408}else{200},"msg":"OK","data":data})).into_response()
             }
         })).route("/v1/chat/completions",post(move |Json(body):Json<serde_json::Value>| {
             let seen = models.clone();
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("question-") {
+                    return user_input_tests::model_response(&body, scenario);
+                }
                 if scenario.starts_with("context-") {
                     if scenario.starts_with("context-loop-overflow") && body["stream"] == true && context_tests::completed_step(&body) == 2 && (scenario.ends_with("twice") || !body.to_string().contains("[Context Summary]")) {
                         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":{"code":"context_length_exceeded","message":"maximum context length"}}))).into_response();
@@ -2381,7 +2391,10 @@ mod tests {
             config.clone(),
             if matches!(
                 scenario,
-                "delegate-cancel" | "delegate-conversations" | "delegate-conversations-approval"
+                "delegate-cancel"
+                    | "delegate-conversations"
+                    | "delegate-conversations-approval"
+                    | "question-stop"
             ) {
                 2
             } else {
@@ -2396,6 +2409,16 @@ mod tests {
             Some(format!("http://{address}")),
         );
         state.office.attach_main(&state.main_office);
+        if scenario.starts_with("question-") {
+            state
+                .main_office
+                .message(
+                    serde_json::json!({"type":"office.capabilities"}),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+        }
         let team = state.main_office.directory().unwrap()[0]["workspace"]["id"]
             .as_str()
             .unwrap()

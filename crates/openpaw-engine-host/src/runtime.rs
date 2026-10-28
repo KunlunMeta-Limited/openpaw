@@ -152,6 +152,7 @@ pub struct SessionHandle {
     pub agent: AgentLoop,
     /// 会话私有 Goal 事实；执行权限不从持久状态继承。
     goal: Arc<GoalContext>,
+    question: Arc<openpaw_engine::user_input::QuestionContext>,
     pub approvals: Arc<HostApprovalManager>,
     /// 本会话独立的子任务身份、结果缓存和执行审批上下文。
     pub(crate) delegation: Arc<DelegationContext>,
@@ -208,6 +209,70 @@ pub struct SessionActivity {
     pub task: String,
 }
 impl SessionHandle {
+    /// 功能：核对提问所属的真实活动回合和消息。
+    /// 参数：invocation为引擎提供的原调用身份。
+    /// 返回：可信主会话、发起会话与输入来源。
+    /// 错误：停止、回合不匹配或无活动执行时拒绝。
+    /// 状态：只读，不获得新许可。
+    /// 并发与取消：同回合闸门内核对停止。
+    /// 权限：归属不由模型参数决定。
+    /// 关联：QuestionRuntime。
+    pub(crate) fn question_scope(
+        &self,
+        invocation: &openpaw_core::ToolInvocationContext,
+    ) -> Result<openpaw_core::user_input::UserQuestionScope, String> {
+        let _gate = self.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let active = self.current_turn.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = active
+            .as_ref()
+            .filter(|turn| invocation.turn_id.as_deref() == Some(turn.outcome.turn_id.as_str()))
+            .ok_or("提问回合归属已经失效")?;
+        if self.cancel_requested.load(Ordering::Acquire) {
+            return Err("原执行已停止".into());
+        }
+        Ok(openpaw_core::user_input::UserQuestionScope {
+            parent_session_id: self
+                .child
+                .as_ref()
+                .map_or_else(|| self.id.clone(), |child| child.parent_id.clone()),
+            asking_session_id: self.id.clone(),
+            source_user_message_id: turn.outcome.user_message_id.clone(),
+        })
+    }
+    /// 功能：沿唯一writer追加问题事实并与显式停止竞争。
+    /// 参数：record为协调器提供的完整事实。
+    /// 返回：可靠追加成功。
+    /// 错误：跨执行、已停止的答案或保存失败均拒绝。
+    /// 状态：只追加版本事件，不修改模型历史。
+    /// 并发与取消：turn_gate内保存，已停止不能接受迟到答案。
+    /// 权限：只写本会话的真实问题。
+    /// 关联：user_question_v1。
+    pub(crate) fn commit_question(
+        &self,
+        record: &openpaw_core::user_input::UserQuestionRecord,
+    ) -> Result<(), String> {
+        use openpaw_core::user_input::UserQuestionState;
+        let _gate = self.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let active = self.current_turn.lock().unwrap_or_else(|e| e.into_inner());
+        if record.scope.asking_session_id != self.id
+            || !active
+                .as_ref()
+                .is_some_and(|turn| turn.outcome.turn_id == record.turn_id)
+        {
+            return Err("问题执行归属已失效".into());
+        }
+        if self.cancel_requested.load(Ordering::Acquire)
+            && record.state != UserQuestionState::Cancelled
+        {
+            return Err("原执行已停止，未接受答案".into());
+        }
+        append_event(
+            self,
+            &SessionEvent::Unknown(Box::new(
+                serde_json::json!({"type":"user_question_v1","record":record}),
+            )),
+        )
+    }
     /// 功能：通过既有唯一 session writer 提交 Goal 事实。
     /// 参数：value 为 Goal 模块已经校验的完整快照。
     /// 返回：持久追加成功。
@@ -674,6 +739,7 @@ struct SessionHandleInit {
     session_path: PathBuf,
     agent: AgentLoop,
     goal: Arc<GoalContext>,
+    question: Arc<openpaw_engine::user_input::QuestionContext>,
     approvals: Arc<HostApprovalManager>,
     delegation: Arc<DelegationContext>,
     workspace: PathBuf,
@@ -1347,6 +1413,7 @@ impl AppState {
         Arc<DelegationContext>,
         Arc<dyn openpaw_core::ToolHost>,
         Arc<GoalContext>,
+        Arc<openpaw_engine::user_input::QuestionContext>,
     ) {
         let context_window = provider.model_capabilities(model).context_window as usize;
         let delegation = DelegationContext::new(
@@ -1376,10 +1443,15 @@ impl AppState {
         } else {
             Arc::new(GoalToolHost::new(tool_host, goal.clone()))
         };
+        let question = Arc::new(openpaw_engine::user_input::QuestionContext::default());
         (
             delegation,
-            crate::context::wrap(tool_host, &self.config.home, id, context_window),
+            openpaw_engine::user_input::wrap_tools(
+                crate::context::wrap(tool_host, &self.config.home, id, context_window),
+                question.clone(),
+            ),
             goal,
+            question,
         )
     }
     async fn load_existing(&self, id: &str) -> Result<Arc<SessionHandle>, SessionLoadError> {
@@ -1438,7 +1510,7 @@ impl AppState {
                 CancellationToken::new(),
             )
         };
-        let (delegation, tool_host, goal) = self.session_tool_host(
+        let (delegation, tool_host, goal, question) = self.session_tool_host(
             id,
             &workspace,
             approvals.clone(),
@@ -1481,6 +1553,7 @@ impl AppState {
             session_path: path,
             agent,
             goal,
+            question,
             approvals,
             delegation,
             workspace,
@@ -1618,7 +1691,7 @@ impl AppState {
         } else {
             HostApprovalManager::new(id.clone(), self.global_events.clone(), cancel)
         };
-        let (delegation, tool_host, goal) = self.session_tool_host(
+        let (delegation, tool_host, goal, question) = self.session_tool_host(
             &id,
             &workspace,
             approvals.clone(),
@@ -1675,6 +1748,7 @@ impl AppState {
             session_path: path,
             agent,
             goal,
+            question,
             approvals,
             delegation,
             workspace,
@@ -1703,6 +1777,7 @@ impl AppState {
             session_path,
             agent,
             goal,
+            question,
             approvals,
             delegation,
             workspace,
@@ -1730,6 +1805,7 @@ impl AppState {
             session_path,
             agent,
             goal,
+            question,
             approvals,
             delegation,
             active: AtomicBool::new(false),
@@ -1759,6 +1835,9 @@ impl AppState {
             }),
             desktop_registrations: self.ai_pc.clone(),
         });
+        handle
+            .question
+            .attach(crate::question::adapter(&handle, self.main_office.clone()));
         handle.goal.attach(crate::goal::runtime_adapter(&handle));
         handle.goal.finish();
         self.main_office.attach_session(&handle);
@@ -1979,7 +2058,7 @@ impl AppState {
                 self.global_events.clone(),
                 CancellationToken::new(),
             );
-            let (delegation, tool_host, goal) = self.session_tool_host(
+            let (delegation, tool_host, goal, question) = self.session_tool_host(
                 &new_id,
                 &source.workspace,
                 approvals.clone(),
@@ -2040,6 +2119,7 @@ impl AppState {
                 session_path: final_path,
                 agent,
                 goal,
+                question,
                 approvals,
                 delegation,
                 workspace: source.workspace.clone(),
@@ -3701,6 +3781,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
             } else if let Err(error) = &goal_reply {
                 (Vec::new(), Err(openpaw_core::Error::Session(error.clone())))
             } else {
+                handle.question.begin();
+                let question_control = handle.question.clone();
                 let progress_handle = handle.clone();
                 let execution = turn_execution::run_turn(
                     &handle.agent,
@@ -3708,6 +3790,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     &provider_tools,
                     &mut sink,
                     TurnOptions {
+                        pause_check: Some(Arc::new(move || question_control.pause_reason())),
                         context_progress: Some(Arc::new(move || {
                             progress_handle.set_activity("thinking", None, "正在整理上下文")
                         })),

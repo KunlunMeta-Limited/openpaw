@@ -63,6 +63,7 @@
     {
       "methods": [
         "async fn call (& self , name : & str , args : serde_json :: Value) -> Result < ToolCallOutcome >",
+        "async fn call_with_context (& self , name : & str , args : serde_json :: Value , _context : & ToolInvocationContext ,) -> Result < ToolCallOutcome >",
         "async fn list_tools (& self) -> Result < Vec < ToolSpec > >",
         "fn remember_media (& self , _media : Vec < crate :: InlineMedia >)",
         "fn set_media_context (& self , _media : Vec < crate :: InlineMedia >)"
@@ -106,6 +107,7 @@
     "enum ToolCategory",
     "enum ToolConcurrency",
     "enum ToolInterruptBehavior",
+    "enum UserQuestionState",
     "struct AllowlistGuardrail",
     "struct ApprovalRequest",
     "struct AutoApproveManager",
@@ -143,10 +145,16 @@
     "struct SystemPromptBlocks",
     "struct ToolAnnotations",
     "struct ToolCallOutcome",
+    "struct ToolInvocationContext",
     "struct ToolSpec",
     "struct Transcript",
     "struct TurnContext",
     "struct Usage",
+    "struct UserQuestionAnswer",
+    "struct UserQuestionOption",
+    "struct UserQuestionRecord",
+    "struct UserQuestionRequest",
+    "struct UserQuestionScope",
     "type DescriptionFn",
     "type Result"
   ],

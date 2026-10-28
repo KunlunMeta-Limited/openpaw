@@ -520,6 +520,18 @@ impl ToolExecutor for ContextToolHost {
             Err(error) => ToolCallOutcome::error(error),
         })
     }
+    async fn call_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        context: &openpaw_core::ToolInvocationContext,
+    ) -> Result<ToolCallOutcome> {
+        if name == "read_context_record" {
+            self.call(name, args).await
+        } else {
+            self.inner.call_with_context(name, args, context).await
+        }
+    }
     fn set_media_context(&self, media: Vec<openpaw_core::InlineMedia>) {
         self.inner.set_media_context(media);
     }
