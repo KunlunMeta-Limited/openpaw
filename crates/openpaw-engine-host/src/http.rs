@@ -1994,6 +1994,7 @@ mod tests {
     use super::*;
     include!("http/goal_tests.rs");
     include!("http/context_tests.rs");
+    include!("http/user_input_tests.rs");
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::response::IntoResponse;

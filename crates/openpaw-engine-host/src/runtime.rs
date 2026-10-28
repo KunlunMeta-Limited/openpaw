@@ -699,16 +699,16 @@ impl AppState {
         self.main_office.bind_runtime(self);
     }
 
-    /// 功能：通过普通接收、执行及 writer 完成一次前台子委派。
-    /// 参数：task_id 为可选真实子身份，goal_task_id 为独立 Goal Task 绑定，child 为可信父关系与展示身份，其余为目录、任务、模型、取消和审批。
-    /// 返回：包含真实子编号和结果的工具结果。
+    /// 功能：通过普通接收及登记启动一次前台子委派，结果等待与实际执行分开。
+    /// 参数：task_id 为可选真实子身份，goal_task_id 为 Goal Task 绑定，其余为可信父关系、目录、任务、模型、取消、审批及需移交的子并发名额。
+    /// 返回：真实子会话及回合身份，和只等待本次可靠结果的执行引用。
     /// 错误：登记或持久化失败返回错误，未登记不执行。
     /// 状态：明确 ID 续用自己的历史，否则建立普通子会话；只返回本轮结果。
-    /// 并发与取消：继承父整体回合授权，模型额度和工作区写锁继续共享；父取消传播。
+    /// 并发与取消：真实子任务持有名额至终态清理；父取消传播，丢弃结果等待不释放名额。
     /// 权限：子仅使用工作区工具和自己的审批，不继承桌面或父上下文。
     /// 关联：CHG-2026-0034、ADR-003、ADR-006。
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_delegated(
+    pub(crate) fn start_delegated(
         self: &Arc<Self>,
         task_id: Option<String>,
         goal_task_id: Option<String>,
@@ -719,7 +719,11 @@ impl AppState {
         model: String,
         parent_cancel: CancellationToken,
         parent_approvals: Arc<HostApprovalManager>,
-    ) -> futures::future::BoxFuture<'static, Result<openpaw_core::ToolCallOutcome, String>> {
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<openpaw_engine::coordination::StartedExecution, String>,
+    > {
         let state = self.clone();
         Box::pin(async move {
             let parent = state
@@ -840,6 +844,7 @@ impl AppState {
                 let (done, completed) = tokio::sync::oneshot::channel();
                 let child_turn_id = turn_id.clone();
                 let task = tokio::spawn(async move {
+                    let _permit = permit;
                     let _approvals = _approvals;
                     run_turn(child_handle.clone(), scheduled).await;
                     if let Some(binding) = goal_binding.as_mut() {
@@ -876,44 +881,50 @@ impl AppState {
                 };
                 (completed, standalone)
             };
-            // 独立可信委派适配器没有已登记父回合，直接持有并等待自己的任务。
-            if let Some(task) = standalone {
-                task.await.map_err(|_| "子回合执行异常".to_string())?;
-            }
-            completed.await.map_err(|_| "子回合执行异常".to_string())?;
-            let terminal = handle
-                .turn_outcomes()
-                .into_iter()
-                .find(|turn| turn.turn_id == turn_id)
-                .ok_or("子回合未保存终态")?;
-            let completed = terminal.state == TurnState::Completed;
-            let result = delegated_result(&handle, &turn_id, &terminal);
-            let status = if completed {
-                "completed"
-            } else if terminal.state == TurnState::Cancelled {
-                "cancelled"
-            } else {
-                "failed"
-            };
-            Ok(openpaw_core::ToolCallOutcome {
-                media: Vec::new(),
-                is_error: !completed,
-                content: format!(
-                    "子 Agent“{}” task_id={}，status={}：\n{}{}",
-                    child.name,
-                    handle.id,
-                    status,
-                    result,
-                    if goal_task_id.is_some() {
-                        "\nGoal 子任务已返回实际结果，尚未验收；由主 Agent 读取或检查后决定。"
-                    } else {
-                        ""
+            Ok(openpaw_engine::coordination::StartedExecution::new(
+                handle.id.clone(),
+                turn_id.clone(),
+                Box::pin(async move {
+                    // 结果等待不拥有执行名额；父登记表仍负责实际任务的取消与join。
+                    if let Some(task) = standalone {
+                        task.await.map_err(|_| "子回合执行异常".to_string())?;
                     }
-                ),
-                structured: Some(
-                    serde_json::json!({"task_id":handle.id,"sessionId":handle.id,"turnId":turn_id,"workspaceId":child.workspace_id,"workspaceName":child.name,"parentSessionId":child.parent_id,"status":status,"result":result}),
-                ),
-            })
+                    completed.await.map_err(|_| "子回合执行异常".to_string())?;
+                    let terminal = handle
+                        .turn_outcomes()
+                        .into_iter()
+                        .find(|turn| turn.turn_id == turn_id)
+                        .ok_or("子回合未保存终态")?;
+                    let completed = terminal.state == TurnState::Completed;
+                    let result = delegated_result(&handle, &turn_id, &terminal);
+                    let status = if completed {
+                        "completed"
+                    } else if terminal.state == TurnState::Cancelled {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    Ok(openpaw_core::ToolCallOutcome {
+                        media: Vec::new(),
+                        is_error: !completed,
+                        content: format!(
+                            "子 Agent“{}” task_id={}，status={}：\n{}{}",
+                            child.name,
+                            handle.id,
+                            status,
+                            result,
+                            if goal_task_id.is_some() {
+                                "\nGoal 子任务已返回实际结果，尚未验收；由主 Agent 读取或检查后决定。"
+                            } else {
+                                ""
+                            }
+                        ),
+                        structured: Some(
+                            serde_json::json!({"task_id":handle.id,"sessionId":handle.id,"turnId":turn_id,"workspaceId":child.workspace_id,"workspaceName":child.name,"parentSessionId":child.parent_id,"status":status,"result":result}),
+                        ),
+                    })
+                }),
+            ))
         })
     }
 

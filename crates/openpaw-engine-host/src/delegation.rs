@@ -9,11 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
-use futures::{stream::BoxStream, StreamExt};
 use openpaw_core::{
-    Capabilities, CompletionRequest, CompletionResponse, Error, LlmProvider, StreamEvent,
-    ToolCallOutcome, ToolCategory, ToolConcurrency, ToolExecutor, ToolHost, ToolHostValidator,
-    ToolSpec,
+    Error, LlmProvider, ToolCallOutcome, ToolCategory, ToolConcurrency, ToolExecutor, ToolHost,
+    ToolHostValidator, ToolSpec,
 };
 use openpaw_engine::AgentEvent;
 use openpaw_tools::ToolRegistry;
@@ -121,7 +119,7 @@ pub(crate) struct DelegationContext {
     sequence: AtomicU64,
     delegations: Mutex<HashMap<String, DelegationRecord>>,
     state_file: PathBuf,
-    slots: Semaphore,
+    slots: Arc<Semaphore>,
     shared: Arc<DelegationShared>,
     #[cfg(test)]
     _runtime_keeper: Option<Arc<crate::runtime::AppState>>,
@@ -194,7 +192,7 @@ impl DelegationContext {
             sequence: AtomicU64::new(sequence),
             delegations: Mutex::new(delegations),
             state_file,
-            slots: Semaphore::new(MAX_PARALLEL_SUBAGENTS),
+            slots: Arc::new(Semaphore::new(MAX_PARALLEL_SUBAGENTS)),
             shared,
             #[cfg(test)]
             _runtime_keeper: None,
@@ -235,10 +233,7 @@ impl DelegationContext {
     /// 权限：不增加模型或工具权限。
     /// 关联：CHG-2026-0032。
     pub(crate) fn limit_provider(&self, provider: Arc<dyn LlmProvider>) -> Arc<dyn LlmProvider> {
-        Arc::new(LimitedProvider {
-            inner: provider,
-            slots: self.shared.model_slots.clone(),
-        })
+        openpaw_engine::coordination::limit_provider(provider, self.shared.model_slots.clone())
     }
 
     /// 功能：为真实子执行组装仅工作区内置工具。
@@ -282,10 +277,10 @@ impl DelegationContext {
                 current.cancel.clone(),
             )
         };
-        let _permit = tokio::select! {
+        let permit = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(cancelled_outcome(&workspace_id, &name, &self.parent_session_id)),
-            permit = self.slots.acquire() => permit.map_err(|_| Error::ToolHost("子 Agent 调度器已关闭".into()))?,
+            permit = self.slots.clone().acquire_owned() => permit.map_err(|_| Error::ToolHost("子 Agent 调度器已关闭".into()))?,
         };
         let runtime = self
             .shared
@@ -295,7 +290,7 @@ impl DelegationContext {
             .upgrade()
             .ok_or_else(|| Error::ToolHost("委派运行时不可用，未启动子任务".into()))?;
         runtime
-            .run_delegated(
+            .start_delegated(
                 input.task_id,
                 input.goal_task_id,
                 crate::runtime::ChildSession {
@@ -310,7 +305,11 @@ impl DelegationContext {
                 model,
                 cancel,
                 self.approvals.clone(),
+                permit,
             )
+            .await
+            .map_err(Error::ToolHost)?
+            .wait()
             .await
             .map_err(Error::ToolHost)
     }
@@ -361,59 +360,6 @@ impl DelegationContext {
         runtime
             .child_context(&self.parent_session_id, &self.workspace)
             .await
-    }
-}
-
-struct LimitedProvider {
-    inner: Arc<dyn LlmProvider>,
-    slots: Arc<Semaphore>,
-}
-
-#[async_trait]
-impl LlmProvider for LimitedProvider {
-    async fn complete(&self, req: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
-        let _permit = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Provider("模型请求调度器已关闭".into()))?;
-        self.inner.complete(req).await
-    }
-
-    async fn stream(
-        &self,
-        req: CompletionRequest,
-    ) -> openpaw_core::Result<BoxStream<'static, openpaw_core::Result<StreamEvent>>> {
-        let permit = self
-            .slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| Error::Provider("模型请求调度器已关闭".into()))?;
-        let stream = self.inner.stream(req).await?;
-        Ok(Box::pin(futures::stream::unfold(
-            (stream, permit),
-            |(mut stream, permit)| async move {
-                stream.next().await.map(|event| (event, (stream, permit)))
-            },
-        )))
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-
-    fn model_capabilities(&self, model: &str) -> Capabilities {
-        self.inner.model_capabilities(model)
-    }
-
-    fn name(&self) -> &str {
-        self.inner.name()
-    }
-
-    fn default_model(&self) -> &str {
-        self.inner.default_model()
     }
 }
 
@@ -941,6 +887,7 @@ impl Drop for SubagentOfficeGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openpaw_core::CompletionRequest;
     use std::collections::HashSet;
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
@@ -1021,7 +968,7 @@ mod tests {
             sequence: AtomicU64::new(sequence),
             delegations: Mutex::new(delegations),
             state_file,
-            slots: Semaphore::new(MAX_PARALLEL_SUBAGENTS),
+            slots: Arc::new(Semaphore::new(MAX_PARALLEL_SUBAGENTS)),
             shared,
             _runtime_keeper: Some(runtime),
             enabled: true,
@@ -1193,14 +1140,14 @@ mod tests {
     #[tokio::test]
     async fn parent_and_child_providers_share_one_process_limit() {
         let shared = DelegationShared::with_slots(1);
-        let first = Arc::new(LimitedProvider {
-            inner: Arc::new(openpaw_llm::EchoProvider::new()),
-            slots: shared.model_slots.clone(),
-        });
-        let second = Arc::new(LimitedProvider {
-            inner: Arc::new(openpaw_llm::EchoProvider::new()),
-            slots: shared.model_slots.clone(),
-        });
+        let first = openpaw_engine::coordination::limit_provider(
+            Arc::new(openpaw_llm::EchoProvider::new()),
+            shared.model_slots.clone(),
+        );
+        let second = openpaw_engine::coordination::limit_provider(
+            Arc::new(openpaw_llm::EchoProvider::new()),
+            shared.model_slots.clone(),
+        );
         let first_stream = first.stream(CompletionRequest::default()).await.unwrap();
 
         assert!(tokio::time::timeout(

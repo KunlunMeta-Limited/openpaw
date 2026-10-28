@@ -15,6 +15,8 @@ pub mod agent_loop;
 pub mod compaction;
 /// 功能：授权原件读取与有界模型上下文；不依赖Store或Host。
 pub mod context;
+/// 功能：中立执行等待与共享模型请求资源协调，不承担会话或Office策略。Stability: experimental。
+pub mod coordination;
 pub mod events;
 pub mod fallback;
 pub mod token_budget;
