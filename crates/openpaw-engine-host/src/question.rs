@@ -45,6 +45,7 @@ impl QuestionRuntime for Adapter {
             .commit_question(record)
     }
     async fn display(&self, record: &UserQuestionRecord) -> Result<UserQuestionAnswer, String> {
+        let handle = self.handle.upgrade().ok_or("提问会话已经结束")?;
         let binding = self
             .office
             .directory()?
@@ -63,7 +64,7 @@ impl QuestionRuntime for Adapter {
             .and_then(|employees| {
                 employees
                     .iter()
-                    .find(|employee| employee["id"] == record.scope.asking_session_id)
+                    .find(|employee| employee["id"] == handle.question_employee_id())
             });
         let actor = employee
             .and_then(|employee| employee["sceneActorId"].as_str())

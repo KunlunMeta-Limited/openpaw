@@ -153,6 +153,12 @@ pub struct SessionHandle {
     /// 会话私有 Goal 事实；执行权限不从持久状态继承。
     goal: Arc<GoalContext>,
     question: Arc<openpaw_engine::user_input::QuestionContext>,
+    child_question_phase: std::sync::Mutex<
+        Option<(
+            String,
+            tokio::sync::watch::Sender<openpaw_engine::coordination::ExecutionPhase>,
+        )>,
+    >,
     pub approvals: Arc<HostApprovalManager>,
     /// 本会话独立的子任务身份、结果缓存和执行审批上下文。
     pub(crate) delegation: Arc<DelegationContext>,
@@ -209,6 +215,19 @@ pub struct SessionActivity {
     pub task: String,
 }
 impl SessionHandle {
+    /// 功能：取得真实提问会话对应的场景成员别名。
+    /// 参数：无。
+    /// 返回：可信子元数据别名，主会话返回自己的身份。
+    /// 错误：无。
+    /// 状态：只读，不改变真实会话身份。
+    /// 并发与取消：元数据不可变。
+    /// 权限：不按人物名字推断归属。
+    /// 关联：question适配器。
+    pub(crate) fn question_employee_id(&self) -> &str {
+        self.child
+            .as_ref()
+            .map_or(&self.id, |child| &child.workspace_id)
+    }
     /// 功能：核对提问所属的真实活动回合和消息。
     /// 参数：invocation为引擎提供的原调用身份。
     /// 返回：可信主会话、发起会话与输入来源。
@@ -227,8 +246,19 @@ impl SessionHandle {
             .as_ref()
             .filter(|turn| invocation.turn_id.as_deref() == Some(turn.outcome.turn_id.as_str()))
             .ok_or("提问回合归属已经失效")?;
-        if self.cancel_requested.load(Ordering::Acquire) {
+        if self.cancel_requested.load(Ordering::Acquire) || self.main_cancel_token().is_cancelled()
+        {
             return Err("原执行已停止".into());
+        }
+        if self.child.is_some()
+            && self
+                .child_question_phase
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|(id, _)| id != &turn.outcome.turn_id)
+        {
+            return Err("提问执行未由当前父回合登记".into());
         }
         Ok(openpaw_core::user_input::UserQuestionScope {
             parent_session_id: self
@@ -255,13 +285,21 @@ impl SessionHandle {
         let _gate = self.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
         let active = self.current_turn.lock().unwrap_or_else(|e| e.into_inner());
         if record.scope.asking_session_id != self.id
-            || active
-                .as_ref()
-                .is_none_or(|turn| turn.outcome.turn_id != record.turn_id)
+            || record.scope.parent_session_id
+                != self
+                    .child
+                    .as_ref()
+                    .map_or(&self.id, |child| &child.parent_id)
+                    .as_str()
+            || active.as_ref().is_none_or(|turn| {
+                turn.outcome.turn_id != record.turn_id
+                    || turn.outcome.user_message_id != record.scope.source_user_message_id
+            })
         {
             return Err("问题执行归属已失效".into());
         }
-        if self.cancel_requested.load(Ordering::Acquire)
+        if (self.cancel_requested.load(Ordering::Acquire)
+            || self.main_cancel_token().is_cancelled())
             && record.state != UserQuestionState::Cancelled
         {
             return Err("原执行已停止，未接受答案".into());
@@ -271,7 +309,28 @@ impl SessionHandle {
             &SessionEvent::Unknown(Box::new(
                 serde_json::json!({"type":"user_question_v1","record":record}),
             )),
-        )
+        )?;
+        // 只有可靠事实提交后才发布阶段；旧回合的通知不能影响新执行。
+        if let Some((_, phase)) = self
+            .child_question_phase
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|(turn, _)| turn == &record.turn_id)
+        {
+            use openpaw_engine::coordination::ExecutionPhase;
+            if record.state == UserQuestionState::Waiting {
+                phase.send_replace(ExecutionPhase::WaitingInput);
+            } else if record.state == UserQuestionState::Answered {
+                phase.send_replace(ExecutionPhase::Running);
+            } else if matches!(
+                record.state,
+                UserQuestionState::Expired | UserQuestionState::Interrupted
+            ) {
+                phase.send_replace(ExecutionPhase::Paused);
+            }
+        }
+        Ok(())
     }
     /// 功能：通过既有唯一 session writer 提交 Goal 事实。
     /// 参数：value 为 Goal 模块已经校验的完整快照。
@@ -850,7 +909,8 @@ impl AppState {
             let turn_id = format!("turn_{}", Uuid::new_v4().simple());
             let user_message_id = format!("msg_{}_{}_user", handle.id, turn_id);
             let permit = slots.clone().try_acquire_owned().ok();
-            let (running, running_state) = tokio::sync::watch::channel(false);
+            use openpaw_engine::coordination::ExecutionPhase;
+            let (phase, phase_state) = tokio::sync::watch::channel(ExecutionPhase::Queued);
             let mut message = openpaw_core::Message::user_text(&task);
             message.uuid = Some(user_message_id.clone());
             let (completed, standalone) = {
@@ -890,6 +950,10 @@ impl AppState {
                 };
                 let cancel = parent_cancel.child_token();
                 *handle.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = cancel.clone();
+                *handle
+                    .child_question_phase
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some((turn_id.clone(), phase.clone()));
                 let _approvals =
                     parent_approvals.attach_child(handle.approvals.clone(), &parent_cancel);
                 if _approvals.is_none() {
@@ -924,31 +988,39 @@ impl AppState {
                     if _permit.is_none() {
                         cancel.cancel();
                     } else {
-                        running.send_replace(true);
+                        phase.send_replace(ExecutionPhase::Running);
                     }
                     let _approvals = _approvals;
-                    run_turn(child_handle.clone(), scheduled).await;
+                    let paused = run_turn(child_handle.clone(), scheduled).await;
                     if let Some(binding) = goal_binding.as_mut() {
                         if let Some(terminal) = child_handle
                             .turn_outcomes()
                             .into_iter()
                             .find(|turn| turn.turn_id == child_turn_id)
                         {
-                            let status = if terminal.state == TurnState::Completed {
+                            let status = if terminal.state == TurnState::Completed
+                                && paused.is_none()
+                            {
                                 "completed"
                             } else if terminal.state == TurnState::Cancelled {
                                 "cancelled"
+                            } else if terminal.state == TurnState::Completed && paused.is_some() {
+                                "paused"
                             } else {
                                 "failed"
                             };
-                            let result =
-                                delegated_result(&child_handle, &terminal.turn_id, &terminal);
+                            let result = delegated_result(
+                                &child_handle,
+                                &terminal.turn_id,
+                                &terminal,
+                                paused.as_deref(),
+                            );
                             if let Err(error) = binding.finish(status, &result) {
                                 tracing::error!(%error, "Goal 子执行结果保存失败");
                             }
                         }
                     }
-                    let _ = done.send(());
+                    let _ = done.send(paused);
                 });
                 let standalone = if let Some(registry) = registry.as_mut() {
                     registry.tasks.push(ForegroundChild {
@@ -965,24 +1037,26 @@ impl AppState {
             Ok(openpaw_engine::coordination::StartedExecution::new(
                 handle.id.clone(),
                 turn_id.clone(),
-                running_state,
+                phase_state,
                 Box::pin(async move {
                     // 结果等待不拥有执行名额；父登记表仍负责实际任务的取消与join。
                     if let Some(task) = standalone {
                         task.await.map_err(|_| "子回合执行异常".to_string())?;
                     }
-                    completed.await.map_err(|_| "子回合执行异常".to_string())?;
+                    let paused = completed.await.map_err(|_| "子回合执行异常".to_string())?;
                     let terminal = handle
                         .turn_outcomes()
                         .into_iter()
                         .find(|turn| turn.turn_id == turn_id)
                         .ok_or("子回合未保存终态")?;
-                    let completed = terminal.state == TurnState::Completed;
-                    let result = delegated_result(&handle, &turn_id, &terminal);
+                    let completed = terminal.state == TurnState::Completed && paused.is_none();
+                    let result = delegated_result(&handle, &turn_id, &terminal, paused.as_deref());
                     let status = if completed {
                         "completed"
                     } else if terminal.state == TurnState::Cancelled {
                         "cancelled"
+                    } else if terminal.state == TurnState::Completed && paused.is_some() {
+                        "paused"
                     } else {
                         "failed"
                     };
@@ -1833,6 +1907,7 @@ impl AppState {
             agent,
             goal,
             question,
+            child_question_phase: std::sync::Mutex::new(None),
             approvals,
             delegation,
             active: AtomicBool::new(false),
@@ -2579,8 +2654,15 @@ pub(crate) fn restored_office_children(
     children.sort_by(|a, b| a.0.cmp(&b.0));
     children
 }
-fn delegated_result(handle: &SessionHandle, turn_id: &str, terminal: &TurnOutcome) -> String {
-    if terminal.state == TurnState::Completed {
+fn delegated_result(
+    handle: &SessionHandle,
+    turn_id: &str,
+    terminal: &TurnOutcome,
+    paused: Option<&str>,
+) -> String {
+    if let Some(reason) = paused.filter(|_| terminal.state == TurnState::Completed) {
+        format!("子执行已暂停：{reason}。尚未完成，请在原聊天明确继续。")
+    } else if terminal.state == TurnState::Completed {
         handle
             .message_cache
             .read()
@@ -3431,13 +3513,13 @@ pub(crate) struct ScheduledTurn {
 }
 /// 功能：在后台任务中执行一个完整 AgentLoop 回合。
 /// 参数：handle 为会话句柄，turn 为已持久化输入及调度凭据。
-/// 返回：无；通过终态快照和 SSE 报告执行结果。
+/// 返回：本次执行的可信暂停原因；终态快照和 SSE 仍报告既有回合结果。
 /// 错误：执行失败安全分类后持久化；持久化失败按 persistence_failed 闭合。
 /// 状态：失败详情与终态原子提交，展示占位不进入模型上下文；完成后释放活动状态。
 /// 并发与取消：由 `SessionHandle` 的 cancel token 和 AgentLoop cancel 控制。
 /// 权限：沿用回合工具权限；上游错误仅公开经过过滤的摘要和可靠元数据。
 /// 关联：`REQ-B-HOST-006`、`CHG-2026-0022`。
-pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
+pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) -> Option<String> {
     let ScheduledTurn {
         turn_id,
         user_message_id,
@@ -3454,7 +3536,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         if let Ok(mut working) = handle.office_working.try_lock() {
             working.clear();
         }
-        return;
+        return None;
     }
     let provider_name = provider.name().to_string();
     let message_count_before = handle
@@ -3463,6 +3545,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         .unwrap_or_else(|error| error.into_inner())
         .len();
     let mut cleanup = TurnCleanup::new(handle.clone(), message_count_before);
+    let mut paused = None;
     let turn_cancel = handle
         .turn_cancel
         .lock()
@@ -3493,7 +3576,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
         };
         finish_turn_with_outcome(&handle, outcome, "无法持久化排队取消终态");
         cleanup.finish();
-        return;
+        return None;
     };
     let started_at = chrono::Utc::now().timestamp_millis();
     let running = TurnOutcome {
@@ -3523,7 +3606,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     };
     if !running_persisted {
         cleanup.finish();
-        return;
+        return None;
     }
     // 仅实际获准执行的可信回合可安装桌面工具身份。重放和排队取消不安装。
     let request_id = handle
@@ -3834,6 +3917,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
                     },
                 )
                 .await;
+                paused = execution.paused;
                 cleanup.checkpoint = Some(execution.checkpoint);
                 let result = execution.result;
                 if let Err(error) = &result {
@@ -4051,6 +4135,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) {
     *handle.office_working.lock().await = roles.clone();
     drop(snapshot);
     cleanup.finish();
+    paused
 }
 fn session_file_updated_at(path: &std::path::Path, fallback: i64) -> i64 {
     std::fs::metadata(path)

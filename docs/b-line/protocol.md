@@ -284,3 +284,10 @@ set_text 仅使用当前启用且非只读的 ValuePattern.SetValue 整值替换
 Everypaw 使用公开 Windows WGC HWND API、原窗口存活租约和物理坐标。子区域必须落入可验证窗口纹理；窗口无效、最小化、cloaked、无帧或几何变化明确失败，不恢复目标、不改读桌面。原件在既有screenshots目录，独立visual_png_sources记录来源，visual_tool_calls关联交付；不是后台历史截图。全局/接收服务screenshots、Restricted、原automatic grant与应用排除/未知身份在取得及返回/ACK时复核；既有四项UIA/metadata开关不充当截图授权。Picker完整presentation epoch变化后，仅留本地实际证据，不交付媒体。
 
 `GET /session/:id/message?turnID=<id>&textOnly=true` 为既有 `API-HOST-SESSION-004` 的可选窄读取扩展，仅返回指定回合assistant文字parts及原info/error；非法/缺turnID返回400，turnID不单独使用。默认完整REST、按messageID读取及公共附件投影保持兼容。Host仍先复制wire_messages完整快照再过滤，历史内存/CPU开销不保证恒定。Everypaw对任意大SSE行（不限媒体）增量丢弃到换行，单行保留≤1 MiB、总wire≤128 MiB且原180秒期限；每2秒和EOF/idle/error检查权威回合，失败回合明确失败，完成回合从窄REST恢复正文。正文/窄REST≤2 MiB，任一超限明确失败。合法同轮4张/20MiB图片不受旧8MiB累计限制；该容量并非无限历史保证，也不是图片token预算。
+# 用户提问的子执行状态（CHG-2026-0054 / 04）
+
+`get_agent_status`／`wait_agent`继续使用本父回合已登记的`session_id`和`turn_id`，增加`waiting_input`及`paused`的真实阶段说明；等待状态变化不产生新子回合或新预算。终态仍使用既有公开回合五态，逻辑暂停由可信执行结果另行报告，不把外层Completed直接解释为工作成功。
+
+子问题的逻辑身份保留真实发起会话；既有`decision.request`仍发到真实父会话的conversation，`actorId`及提问者姓名从可信ChildSession展示别名解析，不按姓名推断归属。提问只允许本次父回合实际登记的子执行；旧子会话关系本身不能为新的未登记执行取得投递许可。
+
+父自身提问受控暂停时，已启动独立孩子仍在本轮归属内收尾；实际结果沿原消息事务保存，并确定性展示完成、失败或暂停说明，父不再请求依赖模型。显式停止仍取消所属父子与问题，迟到回答不能恢复执行；AI Office协议、布局、权限审批与其他主会话均保持既有规则。

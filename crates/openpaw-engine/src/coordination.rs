@@ -11,6 +11,29 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+/// 功能：可信入口报告子执行当前阶段，不等于任务验收。Stability: experimental。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPhase {
+    /// 已接收，尚未取得实际执行名额。
+    Queued,
+    /// 实际执行正在推进。
+    Running,
+    /// 原问题已可靠保存，正在等待明确回答。
+    WaitingInput,
+    /// 未取得有效答案，当前分支已经受控暂停。
+    Paused,
+}
+impl ExecutionPhase {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::WaitingInput => "waiting_input",
+            Self::Paused => "paused",
+        }
+    }
+}
+
 /// 功能：保存已经受理的确切子执行身份及其独立结果等待，不表示执行完成。
 /// Stability: experimental。
 #[derive(Clone)]
@@ -19,13 +42,13 @@ pub struct StartedExecution {
     pub session_id: String,
     /// 本次子回合身份，不与同会话后续执行混用。
     pub turn_id: String,
-    running: watch::Receiver<bool>,
+    phase: watch::Receiver<ExecutionPhase>,
     result: watch::Receiver<Option<Result<ToolCallOutcome, String>>>,
 }
 
 impl StartedExecution {
     /// 功能：绑定已受理执行身份与真实完成等待。
-    /// 参数：session_id、turn_id来自入口，running表示真实名额已取得，result只等待该执行的持久结果。
+    /// 参数：session_id、turn_id来自入口，phase表示可信执行阶段，result只等待该执行的持久结果。
     /// 返回：尚未等待结果的执行引用。
     /// 错误：无；身份与准入由入口校验。
     /// 状态：不启动执行或模型请求。
@@ -35,7 +58,7 @@ impl StartedExecution {
     pub fn new(
         session_id: String,
         turn_id: String,
-        running: watch::Receiver<bool>,
+        phase: watch::Receiver<ExecutionPhase>,
         result: BoxFuture<'static, Result<ToolCallOutcome, String>>,
     ) -> Self {
         let (complete, receiver) = watch::channel(None);
@@ -49,7 +72,7 @@ impl StartedExecution {
         Self {
             session_id,
             turn_id,
-            running,
+            phase,
             result: receiver,
         }
     }
@@ -75,21 +98,19 @@ impl StartedExecution {
     }
 
     fn pending_status(&self) -> &'static str {
-        if *self.running.borrow() {
-            "running"
-        } else {
-            "queued"
-        }
+        self.phase.borrow().status()
     }
 
-    async fn changed(mut self) {
+    async fn changed(mut self, observed: ExecutionPhase) {
         if self.result.borrow_and_update().is_some() {
             return;
         }
-        self.running.borrow_and_update();
+        if *self.phase.borrow_and_update() != observed {
+            return;
+        }
         tokio::select! {
             _ = self.result.changed() => {},
-            _ = self.running.changed() => {},
+            _ = self.phase.changed() => {},
         }
     }
 }
@@ -103,7 +124,7 @@ pub struct ExecutionRegistry(Mutex<Vec<TrackedExecution>>);
 struct TrackedExecution {
     execution: StartedExecution,
     delivered: bool,
-    observed_running: Option<bool>,
+    observed_phase: Option<ExecutionPhase>,
 }
 
 impl ExecutionRegistry {
@@ -135,7 +156,7 @@ impl ExecutionRegistry {
             .push(TrackedExecution {
                 execution,
                 delivered: false,
-                observed_running: None,
+                observed_phase: None,
             });
         outcome
     }
@@ -159,17 +180,17 @@ impl ExecutionRegistry {
         }
         let session_id = input["session_id"].as_str().unwrap();
         let turn_id = input["turn_id"].as_str().unwrap();
-        let (execution, repeated) = {
+        let (execution, repeated, phase) = {
             let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
             let Some(entry) = entries.iter_mut().find(|entry| {
                 entry.execution.session_id == session_id && entry.execution.turn_id == turn_id
             }) else {
                 return ToolCallOutcome::error("执行身份不属于当前父回合，不能查询或等待");
             };
-            let running = *entry.execution.running.borrow();
-            let repeated = entry.observed_running == Some(running);
-            entry.observed_running = Some(running);
-            (entry.execution.clone(), repeated)
+            let phase = *entry.execution.phase.borrow();
+            let repeated = entry.observed_phase == Some(phase);
+            entry.observed_phase = Some(phase);
+            (entry.execution.clone(), repeated, phase)
         };
         if (wait || repeated) && execution.result.borrow().is_none() {
             let duration =
@@ -177,7 +198,7 @@ impl ExecutionRegistry {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return execution_status(&execution, "cancelled", false),
-                _ = tokio::time::timeout(duration, execution.clone().changed()) => {}
+                _ = tokio::time::timeout(duration, execution.clone().changed(phase)) => {}
             }
         }
         let mut entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -204,6 +225,7 @@ impl ExecutionRegistry {
             entry.delivered = true;
             result
         } else {
+            entry.observed_phase = Some(*execution.phase.borrow());
             execution_status(&execution, execution.pending_status(), false)
         }
     }

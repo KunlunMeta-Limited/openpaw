@@ -1,4 +1,556 @@
 #[cfg(test)]
+mod child_question_tests {
+    use super::*;
+
+    fn call(index: usize, name: &str, args: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"index":index,"id":format!("child-question-{name}-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
+    }
+
+    pub(super) async fn model_response(
+        body: &serde_json::Value,
+        questions: &tokio::sync::Mutex<Vec<serde_json::Value>>,
+        gate: &tokio::sync::Notify,
+    ) -> Response {
+        let messages = body["messages"].as_array().unwrap();
+        let latest = messages.iter().rposition(|m| m["role"] == "user").unwrap();
+        let orphan = messages[latest]["content"] == "无父许可仍提问";
+        let task = messages
+            .iter()
+            .find(|m| m["role"] == "user")
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("");
+        let task = if orphan { "child-A-needs-answer" } else { task };
+        let results = messages[if orphan { latest } else { 0 }..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>();
+        let parent = body["tools"].to_string().contains("start_agent");
+        if task == "child-B-delayed" && results.is_empty() {
+            gate.notified().await;
+        }
+        let calls = if parent && task.starts_with("父自己提问") {
+            match results.len() {
+                0 => vec![call(
+                    0,
+                    "start_agent",
+                    serde_json::json!({"task":if task=="父自己提问后暂停"{"child-B-delayed"}else{"child-B-independent"},"name":"独立资料员"}),
+                )],
+                1 => vec![call(
+                    0,
+                    "request_user_input",
+                    serde_json::json!({"question":"请选择交付方式","options":[{"id":"option-a","label":"方案A"},{"id":"option-b","label":"方案B"}]}),
+                )],
+                _ => Vec::new(),
+            }
+        } else if parent {
+            match results.len() {
+                0 => vec![
+                    call(
+                        0,
+                        "start_agent",
+                        serde_json::json!({"task":"child-A-needs-answer","name":"需求员A"}),
+                    ),
+                    call(
+                        1,
+                        "start_agent",
+                        serde_json::json!({"task":"child-B-independent","name":"资料员B"}),
+                    ),
+                ],
+                2 => vec![call(
+                    0,
+                    "write_file",
+                    serde_json::json!({"path":"C-independent.txt","content":"父独立工作已完成"}),
+                )],
+                3 => {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            if questions
+                                .lock()
+                                .await
+                                .iter()
+                                .any(|m| m["type"] == "decision.request")
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("子A应已进入真实待答");
+                    let reference: serde_json::Value =
+                        serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
+                    vec![call(
+                        0,
+                        "get_agent_status",
+                        serde_json::json!({"session_id":reference["session_id"],"turn_id":reference["turn_id"]}),
+                    )]
+                }
+                _ => Vec::new(),
+            }
+        } else if task == "child-A-needs-answer" {
+            match results.len() {
+                0 => vec![call(
+                    0,
+                    "request_user_input",
+                    serde_json::json!({"question":"请选择交付方式","options":[{"id":"option-a","label":"方案A"},{"id":"option-b","label":"方案B"}]}),
+                )],
+                1 => vec![call(
+                    0,
+                    "write_file",
+                    serde_json::json!({"path":"A-dependent.txt","content":"取得明确答案后才执行"}),
+                )],
+                _ => Vec::new(),
+            }
+        } else if results.is_empty() {
+            vec![call(
+                0,
+                "write_file",
+                serde_json::json!({"path":"B-independent.txt","content":"兄弟独立工作已完成"}),
+            )]
+        } else {
+            Vec::new()
+        };
+        let delta = if calls.is_empty() {
+            serde_json::json!({"content":if parent {
+                if task=="子问题失败如实暂停" {
+                    if messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("status=paused"))) {"A已暂停，B与C已完成"} else {"错误地认为A已完成"}
+                } else if task.starts_with("父自己提问") && messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("B实际完成"))) {"父按答案继续并汇总B"} else if messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("A实际完成"))) {"协作完成"} else {"尝试提前汇总"}
+            } else if task=="child-A-needs-answer" {"A实际完成"}else{"B实际完成"}})
+        } else {
+            serde_json::json!({"tool_calls":calls})
+        };
+        let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":if delta["tool_calls"].is_array(){"tool_calls"}else{"stop"}}]});
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn main_child_question_allows_sibling_and_parent_progress_with_owned_waiting_status() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-child-progress", "held-answer").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("A提问时让B和父独立工作继续"))
+            .await
+            .unwrap();
+        let stream =
+            tokio::spawn(async move { to_bytes(response.into_body(), 2_000_000).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if fixture.workspace.path().join("B-independent.txt").exists()
+                    && fixture.workspace.path().join("C-independent.txt").exists()
+                    && fixture.model_seen.lock().await.iter().any(|body| {
+                        body["messages"].as_array().unwrap().iter().any(|m| {
+                            m["role"] == "tool"
+                                && m["content"]
+                                    .as_str()
+                                    .is_some_and(|s| s.contains("waiting_input"))
+                        })
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("A待答时B和父独立C应取得进展，父能查询真实waiting_input");
+        assert!(
+            !fixture.workspace.path().join("A-dependent.txt").exists(),
+            "答案未提交前依赖工作不能提前执行"
+        );
+        assert!(!stream.is_finished(), "父不能因普通汇总而取消有效待答孩子");
+        let card = fixture
+            .seen
+            .lock()
+            .await
+            .iter()
+            .find(|m| m["type"] == "decision.request")
+            .unwrap()
+            .clone();
+        assert_eq!(card["conversationId"], "fixture");
+        assert!(
+            !card["decision"]["actorId"].as_str().unwrap().is_empty(),
+            "子问题应有真实展示人物"
+        );
+        assert!(
+            card["decision"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("需求员A"),
+            "用户应识别真实提问子成员"
+        );
+        fixture.release_model.notify_waiters();
+        let bytes = tokio::time::timeout(Duration::from_secs(8), stream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("协作完成"));
+        assert!(fixture.workspace.path().join("A-dependent.txt").exists());
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["title"] == "需求员A")
+            .unwrap();
+        let history = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{}/message", child["id"].as_str().unwrap()),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            history.to_string().contains("option-a"),
+            "答案只交回真实A的原调用"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_child_question_without_answer_is_paused_instead_of_completed() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-child-paused", "timeout").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("子问题失败如实暂停"))
+            .await
+            .unwrap();
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(8),
+            to_bytes(response.into_body(), 2_000_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.contains("A已暂停，B与C已完成"),
+            "父必须区分未取得答案的暂停与成功：{text}"
+        );
+        assert!(!fixture.workspace.path().join("A-dependent.txt").exists());
+        assert!(fixture.workspace.path().join("B-independent.txt").exists());
+        assert!(fixture.workspace.path().join("C-independent.txt").exists());
+        let bodies = fixture.model_seen.lock().await;
+        assert!(
+            bodies.iter().any(|body| body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("status=paused") && s.contains("超时")))),
+            "父模型应收到本次子执行的真实暂停原因"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_parent_question_pause_keeps_started_independent_child_owned_until_finish() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-child-parent-pause", "timeout").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("父自己提问后暂停"))
+            .await
+            .unwrap();
+        let mut stream =
+            tokio::spawn(async move { to_bytes(response.into_body(), 2_000_000).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let question = fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|m| m["type"] == "decision.request");
+                let child = fixture.model_seen.lock().await.iter().any(|b| {
+                    b["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["role"] == "user" && m["content"] == "child-B-delayed")
+                });
+                if question && child {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("父真实提问和独立子模型均已到达外部门控");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut stream)
+                .await
+                .is_err(),
+            "父自己的受控暂停不能误取消已启动独立孩子"
+        );
+        fixture.release_model.notify_one();
+        let bytes = tokio::time::timeout(Duration::from_secs(5), stream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("执行已暂停"));
+        assert!(
+            std::str::from_utf8(&bytes).unwrap().contains("B实际完成")
+                && std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .contains("status=completed"),
+            "用户应看见独立孩子的实际完成汇总"
+        );
+        assert!(
+            fixture.workspace.path().join("B-independent.txt").exists(),
+            "独立子实际工具必须执行成功"
+        );
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let parent = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| !s["parentID"].is_string())
+            .unwrap();
+        let history = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{}/message", parent["id"].as_str().unwrap()),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            history.to_string().contains("B实际完成"),
+            "父暂停也要保留实际收齐的子结果事实"
+        );
+        assert_eq!(
+            fixture
+                .model_seen
+                .lock()
+                .await
+                .iter()
+                .filter(|body| body["tools"].to_string().contains("start_agent"))
+                .count(),
+            2,
+            "父暂停收尾不能续跑依赖模型"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_child_question_cannot_reuse_display_ownership_after_parent_turn_ends() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-child-ownership", "option-a").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("先完成本轮协作"))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            to_bytes(response.into_body(), 2_000_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["title"] == "需求员A")
+            .unwrap();
+        let path = format!("/session/{}/message", child["id"].as_str().unwrap());
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &path,
+            serde_json::json!({"text":"无父许可仍提问"}),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            1,
+            "旧子会话关系不能为新的未登记执行取得父会话提问许可"
+        );
+    }
+
+    #[tokio::test]
+    async fn main_parent_question_waits_while_started_independent_child_makes_progress() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-child-parent-wait", "held-answer").await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.chat("父自己提问时独立孩子继续"))
+            .await
+            .unwrap();
+        let stream =
+            tokio::spawn(async move { to_bytes(response.into_body(), 2_000_000).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.workspace.path().join("B-independent.txt").exists()
+                    && fixture
+                        .seen
+                        .lock()
+                        .await
+                        .iter()
+                        .any(|m| m["type"] == "decision.request")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("父待答期间独立孩子仍须实际工作");
+        assert!(!stream.is_finished(), "父须等明确回答");
+        fixture.release_model.notify_waiters();
+        let bytes = tokio::time::timeout(Duration::from_secs(5), stream)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("父按答案继续并汇总B"));
+    }
+
+    fn conversation_chat(team: &str, conversation: &str) -> Request<Body> {
+        Request::builder().method("POST").uri("/api/pawoffice/chat").header("content-type","application/json").body(Body::from(serde_json::json!({"version":"1.0","type":"send","teamId":team,"conversationId":conversation,"turnId":"one","messages":[{"role":"user","content":format!("独立协作会话{conversation}")}]}).to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn main_child_question_stop_closes_owned_tree_and_rejects_late_answer_only() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-child-stop", "held-answer").await;
+        let a = fixture
+            .app
+            .clone()
+            .oneshot(conversation_chat(&fixture.team, "a"))
+            .await
+            .unwrap();
+        let b = fixture
+            .app
+            .clone()
+            .oneshot(conversation_chat(&fixture.team, "b"))
+            .await
+            .unwrap();
+        let a = tokio::spawn(async move { to_bytes(a.into_body(), 2_000_000).await.unwrap() });
+        let b = tokio::spawn(async move { to_bytes(b.into_body(), 2_000_000).await.unwrap() });
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|m| m["type"] == "decision.request")
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("两个真实主会话应各有自己的子问题");
+        let response=fixture.app.clone().oneshot(Request::builder().method("POST").uri("/api/pawoffice/chat").header("content-type","application/json").body(Body::from(serde_json::json!({"version":"1.0","type":"cancel","teamId":fixture.team,"conversationId":"a","turnId":"one"}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let a = tokio::time::timeout(Duration::from_secs(5), a)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&a)
+            .unwrap()
+            .contains("\"state\":\"stopped\""));
+        assert!(!b.is_finished(), "停止a不影响b的有效待答");
+        fixture.release_model.notify_waiters();
+        let b = tokio::time::timeout(Duration::from_secs(8), b)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&b).unwrap().contains("协作完成"));
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let mut stopped_parent = None;
+        for session in sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| !s["parentID"].is_string())
+        {
+            let history = child_test_json(
+                &fixture.app,
+                "GET",
+                &format!("/session/{}/message", session["id"].as_str().unwrap()),
+                serde_json::json!({}),
+            )
+            .await;
+            if history.to_string().contains("独立协作会话a") {
+                stopped_parent = Some(session["id"].clone());
+            }
+        }
+        let stopped_parent = stopped_parent.unwrap();
+        let stopped_child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["parentID"] == stopped_parent && s["title"] == "需求员A")
+            .unwrap();
+        let child_id = stopped_child["id"].as_str().unwrap();
+        let turns = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{child_id}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(turns[0]["state"], "cancelled", "迟到回答不能复活子执行");
+        let history = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{child_id}/message"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            !history.to_string().contains("A-dependent.txt"),
+            "停止孩子不能取得答案后再执行依赖工具"
+        );
+    }
+}
+
+#[cfg(test)]
 mod user_input_tests {
     use super::*;
 

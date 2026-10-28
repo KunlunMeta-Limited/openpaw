@@ -2106,6 +2106,7 @@ mod tests {
         let model_seen = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let gateway_seen = seen.clone();
         let models = model_seen.clone();
+        let question_seen = seen.clone();
         let release_model = Arc::new(tokio::sync::Notify::new());
         let model_gate = release_model.clone();
         let question_gate = release_model.clone();
@@ -2173,9 +2174,13 @@ mod tests {
             }
         })).route("/v1/chat/completions",post(move |Json(body):Json<serde_json::Value>| {
             let seen = models.clone();
+            let questions = question_seen.clone();
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("question-child") {
+                    return child_question_tests::model_response(&body, &questions, &gate).await;
+                }
                 if scenario.starts_with("question-") {
                     return user_input_tests::model_response(&body, scenario);
                 }
@@ -2317,7 +2322,9 @@ mod tests {
             ("OPENPAW_MAIN_API_KEY", "fixture-gateway-key".into()),
             (
                 "OPENPAW_ENGINE_MAX_MODEL_REQUESTS",
-                if scenario == "delegate-conversations-async-capacity" {
+                if scenario == "delegate-conversations-async-capacity"
+                    || scenario.starts_with("question-child")
+                {
                     "5"
                 } else if matches!(
                     scenario,
@@ -2401,6 +2408,7 @@ mod tests {
                     | "delegate-conversations"
                     | "delegate-conversations-approval"
                     | "question-stop"
+                    | "question-child-stop"
             ) {
                 2
             } else {

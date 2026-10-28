@@ -916,8 +916,28 @@ impl AgentLoop {
             }
             session.messages.push(model_message);
             if let Some(reason) = pause_check.as_ref().and_then(|check| check()) {
-                let message =
-                    Message::assistant_text(format!("执行已暂停：{reason}。请在原聊天明确继续。"));
+                // 暂停只阻断依赖模型；已经启动的独立分支仍归本轮，先处理真实结果。
+                let mut child_facts = Vec::new();
+                if let Some(coordinate) = &end_turn_coordination {
+                    loop {
+                        match cancel_or(&token, coordinate()).await {
+                            Some(Some(fact)) => {
+                                let message = Message::user_text(&fact).identified();
+                                generated.push(message.clone());
+                                session.messages.push(message);
+                                child_facts.push(fact);
+                            }
+                            Some(None) => break,
+                            None => return Ok(StopReason::EndTurn),
+                        }
+                    }
+                }
+                let mut text = format!("执行已暂停：{reason}。请在原聊天明确继续。");
+                if !child_facts.is_empty() {
+                    text.push_str("\n已启动的独立子任务已收尾，实际完成、失败或暂停情况如下：\n");
+                    text.push_str(&child_facts.join("\n\n"));
+                }
+                let message = Message::assistant_text(text);
                 event_sink(AgentEvent::TextDelta {
                     text: message.text(),
                 });
