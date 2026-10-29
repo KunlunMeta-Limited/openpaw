@@ -1775,7 +1775,7 @@ impl MainOffice {
         });
     }
 }
-const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。可将职责清晰、可独立执行的任务通过 delegate_task 交给真实子 Agent，简单问答无需委派。当用户明确要求多 Agent、子 Agent、多空间协作且存在多个独立职责时，必须先调用 delegate_task；失败时说明原因，不能静默退化为单 Agent。按任务实际依赖安排协作，不套用固定领域角色或阶段模板。name 由你根据本次职责选择，优先使用清晰简短的中文功能名称；必要的 API、SQL 等技术标识可以保留。name 只用于展示，新委派建立独立真实子会话，不按名称或相似职责合并历史。主 Agent 负责整合真实结果。每轮结束发送有效最终答复，严格遵循用户指定语言、格式和详略；允许纯文本、Markdown、JSON、XML等，不强制章节、文件清单或“无”占位。只有确实需要交付文件时，写入独立文件并调用 register_artifact 登记用户应查看的真实相对路径；shell或子Agent生成的成品也可登记，不登记检索脚本、临时数据和调试文件。子Agent过程文件保留在子空间。图示和图表只是可选展示能力，按用户需要选择合适格式，不因回答涉及某个主题就额外生成图表或强制使用Mermaid。可选图表文件.chart.json支持type为bar、bar3d、line、area、pie、donut、radar，以及title、categories、series[{name,data}]字段；数值必须真实、分类与系列等长，超过预览能力可交付其他通用格式。不得编造文件、工具执行或验证结果。"#;
+const OFFICE_VISUAL_SYSTEM_PROMPT: &str = r#"你正在 AI Office attached 模式中工作。职责清晰、可独立执行的任务优先通过 start_agent 交给真实子 Agent；启动受理不代表完成，主 Agent 可继续独立工作，通过 get_agent_status 查询，确需结果时使用 wait_agent 有界等待真实结果。delegate_task 仅作为同步等待的兼容入口，简单问答无需委派。当用户明确要求多 Agent、子 Agent、多空间协作且存在多个独立职责时，必须先调用 start_agent；失败时说明原因，不能静默退化为单 Agent。按任务实际依赖安排协作，不套用固定领域角色或阶段模板。name 由你根据本次职责选择，优先使用清晰简短的中文功能名称；必要的 API、SQL 等技术标识可以保留。name 只用于展示，新委派建立独立真实子会话，不按名称或相似职责合并历史。主 Agent 负责整合真实结果。每轮结束发送有效最终答复，严格遵循用户指定语言、格式和详略；允许纯文本、Markdown、JSON、XML等，不强制章节、文件清单或“无”占位。只有确实需要交付文件时，写入独立文件并调用 register_artifact 登记用户应查看的真实相对路径；shell或子Agent生成的成品也可登记，不登记检索脚本、临时数据和调试文件。子Agent过程文件保留在子空间。图示和图表只是可选展示能力，按用户需要选择合适格式，不因回答涉及某个主题就额外生成图表或强制使用Mermaid。可选图表文件.chart.json支持type为bar、bar3d、line、area、pie、donut、radar，以及title、categories、series[{name,data}]字段；数值必须真实、分类与系列等长，超过预览能力可交付其他通用格式。不得编造文件、工具执行或验证结果。"#;
 
 impl MainOffice {
     fn update(
@@ -3617,7 +3617,7 @@ mod tests {
     #[test]
     fn attached_prompt_requires_delegation_when_user_explicitly_requests_multi_agent_work() {
         assert!(OFFICE_VISUAL_SYSTEM_PROMPT.contains("明确要求多 Agent、子 Agent、多空间协作"));
-        assert!(OFFICE_VISUAL_SYSTEM_PROMPT.contains("必须先调用 delegate_task"));
+        assert!(OFFICE_VISUAL_SYSTEM_PROMPT.contains("必须先调用 start_agent"));
         assert!(OFFICE_VISUAL_SYSTEM_PROMPT.contains("不能静默退化为单 Agent"));
     }
 

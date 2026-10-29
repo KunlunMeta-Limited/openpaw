@@ -651,6 +651,36 @@ mod user_input_tests {
     }
 
     #[tokio::test]
+    async fn main_attached_model_request_defaults_to_nonblocking_collaboration() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-choice", "option-a").await;
+        assert_eq!(send(&fixture).await["state"], "complete");
+        let requests = fixture.model_seen.lock().await;
+        let system = requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            system.contains("优先通过 start_agent"),
+            "默认应启动后继续独立工作"
+        );
+        assert!(system.contains("get_agent_status"));
+        assert!(system.contains("wait_agent"));
+        assert!(system.contains("delegate_task 仅作为同步等待的兼容入口"));
+        assert!(system.contains("明确要求多 Agent、子 Agent、多空间协作"));
+        assert!(system.contains("必须先调用 start_agent"));
+        assert!(system.contains("不能静默退化为单 Agent"));
+        assert!(!system.contains("必须先调用 delegate_task"));
+    }
+
+    #[tokio::test]
     async fn main_user_question_choice_returns_to_the_original_call() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
