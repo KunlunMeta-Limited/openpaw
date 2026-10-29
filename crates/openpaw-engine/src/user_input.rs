@@ -8,8 +8,9 @@ use openpaw_core::{
     ToolSpec,
 };
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 功能：可信入口提供的问题归属、可靠保存和展示效果。
@@ -53,14 +54,202 @@ pub trait QuestionRuntime: Send + Sync {
 /// 功能：只接收可信问答协调器的回合暂停原因。
 pub type PauseCheck = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// 功能：按可信主会话串行化交互展示，不处理答案或工具权限。
+/// 字段/变体语义：lanes仅持有展示名额，pending仅保存可靠当前事实。
+/// 数据来源：可信归属、唯一记录入口和时钟效果。
+/// 数据去向：原问题调用、已有审批展示及有界观察恢复。
+/// 约束：只协调长展示等待，不持有模型或工作区资源。
+/// 稳定性：experimental。
+/// 关联：CHG-2026-0054。
+pub struct QuestionQueue {
+    lanes: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    clock: Arc<dyn QuestionClock>,
+    pending: Mutex<HashMap<String, UserQuestionRecord>>,
+}
+/// 功能：提供可信当前时间和原截止点等待，模型不能设置时钟。
+/// 字段/变体语义：当前毫秒和截止等待必须使用同一时间源。
+/// 数据来源：生产时钟或可信本地fixture。
+/// 数据去向：问题原期限及有界观察恢复。
+/// 约束：只影响问答期限，不增加执行预算。
+/// 稳定性：experimental。
+/// 关联：CHG-2026-0054。
+#[async_trait]
+pub trait QuestionClock: Send + Sync {
+    /// 功能：读取当前Unix毫秒。
+    /// 参数：无。
+    /// 返回：可信毫秒值。
+    /// 错误：无。
+    /// 状态：只读。
+    /// 并发与取消：不得阻塞。
+    /// 权限：仅可信入口提供。
+    /// 关联：问题原deadline；Stability: experimental。
+    fn now_ms(&self) -> i64;
+    /// 功能：等待到原截止点。
+    /// 参数：deadline_ms为原Unix毫秒期限。
+    /// 返回：期限已到。
+    /// 错误：无。
+    /// 状态：不改变问题或执行状态。
+    /// 并发与取消：future可丢弃，时钟推进唤醒。
+    /// 权限：不新建期限或执行许可。
+    /// 关联：可控时间fixture；Stability: experimental。
+    async fn wait_until(&self, deadline_ms: i64);
+}
+struct WallClock;
+#[async_trait]
+impl QuestionClock for WallClock {
+    fn now_ms(&self) -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX)
+    }
+    async fn wait_until(&self, deadline_ms: i64) {
+        let remaining = deadline_ms.saturating_sub(self.now_ms()).max(0) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(remaining)).await;
+    }
+}
+impl Default for QuestionQueue {
+    fn default() -> Self {
+        Self::new(Arc::new(WallClock))
+    }
+}
+/// 功能：持有一次展示名额，丢弃时允许该主会话的后题晋升。
+/// 字段/变体语义：内部guard只表示展示位置。
+/// 数据来源：按可信主会话取得的公平名额。
+/// 数据去向：问题或审批的当前展示等待。
+/// 约束：不表示执行或工具授权。
+/// 稳定性：experimental。
+/// 关联：QuestionQueue。
+pub struct PresentationPermit {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+impl QuestionQueue {
+    /// 功能：以可信时钟构造交互展示协调器。
+    /// 参数：clock为当前时间和截止点等待效果。
+    /// 返回：空协调器。
+    /// 错误：无。
+    /// 状态：不恢复展示或执行。
+    /// 并发与取消：各主会话独立取得名额。
+    /// 权限：不向模型开放配置。
+    /// 关联：Host装配及本地fixture；Stability: experimental。
+    pub fn new(clock: Arc<dyn QuestionClock>) -> Self {
+        Self {
+            lanes: Mutex::new(HashMap::new()),
+            clock,
+            pending: Mutex::new(HashMap::new()),
+        }
+    }
+    /// 功能：读取同一可信时钟的当前毫秒。
+    /// 参数：无。
+    /// 返回：当前Unix毫秒。
+    /// 错误：无。
+    /// 状态：只读。
+    /// 并发与取消：无等待。
+    /// 权限：不创建期限。
+    /// 关联：原deadline与重显剩余时间；Stability: experimental。
+    pub fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
+    }
+    /// 功能：等待原问题截止点，不重建时间窗口。
+    /// 参数：deadline_ms为可靠记录中的原截止点。
+    /// 返回：期限已到。
+    /// 错误：无。
+    /// 状态：不改变执行或问题。
+    /// 并发与取消：丢弃future取消等待。
+    /// 权限：不延长预算。
+    /// 关联：问答及有界观察恢复；Stability: experimental。
+    pub async fn wait_until(&self, deadline_ms: i64) {
+        self.clock.wait_until(deadline_ms).await;
+    }
+    /// 功能：读取指定主会话已可靠记录的当前待答事实。
+    /// 参数：parent为实际主会话身份，入口还须核对当前父turn和实际子执行。
+    /// 返回：Queued或Waiting的完整副本，含原期限与展示代次。
+    /// 错误：无。
+    /// 状态：只读，不包含已终结问题。
+    /// 并发与取消：短锁复制，不访问模型历史。
+    /// 权限：事实不授予执行或回答权限。
+    /// 关联：观察恢复及原问题重显；Stability: experimental。
+    pub fn pending(&self, parent: &str) -> Vec<UserQuestionRecord> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|record| record.scope.parent_session_id == parent)
+            .cloned()
+            .collect()
+    }
+    /// 功能：发布入口已经可靠保存的当前问题事实。
+    /// 参数：record为原执行核验并提交后的记录。
+    /// 返回：无。
+    /// 错误：无；保存失败时不得调用。
+    /// 状态：仅维护当前待答副本，终态移除。
+    /// 并发与取消：短锁，不写持久记录。
+    /// 权限：只有可信记录入口使用，不接受模型声明。
+    /// 关联：唯一writer与展示代次；Stability: experimental。
+    pub fn record_saved(&self, record: &UserQuestionRecord) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(
+            record.state,
+            UserQuestionState::Queued | UserQuestionState::Waiting
+        ) {
+            pending.insert(record.question_id.clone(), record.clone());
+        } else {
+            pending.remove(&record.question_id);
+        }
+    }
+    /// 功能：按到达顺序等待指定主会话的展示名额。
+    /// 参数：parent为入口核验的实际主会话身份。
+    /// 返回：需持有至本题可靠结算的名额。
+    /// 错误：无。
+    /// 状态：不展示、不保存问题、不授予权限。
+    /// 并发与取消：公平异步等待；丢弃future退出排队。
+    /// 权限：调用方只传可信归属。
+    /// 关联：问答与既有权限展示；Stability: experimental。
+    pub async fn acquire(&self, parent: &str) -> PresentationPermit {
+        let lane = {
+            let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+            lanes.retain(|_, lane| lane.strong_count() > 0);
+            lanes
+                .get(parent)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let lane = Arc::new(tokio::sync::Mutex::new(()));
+                    lanes.insert(parent.into(), Arc::downgrade(&lane));
+                    lane
+                })
+        };
+        PresentationPermit {
+            _guard: lane.lock_owned().await,
+        }
+    }
+}
+
 /// 功能：持有已装配的可信问答入口及本次回合暂停事实。
 #[derive(Default)]
 pub struct QuestionContext {
     runtime: Mutex<Option<Arc<dyn QuestionRuntime>>>,
     paused: Mutex<Option<String>>,
+    queue: Arc<QuestionQueue>,
 }
 
 impl QuestionContext {
+    /// 功能：装配根与子会话共享的展示协调器。
+    /// 参数：queue为可信入口共享的协调器。
+    /// 返回：拥有独立暂停事实的问答上下文。
+    /// 错误：无。
+    /// 状态：不开始提问。
+    /// 并发与取消：共享队列但不共享回合暂停。
+    /// 权限：不继承其他会话答案或权限。
+    /// 关联：Host会话装配；Stability: experimental。
+    pub fn new(queue: Arc<QuestionQueue>) -> Self {
+        Self {
+            queue,
+            ..Self::default()
+        }
+    }
     /// 功能：绑定实际入口效果，不启动提问。
     /// 参数：runtime为具有真实执行所有权的适配器。
     /// 返回：无。
@@ -147,34 +336,39 @@ impl QuestionContext {
         if runtime.record(&record).is_err() {
             return self.pause("问题保存失败，尚未取得有效答案".into());
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        record.deadline_ms = Some(
-            i64::try_from(now)
-                .unwrap_or(i64::MAX)
-                .saturating_add(300_000),
-        );
-        record.state = UserQuestionState::Waiting;
-        if runtime.record(&record).is_err() {
-            return self.pause("问题保存失败，尚未取得有效答案".into());
-        }
+        self.queue.record_saved(&record);
         let mut guard = PendingQuestion {
             runtime: runtime.clone(),
             record: record.clone(),
             settled: false,
+            _slot: None,
+            queue: self.queue.clone(),
         };
-        let answer = match tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            runtime.display(&record),
-        )
-        .await
+        guard._slot = Some(self.queue.acquire(&record.scope.parent_session_id).await);
+        let deadline = self.queue.now_ms().saturating_add(300_000);
+        record.deadline_ms = Some(deadline);
+        record.state = UserQuestionState::Waiting;
+        if guard.save(&record).is_err() {
+            return self.pause("问题保存失败，尚未取得有效答案".into());
+        }
+        let answer = tokio::select! {
+            biased;
+            _ = self.queue.wait_until(deadline) => Err("问题已超时，请在原聊天明确继续".into()),
+            result = runtime.display(&record) => result.and_then(|answer|validate_answer(&record.request,answer)),
+        };
+        let answer = if self.queue.now_ms() >= deadline {
+            Err("问题已超时，请在原聊天明确继续".into())
+        } else {
+            answer
+        };
+        if let Some(current) = self
+            .queue
+            .pending(&record.scope.parent_session_id)
+            .into_iter()
+            .find(|current| current.question_id == record.question_id)
         {
-            Ok(Ok(answer)) => validate_answer(&record.request, answer),
-            Ok(Err(reason)) => Err(reason),
-            Err(_) => Err("问题已超时，请在原聊天明确继续".into()),
-        };
+            record = current;
+        }
         match answer {
             Ok(answer) => {
                 record.state = UserQuestionState::Answered;
@@ -189,7 +383,7 @@ impl QuestionContext {
                 record.reason = Some(reason);
             }
         }
-        if runtime.record(&record).is_err() {
+        if guard.save(&record).is_err() {
             return self.pause("答案尚未可靠保存，执行已暂停".into());
         }
         guard.settled = true;
@@ -204,13 +398,32 @@ struct PendingQuestion {
     runtime: Arc<dyn QuestionRuntime>,
     record: UserQuestionRecord,
     settled: bool,
+    _slot: Option<PresentationPermit>,
+    queue: Arc<QuestionQueue>,
+}
+impl PendingQuestion {
+    fn save(&mut self, record: &UserQuestionRecord) -> std::result::Result<(), String> {
+        self.runtime.record(record)?;
+        self.queue.record_saved(record);
+        self.record = record.clone();
+        Ok(())
+    }
 }
 impl Drop for PendingQuestion {
     fn drop(&mut self) {
         if !self.settled {
+            if let Some(current) = self
+                .queue
+                .pending(&self.record.scope.parent_session_id)
+                .into_iter()
+                .find(|current| current.question_id == self.record.question_id)
+            {
+                self.record = current;
+            }
             self.record.state = UserQuestionState::Cancelled;
             self.record.reason = Some("原执行已取消或中断，未接受答案".into());
             let _ = self.runtime.record(&self.record);
+            self.queue.record_saved(&self.record);
         }
     }
 }

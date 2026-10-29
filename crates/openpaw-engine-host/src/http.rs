@@ -1081,6 +1081,14 @@ fn main_approval_bridge(
             pending.insert(id.clone(), cancel.clone());
             let (office, team, handle) = (office.clone(), team.clone(), handle.clone());
             tokio::spawn(async move {
+                let _presentation = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    permit = handle.question_queue.acquire(&handle.id) => permit,
+                };
+                if cancel.is_cancelled() {
+                    return;
+                }
                 let conversation = office
                     .session_record(&team, &handle.id)
                     .and_then(|record| record.conversation);
@@ -2017,6 +2025,7 @@ mod tests {
         env: Vec<(&'static str, Option<std::ffi::OsString>)>,
         release_model: Arc<tokio::sync::Notify>,
         ui_actions: Arc<tokio::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
+        question_clock: Option<Arc<question_queue_tests::Clock>>,
     }
     impl Drop for MainFixture {
         fn drop(&mut self) {
@@ -2120,6 +2129,11 @@ mod tests {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
                 if scenario.starts_with("question-") && body["type"] == "decision.request" {
+                    if choice == "never-answer" {std::future::pending::<()>().await;}
+                    if scenario.starts_with("question-queue") && body["decision"]["kind"]=="confirmation" {
+                        if body["decision"]["title"].as_str().unwrap().contains("write_file") {question_gate.notified().await;}
+                        return Json(serde_json::json!({"code":200,"msg":"User selected","data":{"teamId":body["teamId"],"conversationId":body["conversationId"],"decisionId":body["decision"]["id"],"choiceId":"confirm","label":"允许本次"}})).into_response();
+                    }
                     if choice == "held-answer" { question_gate.notified().await; }
                     return user_input_tests::decision_response(&body, choice);
                 }
@@ -2178,6 +2192,9 @@ mod tests {
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("question-queue") {
+                    return question_queue_tests::model_response(&body,&questions,&gate).await;
+                }
                 if scenario.starts_with("question-child") {
                     return child_question_tests::model_response(&body, &questions, &gate).await;
                 }
@@ -2324,6 +2341,7 @@ mod tests {
                 "OPENPAW_ENGINE_MAX_MODEL_REQUESTS",
                 if scenario == "delegate-conversations-async-capacity"
                     || scenario.starts_with("question-child")
+                    || scenario.starts_with("question-queue")
                 {
                     "5"
                 } else if matches!(
@@ -2347,6 +2365,7 @@ mod tests {
                     || scenario == "delegate-write"
                     || scenario == "delegate-single-approval"
                     || scenario == "delegate-conversations-approval"
+                    || scenario == "question-queue-approval"
                 {
                     "manual"
                 } else {
@@ -2417,6 +2436,14 @@ mod tests {
             0,
         )
         .unwrap();
+        let question_clock = scenario
+            .starts_with("question-queue-clock")
+            .then(|| Arc::new(question_queue_tests::Clock::default()));
+        if let Some(clock) = &question_clock {
+            Arc::get_mut(&mut state).unwrap().question_queue = Arc::new(
+                openpaw_engine::user_input::QuestionQueue::new(clock.clone()),
+            );
+        }
         Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
             &config.home,
             &config.workspace,
@@ -2450,6 +2477,7 @@ mod tests {
             env,
             release_model,
             ui_actions,
+            question_clock,
         }
     }
 

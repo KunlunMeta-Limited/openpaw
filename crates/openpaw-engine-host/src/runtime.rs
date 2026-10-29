@@ -153,6 +153,8 @@ pub struct SessionHandle {
     /// 会话私有 Goal 事实；执行权限不从持久状态继承。
     goal: Arc<GoalContext>,
     question: Arc<openpaw_engine::user_input::QuestionContext>,
+    /// 共享中立展示协调器；当前题及根子归属仍由原回合核验。
+    pub(crate) question_queue: Arc<openpaw_engine::user_input::QuestionQueue>,
     child_question_phase: std::sync::Mutex<
         Option<(
             String,
@@ -215,6 +217,60 @@ pub struct SessionActivity {
     pub task: String,
 }
 impl SessionHandle {
+    /// 功能：读取捕获父回合及其实际登记子执行的有效待答事实。
+    /// 参数：turn为观察者原先捕获的真实父回合。
+    /// 返回：本回合Queued/Waiting副本及其原deadline、展示代次。
+    /// 错误：原回合已停止、失效或不是主会话时返回空。
+    /// 状态：只读，不恢复future或执行许可。
+    /// 并发与取消：短锁核对当前父turn，不等待模型或网络。
+    /// 权限：持久child关系本身不足以取得该快照。
+    /// 关联：Goal有界观察恢复；Stability: experimental。
+    pub fn pending_questions(
+        &self,
+        turn: &str,
+    ) -> Vec<openpaw_core::user_input::UserQuestionRecord> {
+        let _gate = self.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.child.is_some()
+            || !self.is_active()
+            || self.cancel_requested.load(Ordering::Acquire)
+            || self.main_cancel_token().is_cancelled()
+            || self
+                .current_turn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|active| active.outcome.turn_id != turn)
+        {
+            return Vec::new();
+        }
+        let children = self
+            .foreground_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.question_queue
+            .pending(&self.id)
+            .into_iter()
+            .filter(|record| {
+                if record.state == openpaw_core::user_input::UserQuestionState::Waiting
+                    && record
+                        .deadline_ms
+                        .is_none_or(|deadline| deadline <= self.question_queue.now_ms())
+                {
+                    return false;
+                }
+                if record.scope.asking_session_id == self.id {
+                    record.turn_id == turn
+                } else {
+                    children.tasks.iter().any(|child| {
+                        child.handle.id == record.scope.asking_session_id
+                            && child.turn_id == record.turn_id
+                            && child.handle.is_active()
+                            && !child.handle.cancel_requested.load(Ordering::Acquire)
+                    })
+                }
+            })
+            .collect()
+    }
     /// 功能：取得真实提问会话对应的场景成员别名。
     /// 参数：无。
     /// 返回：可信子元数据别名，主会话返回自己的身份。
@@ -310,6 +366,7 @@ impl SessionHandle {
                 serde_json::json!({"type":"user_question_v1","record":record}),
             )),
         )?;
+        self.question_queue.record_saved(record);
         // 只有可靠事实提交后才发布阶段；旧回合的通知不能影响新执行。
         if let Some((_, phase)) = self
             .child_question_phase
@@ -781,6 +838,8 @@ pub struct AppState {
     pub global_events: broadcast::Sender<OpenCodeEvent>,
     /// main 办公室关联与持久快照；与会话共用 home，不保存第二套聊天历史。
     pub(crate) main_office: Arc<crate::office::MainOffice>,
+    /// 主会话分队的问答／审批展示与可信时间效果，不授予执行权限。
+    pub(crate) question_queue: Arc<openpaw_engine::user_input::QuestionQueue>,
     pub(crate) scheduler: Arc<TurnScheduler>,
     delegation_shared: Arc<DelegationShared>,
     session_slots: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -1136,6 +1195,7 @@ impl AppState {
             office,
             global_events,
             main_office,
+            question_queue: Arc::new(openpaw_engine::user_input::QuestionQueue::default()),
             scheduler: TurnScheduler::new(scheduler_config.into()),
             delegation_shared,
             session_slots: Mutex::new(HashMap::new()),
@@ -1544,7 +1604,9 @@ impl AppState {
         } else {
             Arc::new(GoalToolHost::new(tool_host, goal.clone()))
         };
-        let question = Arc::new(openpaw_engine::user_input::QuestionContext::default());
+        let question = Arc::new(openpaw_engine::user_input::QuestionContext::new(
+            self.question_queue.clone(),
+        ));
         (
             delegation,
             openpaw_engine::user_input::wrap_tools(
@@ -1908,6 +1970,7 @@ impl AppState {
             goal,
             question,
             child_question_phase: std::sync::Mutex::new(None),
+            question_queue: self.question_queue.clone(),
             approvals,
             delegation,
             active: AtomicBool::new(false),
