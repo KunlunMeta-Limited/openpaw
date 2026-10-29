@@ -81,33 +81,125 @@ impl QuestionRuntime for Adapter {
                 })
                 .collect::<String>());
         }
-        let request = json!({"type":"decision.request","teamId":team,"conversationId":conversation,"timeoutMs":300000,"decision":decision});
-        let (status, data) = self
-            .office
-            .message(request, Duration::from_secs(305))
-            .await?;
-        if status == 408 {
-            return Err("问题已超时，请在原聊天明确继续".into());
+        let deadline = record.deadline_ms.ok_or("问题没有原截止时间")?;
+        let prefix = record
+            .display_id
+            .rsplit_once('-')
+            .ok_or("问题展示身份无效")?
+            .0;
+        let mut current = record.clone();
+        loop {
+            let now = handle.question_queue.now_ms();
+            let remaining = deadline.saturating_sub(now);
+            let retry_at = now.saturating_add(1000);
+            if remaining < 1000 {
+                return Err("问题已超时，请在原聊天明确继续".into());
+            }
+            decision["id"] = json!(current.display_id);
+            let request = json!({"type":"decision.request","teamId":team,"conversationId":conversation,"timeoutMs":remaining.min(300000),"decision":decision});
+            // 先轮询原回答；页面读到缺失与有效回答同时可用时，不丢弃已知回答。
+            let response = {
+                let response = self
+                    .office
+                    .message(request, Duration::from_millis(remaining as u64 + 5000));
+                tokio::pin!(response);
+                tokio::select! { biased;
+                    result = &mut response => Some(result),
+                    _ = self.missing(&handle, &team, &current.display_id) => None,
+                }
+            }; // 重显前丢弃旧POST；它的迟到响应不能交给新代。
+            if let Some(response) = response {
+                match response {
+                    Ok((status, data))
+                        if status == 409 && data["reasonCode"] == "NO_RECEIVER"
+                            || status == 503
+                                && matches!(
+                                    data["reasonCode"].as_str(),
+                                    Some("RECEIVER_UNAVAILABLE" | "SERVER_CLOSING")
+                                ) => {}
+                    Ok((status, data)) => {
+                        return parse_answer(
+                            status,
+                            data,
+                            &team,
+                            &conversation,
+                            &current.display_id,
+                        )
+                    }
+                    Err(reason)
+                        if matches!(reason.as_str(), "main 请求结果不明" | "main 响应中断") =>
+                        {}
+                    Err(reason) => return Err(reason),
+                }
+                handle.question_queue.wait_until(retry_at).await;
+            }
+            if deadline.saturating_sub(handle.question_queue.now_ms()) < 1000 {
+                return Err("问题已超时，请在原聊天明确继续".into());
+            }
+            current.generation = current
+                .generation
+                .checked_add(1)
+                .ok_or("问题展示代次耗尽")?;
+            current.display_id = format!("{prefix}-{}", current.generation);
+            // 同逻辑题保留原名额及deadline；唯一writer成功后才允许新展示。
+            handle.commit_question(&current)?;
         }
-        if status != 200
-            || data["teamId"] != team
-            || data["conversationId"] != conversation
-            || data["decisionId"] != record.display_id
-        {
-            return Err("问题回答归属无效或展示失败".into());
-        }
-        Ok(UserQuestionAnswer {
-            choice_id: data["choiceId"].as_str().ok_or("答案缺少选项身份")?.into(),
-            label: data["label"].as_str().ok_or("答案缺少标签")?.into(),
-            custom_text: data
-                .get("customText")
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .ok_or("自定义答案格式无效")
-                })
-                .transpose()?,
-        })
     }
+}
+
+impl Adapter {
+    async fn missing(&self, handle: &SessionHandle, team: &str, display: &str) {
+        loop {
+            handle
+                .question_queue
+                .wait_until(handle.question_queue.now_ms().saturating_add(1000))
+                .await;
+            let observed = self
+                .office
+                .message(
+                    json!({"type":"office.read","teamId":team}),
+                    Duration::from_secs(2),
+                )
+                .await;
+            if let Ok((200, data)) = observed {
+                if data["pendingDecisions"]
+                    .as_array()
+                    .is_some_and(|pending| !pending.iter().any(|id| id == display))
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+fn parse_answer(
+    status: u16,
+    data: serde_json::Value,
+    team: &str,
+    conversation: &str,
+    display: &str,
+) -> Result<UserQuestionAnswer, String> {
+    if status == 408 {
+        return Err("问题已超时，请在原聊天明确继续".into());
+    }
+    if status != 200
+        || data["teamId"] != team
+        || data["conversationId"] != conversation
+        || data["decisionId"] != display
+    {
+        return Err("问题回答归属无效或展示失败".into());
+    }
+    Ok(UserQuestionAnswer {
+        choice_id: data["choiceId"].as_str().ok_or("答案缺少选项身份")?.into(),
+        label: data["label"].as_str().ok_or("答案缺少标签")?.into(),
+        custom_text: data
+            .get("customText")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or("自定义答案格式无效")
+            })
+            .transpose()?,
+    })
 }

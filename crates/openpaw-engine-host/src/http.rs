@@ -2026,6 +2026,7 @@ mod tests {
         release_model: Arc<tokio::sync::Notify>,
         ui_actions: Arc<tokio::sync::Mutex<std::collections::VecDeque<serde_json::Value>>>,
         question_clock: Option<Arc<question_queue_tests::Clock>>,
+        question_display: Arc<question_recovery_tests::Display>,
     }
     impl Drop for MainFixture {
         fn drop(&mut self) {
@@ -2121,13 +2122,20 @@ mod tests {
         let question_gate = release_model.clone();
         let ui_actions = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new()));
         let gateway_actions = ui_actions.clone();
+        let question_display = Arc::new(question_recovery_tests::Display::default());
+        let gateway_display = question_display.clone();
         let server = Router::new().route("/api/pawoffice/messages",post(move |headers:HeaderMap,Json(body):Json<serde_json::Value>| {
             let seen = gateway_seen.clone();
             let actions = gateway_actions.clone();
             let question_gate = question_gate.clone();
+            let display = gateway_display.clone();
             async move {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
+                let _visible = display.track(&body);
+                if scenario.starts_with("question-recovery") && body["type"] == "decision.request" {
+                    return display.response(&body).await;
+                }
                 if scenario.starts_with("question-") && body["type"] == "decision.request" {
                     if choice == "never-answer" {std::future::pending::<()>().await;}
                     if scenario.starts_with("question-queue") && body["decision"]["kind"]=="confirmation" {
@@ -2137,6 +2145,7 @@ mod tests {
                     if choice == "held-answer" { question_gate.notified().await; }
                     return user_input_tests::decision_response(&body, choice);
                 }
+                display.before_read(&body).await;
                 let data = match body["type"].as_str() {
                     Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("question-") || scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute"|"goal-replan") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
                     Some("office.read") if body["teamId"].is_string() => {
@@ -2151,7 +2160,7 @@ mod tests {
                         } else { messages.iter().rev().find(|message| message["type"] == "office.snapshot" && message["teamId"] == body["teamId"]).unwrap()["snapshot"].clone() };
                         let actors = ["office-lead","code-agent","file-agent","app-agent","review-agent","data-agent"].into_iter().map(|id|
                             serde_json::json!({"id":id,"presentation":{"sourceRevision":0}})).collect::<Vec<_>>();
-                        serde_json::json!({"snapshot":snapshot,"scene":{"actors":actors},"pendingDecisions":[]})
+                        serde_json::json!({"snapshot":snapshot,"scene":{"actors":actors},"pendingDecisions":display.pending()})
                     },
                     Some("offices.initialize"|"office.read") => serde_json::json!({"offices":[],"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}}),
                     Some("office.snapshot") => serde_json::json!({"teamId":body["teamId"],"seq":body["snapshot"]["seq"],"status":"applied"}),
@@ -2195,7 +2204,7 @@ mod tests {
                 if scenario.starts_with("question-queue") {
                     return question_queue_tests::model_response(&body,&questions,&gate).await;
                 }
-                if scenario.starts_with("question-child") {
+                if scenario.starts_with("question-child") || scenario == "question-recovery-child" {
                     return child_question_tests::model_response(&body, &questions, &gate).await;
                 }
                 if scenario.starts_with("question-") {
@@ -2428,6 +2437,7 @@ mod tests {
                     | "delegate-conversations-approval"
                     | "question-stop"
                     | "question-child-stop"
+                    | "question-recovery-isolation"
             ) {
                 2
             } else {
@@ -2438,7 +2448,9 @@ mod tests {
         .unwrap();
         let question_clock = scenario
             .starts_with("question-queue-clock")
-            .then(|| Arc::new(question_queue_tests::Clock::default()));
+            .then_some(())
+            .or_else(|| scenario.starts_with("question-recovery").then_some(()))
+            .map(|()| Arc::new(question_queue_tests::Clock::default()));
         if let Some(clock) = &question_clock {
             Arc::get_mut(&mut state).unwrap().question_queue = Arc::new(
                 openpaw_engine::user_input::QuestionQueue::new(clock.clone()),
@@ -2478,6 +2490,7 @@ mod tests {
             release_model,
             ui_actions,
             question_clock,
+            question_display,
         }
     }
 
