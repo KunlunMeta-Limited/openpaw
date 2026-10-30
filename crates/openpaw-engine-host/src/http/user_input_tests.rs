@@ -232,6 +232,76 @@ mod history_question_tests {
             "不得用显式wait替代正常收尾验证"
         );
     }
+    #[tokio::test]
+    async fn main_history_question_projection_uses_actual_calls_and_visible_prefix() {
+        use openpaw_core::user_input::UserQuestionState;
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-choice", "option-a").await;
+        let result = send(fixture.app.clone(), fixture.team.clone()).await;
+        assert_eq!(result["text"], "已采用方案A");
+        let owner = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "history")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let events = openpaw_store::catalog::read(fixture.home.path(), &owner)
+            .unwrap()
+            .events;
+        let history = openpaw_store::transcript::replay(&owner, &events).unwrap();
+        let visible = history.visible_messages(&owner);
+        let positions = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                openpaw_core::SessionEvent::Unknown(v) if v["type"] == "user_question_v1" => {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (position, state) in positions.iter().zip([
+            UserQuestionState::Queued,
+            UserQuestionState::Waiting,
+            UserQuestionState::Answered,
+        ]) {
+            let projected =
+                crate::context::validated_questions(&owner, &events[..=*position], visible);
+            assert_eq!(projected.len(), 1, "真实提交前缀应保留合法问题");
+            assert_eq!(projected[0].state, state);
+        }
+        assert!(
+            crate::context::validated_questions(&owner, &events, &[]).is_empty(),
+            "隐藏来源不得读取"
+        );
+        for field in ["answer", "scope", "question_id", "request", "display_id"] {
+            let mut invalid = events.clone();
+            let openpaw_core::SessionEvent::Unknown(value) =
+                &mut invalid[*positions.last().unwrap()]
+            else {
+                unreachable!()
+            };
+            match field {
+                "answer" => value["record"][field]["choice_id"] = serde_json::json!("forged"),
+                "scope" => {
+                    value["record"][field]["source_user_message_id"] = serde_json::json!("foreign")
+                }
+                "request" => value["record"][field]["question"] = serde_json::json!("另一个问题"),
+                _ => value["record"][field] = serde_json::json!("forged"),
+            }
+            assert!(
+                crate::context::validated_questions(&owner, &invalid, visible)
+                    .iter()
+                    .all(|record| record.state != UserQuestionState::Answered),
+                "{field}错配不能成为已答事实"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

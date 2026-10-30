@@ -1231,18 +1231,7 @@ impl AppState {
                                 "child_execution_v1",
                             ),
                         )?;
-                        let read = SessionReader::read(&handle.session_path)
-                            .map_err(|_| "子结果记录不可读")?;
-                        return crate::context::child_executions(&read.events)?
-                            .into_iter()
-                            .rev()
-                            .find(|saved| {
-                                saved.child_turn_id == turn_id && saved.stage == "result_saved"
-                            })
-                            .map(|saved| {
-                                crate::context::child_result_preview(&saved, result_window)
-                            })
-                            .ok_or_else(|| "子结果尚未可靠保存".into());
+                        return Ok(crate::context::child_result_preview(&record, result_window));
                     }
                     Ok(outcome)
                 }),
@@ -2780,7 +2769,15 @@ fn session_workspace(events: &[SessionEvent], fallback: &std::path::Path) -> Pat
         })
         .unwrap_or_else(|| fallback.to_path_buf())
 }
-fn session_child(events: &[SessionEvent]) -> Option<ChildSession> {
+/// 功能：读取原journal已保存的子会话关系。
+/// 参数：events为同一owner的可靠快照。
+/// 返回：原子元数据；缺失或非法为None。
+/// 错误：不补造关系。
+/// 状态：只读。
+/// 并发与取消：同步无锁。
+/// 权限：不代替实际执行来源与规范目录核验。
+/// 关联：恢复、历史和原件投影共用解析。
+pub(crate) fn session_child(events: &[SessionEvent]) -> Option<ChildSession> {
     events.iter().find_map(|event| match event {
         SessionEvent::Unknown(value) if value["type"] == "session_child_v1" => {
             serde_json::from_value(value["child"].clone()).ok()

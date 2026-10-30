@@ -482,6 +482,66 @@ fn validate_answer(
     }
 }
 
+/// 功能：复用实时请求与答案规则核验持久中立问题记录。
+/// 参数：record为入口读取的候选完整记录。
+/// 返回：内容、身份和单条状态结构均合法时为true。
+/// 错误：非法内容返回false，不修补或猜测答案。
+/// 状态：只读，不恢复展示、执行或权限。
+/// 并发与取消：同步纯校验，不持锁或等待。
+/// 权限：仍由入口核验真实回合、来源和记录因果链。
+/// 关联：CHG-2026-0054历史与恢复共用；Stability: experimental。
+pub fn validate_question_record(record: &UserQuestionRecord) -> bool {
+    let identity = format!(
+        "{}/{}/{}/{}",
+        record.scope.asking_session_id, record.turn_id, record.response_index, record.tool_call_id
+    );
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    identity.hash(&mut hash);
+    if record.question_id != identity
+        || record.generation == 0
+        || record.display_id != format!("uq-{:016x}-{}", hash.finish(), record.generation)
+        || [
+            &record.scope.parent_session_id,
+            &record.scope.asking_session_id,
+            &record.scope.source_user_message_id,
+            &record.turn_id,
+            &record.tool_call_id,
+        ]
+        .iter()
+        .any(|v| v.is_empty())
+        || serde_json::to_value(&record.request)
+            .ok()
+            .is_none_or(|value| request(value).is_err())
+        || record.deadline_ms.is_some_and(|deadline| deadline <= 0)
+    {
+        return false;
+    }
+    match record.state {
+        UserQuestionState::Queued => {
+            record.deadline_ms.is_none() && record.answer.is_none() && record.reason.is_none()
+        }
+        UserQuestionState::Waiting => {
+            record.deadline_ms.is_some() && record.answer.is_none() && record.reason.is_none()
+        }
+        UserQuestionState::Answered => {
+            record.deadline_ms.is_some()
+                && record.reason.is_none()
+                && record
+                    .answer
+                    .as_ref()
+                    .is_some_and(|answer| validate_answer(&record.request, answer.clone()).is_ok())
+        }
+        _ => {
+            record.answer.is_none()
+                && record
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| !reason.trim().is_empty())
+                && (record.state != UserQuestionState::Expired || record.deadline_ms.is_some())
+        }
+    }
+}
+
 struct QuestionToolHost {
     inner: Arc<dyn ToolHost>,
     context: Arc<QuestionContext>,
