@@ -1,4 +1,240 @@
 #[cfg(test)]
+mod history_question_tests {
+    use super::*;
+
+    const TAIL: &str = "TAIL_CHECK_f7c908b2_末尾唯一校验";
+    fn child_text() -> String {
+        format!("{}\n{TAIL}", "实际子结果中英🙂|".repeat(12000))
+    }
+    fn response(tool: Option<(&str, serde_json::Value)>, text: &str, index: usize) -> Response {
+        let delta = if let Some((name, args)) = tool {
+            serde_json::json!({"tool_calls":[{"index":0,"id":format!("history-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+        } else {
+            serde_json::json!({"content":text})
+        };
+        let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":if delta["tool_calls"].is_array(){"tool_calls"}else{"stop"}}]});
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    }
+    fn metadata(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .flat_map(str::lines)
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+    pub(super) async fn model_response(
+        body: &serde_json::Value,
+        gate: &tokio::sync::Notify,
+    ) -> Response {
+        if body["stream"] != true || !body["tools"].is_array() {
+            let previews = metadata(body)
+                .into_iter()
+                .filter(|v| v["reference"].is_string() && v["total_chars"].is_number())
+                .collect::<Vec<_>>();
+            let summary = format!("[Context Summary] HISTORY_LONG_RESULT. Read child tail originals; do not guess. {}", serde_json::to_string(&previews).unwrap());
+            return if body["stream"] == true {
+                response(None, &summary, 0)
+            } else {
+                Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":summary},"finish_reason":"stop"}]})).into_response()
+            };
+        }
+        let parent = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["function"]["name"] == "start_agent");
+        if !parent {
+            gate.notified().await;
+            return response(None, &child_text(), 0);
+        }
+        let messages = body["messages"].as_array().unwrap();
+        let tools = messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect::<Vec<_>>();
+        let values = metadata(body);
+        if messages.iter().any(|m| {
+            m["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| calls.iter().any(|c| c["function"]["name"] == "write_file"))
+        }) {
+            return response(None, "已按真实原件末尾交付", tools.len());
+        }
+        if let Some(page) = values.iter().rev().find(|v| v["kind"] == "page") {
+            let text = page["content"].as_str().unwrap_or("");
+            if let Some(tail) = text.lines().find(|line| line.starts_with("TAIL_CHECK_")) {
+                return response(
+                    Some((
+                        "write_file",
+                        serde_json::json!({"path":"tail-check.txt","content":tail}),
+                    )),
+                    "",
+                    tools.len(),
+                );
+            }
+            return response(None, "原件没有给出末尾校验，不交付", tools.len());
+        }
+        if let Some(preview) = values
+            .iter()
+            .rev()
+            .find(|v| v["reference"].is_string() && v["total_chars"].is_number())
+        {
+            let start = preview["total_chars"].as_u64().unwrap().saturating_sub(128);
+            return response(
+                Some((
+                    "read_context_record",
+                    serde_json::json!({"reference":preview["reference"],"start":start,"limit":128}),
+                )),
+                "",
+                tools.len(),
+            );
+        }
+        if tools.is_empty() && !body.to_string().contains("可信子执行结果") {
+            return response(
+                Some((
+                    "start_agent",
+                    serde_json::json!({"task":"history-long-child","name":"长原件员工"}),
+                )),
+                "",
+                0,
+            );
+        }
+        response(None, "父已完成独立工作，真实子结果尚待处理", tools.len())
+    }
+    async fn send(app: Router, team: String) -> serde_json::Value {
+        let response = app.oneshot(Request::builder().method("POST").uri("/api/pawoffice/chat").header("content-type","application/json").body(Body::from(serde_json::json!({"version":"1.0","type":"send","teamId":team,"conversationId":"history","turnId":"long-result","messages":[{"role":"user","content":"HISTORY_LONG_RESULT：启动一个子任务；先做独立工作后正常结束，收到真实结果后从原件末尾读取校验值并写入tail-check.txt。"}]}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(10),
+            to_bytes(response.into_body(), 2_000_000),
+        )
+        .await
+        .expect("真实长子结果收尾必须有界")
+        .unwrap();
+        serde_json::from_str(std::str::from_utf8(&bytes).unwrap().lines().last().unwrap()).unwrap()
+    }
+    #[tokio::test]
+    async fn main_history_long_child_end_turn_result_has_readable_tail_original() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-history-long", "option-a").await;
+        let pending = tokio::spawn(send(fixture.app.clone(), fixture.team.clone()));
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let requests = fixture.model_seen.lock().await;
+                let child = requests.iter().any(|r| {
+                    r["messages"].as_array().is_some_and(|messages| {
+                        messages
+                            .iter()
+                            .any(|m| m["content"] == "history-long-child")
+                    })
+                });
+                let parent = requests.iter().any(|r| {
+                    r["tools"]
+                        .as_array()
+                        .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "start_agent"))
+                        && r["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m["role"] == "tool")
+                });
+                if child && parent {
+                    break;
+                }
+                drop(requests);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if ready.is_err() {
+            let requests = fixture.model_seen.lock().await.iter().map(|r|serde_json::json!({"stream":r["stream"],"tool_count":r["tools"].as_array().map(Vec::len),"users":r["messages"].as_array().unwrap().iter().filter(|m|m["role"]=="user").map(|m|m["content"].clone()).collect::<Vec<_>>(),"tool_results":r["messages"].as_array().unwrap().iter().filter(|m|m["role"]=="tool").count()})).collect::<Vec<_>>();
+            fixture.release_model.notify_one();
+            let terminal = tokio::time::timeout(Duration::from_secs(3), pending)
+                .await
+                .ok()
+                .map(Result::unwrap);
+            panic!("父在子结束前应继续模型并准备正常EndTurn：requests={requests:?}, terminal={terminal:?}");
+        }
+        assert!(!pending.is_finished(), "父应保持执行归属等子真实结果");
+        fixture.release_model.notify_one();
+        let answer = pending.await.unwrap();
+        let session = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "history")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let turns = child_test_json(
+            &fixture.app,
+            "GET",
+            &format!("/session/{session}/turns"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(
+            answer["state"], "complete",
+            "长结果须有界并可读，不能超窗截断：{answer}, turns={turns}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("tail-check.txt")).unwrap(),
+            TAIL,
+            "父必须从分页原件末尾取得值后才交付"
+        );
+        let requests = fixture.model_seen.lock().await;
+        let parent = requests
+            .iter()
+            .filter(|r| {
+                r["tools"]
+                    .as_array()
+                    .is_some_and(|ts| ts.iter().any(|t| t["function"]["name"] == "start_agent"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            parent
+                .iter()
+                .any(|r| r["messages"].to_string().contains("可信子执行结果")),
+            "必须覆盖正常EndTurn协调路径"
+        );
+        assert!(
+            parent
+                .iter()
+                .any(|r| r["messages"].to_string().contains("read_context_record")),
+            "必须实际分页原件"
+        );
+        assert!(
+            parent.iter().all(|r| !r["messages"]
+                .to_string()
+                .contains(&"实际子结果中英🙂|".repeat(12000))),
+            "模型只收有界副本"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["messages"].to_string().contains("wait_agent")
+                    && r["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["role"] == "assistant"
+                            && m["tool_calls"].to_string().contains("wait_agent"))),
+            "不得用显式wait替代正常收尾验证"
+        );
+    }
+}
+
+#[cfg(test)]
 mod goal_question_tests {
     use super::*;
 

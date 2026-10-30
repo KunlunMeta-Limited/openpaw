@@ -2270,6 +2270,9 @@ mod tests {
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("question-history") {
+                    return history_question_tests::model_response(&body, &gate).await;
+                }
                 if scenario.starts_with("question-goal") {
                     return goal_question_tests::model_response(&body,scenario,&questions,&gate).await;
                 }
@@ -2425,7 +2428,7 @@ mod tests {
                     || scenario.starts_with("question-queue")
                 {
                     "5"
-                } else if matches!(
+                } else if scenario.starts_with("question-history") || matches!(
                     scenario,
                     "delegate-concurrent"
                         | "delegate-conversations-async"
@@ -2457,13 +2460,14 @@ mod tests {
         ];
         let mut values = Vec::from(values);
         if scenario.starts_with("context-loop")
+            || scenario.starts_with("question-history")
             || matches!(scenario, "context-fixed-input" | "context-small-window")
         {
             values.push((
                 "OPENPAW_MODEL_CAPABILITIES",
                 if scenario == "context-fixed-input" {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":4096}}}"#
-                } else if scenario == "context-small-window" {
+                } else if scenario == "context-small-window" || scenario.starts_with("question-history") {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":8192}}}"#
                 } else if scenario == "context-loop-provider-default" {
                     r#"{"openai":{"fixture-model":{"input":["text"],"context_window":32768,"default_output_tokens":4096}}}"#
