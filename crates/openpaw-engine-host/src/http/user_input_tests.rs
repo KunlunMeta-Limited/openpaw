@@ -45,6 +45,80 @@ mod history_question_tests {
                 Json(serde_json::json!({"choices":[{"message":{"role":"assistant","content":summary},"finish_reason":"stop"}]})).into_response()
             };
         }
+        let all = body["messages"].as_array().unwrap();
+        if let Some(source) = all.iter().rposition(|m| {
+            m["role"] == "user"
+                && m["content"].as_str().is_some_and(|s| {
+                    s.starts_with("HISTORY_ASK") || s.starts_with("HISTORY_FACT_PROBE")
+                })
+        }) {
+            let current = &all[source..];
+            let tools = current
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .collect::<Vec<_>>();
+            if all[source]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("HISTORY_ASK")
+            {
+                return if tools.is_empty() {
+                    response(
+                        Some((
+                            "request_user_input",
+                            serde_json::json!({"question":"选择交付颜色","options":[{"id":"option-a","label":"方案A"},{"id":"option-b","label":"方案B"}]}),
+                        )),
+                        "",
+                        0,
+                    )
+                } else {
+                    response(None, "已接收真实答案", 1)
+                };
+            }
+            if current
+                .iter()
+                .any(|m| m["tool_calls"].to_string().contains("write_file"))
+            {
+                return response(None, "已恢复并交付真实答案", tools.len());
+            }
+            if let Some(page) = metadata(body).iter().rev().find(|v| v["kind"] == "page") {
+                let record = page["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|v| v["state"] == "answered" && v["answer"]["label"].is_string());
+                return if let Some(record) = record {
+                    response(
+                        Some((
+                            "write_file",
+                            serde_json::json!({"path":"recovered-answer.txt","content":record["answer"]["label"]}),
+                        )),
+                        "",
+                        tools.len(),
+                    )
+                } else {
+                    response(None, "原件未含有效答案", tools.len())
+                };
+            }
+            let values = metadata(body);
+            let fact = values
+                .iter()
+                .rev()
+                .find(|v| v["kind"] == "user_question_fact" || v["kind"] == "message_text_preview");
+            return if let Some(fact) = fact {
+                response(
+                    Some((
+                        "read_context_record",
+                        serde_json::json!({"reference":fact["reference"],"start":0,"limit":2048}),
+                    )),
+                    "",
+                    tools.len(),
+                )
+            } else {
+                response(None, "NO_RELIABLE_FACT", tools.len())
+            };
+        }
         let parent = body["tools"]
             .as_array()
             .unwrap()
@@ -119,6 +193,120 @@ mod history_question_tests {
         .expect("真实长子结果收尾必须有界")
         .unwrap();
         serde_json::from_str(std::str::from_utf8(&bytes).unwrap().lines().last().unwrap()).unwrap()
+    }
+    async fn send_in(
+        app: &Router,
+        team: &str,
+        conversation: &str,
+        turn: &str,
+        text: &str,
+    ) -> serde_json::Value {
+        let history = child_test_json(app,"POST","/api/pawoffice/chat",serde_json::json!({"version":"1.0","type":"history","teamId":team,"conversationId":conversation})).await;
+        let mut messages = history["data"]["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["state"] == "complete")
+            .flat_map(|r| {
+                [
+                    serde_json::json!({"role":"user","content":r["user"]}),
+                    serde_json::json!({"role":"assistant","content":r["assistant"]}),
+                ]
+            })
+            .collect::<Vec<_>>();
+        messages.push(serde_json::json!({"role":"user","content":text}));
+        let response = app.clone().oneshot(Request::builder().method("POST").uri("/api/pawoffice/chat").header("content-type","application/json").body(Body::from(serde_json::json!({"version":"1.0","type":"send","teamId":team,"conversationId":conversation,"turnId":turn,"messages":messages}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(10),
+            to_bytes(response.into_body(), 2_000_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        serde_json::from_str(std::str::from_utf8(&bytes).unwrap().lines().last().unwrap()).unwrap()
+    }
+    #[tokio::test]
+    async fn main_history_answered_prefix_is_used_after_restart_without_reask() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-history-answer", "option-a").await;
+        assert_eq!(
+            send_in(
+                &fixture.app,
+                &fixture.team,
+                "history-answer",
+                "ask",
+                "HISTORY_ASK 先取得答案"
+            )
+            .await["state"],
+            "complete"
+        );
+        let owner = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "history-answer")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let path = fixture
+            .home
+            .path()
+            .join("sessions")
+            .join(format!("{owner}.jsonl"));
+        let original = std::fs::read_to_string(&path).unwrap();
+        let lines = original
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let index = lines
+            .iter()
+            .position(|v| v["type"] == "user_question_v1" && v["record"]["state"] == "answered")
+            .unwrap();
+        std::fs::write(
+            &path,
+            original
+                .lines()
+                .take(index + 1)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        fixture.model_seen.lock().await.clear();
+        let result = send_in(
+            &restarted,
+            &fixture.team,
+            "history-answer",
+            "resume",
+            "HISTORY_FACT_PROBE 使用已可靠回答并从原件确认后交付",
+        )
+        .await;
+        assert_eq!(result["state"], "complete", "{result}");
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("recovered-answer.txt"))
+                .ok()
+                .as_deref(),
+            Some("方案A"),
+            "必须从可靠原件回读后交付：{result}"
+        );
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|v| v["type"] == "decision.request")
+                .count(),
+            1,
+            "重启不能重新问已有答案"
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("message/temporary"));
     }
     #[tokio::test]
     async fn main_history_long_child_end_turn_result_has_readable_tail_original() {

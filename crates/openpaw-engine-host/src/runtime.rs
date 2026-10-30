@@ -3855,6 +3855,24 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) ->
         .collect::<Vec<_>>();
         (!prompts.is_empty()).then(|| prompts.join("\n\n"))
     };
+    let reliable_prompt = SessionReader::read(&handle.session_path)
+        .ok()
+        .and_then(|read| {
+            let history = openpaw_store::transcript::replay(&handle.id, &read.events).ok()?;
+            crate::context::system_supplement(
+                handle.session_path.parent()?.parent()?,
+                &handle.id,
+                &read.events,
+                history.visible_messages(&handle.id),
+                provider.model_capabilities(&model).context_window as usize,
+            )
+        });
+    let system_prompt = [system_prompt, reliable_prompt]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let system_prompt = (!system_prompt.is_empty()).then_some(system_prompt);
     let (mut generated, result) = {
         let mut session = handle.session.lock().await;
         {
