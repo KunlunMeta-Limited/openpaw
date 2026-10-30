@@ -1869,11 +1869,16 @@ mod restart_question_tests {
             .unwrap()["id"]
             .as_str()
             .unwrap();
-        for saved in [false, true] {
+        for (saved, accepted) in [(false, false), (false, true), (true, false), (true, true)] {
             for startup in [false, true] {
                 let home = snapshot(&fixture, &id, |event| {
                     event["type"] == "execution_attempt_v1"
-                        && event["kind"] == "tool_result"
+                        && event["kind"]
+                            == if accepted {
+                                "tool_result"
+                            } else {
+                                "tool_start"
+                            }
                         && event["payload"]["name"] == "start_agent"
                 });
                 if !saved {
