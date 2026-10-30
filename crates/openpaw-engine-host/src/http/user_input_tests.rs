@@ -41,7 +41,7 @@ mod history_question_tests {
         gate: &tokio::sync::Notify,
     ) -> Response {
         if body["stream"] != true || !body["tools"].is_array() {
-            let previews = metadata(body)
+            let mut previews = metadata(body)
                 .into_iter()
                 .filter(|v| v["reference"].is_string() && v["total_chars"].is_number())
                 .map(|mut value| {
@@ -54,7 +54,18 @@ mod history_question_tests {
                     value
                 })
                 .collect::<Vec<_>>();
-            let summary = format!("[Context Summary] Keep actual readable fact indexes; do not guess answers or tail values.\n{}\n", previews.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
+            if body["messages"]
+                .to_string()
+                .contains("[Imported Context Fact]")
+            {
+                previews.clear();
+            }
+            let observed = ["CHILD_VALUE_ONE", "CHILD_VALUE_TWO"]
+                .into_iter()
+                .filter(|value| body["messages"].to_string().contains(value))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let summary = format!("[Context Summary] Keep actual readable fact indexes; do not guess answers or tail values. Observed completed child values: {observed}\n{}\n", previews.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
             return if body["stream"] == true {
                 response(None, &summary, 0)
             } else {
@@ -62,6 +73,131 @@ mod history_question_tests {
             };
         }
         let all = body["messages"].as_array().unwrap();
+        if let Some(source) = all.iter().rposition(|m| {
+            m["role"] == "user"
+                && m["content"].as_str().is_some_and(|s| {
+                    s.starts_with("HISTORY_REUSE_")
+                        || s.starts_with("HISTORY_VISIBILITY_PROBE")
+                        || s.starts_with("HISTORY_READ_REF ")
+                        || s.starts_with("HISTORY_QUERY_OLD ")
+                })
+        }) {
+            let text = all[source]["content"].as_str().unwrap();
+            let current = &all[source..];
+            let tools = current
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .collect::<Vec<_>>();
+            if text.starts_with("HISTORY_VISIBILITY_PROBE") {
+                if !tools.is_empty() {
+                    return response(None, "可见性已按真实模型输入交付", tools.len());
+                }
+                let input = body["messages"].to_string();
+                let observed = if input.contains("CHILD_VALUE_TWO") {
+                    "VISIBLE_TWO"
+                } else if input.contains("CHILD_VALUE_ONE") {
+                    "VISIBLE_ONE"
+                } else {
+                    "VISIBLE_NONE"
+                };
+                return response(
+                    Some((
+                        "write_file",
+                        serde_json::json!({"path":"visibility-check.txt","content":observed}),
+                    )),
+                    "",
+                    0,
+                );
+            }
+            if text.starts_with("HISTORY_READ_REF ") || text.starts_with("HISTORY_QUERY_OLD ") {
+                if !tools.is_empty() {
+                    return response(
+                        None,
+                        tools.last().unwrap()["content"].as_str().unwrap_or(""),
+                        tools.len(),
+                    );
+                }
+                let (name, args) = if let Some(reference) = text.strip_prefix("HISTORY_READ_REF ") {
+                    (
+                        "read_context_record",
+                        serde_json::json!({"reference":reference,"start":0,"limit":512}),
+                    )
+                } else {
+                    let identities = text
+                        .strip_prefix("HISTORY_QUERY_OLD ")
+                        .unwrap()
+                        .split_whitespace()
+                        .collect::<Vec<_>>();
+                    (
+                        "get_agent_status",
+                        serde_json::json!({"session_id":identities[0],"turn_id":identities[1]}),
+                    )
+                };
+                return response(Some((name, args)), "", 0);
+            }
+            let child = !body["tools"].to_string().contains("start_agent");
+            if child {
+                return if tools.is_empty() {
+                    response(
+                        Some((
+                            "request_user_input",
+                            serde_json::json!({"question":if text.ends_with("TWO"){"第二父来源的子问题"}else{"第一父来源的子问题"},"options":[{"id":"option-a","label":"方案A"},{"id":"option-b","label":"方案B"}]}),
+                        )),
+                        "",
+                        0,
+                    )
+                } else {
+                    response(
+                        None,
+                        if text.ends_with("TWO") {
+                            "CHILD_VALUE_TWO"
+                        } else {
+                            "CHILD_VALUE_ONE"
+                        },
+                        1,
+                    )
+                };
+            }
+            if !tools.is_empty()
+                || serde_json::to_string(current)
+                    .unwrap()
+                    .contains("CHILD_VALUE_")
+            {
+                return response(None, "父独立工作完成，按真实结果收尾", tools.len());
+            }
+            let mut args = serde_json::json!({"name":"来源校验员","task":if text.ends_with("TWO"){"HISTORY_REUSE_CHILD_TWO"}else{"HISTORY_REUSE_CHILD_ONE"}});
+            if text.ends_with("TWO") {
+                args["task_id"] = all[..source]
+                    .iter()
+                    .filter(|m| m["role"] == "tool")
+                    .filter_map(|m| {
+                        serde_json::from_str::<serde_json::Value>(m["content"].as_str()?).ok()
+                    })
+                    .find_map(|v| v["session_id"].as_str().map(str::to_owned))
+                    .or_else(|| {
+                        metadata(body).iter().find_map(|value| {
+                            let key: serde_json::Value = serde_json::from_str(
+                                value["reference"].as_str()?.strip_prefix("ctx:v1:")?,
+                            )
+                            .ok()?;
+                            let call = key[3].as_str()?;
+                            (call.starts_with("child-result/")
+                                || call.starts_with("child-question/"))
+                            .then(|| call.split('/').nth(1).unwrap().to_owned())
+                        })
+                    })
+                    .map(serde_json::Value::String)
+                    .expect("续办ID必须来自当前真实模型上下文");
+            }
+            return response(Some(("start_agent", args)), "", 0);
+        }
+        if all.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|text| text.contains("CHILD_VALUE_"))
+        }) {
+            return response(None, "已收尾真实子结果", 0);
+        }
         if let Some(source) = all.iter().rposition(|m| {
             m["role"] == "user"
                 && m["content"].as_str().is_some_and(|s| {
@@ -149,7 +285,9 @@ mod history_question_tests {
                 .find(|v| v["kind"] == "message_text_preview")
                 .or_else(|| {
                     values.iter().rev().find(|v| {
-                        v["kind"] == "user_question_fact" || v["kind"] == "child_result_preview"
+                        v["kind"] == "user_question_fact"
+                            || v["kind"] == "child_result_preview"
+                            || v["kind"] == "imported_context_fact"
                     })
                 });
             return if let Some(fact) = fact {
@@ -514,6 +652,202 @@ mod history_question_tests {
         );
         let fork_read = openpaw_store::catalog::read(fixture.home.path(), fork_id).unwrap();
         assert!(!fork_read.events.iter().any(|event|matches!(event,openpaw_core::SessionEvent::Unknown(v) if matches!(v["type"].as_str(),Some("user_question_v1" | "child_execution_v1")))));
+        for _ in 0..2 {
+            child_test_json(
+                &fixture.app,
+                "POST",
+                &format!("/session/{fork_id}/message"),
+                serde_json::json!({"text":"/compact"}),
+            )
+            .await;
+        }
+        std::fs::remove_file(fixture.workspace.path().join("fork-tail-check.txt")).unwrap();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        child_test_json(&restarted,"POST",&format!("/session/{fork_id}/message"),serde_json::json!({"text":"HISTORY_CHILD_FACT_PROBE 多次压缩与重启后从本owner原件末尾重新核对"})).await;
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("fork-tail-check.txt")).unwrap(),
+            TAIL
+        );
+        let read = openpaw_store::catalog::read(fixture.home.path(), fork_id).unwrap();
+        let history = openpaw_store::transcript::replay(fork_id, &read.events).unwrap();
+        assert!(
+            history.model_contexts.len() >= 2,
+            "需真实多次压缩而非仅提示文字"
+        );
+        for checkpoint in &history.model_contexts {
+            assert!(
+                checkpoint.source_ids.iter().all(|id| history
+                    .messages
+                    .iter()
+                    .any(|message| message.uuid.as_ref() == Some(id))),
+                "checkpoint只能引用真实raw消息"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn main_history_reused_child_facts_obey_each_parent_source_across_revert_fork_and_commit()
+    {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-history-reuse", "option-a").await;
+        for (turn, text) in [
+            ("one", "HISTORY_REUSE_PARENT_ONE"),
+            ("two", "HISTORY_REUSE_PARENT_TWO"),
+        ] {
+            let result = send_in(&fixture.app, &fixture.team, "sources", turn, text).await;
+            let binding = fixture
+                .state
+                .main_office
+                .conversation_record(&fixture.team, "sources")
+                .unwrap()
+                .unwrap()
+                .session
+                .unwrap();
+            assert_eq!(
+                result["state"],
+                "complete",
+                "{turn}: {result}, turns={}, recent={}",
+                child_test_json(
+                    &fixture.app,
+                    "GET",
+                    &format!("/session/{binding}/turns"),
+                    serde_json::json!({})
+                )
+                .await,
+                serde_json::to_string(&fixture.model_seen.lock().await.iter().rev().take(4).map(|request|serde_json::json!({"stream":request["stream"],"tools":request["tools"].as_array().map(Vec::len),"messages":request["messages"]})).collect::<Vec<_>>()).unwrap()
+            );
+        }
+        let owner = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "sources")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let source = openpaw_store::catalog::read(fixture.home.path(), &owner).unwrap();
+        let history = openpaw_store::transcript::replay(&owner, &source.events).unwrap();
+        let second = history
+            .messages
+            .iter()
+            .find(|m| m.role == openpaw_core::Role::User && m.text() == "HISTORY_REUSE_PARENT_TWO")
+            .unwrap()
+            .uuid
+            .clone()
+            .unwrap();
+        let first_child = crate::runtime::restored_office_children(
+            fixture.home.path(),
+            &owner,
+            fixture.workspace.path(),
+        );
+        assert_eq!(first_child.len(), 1, "两次必须续办同一真实员工");
+        let child = openpaw_store::catalog::read(fixture.home.path(), &first_child[0].0).unwrap();
+        let executions = crate::context::child_executions(&child.events)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.stage == "result_saved")
+            .collect::<Vec<_>>();
+        assert_eq!(executions.len(), 2);
+        assert_ne!(executions[0].child_turn_id, executions[1].child_turn_id);
+        let hidden_ref = openpaw_engine::context::record_reference(
+            &owner,
+            &executions[1].parent_turn_id,
+            executions[1].response_index,
+            &format!(
+                "child-result/{}/{}",
+                executions[1].child_session_id, executions[1].child_turn_id
+            ),
+        );
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &format!("/session/{owner}/revert"),
+            serde_json::json!({"messageID":second}),
+        )
+        .await;
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        for expected in ["VISIBLE_ONE", "VISIBLE_TWO"] {
+            if expected == "VISIBLE_TWO" {
+                child_test_json(
+                    &restarted,
+                    "POST",
+                    &format!("/session/{owner}/unrevert"),
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+            let fork = child_test_json(
+                &restarted,
+                "POST",
+                &format!("/session/{owner}/fork"),
+                serde_json::json!({}),
+            )
+            .await;
+            let fork_id = fork["id"].as_str().unwrap();
+            child_test_json(&restarted,"POST",&format!("/session/{fork_id}/message"),serde_json::json!({"text":"HISTORY_VISIBILITY_PROBE 实际读取当前模型可见结果后写入"})).await;
+            assert_eq!(
+                std::fs::read_to_string(fixture.workspace.path().join("visibility-check.txt"))
+                    .unwrap(),
+                expected,
+                "创建父来源仍可见不能放行第二执行"
+            );
+        }
+        child_test_json(
+            &restarted,
+            "POST",
+            &format!("/session/{owner}/revert"),
+            serde_json::json!({"messageID":second}),
+        )
+        .await;
+        assert_eq!(
+            send_in(
+                &restarted,
+                &fixture.team,
+                "sources",
+                "commit",
+                "HISTORY_VISIBILITY_PROBE 提交裁剪后检查"
+            )
+            .await["state"],
+            "complete"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("visibility-check.txt")).unwrap(),
+            "VISIBLE_ONE"
+        );
+        let denied = send_in(
+            &restarted,
+            &fixture.team,
+            "sources",
+            "read-hidden",
+            &format!("HISTORY_READ_REF {hidden_ref}"),
+        )
+        .await;
+        assert!(
+            !denied["text"].as_str().unwrap().contains("CHILD_VALUE_TWO"),
+            "已提交隐藏来源的原件必须拒绝：{denied}"
+        );
+        assert!(
+            denied["text"].as_str().unwrap().contains("不存在")
+                || denied["text"].as_str().unwrap().contains("隐藏")
+        );
+        let old = &executions[0];
+        let query = send_in(
+            &restarted,
+            &fixture.team,
+            "sources",
+            "query-old",
+            &format!(
+                "HISTORY_QUERY_OLD {} {}",
+                old.child_session_id, old.child_turn_id
+            ),
+        )
+        .await;
+        assert!(
+            !query["text"].as_str().unwrap().contains("CHILD_VALUE_ONE"),
+            "旧结果事实不授予本轮查询许可：{query}"
+        );
     }
     #[tokio::test]
     async fn main_history_question_projection_uses_actual_calls_and_visible_prefix() {

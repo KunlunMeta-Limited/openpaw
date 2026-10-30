@@ -3875,6 +3875,8 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) ->
                 &read.events,
                 history.visible_messages(&handle.id),
                 provider.model_capabilities(&model).context_window as usize,
+                provider.name(),
+                &model,
             )
         });
     let system_prompt = [system_prompt, reliable_prompt]
