@@ -26,7 +26,14 @@ mod history_question_tests {
             .iter()
             .filter_map(|m| m["content"].as_str())
             .flat_map(str::lines)
-            .filter_map(|line| serde_json::from_str(line).ok())
+            .filter_map(|line| {
+                serde_json::from_str(
+                    line.strip_prefix("[Assistant] ")
+                        .or_else(|| line.strip_prefix("[User] "))
+                        .unwrap_or(line),
+                )
+                .ok()
+            })
             .collect()
     }
     pub(super) async fn model_response(
@@ -37,8 +44,17 @@ mod history_question_tests {
             let previews = metadata(body)
                 .into_iter()
                 .filter(|v| v["reference"].is_string() && v["total_chars"].is_number())
+                .map(|mut value| {
+                    value["content"] = serde_json::json!(value["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .chars()
+                        .take(64)
+                        .collect::<String>());
+                    value
+                })
                 .collect::<Vec<_>>();
-            let summary = format!("[Context Summary] HISTORY_LONG_RESULT. Read child tail originals; do not guess. {}", serde_json::to_string(&previews).unwrap());
+            let summary = format!("[Context Summary] Keep actual readable fact indexes; do not guess answers or tail values.\n{}\n", previews.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
             return if body["stream"] == true {
                 response(None, &summary, 0)
             } else {
@@ -49,7 +65,9 @@ mod history_question_tests {
         if let Some(source) = all.iter().rposition(|m| {
             m["role"] == "user"
                 && m["content"].as_str().is_some_and(|s| {
-                    s.starts_with("HISTORY_ASK") || s.starts_with("HISTORY_FACT_PROBE")
+                    s.starts_with("HISTORY_ASK")
+                        || s.starts_with("HISTORY_FACT_PROBE")
+                        || s.starts_with("HISTORY_CHILD_FACT_PROBE")
                 })
         }) {
             let current = &all[source..];
@@ -82,12 +100,35 @@ mod history_question_tests {
                 return response(None, "已恢复并交付真实答案", tools.len());
             }
             if let Some(page) = metadata(body).iter().rev().find(|v| v["kind"] == "page") {
+                if all[source]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("HISTORY_CHILD_FACT_PROBE")
+                {
+                    return if let Some(tail) = page["content"]
+                        .as_str()
+                        .unwrap_or("")
+                        .lines()
+                        .find(|line| line.starts_with("TAIL_CHECK_"))
+                    {
+                        response(
+                            Some((
+                                "write_file",
+                                serde_json::json!({"path":"fork-tail-check.txt","content":tail}),
+                            )),
+                            "",
+                            tools.len(),
+                        )
+                    } else {
+                        response(None, "原件末尾尚未读到，不交付", tools.len())
+                    };
+                }
                 let record = page["content"]
                     .as_str()
                     .unwrap_or("")
                     .lines()
                     .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .find(|v| v["state"] == "answered" && v["answer"]["label"].is_string());
+                    .find(|v| v["answer"]["label"].is_string());
                 return if let Some(record) = record {
                     response(
                         Some((
@@ -105,12 +146,29 @@ mod history_question_tests {
             let fact = values
                 .iter()
                 .rev()
-                .find(|v| v["kind"] == "user_question_fact" || v["kind"] == "message_text_preview");
+                .find(|v| v["kind"] == "message_text_preview")
+                .or_else(|| {
+                    values.iter().rev().find(|v| {
+                        v["kind"] == "user_question_fact" || v["kind"] == "child_result_preview"
+                    })
+                });
             return if let Some(fact) = fact {
+                let start = if all[source]["content"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("HISTORY_CHILD_FACT_PROBE")
+                {
+                    fact["total_chars"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        .saturating_sub(128)
+                } else {
+                    0
+                };
                 response(
                     Some((
                         "read_context_record",
-                        serde_json::json!({"reference":fact["reference"],"start":0,"limit":2048}),
+                        serde_json::json!({"reference":fact["reference"],"start":start,"limit":2048}),
                     )),
                     "",
                     tools.len(),
@@ -419,6 +477,43 @@ mod history_question_tests {
                             && m["tool_calls"].to_string().contains("wait_agent"))),
             "不得用显式wait替代正常收尾验证"
         );
+        drop(requests);
+        let fork = child_test_json(
+            &fixture.app,
+            "POST",
+            &format!("/session/{session}/fork"),
+            serde_json::json!({}),
+        )
+        .await;
+        let fork_id = fork["id"].as_str().unwrap();
+        child_test_json(&fixture.app,"POST",&format!("/session/{fork_id}/message"),serde_json::json!({"text":"HISTORY_CHILD_FACT_PROBE 从分支自己的原件末尾取得校验值后交付"})).await;
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("fork-tail-check.txt"))
+                .ok()
+                .as_deref(),
+            Some(TAIL),
+            "分支不能依赖旧owner引用，必须从本owner真实长Message原件末尾交付；turns={} model={}",
+            child_test_json(
+                &fixture.app,
+                "GET",
+                &format!("/session/{fork_id}/turns"),
+                serde_json::json!({})
+            )
+            .await,
+            serde_json::to_string(
+                &fixture
+                    .model_seen
+                    .lock()
+                    .await
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .collect::<Vec<_>>()
+            )
+            .unwrap()
+        );
+        let fork_read = openpaw_store::catalog::read(fixture.home.path(), fork_id).unwrap();
+        assert!(!fork_read.events.iter().any(|event|matches!(event,openpaw_core::SessionEvent::Unknown(v) if matches!(v["type"].as_str(),Some("user_question_v1" | "child_execution_v1")))));
     }
     #[tokio::test]
     async fn main_history_question_projection_uses_actual_calls_and_visible_prefix() {

@@ -2295,7 +2295,7 @@ impl AppState {
                     })?,
                 None => visible_messages.len(),
             };
-            let messages = clone_messages_for_fork(&visible_messages[..fork_len]);
+            let mut messages = clone_messages_for_fork(&visible_messages[..fork_len]);
             let message_presentations: HashMap<_, _> = visible_messages[..fork_len]
                 .iter()
                 .zip(&messages)
@@ -2304,6 +2304,16 @@ impl AppState {
                     Some((new.uuid.clone()?, presentation.clone()))
                 })
                 .collect();
+            let source_read = SessionReader::read(&source.session_path)
+                .map_err(|_| SessionMutationError::Persistence("无法读取分支可靠事实".into()))?;
+            crate::context::import_fork_facts(
+                &self.config.home,
+                source_id,
+                &source_read.events,
+                &visible_messages[..fork_len],
+                &new_id,
+                &mut messages,
+            );
             let ordinal = next_fork_ordinal(&self.config.home, source_id)?;
             let title = format!("{source_title} ({ordinal})");
             let origin = SessionForkOriginV1 {
