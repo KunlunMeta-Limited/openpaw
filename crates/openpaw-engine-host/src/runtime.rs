@@ -3995,9 +3995,7 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) ->
     if handle.goal.prompt().is_some() {
         provider_tools.extend(crate::goal::plan_tools());
     }
-    if !handle.goal.is_execution_turn() {
-        provider_tools.retain(|tool| handle.goal.allowed(&tool.name).is_ok());
-    }
+    handle.goal.filter_tools(&mut provider_tools);
     let system_prompt = if handle.child.is_some() {
         Some("你是主 Agent 委派的独立子 Agent。只完成任务及明确提供的背景，必要时使用工作区工具；不得再次委派。最终给出供父 Agent 整合的真实结果。".to_string())
     } else {

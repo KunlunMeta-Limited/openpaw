@@ -477,7 +477,7 @@ impl GoalContext {
     /// 功能：在真实子创建前原子预留一个满足依赖的 Goal 任务。
     /// 参数：task 为可选 Goal Task 编号，attempt 为本次委派唯一身份。
     /// 返回：Goal 执行返回独占绑定；普通聊天不绑定。
-    /// 错误：缺少许可、未验收依赖、重复绑定或持久化失败时不启动子执行。
+    /// 错误：普通聊天误带Goal参数时提示移除；缺少许可、未验收依赖、重复绑定或持久化失败时不启动子执行。
     /// 状态：先持久标记 running，未准入或 future 丢弃转 interrupted。
     /// 并发与取消：user→state 锁内核对许可、状态与取消，重复委派只有一项能成功。
     /// 权限：持久 active 或其他子任务 running 不构成执行许可。
@@ -489,16 +489,19 @@ impl GoalContext {
     ) -> Result<Option<GoalDelegation>, String> {
         let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if task.is_none()
-            && !user
-                .as_ref()
-                .is_some_and(|user| user.executing || user.editable)
+        if !user
+            .as_ref()
+            .is_some_and(|user| user.executing || user.editable)
             && state
                 .records
                 .last()
                 .is_none_or(|goal| matches!(goal.phase.as_str(), "ended" | "completed"))
         {
-            return Ok(None);
+            return if task.is_some() {
+                Err("普通聊天委派请移除 goal_task_id；仅已确认的 Goal 执行回合使用计划中的真实任务编号，不要编造。".into())
+            } else {
+                Ok(None)
+            };
         }
         let user = user
             .as_ref()
@@ -1397,6 +1400,30 @@ impl GoalContext {
             .is_some_and(|user| user.executing)
     }
 
+    /// 功能：按实际回合许可筛选工具及Goal专用委派参数。
+    /// 参数：tools为会话完整声明在本回合的副本。
+    /// 返回：无；原位保留合法工具，普通回合隐藏goal_task_id。
+    /// 错误：无；未获准的工具只从本轮声明移除。
+    /// 状态：不改原始声明缓存、会话或计划。
+    /// 并发与取消：读取当前许可，实际调用仍重新校验权限与取消。
+    /// 权限：声明不授予执行许可；保留原有allowed筛选。
+    /// 关联：Host run_turn、reserve_delegation、CHG-2026-0055。Stability: experimental。
+    pub fn filter_tools(&self, tools: &mut Vec<ToolSpec>) {
+        if !self.is_execution_turn() {
+            tools.retain(|tool| self.allowed(&tool.name).is_ok());
+            for tool in tools
+                .iter_mut()
+                .filter(|tool| matches!(tool.name.as_str(), "start_agent" | "delegate_task"))
+            {
+                if let Some(properties) = tool.input_schema["properties"].as_object_mut() {
+                    properties.remove("goal_task_id");
+                }
+                tool.description
+                    .push_str("当前回合不提供Goal任务绑定参数。");
+            }
+        }
+    }
+
     /// 功能：生成已持久计划或执行验收事实的规范聊天展示。
     /// 参数：无。
     /// 返回：计划全文或当前执行结果与可追溯验收结论。
@@ -2116,7 +2143,9 @@ pub fn plan_tools() -> Vec<ToolSpec> {
 #[cfg(test)]
 mod tests {
     use super::{GoalContext, GoalRuntime, GoalToolHost};
-    use openpaw_core::{NullToolHost, SessionEvent, ToolExecutor};
+    use openpaw_core::{
+        NullToolHost, SessionEvent, ToolCallOutcome, ToolExecutor, ToolHostValidator, ToolSpec,
+    };
     use serde_json::{json, Value};
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2216,6 +2245,111 @@ mod tests {
             .begin("turn-execute", "message-execute", "确认执行")
             .unwrap();
         (context, runtime)
+    }
+
+    struct DelegationTools;
+    #[async_trait::async_trait]
+    impl ToolExecutor for DelegationTools {
+        async fn list_tools(&self) -> openpaw_core::Result<Vec<ToolSpec>> {
+            Ok(["start_agent", "delegate_task", "get_agent_status"]
+                .into_iter()
+                .map(|name| {
+                    let mut spec = ToolSpec::new(name, "委派或查询真实子会话");
+                    spec.input_schema = json!({"type":"object","required":["task"],"additionalProperties":false,"properties":{"task":{"type":"string"},"task_id":{"type":"string"},"goal_task_id":{"type":"string"}}});
+                    spec
+                })
+                .collect())
+        }
+        async fn call(&self, _name: &str, _input: Value) -> openpaw_core::Result<ToolCallOutcome> {
+            panic!("声明回归不能启动真实工作")
+        }
+    }
+    #[async_trait::async_trait]
+    impl ToolHostValidator for DelegationTools {}
+
+    #[test]
+    fn cached_delegation_declarations_keep_goal_capability_for_later_turns() {
+        let context = GoalContext::new("cold-session");
+        let host = GoalToolHost::new(Arc::new(DelegationTools), context);
+        assert!(
+            ready(host.list_tools())
+                .unwrap()
+                .iter()
+                .all(|spec| spec.input_schema["properties"]
+                    .get("goal_task_id")
+                    .is_some()),
+            "Host创建会话时缓存完整声明，之后才开始普通或Goal回合"
+        );
+    }
+
+    #[test]
+    fn ordinary_delegation_hides_goal_parameters_and_explains_invalid_binding() {
+        let context = GoalContext::new("ordinary");
+        context
+            .begin("ordinary-turn", "ordinary-message", "安排独立查询")
+            .unwrap();
+        let host = GoalToolHost::new(Arc::new(DelegationTools), context.clone());
+        let mut tools = ready(host.list_tools()).unwrap();
+        context.filter_tools(&mut tools);
+        for spec in tools {
+            let goal_parameter = spec.input_schema["properties"].get("goal_task_id");
+            if spec.name == "get_agent_status" {
+                assert!(goal_parameter.is_some(), "不更改其他工具的参数");
+            } else {
+                assert!(goal_parameter.is_none(), "普通委派不应暴露Goal任务绑定");
+                assert!(spec.input_schema["properties"].get("task_id").is_some());
+                assert_eq!(spec.input_schema["required"], json!(["task"]));
+                assert_eq!(spec.input_schema["additionalProperties"], false);
+            }
+        }
+        assert!(context
+            .reserve_delegation(None, "ordinary-attempt")
+            .unwrap()
+            .is_none());
+        let reason = context
+            .reserve_delegation(Some("invented"), "invalid-attempt")
+            .err()
+            .unwrap();
+        assert!(
+            reason.contains("普通聊天") && reason.contains("goal_task_id"),
+            "{reason}"
+        );
+        assert!(context.current().is_none());
+    }
+
+    #[test]
+    fn goal_delegation_parameters_follow_current_turn_authority() {
+        let (context, _) = confirmed_goal();
+        let host = GoalToolHost::new(Arc::new(DelegationTools), context.clone());
+        let cached = ready(host.list_tools()).unwrap();
+        let mut tools = cached.clone();
+        context.filter_tools(&mut tools);
+        assert!(tools.iter().all(|spec| spec.input_schema["properties"]
+            .get("goal_task_id")
+            .is_some()));
+        context.finish();
+        context
+            .begin("later-turn", "later-message", "看看当前进度")
+            .unwrap();
+        tools = cached.clone();
+        context.filter_tools(&mut tools);
+        assert!(tools.iter().all(|spec| spec.name == "get_agent_status"));
+        assert!(context.reserve_delegation(None, "bypass").is_err());
+        assert!(context
+            .reserve_delegation(Some("report"), "no-permission")
+            .is_err());
+        context
+            .begin("continue-turn", "continue-message", "/goal continue")
+            .unwrap();
+        tools = cached;
+        context.filter_tools(&mut tools);
+        assert_eq!(tools.len(), 3);
+        assert!(
+            tools.iter().all(|spec| spec.input_schema["properties"]
+                .get("goal_task_id")
+                .is_some()),
+            "新许可回合应从原始缓存恢复Goal字段"
+        );
     }
 
     #[test]

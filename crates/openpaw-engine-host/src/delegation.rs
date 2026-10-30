@@ -583,7 +583,7 @@ fn save_delegations(
 fn delegate_spec() -> ToolSpec {
     ToolSpec {
         name: "delegate_task".into(),
-        description: "同步兼容入口：启动独立子Agent并等真实结果。优先使用start_agent。task_id续办真实子会话，不传则新建；Goal必须传goal_task_id，产出仍需主Agent验收。".into(),
+        description: "同步兼容入口：启动独立子Agent并等真实结果。优先使用start_agent。普通聊天省略goal_task_id；仅已确认Goal执行回合使用计划中真实任务编号，不能编造。task_id续办真实子会话，不传则新建；Goal产出仍需主Agent验收。".into(),
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -592,7 +592,7 @@ fn delegate_spec() -> ToolSpec {
                 "task": { "type": "string", "minLength": 1, "maxLength": MAX_DELEGATE_TASK_CHARS },
                 "name": { "type": "string", "minLength": 1, "maxLength": MAX_DELEGATE_NAME_CHARS },
                 "task_id": { "type": "string", "minLength": 1, "maxLength": 128 },
-                "goal_task_id": { "type": "string", "minLength": 1, "maxLength": 50 }
+                "goal_task_id": { "type": "string", "minLength": 1, "maxLength": 50, "description": "普通聊天不传；仅当前已确认Goal执行回合绑定计划中真实任务ID，不能编造，不是子会话task_id。" }
             }
         }),
         category: Some(ToolCategory::Communication),
@@ -667,7 +667,7 @@ impl ToolExecutor for DelegatingToolHost {
             tools.push(delegate_spec());
             let mut start = delegate_spec();
             start.name = "start_agent".into();
-            start.description = "优先派发独立子Agent，受理后返回session_id、turn_id，父继续独立工作，需结果时wait_agent。不传task_id新建；续办须用真实子会话task_id，name仅展示。Goal须传goal_task_id，产出仍需主验收。".into();
+            start.description = "优先派发独立子Agent，受理后返回session_id、turn_id，父继续独立工作，需结果时wait_agent。不传task_id新建；续办须用真实子会话task_id，name仅展示。普通聊天省略goal_task_id；仅已确认Goal执行回合使用计划中真实任务编号，不能编造，产出仍需主验收。".into();
             tools.push(start);
             tools.extend(openpaw_engine::coordination::execution_tool_specs());
             tools.push(artifact_spec());
