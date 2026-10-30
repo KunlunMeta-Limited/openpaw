@@ -75,7 +75,7 @@ mod goal_review_tests {
             let owner = fixture.state.main_office.conversation_record(&fixture.team,"review").unwrap().unwrap().session.unwrap();
             let handle = fixture.state.get_typed(&owner).await.unwrap();
             assert_eq!(handle.turn_outcomes().len(),1,"菜单接续不得创建隐藏的新回合");
-            let read = openpaw_store::SessionReader::read(&fixture.home.path().join("sessions").join(format!("{owner}.jsonl"))).unwrap();
+            let read = openpaw_store::SessionReader::read(fixture.home.path().join("sessions").join(format!("{owner}.jsonl"))).unwrap();
             let history = openpaw_store::transcript::replay(&owner,&read.events).unwrap();
             let questions = crate::context::validated_questions(&owner,&read.events,history.visible_messages(&owner));
             assert_eq!(questions.len(),decisions_count(choice),"审核必须保留可信问答原件");
