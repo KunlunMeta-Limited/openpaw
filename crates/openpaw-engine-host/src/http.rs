@@ -571,15 +571,22 @@ fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response 
                 .find(|outcome| outcome.user_message_id == id && !outcome.state.is_terminal())
                 .map(|outcome| GoalStreamCancel {
                     handle: handle.clone(),
-                    turn: outcome.turn_id,
                     generation: {
+                        // 只有真实待答重连取得接管代际；普通Goal多流仍沿原断流取消合同。
+                        let waiting = handle
+                            .pending_questions(&outcome.turn_id)
+                            .iter()
+                            .any(|record| record.deadline_ms.is_some());
                         let mut current = handle
                             .main_observer_generation
                             .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                        *current = current.wrapping_add(1);
+                        if waiting {
+                            *current = current.wrapping_add(1);
+                        }
                         *current
                     },
+                    turn: outcome.turn_id,
                 })
         })
         .flatten();
