@@ -1,4 +1,188 @@
 #[cfg(test)]
+mod restart_question_tests {
+    use super::*;
+
+    fn response(call: Option<(&str, serde_json::Value)>, text: &str) -> Response {
+        let delta = if let Some((name, args)) = call {
+            serde_json::json!({"tool_calls":[{"index":0,"id":"restart-call","type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+        } else {
+            serde_json::json!({"content":text})
+        };
+        let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":if delta["tool_calls"].is_array(){"tool_calls"}else{"stop"}}]});
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    }
+    pub(super) fn model_response(body: &serde_json::Value) -> Response {
+        let messages = body["messages"].as_array().unwrap();
+        let Some(source) = messages.iter().rposition(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("RESTART_"))
+        }) else {
+            return response(None, "真实执行已返回");
+        };
+        let text = messages[source]["content"].as_str().unwrap();
+        let has_result = messages[source..].iter().any(|m| m["role"] == "tool");
+        let parent = body["tools"].to_string().contains("start_agent");
+        if has_result {
+            return response(None, "真实执行已返回");
+        }
+        if !parent {
+            return response(
+                Some((
+                    "write_file",
+                    serde_json::json!({"path":if text.ends_with("_SECOND"){"restart-second.txt"}else{"restart-first.txt"},"content":"真实子产物"}),
+                )),
+                "",
+            );
+        }
+        let previous = messages[..source]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .find_map(|m| {
+                serde_json::from_str::<serde_json::Value>(m["content"].as_str()?)
+                    .ok()
+                    .filter(|r| r["session_id"].is_string())
+            });
+        let mut args = serde_json::json!({"name":"重启测试员","task":"RESTART_CHILD"});
+        if text == "RESTART_RESUME" {
+            args["task_id"] = previous.unwrap()["session_id"].clone();
+            args["task"] = serde_json::json!("RESTART_CHILD_SECOND");
+        }
+        response(Some(("start_agent", args)), "")
+    }
+    async fn request(app: &Router, team: &str, operation: serde_json::Value) -> Response {
+        let mut body =
+            serde_json::json!({"version":"1.0","teamId":team,"conversationId":"restart"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(operation.as_object().unwrap().clone());
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pawoffice/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+    async fn send(app: &Router, team: &str, turn: &str, text: &str) -> serde_json::Value {
+        let history = request(app, team, serde_json::json!({"type":"history"})).await;
+        let history: serde_json::Value =
+            serde_json::from_slice(&to_bytes(history.into_body(), 2_000_000).await.unwrap())
+                .unwrap();
+        let mut messages = Vec::new();
+        for row in history["data"]["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["state"] == "complete")
+        {
+            messages.push(serde_json::json!({"role":"user","content":row["user"]}));
+            messages.push(serde_json::json!({"role":"assistant","content":row["assistant"]}));
+        }
+        messages.push(serde_json::json!({"role":"user","content":text}));
+        let result = request(
+            app,
+            team,
+            serde_json::json!({"type":"send","turnId":turn,"messages":messages}),
+        )
+        .await;
+        assert_eq!(result.status(), StatusCode::OK);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(10),
+            to_bytes(result.into_body(), 2_000_000),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        serde_json::from_str(std::str::from_utf8(&bytes).unwrap().lines().last().unwrap()).unwrap()
+    }
+    #[tokio::test]
+    async fn main_restart_retains_each_execution_source_and_saved_child_result() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-restart-source", "option-a").await;
+        assert_eq!(
+            send(&fixture.app, &fixture.team, "first", "RESTART_START").await["state"],
+            "complete"
+        );
+        assert_eq!(
+            send(&fixture.app, &fixture.team, "second", "RESTART_RESUME").await["state"],
+            "complete"
+        );
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let children = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["parentID"].is_string())
+            .collect::<Vec<_>>();
+        assert_eq!(children.len(), 1, "续办必须是同一真实员工");
+        let child = children[0];
+        let read = openpaw_store::SessionReader::read(
+            &fixture
+                .home
+                .path()
+                .join("sessions")
+                .join(format!("{}.jsonl", child["id"].as_str().unwrap())),
+        )
+        .unwrap();
+        let records = read
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                openpaw_core::SessionEvent::Unknown(v) if v["type"] == "child_execution_v1" => {
+                    Some(v["record"].clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let accepted = records
+            .iter()
+            .filter(|r| r["stage"] == "accepted")
+            .collect::<Vec<_>>();
+        let saved = records
+            .iter()
+            .filter(|r| r["stage"] == "result_saved")
+            .collect::<Vec<_>>();
+        assert_eq!(accepted.len(), 2, "每次真实子执行都必须可靠保存确切父来源");
+        assert_eq!(saved.len(), 2, "结果通知前必须保存真实完整子结果");
+        assert_ne!(
+            accepted[0]["parent_user_message_id"],
+            accepted[1]["parent_user_message_id"]
+        );
+        assert_ne!(accepted[0]["parent_turn_id"], accepted[1]["parent_turn_id"]);
+        assert_ne!(accepted[0]["child_turn_id"], accepted[1]["child_turn_id"]);
+        for record in saved {
+            assert_eq!(record["parent_session_id"], child["parentID"]);
+            assert_eq!(record["tool_call_id"], "restart-call");
+            assert_eq!(record["status"], "completed");
+            assert!(record["outcome"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("真实执行已返回"));
+        }
+        for file in ["restart-first.txt", "restart-second.txt"] {
+            assert_eq!(
+                std::fs::read_to_string(fixture.workspace.path().join(file)).unwrap(),
+                "真实子产物"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod goal_question_tests {
     use super::*;
 
