@@ -1987,7 +1987,11 @@ impl MainOffice {
             record.snapshot["employees"].as_array().into_iter().flatten()
                 .find(|employee|employee["id"] == child)
                 .and_then(|employee|employee["sceneActorId"].as_str()).filter(|actor|!actor.is_empty())
-                .map(|actor|vec![Self::command(team,actor,"thinking","处理子任务",record.snapshot["seq"].as_u64().unwrap_or(1))])
+                .map(|actor|vec![
+                    serde_json::json!({"protocolVersion":"2.0","sceneId":team,"commandId":format!("dispatch-{}",uuid::Uuid::new_v4().simple()),
+                        "type":"activity.start","capability":"office.visit","participants":[{"entityId":"office-lead","role":"visitor"},{"entityId":actor,"role":"host"}],
+                        "params":{"stops":[{"hostId":actor,"message":"请处理这项任务，完成后返回结果。"}]}}),
+                    Self::command(team,actor,"thinking","处理子任务",record.snapshot["seq"].as_u64().unwrap_or(1))])
                 .unwrap_or_default()
         });
     }

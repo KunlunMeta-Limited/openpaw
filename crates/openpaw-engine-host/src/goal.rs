@@ -8,6 +8,7 @@ use openpaw_main_goal::GoalRuntime;
 pub(crate) use openpaw_main_goal::{plan_tools, GoalContext, GoalToolHost};
 use serde_json::Value;
 use std::sync::{Arc, Weak};
+pub(crate) mod review;
 
 struct HostGoalRuntime {
     handle: Weak<SessionHandle>,

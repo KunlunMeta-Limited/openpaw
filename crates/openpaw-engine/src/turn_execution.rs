@@ -41,6 +41,8 @@ impl SessionCheckpoint {
 /// 功能：保存一次调用的中立配置，不改变 AgentLoop 默认模型。
 #[derive(Default)]
 pub struct TurnOptions {
+    /// 功能：工具批次可靠结算后的可选中立交互，不重置预算。Stability: experimental。
+    pub tool_batch_coordination: Option<ToolBatchCoordination>,
     /// 功能：原回合正常结束前可取消地等待可靠协作事实；默认不安装。
     pub end_turn_coordination: Option<EndTurnCoordination>,
     /// 功能：工具批次可靠结算后读取可信入口暂停事实，默认关闭。
@@ -71,6 +73,35 @@ pub type ContextProgress = Arc<dyn Fn() + Send + Sync>;
 /// Stability: experimental。
 pub type EndTurnCoordination =
     Arc<dyn Fn() -> futures::future::BoxFuture<'static, Option<String>> + Send + Sync>;
+
+/// 功能：可信入口在工具批次完成后准备一次交互；无待处理事实时返回空。
+/// 约束：不得在准备阶段展示或等待；Stability: experimental。
+pub type ToolBatchCoordination = Arc<dyn Fn() -> Option<TurnInteraction> + Send + Sync>;
+
+/// 功能：先可靠发布规范说明，再可取消地等待入口交互。
+/// 数据边界：不包含Host、Office或持久writer；Stability: experimental。
+pub struct TurnInteraction {
+    /// 功能：引擎保存并发布的完整可见说明。
+    pub presentation: String,
+    /// 功能：说明发布后才开始等待的可信future，不创建新回合。
+    pub resolve:
+        futures::future::BoxFuture<'static, openpaw_core::Result<TurnInteractionResolution>>,
+}
+
+/// 功能：入口交互结算后的继续或暂停决定；Stability: experimental。
+pub enum TurnInteractionResolution {
+    /// 功能：沿原回合继续，声明与提示仍受实际工具权限校验。
+    Continue {
+        /// 功能：真实结算事实及后续工作说明，不是伪造用户授权。
+        instruction: String,
+        /// 功能：当前可信入口重新筛选的工具声明。
+        tools: Vec<ToolSpec>,
+        /// 功能：保持其他约束的最新系统提示。
+        system: Option<String>,
+    },
+    /// 功能：保存说明并停止后续模型请求，保留已经结算的事实。
+    Pause(String),
+}
 
 /// 功能：描述与传输、存储无关的真实可见输出和工具执行事实。
 /// 约束：包含授权会话的完整正文，不得发送到诊断日志或 Office 动作。

@@ -23,6 +23,7 @@ type ToolUseCall = (String, String, serde_json::Value);
 
 // 完整产出与模型投影分开收集；入口上下文只服务本回合，不进入执行器共享状态。
 struct TurnCollection<'a> {
+    tool_batch_coordination: Option<crate::turn_execution::ToolBatchCoordination>,
     generated: &'a mut Vec<Message>,
     attachments: Vec<openpaw_core::InlineMedia>,
     recorder: Option<crate::turn_execution::ExecutionRecorder>,
@@ -35,6 +36,7 @@ struct TurnCollection<'a> {
 impl<'a> TurnCollection<'a> {
     fn new(generated: &'a mut Vec<Message>) -> Self {
         Self {
+            tool_batch_coordination: None,
             generated,
             attachments: Vec::new(),
             recorder: None,
@@ -502,6 +504,7 @@ impl AgentLoop {
             options.cancel,
             selection,
             TurnCollection {
+                tool_batch_coordination: options.tool_batch_coordination,
                 generated,
                 attachments: options.attachments,
                 recorder: options.recorder,
@@ -526,6 +529,7 @@ impl AgentLoop {
         collection: TurnCollection<'_>,
     ) -> Result<StopReason> {
         let TurnCollection {
+            tool_batch_coordination,
             generated,
             attachments,
             recorder,
@@ -583,7 +587,10 @@ impl AgentLoop {
             .remember_media(openpaw_core::media::message_media(&session.messages));
         openpaw_core::media::validate_media(&turn_media, provider.model_capabilities(&model))?;
 
+        let mut system = system;
+        let mut refreshed_tools: Option<Vec<ToolSpec>> = None;
         loop {
+            let tools = refreshed_tools.as_deref().unwrap_or(tools);
             // ① 检查取消
             if self.is_cancelled() {
                 return Ok(StopReason::EndTurn);
@@ -915,6 +922,54 @@ impl AgentLoop {
                 }
             }
             session.messages.push(model_message);
+            if let Some(interaction) = tool_batch_coordination
+                .as_ref()
+                .and_then(|prepare| prepare())
+                .filter(|_| {
+                    !self.is_cancelled()
+                        && (self.budget.remaining() > 0 || self.budget.expand(1))
+                        && !self
+                            .token_budget_mut()
+                            .as_ref()
+                            .is_some_and(|tracker| tracker.remaining_budget() == Some(0))
+                })
+            {
+                self.publish_interaction(
+                    session,
+                    generated,
+                    event_sink,
+                    (recorder.as_ref(), response_index),
+                    interaction.presentation,
+                )?;
+                response_index += 1;
+                let Some(resolution) = cancel_or(&token, interaction.resolve).await else {
+                    return Ok(StopReason::EndTurn);
+                };
+                match resolution? {
+                    crate::turn_execution::TurnInteractionResolution::Continue {
+                        instruction,
+                        tools,
+                        system: latest_system,
+                    } => {
+                        let fact = Message::user_text(instruction).identified();
+                        generated.push(fact.clone());
+                        session.messages.push(fact);
+                        refreshed_tools = Some(tools);
+                        system = latest_system;
+                        continue;
+                    }
+                    crate::turn_execution::TurnInteractionResolution::Pause(reason) => {
+                        self.publish_interaction(
+                            session,
+                            generated,
+                            event_sink,
+                            (recorder.as_ref(), response_index),
+                            reason,
+                        )?;
+                        return Ok(StopReason::EndTurn);
+                    }
+                }
+            }
             if let Some(reason) = pause_check.as_ref().and_then(|check| check()) {
                 // 暂停只阻断依赖模型；已经启动的独立分支仍归本轮，先处理真实结果。
                 let mut child_facts = Vec::new();
@@ -946,6 +1001,29 @@ impl AgentLoop {
                 return Ok(StopReason::EndTurn);
             }
         }
+    }
+
+    fn publish_interaction(
+        &self,
+        session: &mut openpaw_core::Session,
+        generated: &mut Vec<Message>,
+        sink: &mut (dyn FnMut(AgentEvent) + Send),
+        recording: (Option<&crate::turn_execution::ExecutionRecorder>, usize),
+        text: String,
+    ) -> Result<()> {
+        let message = Message::assistant_text(&text).identified();
+        for (kind, payload) in [
+            ("response_start", serde_json::json!({})),
+            ("text", serde_json::json!({"text":text})),
+            ("response", serde_json::json!({"content":message.content})),
+        ] {
+            crate::turn_execution::observe(recording.0, recording.1, kind, payload)?;
+        }
+        generated.push(message.clone());
+        session.messages.push(message);
+        sink(AgentEvent::MessageStart);
+        sink(AgentEvent::TextDelta { text });
+        Ok(())
     }
 
     async fn finish_after_iteration_budget(
@@ -2177,6 +2255,115 @@ async fn execute_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn interaction_publishes_before_wait_and_preserves_budget_cancel_and_commit_failure() {
+        use crate::turn_execution::{
+            run_turn, TurnInteraction, TurnInteractionResolution, TurnOptions,
+        };
+        use openpaw_core::ToolExecutor;
+        use openpaw_llm::{MockMode, MockProvider};
+        for mode in ["continue", "pause", "cancel", "record-failure", "exhausted"] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join("source.txt"), "real read").unwrap();
+            let provider = Arc::new(MockProvider::scripted(vec![
+                MockMode::ToolUse {
+                    tool_name: "read_file".into(),
+                    input: serde_json::json!({"path":"source.txt"}),
+                    text: String::new(),
+                },
+                MockMode::Fixed("finished".into()),
+            ]));
+            let host = Arc::new(openpaw_tools::ToolRegistry::new(directory.path()));
+            let tools = host.list_tools().await.unwrap();
+            let agent = AgentLoop::new(provider.clone())
+                .with_tool_host(host)
+                .with_budget(IterationBudget::new(if mode == "exhausted" {
+                    1
+                } else {
+                    2
+                }));
+            let mut session = Session::new("fixture", "fixture");
+            session.messages.push(Message::user_text("read once"));
+            let original = serde_json::to_value(&session).unwrap();
+            let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let waiting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let token = CancellationToken::new();
+            let (observed, polled, cancel) = (published.clone(), waiting.clone(), token.clone());
+            let interaction = Arc::new(move || {
+                let (observed, polled, cancel) = (observed.clone(), polled.clone(), cancel.clone());
+                Some(TurnInteraction {
+                    presentation: "canonical plan".into(),
+                    resolve: Box::pin(async move {
+                        assert!(observed.load(Ordering::SeqCst), "等待前必须先可靠发布计划");
+                        polled.store(true, Ordering::SeqCst);
+                        if mode == "cancel" {
+                            cancel.cancel();
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(if mode == "pause" {
+                            TurnInteractionResolution::Pause("paused".into())
+                        } else {
+                            TurnInteractionResolution::Continue {
+                                instruction: "actual accepted answer".into(),
+                                tools: Vec::new(),
+                                system: Some("current constraints".into()),
+                            }
+                        })
+                    }),
+                })
+            });
+            let recorder = Arc::new(move |fact: crate::turn_execution::ExecutionObservation| {
+                if mode == "record-failure"
+                    && fact.kind == "text"
+                    && fact.payload["text"] == "canonical plan"
+                {
+                    Err(Error::session("fixture commit failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            let mut sink = |event| {
+                if matches!(event,AgentEvent::TextDelta {ref text} if text=="canonical plan") {
+                    published.store(true, Ordering::SeqCst);
+                }
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                run_turn(
+                    &agent,
+                    &mut session,
+                    &tools,
+                    &mut sink,
+                    TurnOptions {
+                        tool_batch_coordination: Some(interaction),
+                        recorder: Some(recorder),
+                        cancel: token,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.result.is_err(), mode == "record-failure");
+            assert_eq!(
+                waiting.load(Ordering::SeqCst),
+                !matches!(mode, "record-failure" | "exhausted")
+            );
+            assert_eq!(
+                provider.call_count(),
+                if matches!(mode, "pause" | "cancel" | "record-failure") {
+                    1
+                } else {
+                    2
+                },
+                "{mode}: 交互不得重置迭代预算"
+            );
+            if matches!(mode, "cancel" | "record-failure") {
+                assert_eq!(serde_json::to_value(&session).unwrap(), original);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn media_hook_replacements_are_validated_and_never_keep_stale_media() {

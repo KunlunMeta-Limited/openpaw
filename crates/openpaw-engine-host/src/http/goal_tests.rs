@@ -177,13 +177,13 @@ mod goal_tests {
                     &fixture.team,
                     "proof",
                     "continue",
-                    "/goal continue",
+                    "确认执行",
                 )
                 .await;
             }
             assert!(
                 answer["text"].as_str().unwrap().contains("整体验收已通过"),
-                "变更后完成真实新检查才能通过：{mode}"
+                "变更后完成真实新检查才能通过：{mode}: {answer}"
             );
             let requests = fixture.model_seen.lock().await;
             let results = requests
@@ -266,18 +266,15 @@ mod goal_tests {
         } else if text.starts_with("整体标准改为") {
             match tools.len() {
                 0 => Some(("goal_read", serde_json::json!({}))),
-                1 => update(
+                1 => Some(("bash",serde_json::json!({"command":"printf paused-bypass"}))),
+                2 => update(
                     "set_plan",
                     "",
                     serde_json::json!({"acceptance_criteria":["调整后的资料准确"],"tasks":[definition("a")],"user_excerpt":text}),
                 ),
-                2 => Some((
-                    "bash",
-                    serde_json::json!({"command":"printf paused-bypass"}),
-                )),
                 _ => None,
             }
-        } else if text == "/goal continue" {
+        } else if text == "/goal continue" || (editing && text == "确认执行" && current["plan_version"].as_u64().unwrap_or(0) > 1) {
             match tools.len() {
                 0 => Some(("goal_read", serde_json::json!({}))),
                 1 => {
@@ -1080,7 +1077,7 @@ mod goal_tests {
                     .await
                     .unwrap()
                     .1;
-                if snapshot["snapshot"]["tasks"]
+                if conversation_view(&snapshot["snapshot"],"manual")["tasks"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1093,7 +1090,7 @@ mod goal_tests {
         })
         .await
         .expect("异步当前计划投影应到达既有任务区");
-        let held = snapshot["snapshot"]["tasks"]
+        let held = conversation_view(&snapshot["snapshot"],"manual")["tasks"]
             .as_array()
             .unwrap()
             .iter()
@@ -1105,7 +1102,9 @@ mod goal_tests {
             "既有摘要应说明人工来源"
         );
         let calls = fixture.model_seen.lock().await.len();
-        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        let restarted_state = restart_question_tests::rebuild(&fixture,fixture.home.path());
+        restarted_state.main_office.message(serde_json::json!({"type":"office.capabilities"}),Duration::from_secs(5)).await.unwrap();
+        let restarted = build_router(restarted_state);
         assert_eq!(
             goal_request(
                 &restarted,
@@ -1443,9 +1442,9 @@ mod goal_tests {
                     )
                     .await
                     .unwrap();
-                if read["snapshot"]["goal"]["phase"] == "paused" {
-                    assert_eq!(read["snapshot"]["goal"]["acceptedTaskCount"], 0);
-                    let tasks = read["snapshot"]["tasks"].as_array().unwrap();
+                if observed_goal(&read,"cancel-parallel")["phase"] == "paused" {
+                    assert_eq!(observed_goal(&read,"cancel-parallel")["acceptedTaskCount"], 0);
+                    let tasks = conversation_view(&read["snapshot"],"cancel-parallel")["tasks"].as_array().unwrap();
                     assert_eq!(tasks.len(), 3);
                     assert_eq!(
                         tasks
@@ -1536,7 +1535,7 @@ mod goal_tests {
                     )
                     .await
                     .unwrap();
-                if read["snapshot"]["tasks"]
+                if conversation_view(&read["snapshot"],"parallel")["tasks"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1551,7 +1550,7 @@ mod goal_tests {
         })
         .await
         .expect("异步 Office 投影应同步真实子任务归属");
-        let tasks = read["snapshot"]["tasks"].as_array().unwrap();
+        let tasks = conversation_view(&read["snapshot"],"parallel")["tasks"].as_array().unwrap();
         assert_eq!(tasks.len(), 3, "Goal 委派不生成重复 exec-* 任务");
         assert_eq!(
             tasks
@@ -1598,7 +1597,7 @@ mod goal_tests {
             .await
             .unwrap();
         assert_eq!(
-            read["snapshot"]["goal"]["acceptedTaskCount"], 0,
+            observed_goal(&read,"parallel")["acceptedTaskCount"], 0,
             "子返回不等于验收"
         );
         fixture.release_model.notify_one();
@@ -2245,7 +2244,7 @@ mod goal_tests {
             &fixture.team,
             "resume",
             "continue",
-            "/goal continue",
+            "确认执行",
         )
         .await;
         assert!(finished["text"]
@@ -2797,7 +2796,8 @@ mod goal_tests {
             };
             return goal_fixture_chunk(call, tools.len());
         }
-        if text == "/goal continue" && tools.len() == 3 {
+        let resuming = text == "/goal continue" || (text == "确认执行" && current["plan_version"].as_u64().unwrap_or(0) > 1);
+        if resuming && tools.len() == 3 {
             assert!(
                 tools[2]["content"]
                     .as_str()
@@ -2806,7 +2806,7 @@ mod goal_tests {
                 "停止前的 produced 也必须先复核，不能沿用旧验收授权"
             );
         }
-        if text == "/goal continue" && tools.len() == 5 {
+        if resuming && tools.len() == 5 {
             assert!(
                 tools[4]["content"]
                     .as_str()
@@ -2815,7 +2815,7 @@ mod goal_tests {
                 "未复核中断结果不能取得产出后的shell验收许可"
             );
         }
-        let call = if text == "确认执行" {
+        let call = if text == "确认执行" && !resuming {
             match tools.len() {
                 0 => Some(("goal_read", serde_json::json!({}))),
                 1 => update("start_task", "data", serde_json::json!({})),
@@ -2881,11 +2881,13 @@ mod goal_tests {
         message: &'a serde_json::Value,
         conversation: &str,
     ) -> &'a serde_json::Value {
-        message["snapshot"]["conversations"]
+        &conversation_view(&message["snapshot"],conversation)["goal"]
+    }
+    fn conversation_view<'a>(snapshot: &'a serde_json::Value, conversation: &str) -> &'a serde_json::Value {
+        snapshot["conversations"]
             .as_array()
             .and_then(|rows| rows.iter().find(|row| row["id"] == conversation))
-            .map(|row| &row["goal"])
-            .unwrap_or(&message["snapshot"]["goal"])
+            .unwrap_or(snapshot)
     }
     #[tokio::test]
     async fn main_goal_cancel_keeps_accepted_work_and_never_starts_dependent_delivery() {
@@ -3191,7 +3193,9 @@ mod goal_tests {
         }
         let call = match tools.len() {
             0 => Some(("goal_read", serde_json::json!({}))),
-            1 => {
+            // 新固定菜单会在保存计划后等待；将原越权探针前移，仍验证宿主拒绝。
+            1 => Some(("write_file",serde_json::json!({"path":"premature.txt","content":"must not execute"}))),
+            2 => {
                 let current: serde_json::Value =
                     serde_json::from_str(tools[0]["content"].as_str().unwrap())
                         .unwrap_or(serde_json::Value::Null);
@@ -3232,11 +3236,6 @@ mod goal_tests {
                     }),
                 ))
             }
-            // 故意绕过工具列表，证明确认前由 ToolHost 强制拒绝交付写入。
-            2 => Some((
-                "write_file",
-                serde_json::json!({"path":"premature.txt","content":"must not execute"}),
-            )),
             _ => None,
         };
         goal_fixture_chunk(call, tools.len())
@@ -3321,7 +3320,15 @@ mod goal_tests {
         goal_fixture_chunk(call, tools.len())
     }
 
-    fn goal_fixture_chunk(call: Option<(&str, serde_json::Value)>, index: usize) -> Response {
+    /// 功能：生成本地 Goal 模型的一帧流式工具调用或最终回复。
+    /// 参数：call 为工具名和输入，index 为调用序号。
+    /// 返回：本地 SSE 响应。
+    /// 错误：无。
+    /// 状态：不修改会话。
+    /// 并发与取消：独立构造响应，无等待。
+    /// 权限：仅供测试，不访问真实模型。
+    /// 关联：Goal 与固定审核菜单集成回归。Stability: experimental。
+    pub(super) fn goal_fixture_chunk(call: Option<(&str, serde_json::Value)>, index: usize) -> Response {
         let chunk = if let Some((name, args)) = call {
             serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("goal-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
         } else {
@@ -3358,7 +3365,15 @@ mod goal_tests {
             .unwrap()
     }
 
-    async fn goal_send(
+    /// 功能：通过真实主聊天入口发送 Goal 测试消息并读取终态。
+    /// 参数：app 为路由，team/conversation 为归属，turn 为回合标识，text 为输入。
+    /// 返回：真实 Host 的聊天终态 JSON。
+    /// 错误：测试请求、历史读取或终态异常时断言失败。
+    /// 状态：按正式入口追加测试会话及执行事实。
+    /// 并发与取消：异步等待 Host 终态，沿用测试路由取消语义。
+    /// 权限：仅使用隔离 fixture，不访问真实用户会话。
+    /// 关联：goal_review_tests 与 Goal 原有回归。Stability: experimental。
+    pub(super) async fn goal_send(
         app: &Router,
         team: &str,
         conversation: &str,

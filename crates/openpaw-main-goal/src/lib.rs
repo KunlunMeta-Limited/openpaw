@@ -90,6 +90,33 @@ struct GoalRecord {
     observations: Vec<Observation>,
     #[serde(default)]
     evidence: Vec<Evidence>,
+    #[serde(default)]
+    review: Option<PlanReview>,
+}
+
+/// 功能：绑定后端固定审核与真实计划更新，不携带可恢复的执行许可。
+/// 数据边界：由Goal保存，Host只读取并向原问答通道展示。
+/// 约束：身份、计划全文与问题一旦入队不可由模型改写；Stability: experimental。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PlanReview {
+    /// 功能：当前Goal身份。
+    pub goal_id: String,
+    /// 功能：需要明确批准的完整计划版本。
+    pub plan_version: u64,
+    /// 功能：原活动回合身份。
+    pub turn_id: String,
+    /// 功能：原真实用户消息身份。
+    pub source_user_message_id: String,
+    /// 功能：提交计划的模型响应序号。
+    pub response_index: usize,
+    /// 功能：真实goal_update调用身份，不是模型可指定的新调用。
+    pub tool_call_id: String,
+    /// 功能：引擎应先可靠展示的完整规范计划。
+    pub plan: String,
+    /// 功能：由后端确定的固定问题及选项。
+    pub request: Value,
+    /// 功能：审核记录状态；持久状态不授予执行许可。
+    pub status: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -250,6 +277,7 @@ struct Observation {
     is_error: bool,
 }
 
+#[derive(Clone)]
 struct UserTurn {
     turn_id: String,
     message_id: String,
@@ -257,6 +285,7 @@ struct UserTurn {
     editable: bool,
     executing: bool,
     task_id: Option<String>,
+    main_start: Option<Value>,
 }
 
 /// 功能：承载单个会话的 Goal 事实与当前真实用户回合，不持有 session 强引用。
@@ -475,19 +504,20 @@ impl GoalContext {
     }
 
     /// 功能：在真实子创建前原子预留一个满足依赖的 Goal 任务。
-    /// 参数：task 为可选 Goal Task 编号，attempt 为本次委派唯一身份。
+    /// 参数：task为Goal任务，attempt为唯一尝试，invocation为真实委派调用身份。
     /// 返回：Goal 执行返回独占绑定；普通聊天不绑定。
     /// 错误：普通聊天误带Goal参数时提示移除；缺少许可、未验收依赖、重复绑定或持久化失败时不启动子执行。
     /// 状态：先持久标记 running，未准入或 future 丢弃转 interrupted。
     /// 并发与取消：user→state 锁内核对许可、状态与取消，重复委派只有一项能成功。
     /// 权限：持久 active 或其他子任务 running 不构成执行许可。
-    /// 关联：runtime::run_delegated、GoalDelegation。
+    /// 关联：runtime::run_delegated、GoalDelegation。Stability: experimental。
     pub fn reserve_delegation(
         self: &Arc<Self>,
         task: Option<&str>,
         attempt: &str,
+        invocation: Option<&ToolInvocationContext>,
     ) -> Result<Option<GoalDelegation>, String> {
-        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let mut user = self.user.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !user
             .as_ref()
@@ -504,7 +534,7 @@ impl GoalContext {
             };
         }
         let user = user
-            .as_ref()
+            .as_mut()
             .filter(|user| user.executing)
             .ok_or("本回合没有 Goal 委派执行许可")?;
         self.check_cancelled()?;
@@ -523,8 +553,36 @@ impl GoalContext {
         if question_paused_tasks(goal, &user.turn_id).contains(id) {
             return Err("该分支问答已暂停，等待原聊天用户明确继续，不能同回合重新委派".into());
         }
-        if goal.tasks[index].status != "pending" {
-            return Err("Goal 任务已被启动或已有产出，不能重复委派".into());
+        let transferring = goal.tasks[index].status == "running"
+            && user.task_id.as_deref() == Some(id)
+            && goal.tasks[index].assignee_id.is_none()
+            && goal.tasks[index].delegation_id.is_none()
+            && goal.tasks[index].result.is_empty()
+            && goal.tasks[index].evidence.is_empty()
+            && invocation.is_some_and(|call| {
+                let facts = self.runtime().and_then(|runtime| runtime.execution_facts());
+                let Some(facts) = facts.as_ref().and_then(Value::as_array) else {
+                    return false;
+                };
+                let Some(start) = user.main_start.as_ref().and_then(Value::as_array) else {
+                    return false;
+                };
+                call.turn_id.as_deref() == Some(user.turn_id.as_str())
+                    && facts.len() == start.len() + 1
+                    && facts[..start.len()] == start[..]
+                    && facts.last().is_some_and(|fact| {
+                        fact["kind"] == "tool_start"
+                            && fact["turn_id"] == user.turn_id
+                            && fact["response_index"].as_u64() == Some(call.response_index as u64)
+                            && fact["payload"]["call_id"] == call.tool_call_id
+                            && matches!(
+                                fact["payload"]["name"].as_str(),
+                                Some("start_agent" | "delegate_task")
+                            )
+                    })
+            });
+        if goal.tasks[index].status != "pending" && !transferring {
+            return Err("Goal任务已启动或已有产出，不能重复委派；委派应从pending直接start_agent，不要先start_task。仅本回合尚未开展任何工作的主任务可安全转交。".into());
         }
         if !dependencies_satisfied(&goal.tasks[index], &goal.tasks) {
             return Err("委派任务依赖尚未验收，不能启动".into());
@@ -538,6 +596,10 @@ impl GoalContext {
         let turn_id = user.turn_id.clone();
         self.commit(&next)?;
         *state = next;
+        if transferring {
+            user.task_id = None;
+            user.main_start = None;
+        }
         drop(state);
         // 返回后 runtime 负责准入；不在持有 user 锁时投影或等待子执行。
         Ok(Some(GoalDelegation {
@@ -604,6 +666,25 @@ impl GoalContext {
             .strip_prefix("/goal ")
             .map(str::trim)
             .filter(|s| !s.is_empty() && *s != "continue");
+        if state
+            .records
+            .last()
+            .and_then(|goal| goal.review.as_ref())
+            .is_some_and(|review| {
+                matches!(review.status.as_str(), "queued" | "waiting") && review.turn_id != turn
+            })
+        {
+            let mut next = state.clone();
+            next.records
+                .last_mut()
+                .unwrap()
+                .review
+                .as_mut()
+                .unwrap()
+                .status = "interrupted".into();
+            self.commit(&next)?;
+            *state = next;
+        }
         let current = state.records.last();
         let unfinished =
             current.is_some_and(|goal| goal.phase != "ended" && goal.phase != "completed");
@@ -628,6 +709,7 @@ impl GoalContext {
                     confirmed_version: 0,
                     observations: Vec::new(),
                     evidence: Vec::new(),
+                    review: None,
                 });
                 self.commit(&next)?;
                 *state = next;
@@ -635,8 +717,9 @@ impl GoalContext {
             }
         } else if command == "确认执行"
             && current.is_some_and(|goal| {
-                goal.phase == "draft"
+                matches!(goal.phase.as_str(), "draft" | "paused" | "blocked")
                     && goal.plan_version > 0
+                    && goal.confirmed_version < goal.plan_version
                     && goal.displayed_version == goal.plan_version
             })
         {
@@ -652,6 +735,7 @@ impl GoalContext {
             if current.is_some_and(|goal| {
                 matches!(goal.phase.as_str(), "paused" | "blocked")
                     && goal.confirmed_version > 0
+                    && goal.confirmed_version == goal.plan_version
                     && goal.displayed_version == goal.plan_version
             }) {
                 let mut next = state.clone();
@@ -660,6 +744,12 @@ impl GoalContext {
                 goal.reason = "用户在原聊天显式继续；中断产物必须先复核，已有验收保留".into();
                 self.commit(&next)?;
                 *state = next;
+                None
+            } else if current.is_some_and(|goal| {
+                matches!(goal.phase.as_str(), "draft" | "paused" | "blocked")
+                    && goal.plan_version > goal.confirmed_version
+            }) {
+                // 明确继续未确认计划只开放重新规划；新版本仍必须经过固定审核。
                 None
             } else {
                 Some(
@@ -693,6 +783,7 @@ impl GoalContext {
                     .last()
                     .is_some_and(|goal| goal.phase == "active"),
             task_id: None,
+            main_start: None,
         });
         Ok(reply)
     }
@@ -712,9 +803,225 @@ impl GoalContext {
             return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；人工暂停用manual_pause、明确恢复用manual_resume，携带task_id和user_excerpt引用本轮原文；恢复旧来源任务可解除其替换或拆分任务约束；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。补充条件时可用 recheck_task(task_id,status=pending或blocked,reason) 重检执行阻塞，条件不足仍保持 blocked；这由模型判断，无阻塞证据门槛。人工阻塞不可由普通重检解除。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",self.model_view(json!(goal))));
         }
         if goal.phase != "draft" {
-            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：goal_update(action=start_task,task_id) 后执行工具；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务优先 start_agent(goal_task_id=计划任务编号)，父继续独立工作，需要子结果时 wait_agent(session_id,turn_id)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。人工manual_blocked及其用户来源不可自动解除，continue、重检、移除依赖或新建等价任务均不能绕过；重规划保留原身份、replaces和人工来源，独立工作仍可推进。确实无法推进可 block_task(task_id,reason)，说明原因和所需条件，无工具尝试次数或阻塞证据门槛；受阻依赖等待，独立工作继续。continue 后先重检 blocked 任务，用 recheck_task(task_id,status=pending或blocked,reason) 提交模型判断，仍缺条件保持 blocked，满足才回 pending；人工阻塞不能由普通重检解除。已有原预算和取消约束保持。当前事实：{}",goal.id,self.model_view(json!(goal))));
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：主Agent自己执行才用goal_update(action=start_task,task_id)；委派必须从pending直接start_agent(goal_task_id)，不要先start_task；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务优先 start_agent(goal_task_id=计划任务编号)，父继续独立工作，需要子结果时 wait_agent(session_id,turn_id)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付；读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。人工manual_blocked及其用户来源不可自动解除，continue、重检、移除依赖或新建等价任务均不能绕过；重规划保留原身份、replaces和人工来源，独立工作仍可推进。确实无法推进可 block_task(task_id,reason)，说明原因和所需条件，无工具尝试次数或阻塞证据门槛；受阻依赖等待，独立工作继续。continue 后先重检 blocked 任务，用 recheck_task(task_id,status=pending或blocked,reason) 提交模型判断，仍缺条件保持 blocked，满足才回 pending；人工阻塞不能由普通重检解除。已有原预算和取消约束保持。当前事实：{}",goal.id,self.model_view(json!(goal))));
         }
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
+    }
+
+    fn queue_review(&self, invocation: &ToolInvocationContext) -> Result<(), String> {
+        let mut user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let user = user.as_mut().ok_or("审核缺少真实用户回合")?;
+        // 无调用上下文的旧嵌入入口不伪造工具身份；Host一律使用call_with_context。
+        if invocation.turn_id.is_none() && invocation.tool_call_id.is_empty() {
+            return Ok(());
+        }
+        // 新版本先关闭旧许可；后续绑定或持久化失败也不能沿旧许可交付。
+        user.executing = false;
+        user.editable = false;
+        if invocation.turn_id.as_deref() != Some(user.turn_id.as_str())
+            || invocation.tool_call_id.is_empty()
+        {
+            return Err("计划审核调用不属于当前回合".into());
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        let goal = next.records.last_mut().ok_or("当前没有Goal")?;
+        goal.review = Some(PlanReview {
+            goal_id: goal.id.clone(),
+            plan_version: goal.plan_version,
+            turn_id: user.turn_id.clone(),
+            source_user_message_id: user.message_id.clone(),
+            response_index: invocation.response_index,
+            tool_call_id: invocation.tool_call_id.clone(),
+            plan: render_plan(goal),
+            status: "queued".into(),
+            request: json!({"question":format!("是否执行 Goal 计划 v{}？",goal.plan_version),"description":"完整计划已显示在聊天中。执行只批准这一版本；修改后会再次确认；取消保留历史并结束目标。也可通过其他需求填写修改要求。","options":[{"id":"execute","label":"执行","description":""},{"id":"modify","label":"修改","description":""},{"id":"cancel","label":"取消","description":""}]}),
+        });
+        self.commit(&next)?;
+        *state = next;
+        Ok(())
+    }
+
+    /// 功能：读取本回合尚待安排的唯一计划审核。
+    /// 参数：无。
+    /// 返回：当前真实回合的入队审核副本，无待审核时为空。
+    /// 错误：无。
+    /// 状态：只读，不标记展示或授予许可。
+    /// 并发与取消：短锁，已取消回合不返回审核。
+    /// 权限：不接受模型提供的问题或版本。
+    /// 关联：Host工具批次协调；Stability: experimental。
+    pub fn pending_review(&self) -> Option<PlanReview> {
+        if self.check_cancelled().is_err() {
+            return None;
+        }
+        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let review = state.records.last()?.review.as_ref()?;
+        (review.status == "queued"
+            && user
+                .as_ref()
+                .is_some_and(|user| user.turn_id == review.turn_id))
+        .then(|| review.clone())
+    }
+
+    /// 功能：在引擎可靠发布完整计划后登记该版本已展示。
+    /// 参数：review为本回合原始审核绑定。
+    /// 返回：审核进入等待状态。
+    /// 错误：版本、调用或回合改变，取消及保存失败时拒绝。
+    /// 状态：只提交展示事实，不授权。
+    /// 并发与取消：不跨异步锁，等待前核对原取消信号。
+    /// 权限：仅由可信协调器在发布成功后调用。
+    /// 关联：TurnInteraction；Stability: experimental。
+    pub fn review_displayed(&self, review: &PlanReview) -> Result<(), String> {
+        self.check_cancelled()?;
+        let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        if !user
+            .as_ref()
+            .is_some_and(|user| user.turn_id == review.turn_id)
+        {
+            return Err("审核回合已结束".into());
+        }
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        let goal = next.records.last_mut().ok_or("审核目标已失效")?;
+        if goal.id != review.goal_id
+            || goal.plan_version != review.plan_version
+            || goal.review.as_ref().is_none_or(|saved| {
+                saved.tool_call_id != review.tool_call_id || saved.status != "queued"
+            })
+        {
+            return Err("审核计划或展示已改变".into());
+        }
+        goal.displayed_version = review.plan_version;
+        goal.review.as_mut().unwrap().status = "waiting".into();
+        self.commit(&next)?;
+        *state = next;
+        Ok(())
+    }
+
+    /// 功能：按已可靠保存的真实问题结果结算固定计划审核。
+    /// 参数：review为原绑定，record为唯一writer确认后的问答事实，缺失表示中断。
+    /// 返回：execute、custom、modify、cancel或paused，供原回合继续或暂停。
+    /// 错误：旧版本、跨回合、伪造问题、取消或保存失败均不授权。
+    /// 状态：只执行execute授予当前版本许可；custom只开放规划。
+    /// 并发与取消：短锁提交，取消子任务在释放Goal锁后进行。
+    /// 权限：普通提问及自定义执行文字均不能授予许可。
+    /// 关联：Host审核协调器；Stability: experimental。
+    pub fn settle_review(
+        &self,
+        review: &PlanReview,
+        record: Option<&openpaw_core::user_input::UserQuestionRecord>,
+    ) -> Result<String, String> {
+        self.check_cancelled()?;
+        let mut user_guard = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next_user = user_guard
+            .as_ref()
+            .filter(|user| {
+                user.turn_id == review.turn_id && user.message_id == review.source_user_message_id
+            })
+            .cloned()
+            .ok_or("审核回合归属已失效")?;
+        let user = &mut next_user;
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut next = state.clone();
+        let goal = next.records.last_mut().ok_or("审核目标已失效")?;
+        if goal.id != review.goal_id
+            || goal.plan_version != review.plan_version
+            || goal.displayed_version != review.plan_version
+            || goal.review.as_ref().is_none_or(|saved| {
+                saved.status != "waiting" || saved.tool_call_id != review.tool_call_id
+            })
+        {
+            return Err("审核版本已过期或已经处理".into());
+        }
+        let mut answer = None;
+        if let Some(record) = record {
+            if record.scope.asking_session_id != self.owner
+                || record.scope.parent_session_id != self.owner
+                || record.scope.source_user_message_id != review.source_user_message_id
+                || record.turn_id != review.turn_id
+                || record.response_index != review.response_index
+                || record.tool_call_id != review.tool_call_id
+                || record.question_id
+                    != format!(
+                        "{}/{}/{}/{}",
+                        self.owner, review.turn_id, review.response_index, review.tool_call_id
+                    )
+                || serde_json::to_value(&record.request).ok() != Some(review.request.clone())
+                || !openpaw_core::user_input::UserQuestionState::Answered.eq(&record.state)
+            {
+                return Err("计划审核回答归属无效".into());
+            }
+            answer = record.answer.as_ref();
+        }
+        let action = answer.map_or("paused", |answer| answer.choice_id.as_str());
+        match action {
+            "execute"
+                if answer.is_some_and(|answer| {
+                    answer.label == "执行" && answer.custom_text.is_none()
+                }) =>
+            {
+                goal.confirmed_version = goal.plan_version;
+                goal.phase = "active".into();
+                user.executing = true;
+            }
+            "custom"
+                if answer
+                    .and_then(|answer| answer.custom_text.as_deref())
+                    .is_some_and(|text| !text.trim().is_empty()) =>
+            {
+                user.text = answer.unwrap().custom_text.clone().unwrap();
+                user.editable = true;
+                goal.phase = if goal.confirmed_version > 0 {
+                    "paused"
+                } else {
+                    "draft"
+                }
+                .into();
+            }
+            "modify"
+                if answer.is_some_and(|answer| {
+                    answer.label == "修改" && answer.custom_text.is_none()
+                }) =>
+            {
+                goal.phase = if goal.confirmed_version > 0 {
+                    "paused"
+                } else {
+                    "draft"
+                }
+                .into();
+            }
+            "paused" if answer.is_none() => {
+                goal.phase = if goal.confirmed_version > 0 {
+                    "paused"
+                } else {
+                    "draft"
+                }
+                .into();
+            }
+            "cancel"
+                if answer.is_some_and(|answer| {
+                    answer.label == "取消" && answer.custom_text.is_none()
+                }) =>
+            {
+                goal.phase = "ended".into();
+            }
+            _ => return Err("审核答案无效，未批准执行".into()),
+        }
+        goal.review.as_mut().unwrap().status = action.into();
+        goal.reason = format!("用户计划审核：{action}，版本{}", review.plan_version);
+        goal.history.push(json!({"action":"plan_review","plan_version":review.plan_version,"turn_id":review.turn_id,"tool_call_id":review.tool_call_id,"decision":action}));
+        self.commit(&next)?;
+        *state = next;
+        *user_guard = Some(next_user);
+        drop(state);
+        drop(user_guard);
+        if action == "cancel" {
+            if let Some(runtime) = self.runtime() {
+                runtime.cancel_children();
+            }
+        }
+        Ok(action.into())
     }
 
     fn read(&self) -> Value {
@@ -732,6 +1039,9 @@ impl GoalContext {
 
     // 模型只使用当前计划和可回读事实；完整read/current继续供持久化和Office。
     fn model_view(&self, mut value: Value) -> Value {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("review");
+        }
         if !value["id"].is_string() {
             return value;
         }
@@ -1274,6 +1584,7 @@ impl GoalContext {
         *state = next;
         if action == "start_task" || (action == "recheck_task" && input["status"] == "produced") {
             user.task_id = input["task_id"].as_str().map(str::to_owned);
+            user.main_start = self.runtime().and_then(|runtime| runtime.execution_facts());
         }
         if action == "recheck_task"
             && input["status"] == "pending"
@@ -1495,12 +1806,32 @@ impl GoalContext {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|user| user.editable);
+        let turn = self
+            .user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|user| user.turn_id.clone());
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .records
             .last()
-            .filter(|goal| goal.plan_version > 0 && (goal.phase == "draft" || editing))
+            .filter(|goal| {
+                goal.plan_version > 0
+                    && (goal.phase == "draft"
+                        || editing
+                        || goal
+                            .review
+                            .as_ref()
+                            .is_some_and(|review| review.status == "queued"))
+                    && !(goal.phase != "ended"
+                        && goal.displayed_version == goal.plan_version
+                        && goal.review.as_ref().is_some_and(|review| {
+                            review.status != "queued"
+                                && Some(review.turn_id.as_str()) == turn.as_deref()
+                        }))
+            })
             .map(render_plan)
     }
 
@@ -1513,6 +1844,9 @@ impl GoalContext {
     /// 权限：不产生执行许可。
     /// 关联：初始确认必须绑定最近展示版本。
     pub fn displayed(&self) -> Result<(), String> {
+        if self.presentation().is_none() {
+            return Ok(());
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut next = state.clone();
         if let Some(goal) = next
@@ -1537,6 +1871,18 @@ impl GoalContext {
     /// 关联：ToolHostValidator与ToolExecutor双重检查；新派发和只读等待。Stability: experimental。
     pub fn allowed(&self, name: &str) -> Result<(), String> {
         let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
+        if self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .records
+            .last()
+            .and_then(|goal| goal.review.as_ref())
+            .is_some_and(|review| matches!(review.status.as_str(), "queued" | "waiting"))
+            && !matches!(name, "goal_read" | "get_agent_status" | "wait_agent")
+        {
+            return Err("当前计划版本正在等待固定审核，尚未批准执行或再次修改".into());
+        }
         let editing = user.as_ref().is_some_and(|user| user.editable);
         let executing = user.as_ref().is_some_and(|user| user.executing);
         if executing {
@@ -1999,6 +2345,8 @@ fn render_plan(goal: &GoalRecord) -> String {
         goal.reason,
         if goal.phase == "ended" {
             "此 Goal 已明确结束，历史保留；未标记为验收完成。"
+        } else if goal.plan_version > goal.confirmed_version {
+            "当前版本尚未批准交付，请通过确认菜单选择执行／修改／取消。可以在原聊天补充修改要求；菜单失效后可回复“确认执行”。/goal continue 不会跳过新版本确认。"
         } else if goal.confirmed_version > 0 {
             "Goal 已停止，修改要求没有恢复交付。核对后请在原聊天发送 /goal continue；中断任务先复核真实产物。"
         } else {
@@ -2065,7 +2413,15 @@ impl ToolExecutor for GoalToolHost {
         }
         let value = match name {
             "goal_read" => Ok(self.context.read()),
-            "goal_update" => self.context.update(args),
+            "goal_update" => {
+                let plan_change = matches!(args["action"].as_str(), Some("set_plan" | "replan"));
+                self.context.update(args).and_then(|value| {
+                    if plan_change {
+                        self.context.queue_review(context)?;
+                    }
+                    Ok(value)
+                })
+            }
             _ => {
                 let mut outcome = self
                     .inner
@@ -2186,6 +2542,7 @@ mod tests {
     struct RecordingRuntime {
         events: Mutex<Vec<SessionEvent>>,
         cancelled: AtomicBool,
+        facts: Mutex<Vec<Value>>,
     }
 
     impl GoalRuntime for RecordingRuntime {
@@ -2200,7 +2557,7 @@ mod tests {
             self.cancelled.load(Ordering::SeqCst)
         }
         fn execution_facts(&self) -> Option<Value> {
-            None
+            Some(json!(*self.facts.lock().unwrap()))
         }
         fn cancel_children(&self) {}
         fn project(&self, _goal: Value) {}
@@ -2245,6 +2602,192 @@ mod tests {
             .begin("turn-execute", "message-execute", "确认执行")
             .unwrap();
         (context, runtime)
+    }
+
+    #[test]
+    fn main_task_without_work_can_transfer_once_but_started_work_cannot() {
+        for started_work in [false, true] {
+            let (context, runtime) = confirmed_goal();
+            let goal = context.current().unwrap();
+            context.update(json!({"action":"start_task","goal_id":goal["id"],"expected_version":1,"task_id":"report","reason":"开始当前任务"})).unwrap();
+            if started_work {
+                runtime.facts.lock().unwrap().push(json!({"turn_id":"turn-execute","sequence":10,"kind":"tool_start","payload":{"name":"write_file","call_id":"work"}}));
+            }
+            let invocation = openpaw_core::ToolInvocationContext {
+                turn_id: Some("turn-execute".into()),
+                response_index: 1,
+                tool_call_id: "dispatch".into(),
+            };
+            runtime.facts.lock().unwrap().push(json!({"turn_id":"turn-execute","response_index":1,"kind":"tool_start","payload":{"name":"start_agent","call_id":"dispatch"}}));
+            let result =
+                context.reserve_delegation(Some("report"), "attempt-transfer", Some(&invocation));
+            if started_work {
+                assert!(result.is_err(), "已开始的工作不得重复派发");
+            } else {
+                let binding = result.expect("尚未开展工作的主任务应能原子转交").unwrap();
+                assert!(context
+                    .reserve_delegation(Some("report"), "attempt-duplicate", None)
+                    .is_err());
+                binding.bind("real-child", "child-workspace").unwrap();
+                assert_eq!(
+                    context.current().unwrap()["tasks"][0]["assignee_id"],
+                    "real-child"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_review_binds_version_and_only_explicit_execute_grants_permission() {
+        for choice in [
+            "execute",
+            "modify",
+            "cancel",
+            "custom",
+            "paused",
+            "failed-save",
+            "cancelled",
+        ] {
+            let (context, runtime) = confirmed_goal();
+            let goal = context.current().unwrap();
+            let host = GoalToolHost::new(Arc::new(NullToolHost), context.clone());
+            let invocation = openpaw_core::ToolInvocationContext {
+                turn_id: Some("turn-execute".into()),
+                response_index: 2,
+                tool_call_id: "new-plan".into(),
+            };
+            let outcome = ready(host.call_with_context("goal_update",json!({"action":"replan","goal_id":goal["id"],"expected_version":1,"reason":"重规划","tasks":[{"id":"report","title":"生成报告","expected_result":"report.txt","acceptance_criteria":["内容完整"],"dependencies":[]}]}),&invocation)).unwrap();
+            assert!(!outcome.is_error, "{}", outcome.content);
+            assert!(!context.is_execution_turn());
+            assert!(context.allowed("start_agent").is_err());
+            assert!(
+                context.allowed("goal_update").is_err(),
+                "不得跳过尚待审核的版本"
+            );
+            let review = context.pending_review().unwrap();
+            assert_eq!(review.plan_version, 2);
+            context.review_displayed(&review).unwrap();
+            let answer_choice = if matches!(choice, "failed-save" | "cancelled") {
+                "execute"
+            } else {
+                choice
+            };
+            let record: openpaw_core::user_input::UserQuestionRecord = serde_json::from_value(json!({
+                "question_id":"session-a/turn-execute/2/new-plan","scope":{"parent_session_id":"session-a","asking_session_id":"session-a","source_user_message_id":"message-execute"},
+                "turn_id":"turn-execute","response_index":2,"tool_call_id":"new-plan","request":review.request,"state":"answered","generation":1,"display_id":"review-1","deadline_ms":9999999999999i64,
+                "answer":{"choice_id":answer_choice,"label":match answer_choice {"execute"=>"执行","modify"=>"修改","cancel"=>"取消",_=>"其他"},"custom_text":if choice=="custom" {json!("执行")} else {Value::Null}},"reason":null,
+            })).unwrap();
+            let mut wrong = record.clone();
+            wrong.scope.asking_session_id = "another-session".into();
+            assert!(context.settle_review(&review, Some(&wrong)).is_err());
+            let mut stale = review.clone();
+            stale.plan_version -= 1;
+            assert!(
+                context.settle_review(&stale, Some(&record)).is_err(),
+                "旧版本答案不得授权当前版本"
+            );
+            if choice == "failed-save" {
+                context.attach(Arc::new(UnavailableRuntime));
+            }
+            if choice == "cancelled" {
+                runtime.cancelled.store(true, Ordering::SeqCst);
+            }
+            let result = context.settle_review(&review, (choice != "paused").then_some(&record));
+            if matches!(choice, "failed-save" | "cancelled") {
+                assert!(result.is_err());
+                assert!(!context.is_execution_turn());
+                continue;
+            }
+            assert_eq!(result.unwrap(), choice);
+            assert_eq!(
+                context.is_execution_turn(),
+                choice == "execute",
+                "自定义执行文字不能自授权"
+            );
+            assert!(
+                context.settle_review(&review, Some(&record)).is_err(),
+                "重复答案不得重复接续"
+            );
+        }
+    }
+
+    #[test]
+    fn final_budget_replan_displays_full_plan_before_next_turn_confirmation() {
+        let (context, _) = confirmed_goal();
+        let host = GoalToolHost::new(Arc::new(NullToolHost), context.clone());
+        let goal = context.current().unwrap();
+        let invocation = openpaw_core::ToolInvocationContext {
+            turn_id: Some("turn-execute".into()),
+            response_index: 9,
+            tool_call_id: "last-budget-plan".into(),
+        };
+        let outcome = ready(host.call_with_context("goal_update", json!({
+            "action":"replan", "goal_id":goal["id"], "expected_version":1,
+            "reason":"最后一轮调整", "tasks":[{"id":"report", "title":"更新报告",
+                "expected_result":"report.txt", "acceptance_criteria":["新内容完整"], "dependencies":[]}]
+        }), &invocation)).unwrap();
+        assert!(!outcome.is_error, "{}", outcome.content);
+        let presentation = context
+            .presentation()
+            .expect("预算耗尽仍须展示待审核的完整新版本");
+        assert!(presentation.contains("新内容完整"));
+        assert_eq!(context.current().unwrap()["displayed_version"], 1);
+        context.displayed().unwrap();
+        assert_eq!(context.current().unwrap()["displayed_version"], 2);
+        context.finish();
+        context
+            .begin("turn-after-budget", "after-budget", "确认执行")
+            .unwrap();
+        assert!(context.is_execution_turn());
+    }
+
+    #[test]
+    fn missing_plan_presentation_cannot_mark_new_version_displayed() {
+        let (context, runtime) = confirmed_goal();
+        let goal = context.current().unwrap();
+        context.update(json!({"action":"replan", "goal_id":goal["id"], "expected_version":1,
+            "reason":"审核保存前更新", "tasks":[{"id":"report", "title":"更新报告",
+            "expected_result":"report.txt", "acceptance_criteria":["新内容完整"], "dependencies":[]}]})).unwrap();
+        context.attach(Arc::new(UnavailableRuntime));
+        assert!(context
+            .queue_review(&openpaw_core::ToolInvocationContext {
+                turn_id: Some("turn-execute".into()),
+                response_index: 9,
+                tool_call_id: "failed-review".into()
+            })
+            .is_err());
+        context.attach(runtime);
+        assert!(context.presentation().is_none());
+        context.displayed().unwrap();
+        assert_eq!(
+            context.current().unwrap()["displayed_version"],
+            1,
+            "未展示的新版本不得标记为可文字确认"
+        );
+        context.finish();
+        context
+            .begin("next-turn", "next-message", "确认执行")
+            .unwrap();
+        assert!(!context.is_execution_turn());
+    }
+
+    #[test]
+    fn failed_review_queue_closes_prior_execution_permission() {
+        let (context, _) = confirmed_goal();
+        assert!(context.is_execution_turn());
+        context.attach(Arc::new(UnavailableRuntime));
+        assert!(context
+            .queue_review(&openpaw_core::ToolInvocationContext {
+                turn_id: Some("turn-execute".into()),
+                response_index: 1,
+                tool_call_id: "new-plan".into()
+            })
+            .is_err());
+        assert!(!context.is_execution_turn());
+        assert!(context.allowed("write_file").is_err());
+        assert!(context
+            .reserve_delegation(Some("report"), "attempt-after-failed-queue", None)
+            .is_err());
     }
 
     struct DelegationTools;
@@ -2303,11 +2846,11 @@ mod tests {
             }
         }
         assert!(context
-            .reserve_delegation(None, "ordinary-attempt")
+            .reserve_delegation(None, "ordinary-attempt", None)
             .unwrap()
             .is_none());
         let reason = context
-            .reserve_delegation(Some("invented"), "invalid-attempt")
+            .reserve_delegation(Some("invented"), "invalid-attempt", None)
             .err()
             .unwrap();
         assert!(
@@ -2334,9 +2877,9 @@ mod tests {
         tools = cached.clone();
         context.filter_tools(&mut tools);
         assert!(tools.iter().all(|spec| spec.name == "get_agent_status"));
-        assert!(context.reserve_delegation(None, "bypass").is_err());
+        assert!(context.reserve_delegation(None, "bypass", None).is_err());
         assert!(context
-            .reserve_delegation(Some("report"), "no-permission")
+            .reserve_delegation(Some("report"), "no-permission", None)
             .is_err());
         context
             .begin("continue-turn", "continue-message", "/goal continue")
@@ -2357,7 +2900,7 @@ mod tests {
         let (context, runtime) = confirmed_goal();
         runtime.cancelled.store(true, Ordering::SeqCst);
         let error = context
-            .reserve_delegation(Some("report"), "attempt-a")
+            .reserve_delegation(Some("report"), "attempt-a", None)
             .err()
             .unwrap();
         assert!(error.contains("取消"), "{error}");

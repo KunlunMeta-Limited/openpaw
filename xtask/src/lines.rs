@@ -25,10 +25,12 @@ const CRATE_CAPS: &[(&str, usize)] = &[
     ("openpaw-reflect-lite", 3_000),
     // 用户于 2026-10-26 授权按当前实现规模调整 Host 预算，保留约 584 行余量。
     // CHG-2026-0054：2026-10-28用户批准问答与非阻塞委派的Host上限15000，其余额度及计数不变。
-    ("openpaw-engine-host", 15_000),
+    // CHG-2026-0056：用户在实测15158行后批准Host15400，计数规则与其余cap不变。
+    ("openpaw-engine-host", 15_400),
     ("openpaw-goal-ledger", 2_000),
     // CHG-2026-0050：用户批准完整主聊天 Goal module 提取，单列新增额度，既有上限与算法不变。
-    ("openpaw-main-goal", 2_200),
+    // CHG-2026-0056：用户在实测2472行后批准Goal2600，保留固定审核及权限保护。
+    ("openpaw-main-goal", 2_600),
     // Local sandbox (plan section 3.4 budget lives in the tools domain; the
     // crate is standalone for the crate-level unsafe allowance, D-9).
     ("openpaw-sandbox", 4_500),

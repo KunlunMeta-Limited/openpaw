@@ -2502,7 +2502,7 @@ mod goal_question_tests {
                 tokio::time::timeout(Duration::from_secs(5), async {
                     loop {
                         if questions.lock().await.iter().any(|m| {
-                            m["type"] == "decision.request" && m["decision"]["kind"] == "choice"
+                            m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式" && m["decision"]["kind"] == "choice"
                         }) {
                             break;
                         }
@@ -2743,7 +2743,7 @@ mod goal_question_tests {
                     .lock()
                     .await
                     .iter()
-                    .any(|m| m["type"] == "decision.request" && m["decision"]["kind"] == "choice")
+                    .any(|m| m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式" && m["decision"]["kind"] == "choice")
                     && fixture.workspace.path().join("b.txt").exists()
                 {
                     break;
@@ -2762,7 +2762,7 @@ mod goal_question_tests {
                     .lock()
                     .await
                     .iter()
-                    .any(|m| m["type"] == "decision.request" && m["decision"]["kind"] == "choice")
+                    .any(|m| m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式" && m["decision"]["kind"] == "choice")
                 {
                     break;
                 }
@@ -2818,12 +2818,12 @@ mod goal_question_tests {
             .lock()
             .await
             .iter()
-            .filter(|m| m["type"] == "decision.request")
+            .filter(|m| m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式")
             .count();
         for phase in ["queued", "waiting", "answered"] {
             for startup in [false, true] {
                 let home = restart_question_tests::snapshot(&fixture, &id, |event| {
-                    event["type"] == "user_question_v1" && event["record"]["state"] == phase
+                    event["type"] == "user_question_v1" && event["record"]["state"] == phase && event["record"]["request"]["question"] == "请选择交付方式"
                 });
                 let state = restart_question_tests::rebuild(&fixture, home.path());
                 if startup {
@@ -2875,7 +2875,7 @@ mod goal_question_tests {
                 .lock()
                 .await
                 .iter()
-                .filter(|m| m["type"] == "decision.request")
+                .filter(|m| m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式")
                 .count(),
             cards
         );
@@ -2919,7 +2919,7 @@ mod goal_question_tests {
             if !answered {
                 assert_eq!(
                     fixture.model_seen.lock().await.len(),
-                    6,
+                    5,
                     "受控暂停后不请求下一轮模型"
                 );
             }
@@ -2978,7 +2978,7 @@ mod goal_question_tests {
                 .lock()
                 .await
                 .iter()
-                .filter(|m| m["type"] == "decision.request")
+                .filter(|m| m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式")
                 .count(),
             1
         );
@@ -3084,7 +3084,7 @@ mod goal_question_tests {
                     .await
                     .iter()
                     .filter(|m| {
-                        m["type"] == "decision.request" && m["decision"]["kind"] == "choice"
+                        m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式" && m["decision"]["kind"] == "choice"
                     })
                     .count()
                     == 2
@@ -3154,7 +3154,7 @@ mod goal_question_tests {
                     .lock()
                     .await
                     .iter()
-                    .filter(|m| m["type"] == "decision.request")
+                    .filter(|m| m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式")
                     .count(),
                 1
             );
@@ -3226,7 +3226,7 @@ mod goal_question_tests {
                 .lock()
                 .await
                 .iter()
-                .filter(|m| m["type"] == "decision.request")
+                .filter(|m| m["type"] == "decision.request" && m["decision"]["title"] == "请选择交付方式")
                 .count(),
             1,
             "规划阶段应真实提问"

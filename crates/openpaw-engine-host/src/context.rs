@@ -423,7 +423,7 @@ pub(crate) fn validated_questions(
     let parent = crate::runtime::session_child(events)
         .map_or_else(|| owner.to_owned(), |child| child.parent_id);
     let mut records: Vec<UserQuestionRecord> = Vec::new();
-    for event in events {
+    for (event_index, event) in events.iter().enumerate() {
         let SessionEvent::Unknown(value) = event else {
             continue;
         };
@@ -434,6 +434,26 @@ pub(crate) fn validated_questions(
         else {
             continue;
         };
+        let review = events[..event_index].iter().rev().find_map(|event| {
+            let SessionEvent::Unknown(value) = event else {
+                return None;
+            };
+            if value["type"] != "session_goal_state_v1" || value["owner"] != owner {
+                return None;
+            }
+            let goal = value["state"]["records"].as_array()?.last()?;
+            let review = &goal["review"];
+            (review["turn_id"] == record.turn_id
+                && review["response_index"] == record.response_index
+                && review["tool_call_id"] == record.tool_call_id
+                && review["source_user_message_id"] == record.scope.source_user_message_id
+                && review["goal_id"] == goal["id"]
+                && review["plan_version"] == goal["plan_version"]
+                && goal["displayed_version"] == goal["plan_version"]
+                && review["status"] == "waiting"
+                && Some(review["request"].clone()) == serde_json::to_value(&record.request).ok())
+            .then(|| review.clone())
+        });
         if record.scope.asking_session_id != owner
             || record.scope.parent_session_id != parent
             || !openpaw_engine::user_input::validate_question_record(&record)
@@ -444,11 +464,25 @@ pub(crate) fn validated_questions(
                     && r.response_index == record.response_index
                     && r.kind == "tool_start"
                     && r.payload["call_id"] == record.tool_call_id
-                    && r.payload["name"] == "request_user_input"
-                    && serde_json::from_value::<UserQuestionRequest>(r.payload["input"].clone())
+                    && ((r.payload["name"] == "request_user_input"
+                        && serde_json::from_value::<UserQuestionRequest>(
+                            r.payload["input"].clone(),
+                        )
                         .ok()
                         .and_then(|input| serde_json::to_value(input).ok())
-                        == serde_json::to_value(&record.request).ok()
+                            == serde_json::to_value(&record.request).ok())
+                        || (r.payload["name"] == "goal_update"
+                            && review.as_ref().is_some_and(|review| {
+                                r.payload["input"]["goal_id"] == review["goal_id"]
+                                    && matches!(
+                                        r.payload["input"]["action"].as_str(),
+                                        Some("set_plan" | "replan")
+                                    )
+                                    && r.payload["input"]["expected_version"]
+                                        .as_u64()
+                                        .and_then(|version| version.checked_add(1))
+                                        == review["plan_version"].as_u64()
+                            })))
             })
         {
             continue;

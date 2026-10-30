@@ -2072,6 +2072,7 @@ mod tests {
     include!("http/goal_tests.rs");
     include!("http/context_tests.rs");
     include!("http/user_input_tests.rs");
+    include!("http/goal_review_tests.rs");
     use axum::body::to_bytes;
     use axum::extract::State;
     use axum::response::IntoResponse;
@@ -2185,6 +2186,7 @@ mod tests {
         let model_seen = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
         let gateway_seen = seen.clone();
         let models = model_seen.clone();
+        let review_models = model_seen.clone();
         let question_seen = seen.clone();
         let release_model = Arc::new(tokio::sync::Notify::new());
         let model_gate = release_model.clone();
@@ -2198,10 +2200,18 @@ mod tests {
             let actions = gateway_actions.clone();
             let question_gate = question_gate.clone();
             let display = gateway_display.clone();
+            let review_models = review_models.clone();
             async move {
                 assert_eq!(headers[header::AUTHORIZATION],"Bearer fixture-gateway-key");
                 seen.lock().await.push(body.clone());
                 let _visible = display.track(&body);
+                if body["type"] == "decision.request" && body["decision"]["title"].as_str().is_some_and(|title|title.starts_with("是否执行 Goal 计划 v")) {
+                    if choice == "held-review" { question_gate.notified().await; }
+                    let count = seen.lock().await.iter().filter(|m|m["type"] == "decision.request" && m["decision"]["title"].as_str().is_some_and(|title|title.starts_with("是否执行 Goal 计划 v"))).count();
+                    let executing = review_models.lock().await.last().and_then(|request|request["messages"].as_array()).and_then(|messages|messages.iter().rev().find(|m|m["role"]=="user" && !m["content"].as_str().unwrap_or("").starts_with("用户") && !m["content"].as_str().unwrap_or("").starts_with("Goal 仍有"))).and_then(|m|m["content"].as_str()).is_some_and(|text|text == "确认执行" || text == "/goal continue");
+                    let selected = if scenario.starts_with("goal-menu-") {choice} else if executing {"execute"} else {"modify"};
+                    return goal_review_tests::decision_response(&body,selected,count);
+                }
                 if scenario.starts_with("question-recovery") && body["type"] == "decision.request" {
                     return display.response(&body).await;
                 }
@@ -2216,7 +2226,7 @@ mod tests {
                 }
                 display.before_read(&body).await;
                 let data = match body["type"].as_str() {
-                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("question-") || scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute"|"goal-replan") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
+                    Some("office.capabilities") => serde_json::json!({"scene":{"actors":[]},"ui":{},"requests":if scenario.starts_with("question-") || scenario.starts_with("goal-menu-") || scenario.starts_with("delegate-conversations") || matches!(scenario,"goal-isolation"|"goal-execute"|"goal-replan"|"goal-review"|"goal-delegate"|"goal-manual") {serde_json::json!({"snapshot":{"properties":{"conversations":{}}}})}else{serde_json::json!({})},"responses":{"success":{},"error":{}}}),
                     Some("office.read") if body["teamId"].is_string() => {
                         let messages = seen.lock().await;
                         let snapshot = if scenario.starts_with("goal-") {
@@ -2270,6 +2280,14 @@ mod tests {
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("goal-menu-") { return goal_review_tests::model_response(&body,scenario); }
+                // 旧脚本按真实用户输入定位步骤；Host审核事实不是新的人类消息。
+                // model_seen保留原始请求，下面仅调整本地脚本的步骤定位副本。
+                let mut body = body;
+                if let Some(messages) = body["messages"].as_array_mut() {
+                    messages.retain(|message| !(message["role"] == "user" && message["content"].as_str().is_some_and(|text|
+                        text.starts_with("用户已明确批准刚展示的当前计划版本。") || text.starts_with("用户通过该版本审核提出修改要求"))));
+                }
                 if scenario.starts_with("question-history") {
                     return history_question_tests::model_response(&body, &gate).await;
                 }
@@ -2314,7 +2332,7 @@ mod tests {
                     if scenario == "goal-agent-error" && messages[latest]["content"] == "确认执行" && tools == 8 {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    if messages[latest]["content"] == "确认执行" && tools == if scenario == "goal-resume-produced" {9} else {8} {
+                    if messages[latest]["content"] == "确认执行" && messages.iter().filter(|m|m["role"]=="user" && m["content"]=="确认执行").count() == 1 && tools == if scenario == "goal-resume-produced" {9} else {8} {
                         gate.notified().await;
                     }
                     if scenario == "goal-resume-late" && messages[latest]["content"] == "/goal continue" && tools == 0 {
@@ -2542,7 +2560,18 @@ mod tests {
             Some(format!("http://{address}")),
         );
         state.office.attach_main(&state.main_office);
-        if scenario.starts_with("question-") {
+        if scenario.starts_with("question-")
+            || scenario.starts_with("goal-menu-")
+            || matches!(
+                scenario,
+                "goal-isolation"
+                    | "goal-execute"
+                    | "goal-replan"
+                    | "goal-review"
+                    | "goal-delegate"
+                    | "goal-manual"
+            )
+        {
             state
                 .main_office
                 .message(
@@ -5765,6 +5794,19 @@ Path('exclusive').rmdir()
             .filter(|event| event["kind"] == "task.assigned")
             .collect();
         assert_eq!(assignments.len(), 1);
+        let dispatches: Vec<_> = seen
+            .iter()
+            .filter(|message| {
+                message["command"]["capability"] == "office.visit"
+                    && message["command"]["participants"][0]["entityId"] == "office-lead"
+                    && message["command"]["participants"][1]["entityId"] != "office-lead"
+            })
+            .collect();
+        assert_eq!(
+            dispatches.len(),
+            1,
+            "真实子执行必须发送一次主到子的派工交接"
+        );
         assert!(seen
             .iter()
             .any(|message| message["command"]["capability"] == "office.visit"
@@ -5824,6 +5866,13 @@ Path('exclusive').rmdir()
         assert_eq!(
             seen.iter()
                 .filter(|message| message["command"]["capability"] == "office.visit")
+                .count(),
+            6
+        );
+        assert_eq!(
+            seen.iter()
+                .filter(|message| message["command"]["capability"] == "office.visit"
+                    && message["command"]["participants"][0]["entityId"] == "office-lead")
                 .count(),
             3
         );

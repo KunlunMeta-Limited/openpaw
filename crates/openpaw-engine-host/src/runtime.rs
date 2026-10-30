@@ -947,9 +947,11 @@ impl AppState {
             } else {
                 None
             };
-            let mut goal_binding = parent
-                .goal
-                .reserve_delegation(goal_task_id.as_deref(), &child.workspace_id)?;
+            let mut goal_binding = parent.goal.reserve_delegation(
+                goal_task_id.as_deref(),
+                &child.workspace_id,
+                origin.as_ref().map(|(_, context, _)| context),
+            )?;
             let handle = if let Some(id) = task_id {
                 let handle = state
                     .get_typed(&id)
@@ -3996,13 +3998,12 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) ->
         provider_tools.extend(crate::goal::plan_tools());
     }
     handle.goal.filter_tools(&mut provider_tools);
-    let system_prompt = if handle.child.is_some() {
+    let base_prompt = if handle.child.is_some() {
         Some("你是主 Agent 委派的独立子 Agent。只完成任务及明确提供的背景，必要时使用工作区工具；不得再次委派。最终给出供父 Agent 整合的真实结果。".to_string())
     } else {
         let prompts = [
             handle.office.system_prompt(),
             handle.delegation.context_prompt().await,
-            handle.goal.prompt(),
         ]
         .into_iter()
         .flatten()
@@ -4023,7 +4024,13 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) ->
                 &model,
             )
         });
-    let system_prompt = [system_prompt, reliable_prompt]
+    let base_prompt = [base_prompt, reliable_prompt]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let base_prompt = (!base_prompt.is_empty()).then_some(base_prompt);
+    let system_prompt = [base_prompt.clone(), handle.goal.prompt()]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -4244,6 +4251,15 @@ pub(crate) async fn run_turn(handle: Arc<SessionHandle>, turn: ScheduledTurn) ->
                     &provider_tools,
                     &mut sink,
                     TurnOptions {
+                        tool_batch_coordination: handle.child.is_none().then(|| {
+                            crate::goal::review::coordination(
+                                handle.clone(),
+                                handle.goal.clone(),
+                                handle.question.clone(),
+                                handle.session_path.clone(),
+                                base_prompt.clone(),
+                            )
+                        }),
                         end_turn_coordination: Some(handle.delegation.end_turn_coordination()),
                         pause_check: Some(Arc::new(move || question_control.pause_reason())),
                         context_progress: Some(Arc::new(move || {
