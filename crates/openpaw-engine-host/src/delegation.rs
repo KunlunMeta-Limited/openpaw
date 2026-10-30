@@ -258,6 +258,7 @@ impl DelegationContext {
         &self,
         input: DelegateTaskInput,
         synchronous: bool,
+        invocation: Option<openpaw_core::ToolInvocationContext>,
     ) -> openpaw_core::Result<ToolCallOutcome> {
         let task = input.task.trim();
         if task.is_empty() || task.chars().count() > MAX_DELEGATE_TASK_CHARS {
@@ -315,6 +316,17 @@ impl DelegationContext {
                 cancel,
                 self.approvals.clone(),
                 self.slots.clone(),
+                invocation.map(|context| {
+                    (
+                        if synchronous {
+                            "delegate_task"
+                        } else {
+                            "start_agent"
+                        }
+                        .into(),
+                        context,
+                    )
+                }),
             )
             .await
             .map_err(Error::ToolHost)?;
@@ -668,6 +680,23 @@ impl ToolExecutor for DelegatingToolHost {
         name: &str,
         args: serde_json::Value,
     ) -> openpaw_core::Result<ToolCallOutcome> {
+        self.call_with_context(name, args, &openpaw_core::ToolInvocationContext::default())
+            .await
+    }
+    /// 功能：将确切启动调用身份传入真实子回合准入。
+    /// 参数：name、args为原调用，invocation由引擎提供。
+    /// 返回：原工具结果或真实子执行受理。
+    /// 错误：沿用原工具与准入错误。
+    /// 状态：只在可靠准入后保存本次父子来源。
+    /// 并发与取消：不从并发调用次序猜测身份。
+    /// 权限：上下文不授予其他父回合的访问许可。
+    /// 关联：CHG-2026-0054、child_execution_v1。
+    async fn call_with_context(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        invocation: &openpaw_core::ToolInvocationContext,
+    ) -> openpaw_core::Result<ToolCallOutcome> {
         if name == "register_artifact" {
             if !self.context.enabled {
                 return Ok(ToolCallOutcome::error("当前Host未启用Office产物登记"));
@@ -722,7 +751,7 @@ impl ToolExecutor for DelegatingToolHost {
                 .await);
         }
         if !matches!(name, "delegate_task" | "start_agent") {
-            return self.builtin.call(name, args).await;
+            return self.builtin.call_with_context(name, args, invocation).await;
         }
         if !self.context.enabled {
             return Ok(ToolCallOutcome::error(
@@ -737,7 +766,13 @@ impl ToolExecutor for DelegatingToolHost {
                 )))
             }
         };
-        self.context.run(input, name == "delegate_task").await
+        self.context
+            .run(
+                input,
+                name == "delegate_task",
+                invocation.turn_id.as_ref().map(|_| invocation.clone()),
+            )
+            .await
     }
 }
 

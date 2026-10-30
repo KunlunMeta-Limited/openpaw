@@ -2276,6 +2276,9 @@ mod tests {
                 if scenario.starts_with("question-goal") {
                     return goal_question_tests::model_response(&body,scenario,&questions,&gate).await;
                 }
+                if scenario.starts_with("question-restart") {
+                    return restart_question_tests::model_response(&body);
+                }
                 if scenario.starts_with("question-queue") {
                     return question_queue_tests::model_response(&body,&questions,&gate).await;
                 }

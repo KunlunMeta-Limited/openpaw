@@ -906,6 +906,7 @@ impl AppState {
         parent_cancel: CancellationToken,
         parent_approvals: Arc<HostApprovalManager>,
         slots: Arc<tokio::sync::Semaphore>,
+        invocation: Option<(String, openpaw_core::ToolInvocationContext)>,
     ) -> futures::future::BoxFuture<
         'static,
         Result<openpaw_engine::coordination::StartedExecution, String>,
@@ -916,6 +917,35 @@ impl AppState {
                 .get_typed(&child.parent_id)
                 .await
                 .map_err(|_| "父会话不存在或不可读".to_string())?;
+            let origin = if let Some((name, context)) = invocation {
+                let _gate = parent.turn_gate.lock().unwrap_or_else(|e| e.into_inner());
+                let current = parent
+                    .current_turn
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let turn = current
+                    .as_ref()
+                    .filter(|t| context.turn_id.as_deref() == Some(t.outcome.turn_id.as_str()))
+                    .ok_or("启动回合归属已失效")?;
+                if !parent
+                    .execution_attempts
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|r| {
+                        r.turn_id == turn.outcome.turn_id
+                            && r.response_index == context.response_index
+                            && r.kind == "tool_start"
+                            && r.payload["call_id"] == context.tool_call_id
+                            && r.payload["name"] == name
+                    })
+                {
+                    return Err("启动调用尚未可靠登记".into());
+                }
+                Some((name, context, turn.outcome.user_message_id.clone()))
+            } else {
+                None
+            };
             let mut goal_binding = parent
                 .goal
                 .reserve_delegation(goal_task_id.as_deref(), &child.workspace_id)?;
@@ -969,6 +999,24 @@ impl AppState {
             let parent = state.get_typed(&child.parent_id).await.ok();
             let turn_id = format!("turn_{}", Uuid::new_v4().simple());
             let user_message_id = format!("msg_{}_{}_user", handle.id, turn_id);
+            let origin =
+                origin.map(
+                    |(name, context, source)| crate::context::ChildExecutionRecord {
+                        parent_session_id: child.parent_id.clone(),
+                        parent_turn_id: context.turn_id.unwrap(),
+                        parent_user_message_id: source,
+                        response_index: context.response_index,
+                        tool_call_id: context.tool_call_id,
+                        tool_name: name,
+                        child_session_id: handle.id.clone(),
+                        child_turn_id: turn_id.clone(),
+                        child_user_message_id: user_message_id.clone(),
+                        stage: "accepted".into(),
+                        occurred_at: chrono::Utc::now().timestamp_millis(),
+                        status: None,
+                        outcome: None,
+                    },
+                );
             let permit = slots.clone().try_acquire_owned().ok();
             use openpaw_engine::coordination::ExecutionPhase;
             let (phase, phase_state) = tokio::sync::watch::channel(ExecutionPhase::Queued);
@@ -1010,6 +1058,36 @@ impl AppState {
                     _ => return Err("子会话暂时不能接收任务".into()),
                 };
                 let cancel = parent_cancel.child_token();
+                if let Some(record) = &origin {
+                    if let Err(error) = append_event(
+                        &handle,
+                        &openpaw_store::transcript::encode(
+                            &serde_json::json!({"record":record}),
+                            "child_execution_v1",
+                        ),
+                    ) {
+                        if let Some(turn) = handle
+                            .turn_outcomes()
+                            .into_iter()
+                            .find(|turn| turn.turn_id == turn_id)
+                        {
+                            finish_turn_with_outcome(
+                                &handle,
+                                terminal_outcome(
+                                    &turn,
+                                    TurnState::Failed,
+                                    Some(turn_error(
+                                        "persistence_failed",
+                                        "子执行来源保存失败，未执行工具。",
+                                        false,
+                                    )),
+                                ),
+                                "子执行来源失败终态未保存",
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
                 *handle.turn_cancel.lock().unwrap_or_else(|e| e.into_inner()) = cancel.clone();
                 *handle
                     .child_question_phase
@@ -1121,7 +1199,7 @@ impl AppState {
                     } else {
                         "failed"
                     };
-                    Ok(openpaw_core::ToolCallOutcome {
+                    let outcome = openpaw_core::ToolCallOutcome {
                         media: Vec::new(),
                         is_error: !completed,
                         content: format!(
@@ -1139,7 +1217,31 @@ impl AppState {
                         structured: Some(
                             serde_json::json!({"task_id":handle.id,"sessionId":handle.id,"turnId":turn_id,"workspaceId":child.workspace_id,"workspaceName":child.name,"parentSessionId":child.parent_id,"status":status,"result":result}),
                         ),
-                    })
+                    };
+                    if let Some(mut record) = origin {
+                        record.stage = "result_saved".into();
+                        record.status = Some(status.into());
+                        record.outcome = Some(outcome);
+                        record.occurred_at = chrono::Utc::now().timestamp_millis();
+                        append_event(
+                            &handle,
+                            &openpaw_store::transcript::encode(
+                                &serde_json::json!({"record":record}),
+                                "child_execution_v1",
+                            ),
+                        )?;
+                        let read = SessionReader::read(&handle.session_path)
+                            .map_err(|_| "子结果记录不可读")?;
+                        return crate::context::child_executions(&read.events)?
+                            .into_iter()
+                            .rev()
+                            .find(|saved| {
+                                saved.child_turn_id == turn_id && saved.stage == "result_saved"
+                            })
+                            .and_then(|saved| saved.outcome)
+                            .ok_or_else(|| "子结果尚未可靠保存".into());
+                    }
+                    Ok(outcome)
                 }),
             ))
         })
@@ -5906,6 +6008,31 @@ pub(crate) mod desktop {
                 ));
             }
             self.inner.call(name, args).await
+        }
+        /// 功能：保留非桌面工具的引擎调用身份。
+        /// 参数：name、args、context为原工具调用。
+        /// 返回：原工具结果。
+        /// 错误：沿用桌面或内置工具错误。
+        /// 状态：不改变登记或调用来源。
+        /// 并发与取消：沿原工具执行规则。
+        /// 权限：桌面及授权检索仍使用原校验。
+        /// 关联：child_execution_v1确切启动来源。
+        async fn call_with_context(
+            &self,
+            name: &str,
+            args: Value,
+            context: &openpaw_core::ToolInvocationContext,
+        ) -> openpaw_core::Result<ToolCallOutcome> {
+            if visual::route_for(name).is_some()
+                || matches!(
+                    name,
+                    "ai_pc_current_context" | "ai_pc_history_search" | "session_search"
+                )
+            {
+                self.call(name, args).await
+            } else {
+                self.inner.call_with_context(name, args, context).await
+            }
         }
     }
     #[async_trait]
