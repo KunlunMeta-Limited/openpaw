@@ -970,16 +970,15 @@ mod restart_question_tests {
                 "",
             );
         }
-        if matches!(
-            text,
-            "RESTART_CONTINUE_CHILD"
-                | "RESTART_CONTINUE_CHILD_ANSWER"
-                | "RESTART_CONTINUE_SIDE_EFFECT"
-        ) {
+        if text.starts_with("RESTART_CONTINUE_CHILD") || text == "RESTART_CONTINUE_SIDE_EFFECT" {
             let expected = if text.ends_with("_ANSWER") {
                 "option-a"
             } else if text.ends_with("SIDE_EFFECT") {
                 "restart-side-effect.txt"
+            } else if text.ends_with("_PAUSED") {
+                "status=paused"
+            } else if text.ends_with("_CANCELLED") {
+                "status=cancelled"
             } else {
                 "真实执行已返回"
             };
@@ -994,6 +993,10 @@ mod restart_question_tests {
                             "CHILD_ANSWER_REUSED"
                         } else if text.ends_with("SIDE_EFFECT") {
                             "SIDE_EFFECT_REUSED"
+                        } else if text.ends_with("_PAUSED") {
+                            "CHILD_PAUSED"
+                        } else if text.ends_with("_CANCELLED") {
+                            "CHILD_CANCELLED"
                         } else {
                             "CHILD_RESULT_REUSED"
                         }
@@ -1144,6 +1147,14 @@ mod restart_question_tests {
             }
         }
     }
+    /// 功能：复制真实fixture后截取其可靠事件前缀。
+    /// 参数：fixture为隔离源，id为原会话，cut为真实断点。
+    /// 返回：新建的独立临时home。
+    /// 错误：断点不存在或复制失败时测试失败。
+    /// 状态：不修改原fixture、工作目录或生产记录。
+    /// 并发与取消：同步复制已可靠事件，不恢复future。
+    /// 权限：仅操作本测试临时目录。
+    /// 关联：08冷加载与启动恢复测试共用。
     pub(super) fn snapshot(
         fixture: &MainFixture,
         id: &str,
@@ -1175,6 +1186,14 @@ mod restart_question_tests {
         assert!(found, "必须截取真实已保存断点，不造业务事实");
         std::fs::write(path, prefix).unwrap();
     }
+    /// 功能：以合成home重建实际Host进程状态。
+    /// 参数：fixture提供原本地模型和Office端点，home为独立存储。
+    /// 返回：尚未恢复执行的全新AppState。
+    /// 错误：原fixture端点缺失时测试失败。
+    /// 状态：不恢复旧future、模型请求或卡片。
+    /// 并发与取消：新建运行时，不共享原会话锁和writer。
+    /// 权限：沿原配置，不连接真实模型或15180。
+    /// 关联：08服务重启fixture。
     pub(super) fn rebuild(fixture: &MainFixture, home: &std::path::Path) -> Arc<AppState> {
         let mut config = fixture.state.config.clone();
         config.home = home.into();
@@ -1198,6 +1217,14 @@ mod restart_question_tests {
             .session
             .unwrap()
     }
+    /// 功能：读取隔离journal中的实际持久问题记录。
+    /// 参数：home为测试存储根，id为真实会话。
+    /// 返回：按保存顺序排列的原记录。
+    /// 错误：原journal不可读时测试失败。
+    /// 状态：只读，不伪造已答或重启状态。
+    /// 并发与取消：读取可靠快照，不获取执行许可。
+    /// 权限：仅使用测试提供的真实owner。
+    /// 关联：08公开行为及可靠前缀验证。
     pub(super) fn question_records(home: &std::path::Path, id: &str) -> Vec<serde_json::Value> {
         let read =
             openpaw_store::SessionReader::read(home.join("sessions").join(format!("{id}.jsonl")))
@@ -1381,6 +1408,185 @@ mod restart_question_tests {
             cards,
             "已知答案不能重启后重复提问"
         );
+    }
+    #[tokio::test]
+    async fn main_restart_paused_or_cancelled_child_never_becomes_completed_or_accepts_late_answer()
+    {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for stopped in [false, true] {
+            let fixture = main_fixture(
+                "question-restart-paused-child",
+                if stopped {
+                    "held-answer"
+                } else {
+                    "wrong-label"
+                },
+            )
+            .await;
+            if stopped {
+                let app = fixture.app.clone();
+                let team = fixture.team.clone();
+                let pending = tokio::spawn(async move {
+                    send(&app, &team, "question", "RESTART_START_QUESTION").await
+                });
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if fixture
+                            .seen
+                            .lock()
+                            .await
+                            .iter()
+                            .any(|m| m["type"] == "decision.request")
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let cancelled = request(
+                    &fixture.app,
+                    &fixture.team,
+                    serde_json::json!({"type":"cancel","turnId":"question"}),
+                )
+                .await;
+                assert_eq!(cancelled.status(), StatusCode::OK);
+                assert_ne!(pending.await.unwrap()["state"], "complete");
+            } else {
+                assert_eq!(
+                    send(
+                        &fixture.app,
+                        &fixture.team,
+                        "question",
+                        "RESTART_START_QUESTION"
+                    )
+                    .await["state"],
+                    "complete"
+                );
+            }
+            let id = parent_id(&fixture);
+            let sessions =
+                child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+            let child = sessions
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["parentID"] == id)
+                .unwrap()["id"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                question_records(fixture.home.path(), child).last().unwrap()["state"],
+                if stopped { "cancelled" } else { "interrupted" }
+            );
+            let cards = fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count();
+            for startup in [false, true] {
+                let home = snapshot(&fixture, &id, |event| {
+                    if stopped {
+                        event["type"] == "turn_outcome" && event["state"] == "cancelled"
+                    } else {
+                        event["type"] == "execution_attempt_v1"
+                            && event["kind"] == "tool_result"
+                            && event["payload"]["name"] == "start_agent"
+                    }
+                });
+                truncate_prefix(home.path(), child, |event| {
+                    if stopped {
+                        event["type"] == "turn_outcome" && event["state"] == "cancelled"
+                    } else {
+                        event["type"] == "turn_finish_commit_v1"
+                    }
+                });
+                let state = rebuild(&fixture, home.path());
+                let calls = fixture.model_seen.lock().await.len();
+                if startup {
+                    assert_eq!(state.recover_orphaned_turns().await, usize::from(!stopped));
+                }
+                let app = build_router(state);
+                assert_eq!(
+                    request(&app, &fixture.team, serde_json::json!({"type":"history"}))
+                        .await
+                        .status(),
+                    StatusCode::OK
+                );
+                fixture.release_model.notify_waiters();
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    fixture.model_seen.lock().await.len(),
+                    calls,
+                    "恢复/迟到答案不得唤醒执行"
+                );
+                let read = openpaw_store::SessionReader::read(
+                    home.path().join("sessions").join(format!("{child}.jsonl")),
+                )
+                .unwrap();
+                let saved = crate::context::child_executions(&read.events).unwrap();
+                assert_eq!(
+                    saved.last().unwrap().status.as_deref(),
+                    Some(if stopped { "cancelled" } else { "paused" })
+                );
+                assert!(saved.last().unwrap().outcome.as_ref().unwrap().is_error);
+                let result = send(
+                    &app,
+                    &fixture.team,
+                    "explicit-read",
+                    if stopped {
+                        "RESTART_CONTINUE_CHILD_CANCELLED"
+                    } else {
+                        "RESTART_CONTINUE_CHILD_PAUSED"
+                    },
+                )
+                .await;
+                assert_eq!(
+                    result["text"],
+                    if stopped {
+                        "CHILD_CANCELLED"
+                    } else {
+                        "CHILD_PAUSED"
+                    }
+                );
+                assert_eq!(
+                    child_test_json(
+                        &app,
+                        "GET",
+                        &format!("/session/{child}/turns"),
+                        serde_json::json!({})
+                    )
+                    .await
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                    1
+                );
+                assert!(!question_records(home.path(), child)
+                    .iter()
+                    .any(|q| q["state"] == "answered"));
+                assert_eq!(
+                    child_test_json(&app, "GET", "/session/status", serde_json::json!({})).await,
+                    serde_json::json!({})
+                );
+            }
+            assert_eq!(
+                fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|m| m["type"] == "decision.request")
+                    .count(),
+                cards
+            );
+        }
     }
     #[tokio::test]
     async fn main_restart_model_failure_keeps_known_side_effect_and_child_result_without_replay() {
