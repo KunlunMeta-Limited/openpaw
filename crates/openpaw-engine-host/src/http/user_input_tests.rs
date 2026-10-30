@@ -155,6 +155,31 @@ mod goal_question_tests {
                 }
             }
             if scenario.contains("root") {
+                if scenario.ends_with("-batch") {
+                    if results.len() == 2 {
+                        let calls = [
+                            ("request_user_input", question()),
+                            ("write_file", serde_json::json!({"path":"same-batch.txt","content":"必须取得答案后才能交付"})),
+                        ].into_iter().enumerate().map(|(index,(name,args))|serde_json::json!({"index":index,"id":format!("gq-batch-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})).collect::<Vec<_>>();
+                        let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]});
+                        return (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+                        )
+                            .into_response();
+                    }
+                    return chunk(
+                        results.len(),
+                        match results.len() {
+                            0 => Some(("goal_read", serde_json::json!({}))),
+                            1 => update("start_task", "a", serde_json::json!({})),
+                            4 => update("block_task", "a", serde_json::json!({})),
+                            5 => update("block_task", "b", serde_json::json!({})),
+                            6 => update("block_task", "c", serde_json::json!({})),
+                            _ => None,
+                        },
+                    );
+                }
                 if scenario.ends_with("-orphan") && results.len() == 2 {
                     std::future::pending::<()>().await;
                 }
@@ -506,6 +531,51 @@ mod goal_question_tests {
         })
         .await
         .expect("原Goal回合应有界进入指定公开终态")
+    }
+    #[tokio::test]
+    async fn main_goal_question_same_batch_wait_requires_answer_before_delivery() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for (choice, expires, answered) in [
+            ("held-answer", true, false),
+            ("held-wrong-label", false, false),
+            ("held-answer", false, true),
+        ] {
+            let fixture = main_fixture("question-goal-root-batch", choice).await;
+            finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+            let pending = tokio::spawn(finish(send(&fixture, "execute", "确认执行").await));
+            wait_presented(&fixture).await;
+            assert!(!pending.is_finished(), "未提交问题时原执行仍在等待");
+            assert!(
+                !fixture.workspace.path().join("same-batch.txt").exists(),
+                "题未提交时同一模型响应的依赖交付工具不得执行"
+            );
+            if expires {
+                fixture.question_clock.as_ref().unwrap().advance(300000);
+            } else {
+                fixture.release_model.notify_one();
+            }
+            assert_eq!(pending.await.unwrap()["state"], "complete");
+            assert_eq!(
+                fixture.workspace.path().join("same-batch.txt").exists(),
+                answered,
+                "提问超时或答复无效后同一模型响应中的依赖交付工具不得执行：{choice}"
+            );
+            let phase = if answered { "blocked" } else { "paused" };
+            assert_eq!(
+                wait_goal(&fixture, |g| g["phase"] == phase).await["acceptedTaskCount"],
+                0
+            );
+            if !answered {
+                assert_eq!(
+                    fixture.model_seen.lock().await.len(),
+                    6,
+                    "受控暂停后不请求下一轮模型"
+                );
+            }
+        }
     }
     #[tokio::test]
     async fn main_goal_question_root_answer_only_resumes_original_question() {

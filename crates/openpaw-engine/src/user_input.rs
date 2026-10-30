@@ -519,6 +519,9 @@ impl ToolExecutor for QuestionToolHost {
         args: Value,
         context: &ToolInvocationContext,
     ) -> Result<ToolCallOutcome> {
+        if let Some(reason) = self.context.pause_reason() {
+            return Ok(ToolCallOutcome::error(reason));
+        }
         if name == "request_user_input" {
             Ok(self.context.ask(args, context).await)
         } else {

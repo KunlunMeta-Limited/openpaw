@@ -2211,8 +2211,8 @@ mod tests {
                         if body["decision"]["title"].as_str().unwrap().contains("write_file") {question_gate.notified().await;}
                         return Json(serde_json::json!({"code":200,"msg":"User selected","data":{"teamId":body["teamId"],"conversationId":body["conversationId"],"decisionId":body["decision"]["id"],"choiceId":"confirm","label":"允许本次"}})).into_response();
                     }
-                    if choice == "held-answer" { question_gate.notified().await; }
-                    return user_input_tests::decision_response(&body, choice);
+                    if matches!(choice,"held-answer"|"held-wrong-label") { question_gate.notified().await; }
+                    return user_input_tests::decision_response(&body, if choice == "held-wrong-label" {"wrong-label"} else {choice});
                 }
                 display.before_read(&body).await;
                 let data = match body["type"].as_str() {

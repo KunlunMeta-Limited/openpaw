@@ -1471,7 +1471,11 @@ impl AgentLoop {
         if tool_uses.is_empty() {
             return Ok(Vec::new());
         }
-        if self.parallel_tools && tool_uses.len() > 1 {
+        // 提问批次按模型顺序结算，后续调用才能检查原问题的可信暂停事实。
+        let asks_user = tool_uses
+            .iter()
+            .any(|(_, name, _)| name == "request_user_input");
+        if self.parallel_tools && tool_uses.len() > 1 && !asks_user {
             self.execute_tools_phased(tool_uses, event_sink, recording, turn_id)
                 .await
         } else {
