@@ -808,9 +808,11 @@ impl GoalContext {
         Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
 
-    fn queue_review(&self, invocation: &ToolInvocationContext) -> Result<(), String> {
-        let mut user = self.user.lock().unwrap_or_else(|e| e.into_inner());
-        let user = user.as_mut().ok_or("审核缺少真实用户回合")?;
+    fn queue_review(
+        &self,
+        user: &mut UserTurn,
+        invocation: &ToolInvocationContext,
+    ) -> Result<(), String> {
         // 无调用上下文的旧嵌入入口不伪造工具身份；Host一律使用call_with_context。
         if invocation.turn_id.is_none() && invocation.tool_call_id.is_empty() {
             return Ok(());
@@ -1185,10 +1187,19 @@ impl GoalContext {
         (value["plan_version"].as_u64().unwrap_or(0) > 0).then_some(value)
     }
 
-    fn update(&self, input: Value) -> Result<Value, String> {
+    fn update(&self, input: Value, invocation: &ToolInvocationContext) -> Result<Value, String> {
+        let plan_change = matches!(input["action"].as_str(), Some("set_plan" | "replan"));
+        // 计划提交、关闭旧许可和审核绑定始终持有同一user锁；并发工具不能插入新版本间隙。
         let mut user = self.user.lock().unwrap_or_else(|e| e.into_inner());
         if user.as_ref().is_some_and(|user| user.executing) {
-            let result = self.execute_update(user.as_mut().unwrap(), input);
+            let result = self
+                .execute_update(user.as_mut().unwrap(), input)
+                .and_then(|value| {
+                    if plan_change {
+                        self.queue_review(user.as_mut().unwrap(), invocation)?;
+                    }
+                    Ok(value)
+                });
             let paused = self.read()["phase"] == "paused";
             drop(user);
             if paused {
@@ -1200,7 +1211,7 @@ impl GoalContext {
             return result;
         }
         let user = user
-            .as_ref()
+            .as_mut()
             .filter(|user| user.editable)
             .ok_or("本回合没有 Goal 用户编辑权限")?;
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1333,6 +1344,10 @@ impl GoalContext {
         let result = json!(goal);
         self.commit(&next)?;
         *state = next;
+        drop(state);
+        if plan_change {
+            self.queue_review(user, invocation)?;
+        }
         Ok(result)
     }
 
@@ -2413,15 +2428,7 @@ impl ToolExecutor for GoalToolHost {
         }
         let value = match name {
             "goal_read" => Ok(self.context.read()),
-            "goal_update" => {
-                let plan_change = matches!(args["action"].as_str(), Some("set_plan" | "replan"));
-                self.context.update(args).and_then(|value| {
-                    if plan_change {
-                        self.context.queue_review(context)?;
-                    }
-                    Ok(value)
-                })
-            }
+            "goal_update" => self.context.update(args, context),
             _ => {
                 let mut outcome = self
                     .inner
@@ -2609,7 +2616,7 @@ mod tests {
         for started_work in [false, true] {
             let (context, runtime) = confirmed_goal();
             let goal = context.current().unwrap();
-            context.update(json!({"action":"start_task","goal_id":goal["id"],"expected_version":1,"task_id":"report","reason":"开始当前任务"})).unwrap();
+            context.update(json!({"action":"start_task","goal_id":goal["id"],"expected_version":1,"task_id":"report","reason":"开始当前任务"}), &Default::default()).unwrap();
             if started_work {
                 runtime.facts.lock().unwrap().push(json!({"turn_id":"turn-execute","sequence":10,"kind":"tool_start","payload":{"name":"write_file","call_id":"work"}}));
             }
@@ -2712,6 +2719,55 @@ mod tests {
     }
 
     #[test]
+    fn replan_closes_old_permission_before_releasing_update_for_projection() {
+        struct GatedProjection {
+            inner: Arc<RecordingRuntime>,
+            gate: Arc<std::sync::Barrier>,
+        }
+        impl GoalRuntime for GatedProjection {
+            fn commit(&self, event: Value) -> Result<(), String> {
+                self.inner.commit(event)
+            }
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+            fn execution_facts(&self) -> Option<Value> {
+                self.inner.execution_facts()
+            }
+            fn cancel_children(&self) {}
+            fn project(&self, _: Value) {
+                self.gate.wait();
+                self.gate.wait();
+            }
+        }
+        let (context, runtime) = confirmed_goal();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        context.attach(Arc::new(GatedProjection {
+            inner: runtime,
+            gate: gate.clone(),
+        }));
+        let copy = context.clone();
+        let worker = std::thread::spawn(move || {
+            let host = GoalToolHost::new(Arc::new(NullToolHost), copy.clone());
+            ready(host.call_with_context("goal_update", json!({
+                "action":"replan", "goal_id":copy.current().unwrap()["id"], "expected_version":1,
+                "reason":"并发保护", "tasks":[{"id":"report", "title":"更新报告",
+                "expected_result":"report.txt", "acceptance_criteria":["内容完整"], "dependencies":[]}]
+            }), &openpaw_core::ToolInvocationContext {
+                turn_id:Some("turn-execute".into()), response_index:2, tool_call_id:"parallel-plan".into()
+            })).unwrap()
+        });
+        gate.wait();
+        let permission = context.allowed("start_agent");
+        gate.wait();
+        assert!(!worker.join().unwrap().is_error);
+        assert!(
+            permission.is_err(),
+            "提交新版本后不得暴露仍获旧许可的并发窗口"
+        );
+    }
+
+    #[test]
     fn final_budget_replan_displays_full_plan_before_next_turn_confirmation() {
         let (context, _) = confirmed_goal();
         let host = GoalToolHost::new(Arc::new(NullToolHost), context.clone());
@@ -2747,14 +2803,17 @@ mod tests {
         let goal = context.current().unwrap();
         context.update(json!({"action":"replan", "goal_id":goal["id"], "expected_version":1,
             "reason":"审核保存前更新", "tasks":[{"id":"report", "title":"更新报告",
-            "expected_result":"report.txt", "acceptance_criteria":["新内容完整"], "dependencies":[]}]})).unwrap();
+            "expected_result":"report.txt", "acceptance_criteria":["新内容完整"], "dependencies":[]}]}), &Default::default()).unwrap();
         context.attach(Arc::new(UnavailableRuntime));
         assert!(context
-            .queue_review(&openpaw_core::ToolInvocationContext {
-                turn_id: Some("turn-execute".into()),
-                response_index: 9,
-                tool_call_id: "failed-review".into()
-            })
+            .queue_review(
+                context.user.lock().unwrap().as_mut().unwrap(),
+                &openpaw_core::ToolInvocationContext {
+                    turn_id: Some("turn-execute".into()),
+                    response_index: 9,
+                    tool_call_id: "failed-review".into()
+                }
+            )
             .is_err());
         context.attach(runtime);
         assert!(context.presentation().is_none());
@@ -2777,11 +2836,14 @@ mod tests {
         assert!(context.is_execution_turn());
         context.attach(Arc::new(UnavailableRuntime));
         assert!(context
-            .queue_review(&openpaw_core::ToolInvocationContext {
-                turn_id: Some("turn-execute".into()),
-                response_index: 1,
-                tool_call_id: "new-plan".into()
-            })
+            .queue_review(
+                context.user.lock().unwrap().as_mut().unwrap(),
+                &openpaw_core::ToolInvocationContext {
+                    turn_id: Some("turn-execute".into()),
+                    response_index: 1,
+                    tool_call_id: "new-plan".into()
+                }
+            )
             .is_err());
         assert!(!context.is_execution_turn());
         assert!(context.allowed("write_file").is_err());

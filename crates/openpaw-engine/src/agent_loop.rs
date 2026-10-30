@@ -928,10 +928,10 @@ impl AgentLoop {
                 .filter(|_| {
                     !self.is_cancelled()
                         && (self.budget.remaining() > 0 || self.budget.expand(1))
-                        && !self
+                        && self
                             .token_budget_mut()
                             .as_ref()
-                            .is_some_and(|tracker| tracker.remaining_budget() == Some(0))
+                            .is_none_or(|tracker| tracker.remaining_budget() != Some(0))
                 })
             {
                 self.publish_interaction(
