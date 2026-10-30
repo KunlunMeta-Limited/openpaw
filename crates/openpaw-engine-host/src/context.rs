@@ -93,7 +93,7 @@ pub(crate) fn wrap(
                 goal,
                 &key.call,
             )?;
-            if visible_source(&history, visible, &source_turn).is_none() {
+            if visible_source(history, visible, &source_turn).is_none() {
                 return Err("Goal原件不存在或已隐藏".into());
             }
             return Ok((text, is_error));
@@ -101,7 +101,7 @@ pub(crate) fn wrap(
         if turn.starts_with("message/") {
             return openpaw_engine::context::message_original(&key, visible);
         }
-        if visible_source(&history, visible, turn).is_none() {
+        if visible_source(history, visible, turn).is_none() {
             return Err("原件不存在或已隐藏".into());
         }
         if let Some(fact) = reliable_facts(&home, &owner, &read.events, visible)
