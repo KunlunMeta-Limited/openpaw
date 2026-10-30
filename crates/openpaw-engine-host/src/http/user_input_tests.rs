@@ -4821,7 +4821,7 @@ mod user_input_tests {
                 .lines()
                 .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
                 .filter(|event| event["type"] == "user_question_v1")
-                .last()
+                .next_back()
                 .unwrap();
             assert_eq!(
                 terminal["record"]["state"],
