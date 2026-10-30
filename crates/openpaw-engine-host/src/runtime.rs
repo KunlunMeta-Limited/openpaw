@@ -2869,7 +2869,15 @@ fn delegated_outcome(
         ),
     }
 }
-fn delegated_result(
+/// 功能：从本次实际终态及原消息整理唯一子结果文本。
+/// 参数：owner/messages为原件，terminal为本次终态，paused为可信暂停原因。
+/// 返回：实际最终文本、合法空文本fallback或未完成原因。
+/// 错误：不编造成功结果。
+/// 状态：只读，不写入或启动执行。
+/// 并发与取消：同步，不持执行资源。
+/// 权限：调用方核验来源，此函数不授予许可。
+/// 关联：正常发布、重启恢复与原件投影共用。
+pub(crate) fn delegated_result(
     owner: &str,
     messages: &[openpaw_core::Message],
     terminal: &TurnOutcome,
