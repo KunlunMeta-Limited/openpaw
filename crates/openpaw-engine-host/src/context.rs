@@ -29,7 +29,7 @@ pub(crate) struct ChildExecutionRecord {
     pub(crate) child_turn_id: String,
     /// 功能：本次子输入。
     pub(crate) child_user_message_id: String,
-    /// 功能：accepted或result_saved；受理不表示完成。
+    /// 功能：accepted、result_saved或interrupted；受理不表示完成。
     pub(crate) stage: String,
     /// 功能：可靠保存时间，Unix毫秒。
     pub(crate) occurred_at: i64,

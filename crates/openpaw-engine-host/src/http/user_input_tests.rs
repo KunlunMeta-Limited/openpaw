@@ -617,8 +617,105 @@ mod restart_question_tests {
         let text = messages[source]["content"].as_str().unwrap();
         let has_result = messages[source..].iter().any(|m| m["role"] == "tool");
         let parent = body["tools"].to_string().contains("start_agent");
+        if (text == "RESTART_WRITE_FAIL" && has_result)
+            || (text == "RESTART_START_FAIL"
+                && messages[source..].iter().any(|m| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("真实执行已返回"))
+                }))
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if text == "RESTART_WRITE_FAIL" {
+            return response(
+                Some((
+                    "edit_file",
+                    serde_json::json!({"path":"restart-side-effect.txt","old_string":"原始","new_string":"已修改"}),
+                )),
+                "",
+            );
+        }
+        if matches!(
+            text,
+            "RESTART_CONTINUE_CHILD"
+                | "RESTART_CONTINUE_CHILD_ANSWER"
+                | "RESTART_CONTINUE_SIDE_EFFECT"
+        ) {
+            let expected = if text.ends_with("_ANSWER") {
+                "option-a"
+            } else if text.ends_with("SIDE_EFFECT") {
+                "restart-side-effect.txt"
+            } else {
+                "真实执行已返回"
+            };
+            if has_result {
+                return response(
+                    None,
+                    if messages[source..].iter().any(|m| {
+                        m["role"] == "tool"
+                            && m["content"].as_str().is_some_and(|s| s.contains(expected))
+                    }) {
+                        if text.ends_with("_ANSWER") {
+                            "CHILD_ANSWER_REUSED"
+                        } else if text.ends_with("SIDE_EFFECT") {
+                            "SIDE_EFFECT_REUSED"
+                        } else {
+                            "CHILD_RESULT_REUSED"
+                        }
+                    } else {
+                        "NO_CHILD_ORIGINAL"
+                    },
+                );
+            }
+            let fact = messages
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .flat_map(str::lines)
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|v| {
+                    v["kind"]
+                        == if text.ends_with("_ANSWER") {
+                            "user_question_fact"
+                        } else if text.ends_with("SIDE_EFFECT") {
+                            "tool_result_fact"
+                        } else {
+                            "child_result_preview"
+                        }
+                });
+            if let Some(fact) = fact {
+                return response(
+                    Some((
+                        "read_context_record",
+                        serde_json::json!({"reference":fact["reference"],"start":0,"limit":4096}),
+                    )),
+                    "",
+                );
+            }
+            return response(None, "NO_CHILD_FACT");
+        }
         if has_result {
             return response(None, "真实执行已返回");
+        }
+        if text == "RESTART_CONTINUE_ANSWER"
+            && messages
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .any(|s| s.contains("choice_id") && s.contains("option-a"))
+        {
+            return response(None, "ANSWER_REUSED");
+        }
+        if matches!(
+            text,
+            "RESTART_QUESTION" | "RESTART_CHILD_QUESTION" | "RESTART_CONTINUE_ANSWER"
+        ) {
+            return response(
+                Some((
+                    "request_user_input",
+                    serde_json::json!({"question":"请选择交付方式","options":[{"id":"option-a","label":"方案A"},{"id":"option-b","label":"方案B"}]}),
+                )),
+                "",
+            );
         }
         if !parent {
             return response(
@@ -638,9 +735,16 @@ mod restart_question_tests {
                     .filter(|r| r["session_id"].is_string())
             });
         let mut args = serde_json::json!({"name":"重启测试员","task":"RESTART_CHILD"});
+        if text == "RESTART_START_QUESTION" {
+            args["task"] = serde_json::json!("RESTART_CHILD_QUESTION");
+        }
         if text == "RESTART_RESUME" {
             args["task_id"] = previous.unwrap()["session_id"].clone();
             args["task"] = serde_json::json!("RESTART_CHILD_SECOND");
+        }
+        if let Some(id) = text.strip_prefix("RESTART_RESUME_ANSWER ") {
+            args["task_id"] = serde_json::json!(id);
+            args["task"] = serde_json::json!("RESTART_CONTINUE_ANSWER");
         }
         response(Some(("start_agent", args)), "")
     }
@@ -694,6 +798,628 @@ mod restart_question_tests {
         .unwrap();
         serde_json::from_str(std::str::from_utf8(&bytes).unwrap().lines().last().unwrap()).unwrap()
     }
+    fn copy_directory(source: &std::path::Path, target: &std::path::Path) {
+        std::fs::create_dir_all(target).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let to = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_directory(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), to).unwrap();
+            }
+        }
+    }
+    pub(super) fn snapshot(
+        fixture: &MainFixture,
+        id: &str,
+        cut: impl Fn(&serde_json::Value) -> bool,
+    ) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        for dir in ["sessions", "offices"] {
+            let source = fixture.home.path().join(dir);
+            if source.exists() {
+                copy_directory(&source, &home.path().join(dir));
+            }
+        }
+        truncate_prefix(home.path(), id, cut);
+        home
+    }
+    fn truncate_prefix(home: &std::path::Path, id: &str, cut: impl Fn(&serde_json::Value) -> bool) {
+        let path = home.join("sessions").join(format!("{id}.jsonl"));
+        let original = std::fs::read_to_string(&path).unwrap();
+        let mut prefix = String::new();
+        let mut found = false;
+        for line in original.lines() {
+            prefix.push_str(line);
+            prefix.push('\n');
+            if cut(&serde_json::from_str(line).unwrap()) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "必须截取真实已保存断点，不造业务事实");
+        std::fs::write(path, prefix).unwrap();
+    }
+    pub(super) fn rebuild(fixture: &MainFixture, home: &std::path::Path) -> Arc<AppState> {
+        let mut config = fixture.state.config.clone();
+        config.home = home.into();
+        let mut state = AppState::new(config.clone());
+        let base = std::env::var("OPENPAW_OPENAI_BASE_URL").unwrap();
+        Arc::get_mut(&mut state).unwrap().main_office = crate::office::MainOffice::new(
+            home,
+            &config.workspace,
+            Some(base.trim_end_matches("/v1").into()),
+        );
+        state.office.attach_main(&state.main_office);
+        state
+    }
+    fn parent_id(fixture: &MainFixture) -> String {
+        fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "restart")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap()
+    }
+    pub(super) fn question_records(home: &std::path::Path, id: &str) -> Vec<serde_json::Value> {
+        let read =
+            openpaw_store::SessionReader::read(home.join("sessions").join(format!("{id}.jsonl")))
+                .unwrap();
+        read.events
+            .iter()
+            .filter_map(|event| match event {
+                openpaw_core::SessionEvent::Unknown(v) if v["type"] == "user_question_v1" => {
+                    Some(v["record"].clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+    #[tokio::test]
+    async fn main_restart_marks_queued_and_waiting_questions_interrupted_without_execution() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-restart-question", "option-a").await;
+        assert_eq!(
+            send(&fixture.app, &fixture.team, "question", "RESTART_QUESTION").await["state"],
+            "complete"
+        );
+        let id = parent_id(&fixture);
+        let calls = fixture.model_seen.lock().await.len();
+        let cards = fixture
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m["type"] == "decision.request")
+            .count();
+        for phase in ["queued", "waiting"] {
+            for startup in [false, true] {
+                let home = snapshot(&fixture, &id, |event| {
+                    event["type"] == "user_question_v1" && event["record"]["state"] == phase
+                });
+                let original = question_records(home.path(), &id).pop().unwrap();
+                let state = rebuild(&fixture, home.path());
+                if startup {
+                    assert_eq!(state.recover_orphaned_turns().await, 1);
+                }
+                let app = build_router(state);
+                let turns = child_test_json(
+                    &app,
+                    "GET",
+                    &format!("/session/{id}/turns"),
+                    serde_json::json!({}),
+                )
+                .await;
+                assert_eq!(turns[0]["state"], "failed");
+                assert_eq!(turns[0]["error"]["code"], "host_restarted");
+                let record = question_records(home.path(), &id).pop().unwrap();
+                assert_eq!(
+                    record["state"], "interrupted",
+                    "{phase}经过{startup}恢复必须结束旧问题"
+                );
+                for field in [
+                    "question_id",
+                    "display_id",
+                    "generation",
+                    "deadline_ms",
+                    "tool_call_id",
+                    "scope",
+                ] {
+                    assert_eq!(record[field], original[field]);
+                }
+                assert!(record["answer"].is_null());
+                assert_eq!(
+                    child_test_json(&app, "GET", "/session/status", serde_json::json!({})).await,
+                    serde_json::json!({})
+                );
+            }
+        }
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            calls,
+            "重启不能自动请求模型"
+        );
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            cards,
+            "重启不能重投卡片"
+        );
+    }
+    #[tokio::test]
+    async fn main_restart_reuses_durable_answer_before_missing_tool_result_and_after_another_restart(
+    ) {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-restart-question", "option-a").await;
+        assert_eq!(
+            send(&fixture.app, &fixture.team, "question", "RESTART_QUESTION").await["state"],
+            "complete"
+        );
+        let id = parent_id(&fixture);
+        let cards = fixture
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m["type"] == "decision.request")
+            .count();
+        for startup in [false, true] {
+            let home = snapshot(&fixture, &id, |event| {
+                event["type"] == "user_question_v1" && event["record"]["state"] == "answered"
+            });
+            let state = rebuild(&fixture, home.path());
+            let calls = fixture.model_seen.lock().await.len();
+            if startup {
+                assert_eq!(state.recover_orphaned_turns().await, 1);
+            }
+            let app = build_router(state);
+            let messages = child_test_json(
+                &app,
+                "GET",
+                &format!("/session/{id}/message"),
+                serde_json::json!({}),
+            )
+            .await;
+            let question = messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|m| m["parts"].as_array().unwrap())
+                .find(|part| part["tool"] == "request_user_input")
+                .unwrap();
+            assert_eq!(
+                question["state"]["status"], "completed",
+                "可靠接受答案必须先于unknown结果恢复"
+            );
+            assert!(question["state"].to_string().contains("option-a"));
+            assert_eq!(
+                fixture.model_seen.lock().await.len(),
+                calls,
+                "恢复本身不启动模型"
+            );
+            let result = send(&app, &fixture.team, "continue", "RESTART_CONTINUE_ANSWER").await;
+            assert_eq!(result["state"], "complete");
+            assert_eq!(
+                result["text"], "ANSWER_REUSED",
+                "用户明确继续时模型必须真正使用可靠答案"
+            );
+            let next = build_router(rebuild(&fixture, home.path()));
+            assert_eq!(
+                send(
+                    &next,
+                    &fixture.team,
+                    "continue-again",
+                    "RESTART_CONTINUE_ANSWER"
+                )
+                .await["text"],
+                "ANSWER_REUSED"
+            );
+            assert_eq!(
+                question_records(home.path(), &id)
+                    .iter()
+                    .filter(|q| q["state"] == "answered")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            cards,
+            "已知答案不能重启后重复提问"
+        );
+    }
+    #[tokio::test]
+    async fn main_restart_model_failure_keeps_known_side_effect_and_child_result_without_replay() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for (source, continuation, expected) in [
+            (
+                "RESTART_WRITE_FAIL",
+                "RESTART_CONTINUE_SIDE_EFFECT",
+                "SIDE_EFFECT_REUSED",
+            ),
+            (
+                "RESTART_START_FAIL",
+                "RESTART_CONTINUE_CHILD",
+                "CHILD_RESULT_REUSED",
+            ),
+        ] {
+            let fixture = main_fixture("question-restart-model-failure", "option-a").await;
+            std::fs::write(
+                fixture.workspace.path().join("restart-side-effect.txt"),
+                "原始",
+            )
+            .unwrap();
+            let result = send(&fixture.app, &fixture.team, source, source).await;
+            assert_ne!(
+                result["state"], "complete",
+                "{source}此断点必须经过真实后续模型失败"
+            );
+            let id = parent_id(&fixture);
+            for startup in [false, true] {
+                let home = snapshot(&fixture, &id, |event| {
+                    (event["type"] == "turn_outcome" && event["state"] == "failed")
+                        || (event["type"] == "turn_finish_commit_v1"
+                            && event["terminal"]["state"] == "failed")
+                });
+                let state = rebuild(&fixture, home.path());
+                let calls = fixture.model_seen.lock().await.len();
+                if startup {
+                    assert_eq!(state.recover_orphaned_turns().await, 0);
+                }
+                let app = build_router(state);
+                assert_eq!(
+                    request(&app, &fixture.team, serde_json::json!({"type":"history"}))
+                        .await
+                        .status(),
+                    StatusCode::OK
+                );
+                assert_eq!(fixture.model_seen.lock().await.len(), calls);
+                assert_eq!(
+                    send(&app, &fixture.team, "explicit-continue", continuation).await["text"],
+                    expected,
+                    "generated回滚不应丢失可靠工具/子执行事实"
+                );
+                if source == "RESTART_WRITE_FAIL" {
+                    let messages = child_test_json(
+                        &app,
+                        "GET",
+                        &format!("/session/{id}/message"),
+                        serde_json::json!({}),
+                    )
+                    .await;
+                    assert_eq!(
+                        messages
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .flat_map(|m| m["parts"].as_array().unwrap())
+                            .filter(|p| p["tool"] == "edit_file")
+                            .count(),
+                        1,
+                        "已知副作用不得重试"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(
+                            fixture.workspace.path().join("restart-side-effect.txt")
+                        )
+                        .unwrap(),
+                        "已修改"
+                    );
+                } else {
+                    let sessions =
+                        child_test_json(&app, "GET", "/session", serde_json::json!({})).await;
+                    assert_eq!(
+                        sessions
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|s| s["parentID"] == id)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(fixture.workspace.path().join("restart-first.txt"))
+                            .unwrap(),
+                        "真实子产物"
+                    );
+                }
+            }
+        }
+    }
+    #[tokio::test]
+    async fn main_restart_child_pending_and_accepted_answer_require_explicit_continuation() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-restart-child-question", "option-a").await;
+        assert_eq!(
+            send(
+                &fixture.app,
+                &fixture.team,
+                "question",
+                "RESTART_START_QUESTION"
+            )
+            .await["state"],
+            "complete"
+        );
+        let id = parent_id(&fixture);
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["parentID"] == id)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        let cards = fixture
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m["type"] == "decision.request")
+            .count();
+        for phase in ["queued", "waiting", "answered"] {
+            for startup in [false, true] {
+                let home = snapshot(&fixture, &id, |event| {
+                    event["type"] == "execution_attempt_v1"
+                        && event["kind"] == "tool_result"
+                        && event["payload"]["name"] == "start_agent"
+                });
+                truncate_prefix(home.path(), child, |event| {
+                    event["type"] == "user_question_v1" && event["record"]["state"] == phase
+                });
+                let original = question_records(home.path(), child).pop().unwrap();
+                let calls = fixture.model_seen.lock().await.len();
+                let state = rebuild(&fixture, home.path());
+                if startup {
+                    assert_eq!(state.recover_orphaned_turns().await, 2);
+                }
+                let app = build_router(state);
+                let history =
+                    request(&app, &fixture.team, serde_json::json!({"type":"history"})).await;
+                assert_eq!(history.status(), StatusCode::OK);
+                let saved = question_records(home.path(), child).pop().unwrap();
+                assert_eq!(
+                    saved["state"],
+                    if phase == "answered" {
+                        "answered"
+                    } else {
+                        "interrupted"
+                    }
+                );
+                for key in [
+                    "question_id",
+                    "scope",
+                    "tool_call_id",
+                    "display_id",
+                    "generation",
+                    "deadline_ms",
+                ] {
+                    assert_eq!(saved[key], original[key]);
+                }
+                assert_eq!(
+                    fixture.model_seen.lock().await.len(),
+                    calls,
+                    "恢复不得执行模型或工具"
+                );
+                assert_eq!(
+                    child_test_json(&app, "GET", "/session/status", serde_json::json!({})).await,
+                    serde_json::json!({})
+                );
+                let read = openpaw_store::SessionReader::read(
+                    home.path().join("sessions").join(format!("{child}.jsonl")),
+                )
+                .unwrap();
+                assert!(
+                    !crate::context::child_executions(&read.events)
+                        .unwrap()
+                        .iter()
+                        .any(|r| r.status.as_deref() == Some("completed")),
+                    "已答不代表子任务交付"
+                );
+                if phase == "answered" {
+                    assert_eq!(
+                        send(
+                            &app,
+                            &fixture.team,
+                            "parent-continue",
+                            "RESTART_CONTINUE_CHILD_ANSWER"
+                        )
+                        .await["text"],
+                        "CHILD_ANSWER_REUSED"
+                    );
+                    let resumed = send(
+                        &app,
+                        &fixture.team,
+                        "child-continue",
+                        &format!("RESTART_RESUME_ANSWER {child}"),
+                    )
+                    .await;
+                    assert_eq!(resumed["state"], "complete");
+                    let turns = child_test_json(
+                        &app,
+                        "GET",
+                        &format!("/session/{child}/turns"),
+                        serde_json::json!({}),
+                    )
+                    .await;
+                    assert_eq!(
+                        turns.as_array().unwrap().len(),
+                        2,
+                        "仅明确续办才创建新子turn"
+                    );
+                    let messages = child_test_json(
+                        &app,
+                        "GET",
+                        &format!("/session/{child}/message"),
+                        serde_json::json!({}),
+                    )
+                    .await;
+                    assert!(
+                        messages.to_string().contains("ANSWER_REUSED"),
+                        "既有子会话自身也必须使用保存答案"
+                    );
+                    assert_eq!(
+                        question_records(home.path(), child)
+                            .iter()
+                            .filter(|q| q["state"] == "answered")
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            cards,
+            "重启与续办不重复已答题或恢复旧卡片"
+        );
+    }
+    #[tokio::test]
+    async fn main_restart_recovers_child_terminal_before_result_saved_and_parent_delivery() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-restart-source", "option-a").await;
+        assert_eq!(
+            send(&fixture.app, &fixture.team, "first", "RESTART_START").await["state"],
+            "complete"
+        );
+        let id = parent_id(&fixture);
+        let sessions =
+            child_test_json(&fixture.app, "GET", "/session", serde_json::json!({})).await;
+        let child = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["parentID"] == id)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap();
+        for saved in [false, true] {
+            for startup in [false, true] {
+                let home = snapshot(&fixture, &id, |event| {
+                    event["type"] == "execution_attempt_v1"
+                        && event["kind"] == "tool_result"
+                        && event["payload"]["name"] == "start_agent"
+                });
+                if !saved {
+                    truncate_prefix(home.path(), child, |event| {
+                        event["type"] == "turn_finish_commit_v1"
+                    });
+                }
+                let state = rebuild(&fixture, home.path());
+                let calls = fixture.model_seen.lock().await.len();
+                if startup {
+                    assert_eq!(state.recover_orphaned_turns().await, 1);
+                }
+                let app = build_router(state);
+                let loaded =
+                    request(&app, &fixture.team, serde_json::json!({"type":"history"})).await;
+                assert_eq!(loaded.status(), StatusCode::OK);
+                assert_eq!(
+                    fixture.model_seen.lock().await.len(),
+                    calls,
+                    "父会话加载不得自动请求模型"
+                );
+                let result = send(&app, &fixture.team, "continue", "RESTART_CONTINUE_CHILD").await;
+                assert_eq!(result["state"], "complete");
+                assert_eq!(
+                    result["text"], "CHILD_RESULT_REUSED",
+                    "父入口必须直接复用子事实，不依赖先打开子详情"
+                );
+                let turns = child_test_json(
+                    &app,
+                    "GET",
+                    &format!("/session/{child}/turns"),
+                    serde_json::json!({}),
+                )
+                .await;
+                assert_eq!(
+                    turns.as_array().unwrap().len(),
+                    1,
+                    "续办只能读取旧子结果，不能重跑子turn"
+                );
+                assert_eq!(turns[0]["state"], "completed");
+                let read = openpaw_store::SessionReader::read(
+                    home.path().join("sessions").join(format!("{child}.jsonl")),
+                )
+                .unwrap();
+                let records = read
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        openpaw_core::SessionEvent::Unknown(v)
+                            if v["type"] == "child_execution_v1" =>
+                        {
+                            Some(v["record"].clone())
+                        }
+                        _ => None,
+                    })
+                    .filter(|r| r["stage"] == "result_saved")
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "已提交真实子终态必须在重启后作为已知结果保留"
+                );
+                assert_eq!(records[0]["status"], "completed");
+                assert!(records[0]["outcome"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("真实执行已返回"));
+                assert_eq!(
+                    std::fs::read_to_string(fixture.workspace.path().join("restart-first.txt"))
+                        .unwrap(),
+                    "真实子产物"
+                );
+                assert_eq!(
+                    child_test_json(&app, "GET", "/session", serde_json::json!({}))
+                        .await
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|s| s["parentID"].is_string())
+                        .count(),
+                    1,
+                    "不能通过新建执行恢复旧结果"
+                );
+            }
+        }
+    }
     #[tokio::test]
     async fn main_restart_retains_each_execution_source_and_saved_child_result() {
         let _guard = PROVIDER_ENV_LOCK
@@ -720,7 +1446,7 @@ mod restart_question_tests {
         assert_eq!(children.len(), 1, "续办必须是同一真实员工");
         let child = children[0];
         let read = openpaw_store::SessionReader::read(
-            &fixture
+            fixture
                 .home
                 .path()
                 .join("sessions")
@@ -1304,6 +2030,92 @@ mod goal_question_tests {
         })
         .await
         .expect("原Goal回合应有界进入指定公开终态")
+    }
+    #[tokio::test]
+    async fn main_restart_goal_question_preserves_facts_without_restoring_execution_permission() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-root-answer", "option-a").await;
+        finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+        finish(send(&fixture, "execute", "确认执行").await).await;
+        let id = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "goal-question")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let original_goal = goal(&fixture).await;
+        let calls = fixture.model_seen.lock().await.len();
+        let cards = fixture
+            .seen
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m["type"] == "decision.request")
+            .count();
+        for phase in ["queued", "waiting", "answered"] {
+            for startup in [false, true] {
+                let home = restart_question_tests::snapshot(&fixture, &id, |event| {
+                    event["type"] == "user_question_v1" && event["record"]["state"] == phase
+                });
+                let state = restart_question_tests::rebuild(&fixture, home.path());
+                if startup {
+                    assert_eq!(state.recover_orphaned_turns().await, 1);
+                }
+                let app = build_router(state.clone());
+                child_test_json(&app,"POST","/api/pawoffice/chat",serde_json::json!({"version":"1.0","type":"history","teamId":fixture.team,"conversationId":"goal-question"})).await;
+                let boards = state.main_office.directory().unwrap();
+                let board = boards
+                    .iter()
+                    .find(|b| b["workspace"]["id"] == fixture.team)
+                    .unwrap();
+                let view = board["conversations"]
+                    .as_array()
+                    .and_then(|rows| rows.iter().find(|r| r["id"] == "goal-question"))
+                    .unwrap_or(board);
+                let goal = &view["goal"];
+                assert_eq!(goal["id"], original_goal["id"]);
+                assert_eq!(goal["phase"], "paused");
+                assert_eq!(goal["acceptedTaskCount"], 0);
+                assert!(!view["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["status"] == "running"));
+                let records = restart_question_tests::question_records(home.path(), &id);
+                assert_eq!(
+                    records.last().unwrap()["state"],
+                    if phase == "answered" {
+                        "answered"
+                    } else {
+                        "interrupted"
+                    }
+                );
+                assert_eq!(
+                    child_test_json(&app, "GET", "/session/status", serde_json::json!({})).await,
+                    serde_json::json!({})
+                );
+                assert_eq!(
+                    fixture.model_seen.lock().await.len(),
+                    calls,
+                    "恢复Goal只能恢复事实不能执行"
+                );
+            }
+        }
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            cards
+        );
     }
     #[tokio::test]
     async fn main_goal_question_same_batch_wait_requires_answer_before_delivery() {
