@@ -825,6 +825,668 @@ mod goal_question_tests {
 }
 
 #[cfg(test)]
+mod question_recovery_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[derive(Default)]
+    pub(super) struct Display {
+        visible: std::sync::Mutex<HashSet<String>>,
+        replies: std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<&'static str>>>,
+        observations: std::sync::Mutex<Vec<Vec<String>>>,
+        hold_read: std::sync::atomic::AtomicBool,
+        read_waiting: tokio::sync::Notify,
+        release_read: tokio::sync::Notify,
+    }
+    pub(super) struct Visible(Arc<Display>, String);
+    impl Drop for Visible {
+        fn drop(&mut self) {
+            self.0.visible.lock().unwrap().remove(&self.1);
+        }
+    }
+    impl Display {
+        pub(super) async fn before_read(&self, body: &serde_json::Value) {
+            if body["type"] == "office.read"
+                && body["teamId"].is_string()
+                && self.hold_read.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.read_waiting.notify_one();
+                self.release_read.notified().await;
+            }
+        }
+        pub(super) fn track(self: &Arc<Self>, body: &serde_json::Value) -> Option<Visible> {
+            if body["type"] != "decision.request" {
+                return None;
+            }
+            let id = body["decision"]["id"].as_str().unwrap().to_owned();
+            self.visible.lock().unwrap().insert(id.clone());
+            Some(Visible(self.clone(), id))
+        }
+        pub(super) fn pending(&self) -> Vec<String> {
+            let pending = self
+                .visible
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            self.observations.lock().unwrap().push(pending.clone());
+            pending
+        }
+        fn refresh(&self) {
+            self.visible.lock().unwrap().clear();
+        }
+        fn submit(&self, id: &str, choice: &'static str) {
+            self.replies
+                .lock()
+                .unwrap()
+                .remove(id)
+                .unwrap()
+                .send(choice)
+                .ok();
+        }
+        pub(super) async fn response(&self, body: &serde_json::Value) -> Response {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.replies
+                .lock()
+                .unwrap()
+                .insert(body["decision"]["id"].as_str().unwrap().into(), sender);
+            let choice = receiver.await.unwrap_or("timeout");
+            if choice == "offline" {
+                return (StatusCode::CONFLICT, Json(serde_json::json!({"code":409,"msg":"No online page","data":{"reasonCode":"NO_RECEIVER","details":{},"issues":[]}}))).into_response();
+            }
+            if choice == "disconnect" {
+                return Response::new(Body::from_stream(futures::stream::iter([
+                    Err::<String, _>(std::io::Error::other("fixture response disconnected")),
+                ])));
+            }
+            user_input_tests::decision_response(body, choice)
+        }
+    }
+    async fn start(fixture: &MainFixture) -> tokio::task::JoinHandle<axum::body::Bytes> {
+        start_in(fixture, "question").await
+    }
+    async fn start_in(
+        fixture: &MainFixture,
+        conversation: &str,
+    ) -> tokio::task::JoinHandle<axum::body::Bytes> {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(Request::builder().method("POST").uri("/api/pawoffice/chat").header("content-type","application/json")
+                .body(Body::from(serde_json::json!({"version":"1.0","type":"send","teamId":fixture.team,"conversationId":conversation,"turnId":"one","messages":[{"role":"user","content":"先问我，再按答案完成"}]}).to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::spawn(async move { to_bytes(response.into_body(), 2_000_000).await.unwrap() })
+    }
+    async fn card(fixture: &MainFixture, count: usize) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let cards = fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|m| m["type"] == "decision.request")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if cards.len() >= count {
+                    let card = &cards[count - 1];
+                    if fixture
+                        .question_display
+                        .replies
+                        .lock()
+                        .unwrap()
+                        .contains_key(card["decision"]["id"].as_str().unwrap())
+                    {
+                        return card.clone();
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("实际Office对端应收到第{count}次展示请求：{error}"))
+    }
+    fn records(fixture: &MainFixture) -> Vec<serde_json::Value> {
+        std::fs::read_dir(fixture.home.path().join("sessions"))
+            .unwrap()
+            .flat_map(|file| {
+                std::fs::read_to_string(file.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter(|event| event["type"] == "user_question_v1")
+                    .map(|event| event["record"].clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn main_question_recovery_replays_missing_card_on_original_deadline_and_call() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-refresh", "controlled").await;
+        let turn = start(&fixture).await;
+        let original = card(&fixture, 1).await;
+        fixture.question_display.refresh();
+        fixture.question_clock.as_ref().unwrap().advance(60_000);
+        let replay = card(&fixture, 2).await;
+        assert_ne!(original["decision"]["id"], replay["decision"]["id"]);
+        assert_eq!(replay["timeoutMs"], 240000, "刷新不能重建五分钟期限");
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            1,
+            "恢复展示不调用模型"
+        );
+        let before = records(&fixture);
+        assert_eq!(before.last().unwrap()["generation"], 2);
+        assert_eq!(before.last().unwrap()["deadline_ms"], 301000);
+        fixture
+            .question_display
+            .submit(replay["decision"]["id"].as_str().unwrap(), "option-a");
+        let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("已采用方案A"));
+        let after = records(&fixture);
+        let answered = after.last().unwrap();
+        assert_eq!(answered["state"], "answered");
+        assert_eq!(answered["question_id"], before[0]["question_id"]);
+        assert_eq!(answered["generation"], 2, "终态不能写回旧展示代次");
+        assert_eq!(answered["display_id"], replay["decision"]["id"]);
+        assert_eq!(fixture.model_seen.lock().await.len(), 2, "只接续原调用一次");
+    }
+
+    #[tokio::test]
+    async fn main_question_recovery_temporary_offline_reasks_without_guessing_an_answer() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-offline", "controlled").await;
+        let turn = start(&fixture).await;
+        let original = card(&fixture, 1).await;
+        fixture
+            .question_display
+            .submit(original["decision"]["id"].as_str().unwrap(), "offline");
+        fixture.question_clock.as_ref().unwrap().advance(1_000);
+        let replay = card(&fixture, 2).await;
+        assert_eq!(replay["timeoutMs"], 299000);
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            1,
+            "离线不能猜测用户答案"
+        );
+        fixture
+            .question_display
+            .submit(replay["decision"]["id"].as_str().unwrap(), "custom");
+        let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("我需要Markdown报告"));
+        assert_eq!(records(&fixture).last().unwrap()["generation"], 2);
+    }
+
+    #[tokio::test]
+    async fn main_question_recovery_keeps_visible_draft_and_never_reasks_a_saved_answer() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-visible", "controlled").await;
+        let turn = start(&fixture).await;
+        let original = card(&fixture, 1).await;
+        let id = original["decision"]["id"].as_str().unwrap();
+        fixture.question_clock.as_ref().unwrap().advance(60_000);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture
+                    .question_display
+                    .observations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|snapshot| snapshot.iter().any(|seen| seen == id))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("实际查询确认原卡片仍存在");
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            1,
+            "不能定时替换正常填写中的卡片"
+        );
+        fixture.question_display.submit(id, "option-a");
+        let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("已采用方案A"));
+        fixture.question_display.refresh();
+        fixture.question_clock.as_ref().unwrap().advance(60_000);
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            1,
+            "已保存答案不再重建展示"
+        );
+        assert_eq!(
+            records(&fixture)
+                .iter()
+                .filter(|record| record["state"] == "answered")
+                .count(),
+            1
+        );
+        assert_eq!(fixture.model_seen.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn main_question_recovery_unknown_stream_response_and_late_old_answer_use_only_new_generation(
+    ) {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-disconnect", "controlled").await;
+        let turn = start(&fixture).await;
+        let original = card(&fixture, 1).await;
+        fixture
+            .question_display
+            .submit(original["decision"]["id"].as_str().unwrap(), "disconnect");
+        fixture.question_clock.as_ref().unwrap().advance(60_000);
+        let replay = card(&fixture, 2).await;
+        assert_eq!(replay["timeoutMs"], 240000);
+        assert_eq!(
+            fixture.model_seen.lock().await.len(),
+            1,
+            "响应丢失未确认答案时不能接续"
+        );
+        fixture.question_display.refresh();
+        fixture.question_clock.as_ref().unwrap().advance(1_000);
+        let newest = card(&fixture, 3).await;
+        fixture
+            .question_display
+            .submit(replay["decision"]["id"].as_str().unwrap(), "option-a");
+        fixture
+            .question_display
+            .submit(newest["decision"]["id"].as_str().unwrap(), "custom");
+        let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("我需要Markdown报告"), "{text}");
+        let saved = records(&fixture);
+        let terminal = saved.last().unwrap();
+        assert_eq!(terminal["generation"], 3);
+        assert_eq!(terminal["display_id"], newest["decision"]["id"]);
+        assert_eq!(
+            terminal["answer"]["choice_id"], "custom",
+            "迟到旧回答不能替换新代答案"
+        );
+        assert_eq!(
+            saved
+                .iter()
+                .filter(|record| record["state"] == "answered")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn main_question_recovery_less_than_interface_minimum_expires_without_extending_deadline()
+    {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-small-window", "controlled").await;
+        let turn = start(&fixture).await;
+        card(&fixture, 1).await;
+        fixture.question_display.refresh();
+        fixture.question_clock.as_ref().unwrap().advance(299_500);
+        let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("已暂停"));
+        let saved = records(&fixture);
+        assert_eq!(saved.last().unwrap()["state"], "expired");
+        assert_eq!(saved.last().unwrap()["deadline_ms"], 301000);
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            1
+        );
+        assert_eq!(fixture.model_seen.lock().await.len(), 1);
+    }
+    #[tokio::test]
+    async fn main_question_recovery_stop_keeps_current_generation_and_rejects_late_answer() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-stop", "controlled").await;
+        let turn = start(&fixture).await;
+        card(&fixture, 1).await;
+        fixture.question_display.refresh();
+        fixture.question_clock.as_ref().unwrap().advance(1000);
+        let replay = card(&fixture, 2).await;
+        let session = records(&fixture)[0]["scope"]["asking_session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        child_test_json(
+            &fixture.app,
+            "POST",
+            &format!("/session/{session}/abort"),
+            serde_json::json!({}),
+        )
+        .await;
+        fixture
+            .question_display
+            .submit(replay["decision"]["id"].as_str().unwrap(), "option-a");
+        fixture.question_clock.as_ref().unwrap().advance(60000);
+        let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("stopped"));
+        let saved = records(&fixture);
+        assert_eq!(saved.last().unwrap()["state"], "cancelled");
+        assert_eq!(
+            saved.last().unwrap()["generation"],
+            2,
+            "Drop取消必须保留最新可靠代次"
+        );
+        assert_eq!(
+            saved.last().unwrap()["display_id"],
+            replay["decision"]["id"]
+        );
+        assert!(!saved.iter().any(|record| record["state"] == "answered"));
+        assert_eq!(fixture.model_seen.lock().await.len(), 1);
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn main_question_recovery_save_failure_never_publishes_unsaved_generation() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-save", "controlled").await;
+        let turn = start(&fixture).await;
+        card(&fixture, 1).await;
+        let path = std::fs::read_dir(fixture.home.path().join("sessions"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let retained = path.with_extension("retained");
+        std::fs::rename(&path, &retained).unwrap();
+        fixture.question_display.refresh();
+        fixture.question_clock.as_ref().unwrap().advance(1000);
+        let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::rename(&retained, &path).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("\"state\":\"error\""), "{text}");
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            1,
+            "保存失败不能发出新代请求"
+        );
+        assert_eq!(fixture.model_seen.lock().await.len(), 1);
+        assert!(records(&fixture)
+            .iter()
+            .all(|record| record["generation"] == 1 && record["state"] != "answered"));
+    }
+
+    #[tokio::test]
+    async fn main_question_recovery_child_replays_into_same_parent_while_independent_work_continues(
+    ) {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-child", "controlled").await;
+        let turn = start(&fixture).await;
+        let original = card(&fixture, 1).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if fixture.workspace.path().join("B-independent.txt").exists()
+                    && fixture.workspace.path().join("C-independent.txt").exists()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("子待答时父与独立兄弟继续完成产物");
+        assert!(!fixture.workspace.path().join("A-dependent.txt").exists());
+        fixture.question_display.refresh();
+        fixture.question_clock.as_ref().unwrap().advance(60000);
+        let replay = card(&fixture, 2).await;
+        assert_eq!(original["conversationId"], replay["conversationId"]);
+        assert_eq!(
+            original["decision"]["actorId"],
+            replay["decision"]["actorId"]
+        );
+        assert_eq!(replay["timeoutMs"], 240000);
+        fixture
+            .question_display
+            .submit(replay["decision"]["id"].as_str().unwrap(), "custom");
+        let bytes = tokio::time::timeout(Duration::from_secs(8), turn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("协作完成"));
+        assert!(fixture.workspace.path().join("A-dependent.txt").exists());
+        let saved = records(&fixture);
+        let answered = saved
+            .iter()
+            .find(|record| record["state"] == "answered")
+            .unwrap();
+        assert_ne!(
+            answered["scope"]["asking_session_id"],
+            answered["scope"]["parent_session_id"]
+        );
+        assert_eq!(answered["generation"], 2);
+        assert_eq!(answered["answer"]["choice_id"], "custom");
+    }
+    #[tokio::test]
+    async fn main_question_recovery_invalid_replayed_answer_does_not_interrupt_another_conversation(
+    ) {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-recovery-isolation", "controlled").await;
+        let a = start_in(&fixture, "a").await;
+        let first = card(&fixture, 1).await;
+        let b = start_in(&fixture, "b").await;
+        let second = card(&fixture, 2).await;
+        fixture
+            .question_display
+            .visible
+            .lock()
+            .unwrap()
+            .remove(first["decision"]["id"].as_str().unwrap());
+        fixture.question_clock.as_ref().unwrap().advance(60000);
+        let replay = card(&fixture, 3).await;
+        assert_eq!(replay["conversationId"], "a");
+        fixture
+            .question_display
+            .submit(replay["decision"]["id"].as_str().unwrap(), "wrong-display");
+        fixture
+            .question_display
+            .submit(second["decision"]["id"].as_str().unwrap(), "custom");
+        let a = tokio::time::timeout(Duration::from_secs(5), a)
+            .await
+            .unwrap()
+            .unwrap();
+        let b = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&a).unwrap().contains("已暂停"));
+        assert!(std::str::from_utf8(&b)
+            .unwrap()
+            .contains("我需要Markdown报告"));
+        let saved = records(&fixture);
+        assert_eq!(
+            saved
+                .iter()
+                .filter(|record| record["state"] == "answered")
+                .count(),
+            1
+        );
+        assert_eq!(
+            saved
+                .iter()
+                .filter(|record| record["state"] == "interrupted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            3,
+            "错误归属不应无限重投"
+        );
+    }
+    #[tokio::test]
+    async fn main_question_recovery_answer_or_stop_during_missing_observation_does_not_reissue() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for answer in [true, false] {
+            let fixture = main_fixture("question-recovery-observation-race", "controlled").await;
+            let turn = start(&fixture).await;
+            let original = card(&fixture, 1).await;
+            fixture
+                .question_display
+                .hold_read
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            fixture.question_display.refresh();
+            fixture.question_clock.as_ref().unwrap().advance(1000);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.question_display.read_waiting.notified(),
+            )
+            .await
+            .expect("缺失观察已在外部对端等待回复");
+            if answer {
+                fixture
+                    .question_display
+                    .submit(original["decision"]["id"].as_str().unwrap(), "option-a");
+            } else {
+                let session = records(&fixture)[0]["scope"]["asking_session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                child_test_json(
+                    &fixture.app,
+                    "POST",
+                    &format!("/session/{session}/abort"),
+                    serde_json::json!({}),
+                )
+                .await;
+            }
+            let bytes = tokio::time::timeout(Duration::from_secs(5), turn)
+                .await
+                .unwrap()
+                .unwrap();
+            fixture
+                .question_display
+                .hold_read
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            fixture.question_display.release_read.notify_waiters();
+            fixture.question_clock.as_ref().unwrap().advance(1000);
+            let text = std::str::from_utf8(&bytes).unwrap();
+            assert!(
+                text.contains(if answer {
+                    "已采用方案A"
+                } else {
+                    "stopped"
+                }),
+                "{text}"
+            );
+            assert_eq!(
+                fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|m| m["type"] == "decision.request")
+                    .count(),
+                1,
+                "已接受回答或停止不能被缺失观察复活"
+            );
+            assert_eq!(
+                records(&fixture).last().unwrap()["state"],
+                if answer { "answered" } else { "cancelled" }
+            );
+            assert_eq!(records(&fixture).last().unwrap()["generation"], 1);
+        }
+    }
+}
+
+#[cfg(test)]
 mod child_question_tests {
     use super::*;
 
@@ -1522,7 +2184,12 @@ mod user_input_tests {
             .find(|message| message["type"] == "decision.request")
             .expect("既有面板收到问题");
         assert_eq!(question["decision"]["kind"], "choice");
-        assert_eq!(question["timeoutMs"], 300000);
+        assert!(
+            question["timeoutMs"]
+                .as_u64()
+                .is_some_and(|ms| (1000..=300000).contains(&ms)),
+            "首次投递也应扣除原deadline已经消耗的时间"
+        );
         assert_eq!(question["decision"]["options"][0]["id"], "option-a");
         let models = fixture.model_seen.lock().await;
         assert!(!models[0]["tools"]
