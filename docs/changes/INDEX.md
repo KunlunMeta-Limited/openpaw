@@ -1,6 +1,6 @@
 # CHG 索引
 
-- [CHG-2026-0055：普通委派参数边界](CHG-2026-0055-普通委派参数边界.md)：approved，用户批准两处业务文件及runtime单处接线追加；普通聊天隐藏Goal参数并提供纠错，Goal保护保留。本地实施中，不修改前端或部署15180。
+- [CHG-2026-0055：普通委派参数边界](CHG-2026-0055-普通委派参数边界.md)：本地implemented／ready-for-human，代码3785672；三处获批业务文件、Goal6／workspace996／Host309／CLI26及四组原版浏览器隔离联调通过，Goal保护保留。正式CODEOWNER/CI与既有基线限制独立；未修改前端或部署15180。
 
 - [CHG-2026-0054：用户提问与非阻塞委派](CHG-2026-0054-用户提问与非阻塞委派.md)：approved，本地九票及审查修复完成，ready-for-human。9ed3a7b的Host309、CLI26、双配置workspace严格Clippy、格式及六项xtask通过；Standards三项closed/新增0、Spec0。workspace993和原版浏览器五组属于9c候选；基线Core模块缺Stability仍失败、cargo-deny不可用，正式CODEOWNER/CI独立。11个实现树已清理，原版AI Office保持，15180仍运行用户演示9c4bb23。
 
@@ -41,7 +41,7 @@
 
 | 变更编号 | 标题 | 状态 | 风险 | 负责人 | 接口数量 | 文件数量 |
 | --- | --- | --- | --- | --- | ---: | ---: |
-| CHG-2026-0055 | [普通委派参数边界](CHG-2026-0055-普通委派参数边界.md) | approved / 本地实施中 | low | 用户批准；Codex实施 | 模型工具schema随回合筛选，新增本地Goal筛选方法；无新增HTTP或Core类型/trait | 5 |
+| CHG-2026-0055 | [普通委派参数边界](CHG-2026-0055-普通委派参数边界.md) | implemented / 本地ready-for-human | low | 用户批准；Codex实施验证 | 回合schema筛选及可纠正拒绝；普通子执行与确认Goal声明实测通过，正式审查独立 | 5 |
 | CHG-2026-0054 | [用户提问与非阻塞委派](CHG-2026-0054-用户提问与非阻塞委派.md) | approved / 本地实施及审查修复完成，ready-for-human；基线stability限制保留 | high | 用户批准；Codex实施 | 中立调用上下文、可信控制及已有聊天接线；无新增HTTP路由 | 实际24；允许26 |
 | CHG-2026-0053 | [初始化成员布局](CHG-2026-0053-初始化成员布局.md) | approved / 本地实施、门禁通过；15180部署证据单独记录 | low | 用户授权；Codex实施 | 既有可选layoutId | 3 |
 | CHG-2026-0038 | [子会话并发审批与停止](CHG-2026-0038-子会话并发审批与停止.md) | approved / 实施中 | high | 用户批准；Codex 实施 | 沿用既有 HTTP/SSE | 5 |
