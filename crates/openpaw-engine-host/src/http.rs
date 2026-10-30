@@ -2431,15 +2431,17 @@ mod tests {
                     || scenario.starts_with("question-queue")
                 {
                     "5"
-                } else if scenario.starts_with("question-history") || matches!(
-                    scenario,
-                    "delegate-concurrent"
-                        | "delegate-conversations-async"
-                        | "goal-delegate"
-                        | "delegate-cancel"
-                        | "delegate-conversations"
-                        | "delegate-conversations-approval"
-                ) {
+                } else if scenario.starts_with("question-history")
+                    || matches!(
+                        scenario,
+                        "delegate-concurrent"
+                            | "delegate-conversations-async"
+                            | "goal-delegate"
+                            | "delegate-cancel"
+                            | "delegate-conversations"
+                            | "delegate-conversations-approval"
+                    )
+                {
                     "2"
                 } else {
                     "1"

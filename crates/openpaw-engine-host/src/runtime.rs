@@ -912,6 +912,7 @@ impl AppState {
         Result<openpaw_engine::coordination::StartedExecution, String>,
     > {
         let state = self.clone();
+        let result_window = provider.model_capabilities(&model).context_window as usize;
         Box::pin(async move {
             let parent = state
                 .get_typed(&child.parent_id)
@@ -1238,7 +1239,9 @@ impl AppState {
                             .find(|saved| {
                                 saved.child_turn_id == turn_id && saved.stage == "result_saved"
                             })
-                            .and_then(|saved| saved.outcome)
+                            .map(|saved| {
+                                crate::context::child_result_preview(&saved, result_window)
+                            })
                             .ok_or_else(|| "子结果尚未可靠保存".into());
                     }
                     Ok(outcome)
