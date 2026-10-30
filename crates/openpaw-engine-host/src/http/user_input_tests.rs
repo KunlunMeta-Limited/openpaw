@@ -235,7 +235,12 @@ mod history_question_tests {
             {
                 return response(None, "已恢复并交付真实答案", tools.len());
             }
-            if let Some(page) = metadata(body).iter().rev().find(|v| v["kind"] == "page") {
+            let page_all = all[source]["content"]
+                .as_str()
+                .unwrap()
+                .contains("PAGE_ALL");
+            let pages = metadata(&serde_json::json!({"messages":current}));
+            if let Some(page) = pages.iter().rev().find(|v| v["kind"] == "page") {
                 if all[source]["content"]
                     .as_str()
                     .unwrap()
@@ -259,6 +264,27 @@ mod history_question_tests {
                         response(None, "原件末尾尚未读到，不交付", tools.len())
                     };
                 }
+                if page_all {
+                    return if page["has_more"] == true {
+                        response(
+                            Some((
+                                "read_context_record",
+                                serde_json::json!({"reference":page["reference"],"start":page["next_start"],"limit":256}),
+                            )),
+                            "",
+                            tools.len(),
+                        )
+                    } else {
+                        response(
+                            Some((
+                                "write_file",
+                                serde_json::json!({"path":"recovered-answer-tail.txt","content":page["content"]}),
+                            )),
+                            "",
+                            tools.len(),
+                        )
+                    };
+                }
                 let record = page["content"]
                     .as_str()
                     .unwrap_or("")
@@ -269,7 +295,7 @@ mod history_question_tests {
                     response(
                         Some((
                             "write_file",
-                            serde_json::json!({"path":"recovered-answer.txt","content":record["answer"]["label"]}),
+                            serde_json::json!({"path":"recovered-answer.txt","content":record["answer"]["custom_text"].as_str().or_else(||record["answer"]["label"].as_str()).unwrap()}),
                         )),
                         "",
                         tools.len(),
@@ -306,7 +332,7 @@ mod history_question_tests {
                 response(
                     Some((
                         "read_context_record",
-                        serde_json::json!({"reference":fact["reference"],"start":start,"limit":2048}),
+                        serde_json::json!({"reference":fact["reference"],"start":start,"limit":if page_all{256}else{2048}}),
                     )),
                     "",
                     tools.len(),
@@ -503,6 +529,174 @@ mod history_question_tests {
         );
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("message/temporary"));
+    }
+    fn assert_complete_custom_pages(
+        requests: &[serde_json::Value],
+        owner: &str,
+        delivered_tail: &str,
+    ) {
+        let pages = requests
+            .iter()
+            .filter(|request| request["stream"] == true && request["tools"].is_array())
+            .flat_map(|request| request["messages"].as_array().unwrap())
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| {
+                serde_json::from_str::<serde_json::Value>(message["content"].as_str()?).ok()
+            })
+            .filter(|value| value["kind"] == "page")
+            .collect::<Vec<_>>();
+        assert!(pages.len() > 1, "完整答案必须经过真实工具分页进入模型输入");
+        let reference = pages[0]["reference"].as_str().unwrap();
+        openpaw_engine::context::parse_reference(reference, owner).unwrap();
+        let total = pages[0]["total_chars"].as_u64().unwrap() as usize;
+        let mut observed = vec![None; total];
+        for page in &pages {
+            assert_eq!(page["reference"], reference);
+            assert_eq!(page["total_chars"], total);
+            let start = page["start"].as_u64().unwrap() as usize;
+            let content = page["content"].as_str().unwrap();
+            let end = start + content.chars().count();
+            assert_eq!(page["next_start"], end);
+            assert_eq!(page["has_more"], end < total);
+            for (offset, ch) in content.chars().enumerate() {
+                let cell = &mut observed[start + offset];
+                assert!(cell.is_none_or(|previous| previous == ch));
+                *cell = Some(ch);
+            }
+        }
+        let original = observed
+            .into_iter()
+            .map(|ch| ch.expect("完整原件不能有未进入真实模型输入的缺页"))
+            .collect::<String>();
+        let record = original
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| value["answer"]["custom_text"].is_string())
+            .expect("必须从真实页面重建已接受回答原件");
+        assert_eq!(record["state"], "answered");
+        assert_eq!(record["answer"]["custom_text"], "补".repeat(1000));
+        let last = pages
+            .iter()
+            .rfind(|page| page["has_more"] == false)
+            .unwrap();
+        assert_eq!(delivered_tail, last["content"].as_str().unwrap());
+    }
+    #[tokio::test]
+    async fn main_history_max_custom_answer_survives_missing_result_fork_and_restart() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-history-answer", "max-custom").await;
+        assert_eq!(
+            send_in(
+                &fixture.app,
+                &fixture.team,
+                "custom",
+                "ask",
+                "HISTORY_ASK 取得完整补充"
+            )
+            .await["state"],
+            "complete"
+        );
+        let owner = fixture
+            .state
+            .main_office
+            .conversation_record(&fixture.team, "custom")
+            .unwrap()
+            .unwrap()
+            .session
+            .unwrap();
+        let path = fixture
+            .home
+            .path()
+            .join("sessions")
+            .join(format!("{owner}.jsonl"));
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let index = raw
+            .lines()
+            .position(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["type"] == "user_question_v1" && value["record"]["state"] == "answered"
+            })
+            .unwrap();
+        std::fs::write(
+            &path,
+            raw.lines().take(index + 1).collect::<Vec<_>>().join("\n") + "\n",
+        )
+        .unwrap();
+        let restarted = build_router(AppState::new(fixture.state.config.clone()));
+        let fork = child_test_json(
+            &restarted,
+            "POST",
+            &format!("/session/{owner}/fork"),
+            serde_json::json!({}),
+        )
+        .await;
+        let fork_id = fork["id"].as_str().unwrap();
+        fixture.model_seen.lock().await.clear();
+        child_test_json(
+            &restarted,
+            "POST",
+            &format!("/session/{fork_id}/message"),
+            serde_json::json!({"text":"HISTORY_FACT_PROBE PAGE_ALL 逐页回读完整补充后交付末页"}),
+        )
+        .await;
+        assert_complete_custom_pages(
+            &fixture.model_seen.lock().await,
+            fork_id,
+            &std::fs::read_to_string(fixture.workspace.path().join("recovered-answer-tail.txt"))
+                .unwrap(),
+        );
+        std::fs::remove_file(fixture.workspace.path().join("recovered-answer-tail.txt")).unwrap();
+        fixture.model_seen.lock().await.clear();
+        assert_eq!(
+            send_in(
+                &restarted,
+                &fixture.team,
+                "custom",
+                "resume",
+                "HISTORY_FACT_PROBE PAGE_ALL 继续逐页回读完整自定义补充后交付末页"
+            )
+            .await["state"],
+            "complete"
+        );
+        assert_complete_custom_pages(
+            &fixture.model_seen.lock().await,
+            &owner,
+            &std::fs::read_to_string(fixture.workspace.path().join("recovered-answer-tail.txt"))
+                .unwrap(),
+        );
+        assert!(
+            fixture
+                .model_seen
+                .lock()
+                .await
+                .iter()
+                .any(
+                    |request| request["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message["role"] == "system"
+                            && message["content"]
+                                .as_str()
+                                .unwrap_or("")
+                                .contains("answer_truncated"))
+                ),
+            "合法长答案也必须保留有界预览和原件引用"
+        );
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|v| v["type"] == "decision.request")
+                .count(),
+            1,
+            "分支或重启均不能重问可靠答案"
+        );
     }
     #[tokio::test]
     async fn main_history_long_child_end_turn_result_has_readable_tail_original() {
@@ -4096,12 +4290,13 @@ mod user_input_tests {
         }
         let mut data = serde_json::json!({"teamId":body["teamId"],"conversationId":body["conversationId"],"decisionId":body["decision"]["id"],"choiceId":"option-a","label":"方案A"});
         match choice {
-            "custom" | "empty-custom" | "long-custom" => {
+            "custom" | "empty-custom" | "long-custom" | "max-custom" => {
                 data["choiceId"] = serde_json::json!("custom");
                 data["label"] = serde_json::json!("其他");
                 data["customText"] = serde_json::json!(match choice {
                     "empty-custom" => "   ".into(),
                     "long-custom" => "🙂".repeat(501),
+                    "max-custom" => "补".repeat(1000),
                     _ => "  我需要Markdown报告  ".into(),
                 });
             }
