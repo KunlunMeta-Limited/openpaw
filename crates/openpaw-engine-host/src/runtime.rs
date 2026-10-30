@@ -1138,20 +1138,13 @@ impl AppState {
                             .into_iter()
                             .find(|turn| turn.turn_id == child_turn_id)
                         {
-                            let status = if terminal.state == TurnState::Completed
-                                && paused.is_none()
-                            {
-                                "completed"
-                            } else if terminal.state == TurnState::Cancelled {
-                                "cancelled"
-                            } else if terminal.state == TurnState::Completed && paused.is_some() {
-                                "paused"
-                            } else {
-                                "failed"
-                            };
+                            let status = delegated_status(&terminal, paused.as_deref());
                             let result = delegated_result(
-                                &child_handle,
-                                &terminal.turn_id,
+                                &child_handle.id,
+                                &child_handle
+                                    .message_cache
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner()),
                                 &terminal,
                                 paused.as_deref(),
                             );
@@ -1189,36 +1182,24 @@ impl AppState {
                         .into_iter()
                         .find(|turn| turn.turn_id == turn_id)
                         .ok_or("子回合未保存终态")?;
-                    let completed = terminal.state == TurnState::Completed && paused.is_none();
-                    let result = delegated_result(&handle, &turn_id, &terminal, paused.as_deref());
-                    let status = if completed {
-                        "completed"
-                    } else if terminal.state == TurnState::Cancelled {
-                        "cancelled"
-                    } else if terminal.state == TurnState::Completed && paused.is_some() {
-                        "paused"
-                    } else {
-                        "failed"
-                    };
-                    let outcome = openpaw_core::ToolCallOutcome {
-                        media: Vec::new(),
-                        is_error: !completed,
-                        content: format!(
-                            "子 Agent“{}” task_id={}，status={}：\n{}{}",
-                            child.name,
-                            handle.id,
-                            status,
-                            result,
-                            if goal_task_id.is_some() {
-                                "\nGoal 子任务已返回实际结果，尚未验收；由主 Agent 读取或检查后决定。"
-                            } else {
-                                ""
-                            }
-                        ),
-                        structured: Some(
-                            serde_json::json!({"task_id":handle.id,"sessionId":handle.id,"turnId":turn_id,"workspaceId":child.workspace_id,"workspaceName":child.name,"parentSessionId":child.parent_id,"status":status,"result":result}),
-                        ),
-                    };
+                    let status = delegated_status(&terminal, paused.as_deref());
+                    let result = delegated_result(
+                        &handle.id,
+                        &handle
+                            .message_cache
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner()),
+                        &terminal,
+                        paused.as_deref(),
+                    );
+                    let outcome = delegated_outcome(
+                        &child,
+                        &handle.id,
+                        &turn_id,
+                        status,
+                        &result,
+                        goal_task_id.is_some(),
+                    );
                     if let Some(mut record) = origin {
                         record.stage = "result_saved".into();
                         record.status = Some(status.into());
@@ -1545,7 +1526,13 @@ impl AppState {
         self.get_typed(id).await.ok()
     }
     /// 功能：获取或懒加载指定 session，并保留稳定失败分类。
+    /// 参数：id为持久会话身份。
+    /// 返回：唯一会话槽组装的共享句柄。
+    /// 错误：缺失、损坏或不可访问时保留原分类。
+    /// 状态：根加载前经既有子槽闭合可靠事实，不恢复执行。
     /// 并发与取消：全局 slot map 锁只用于取得槽；磁盘和 ToolHost await 仅持有目标 session 槽。
+    /// 权限：不授予工具、问题展示或子执行许可。
+    /// 关联：CHG-2026-0054重启事实恢复。
     pub(crate) async fn get_typed(&self, id: &str) -> Result<Arc<SessionHandle>, SessionLoadError> {
         if !valid_session_id(id) {
             return Err(SessionLoadError::NotFound);
@@ -1555,6 +1542,19 @@ impl AppState {
                 return Err(SessionLoadError::NotFound);
             }
             return Ok(handle);
+        }
+        // 根会话先经已有子槽闭合事实；此处尚未持有父槽或writer，子加载不反向加载父。
+        if openpaw_store::catalog::read(&self.config.home, id)
+            .is_ok_and(|read| session_child(&read.events).is_none())
+        {
+            for child_id in openpaw_store::catalog::discover(&self.config.home).unwrap_or_default()
+            {
+                if openpaw_store::catalog::read(&self.config.home, &child_id).is_ok_and(|read| {
+                    session_child(&read.events).is_some_and(|child| child.parent_id == id)
+                }) {
+                    let _ = Box::pin(self.get_typed(&child_id)).await;
+                }
+            }
         }
         let slot = self.session_slot(id).await;
         let _session_lifecycle = slot.lock().await;
@@ -1734,15 +1734,16 @@ impl AppState {
         let workspace = absolute_workspace(session_workspace(&read.events, &self.config.workspace))
             .map_err(|_| SessionLoadError::Unavailable)?;
         let mut writer = SessionWriter::open_append(&path).map_err(classify_session_error)?;
+        let mut projection = restored_session_projection(id, &read.events)?;
+        recover_session_facts(id, &read.events, &mut projection, &mut writer)?;
+        read = SessionReader::read(&path).map_err(classify_session_error)?;
         let projection = restored_session_projection(id, &read.events)?;
         let model_contexts = projection.model_contexts;
-        let mut execution_attempts = projection.execution_attempts;
+        let execution_attempts = projection.execution_attempts;
         let message_presentations = projection.message_presentations;
         let messages = projection.messages;
-        let mut turn_outcomes = projection.turn_outcomes;
+        let turn_outcomes = projection.turn_outcomes;
         let turn_errors = projection.turn_errors;
-        recover_unknown_tools(&mut execution_attempts, &mut writer)?;
-        recover_hanging_outcomes(&mut turn_outcomes, &mut writer)?;
         let request_admissions = projection.request_admissions;
         let mutation = projection.mutation;
         let turn_sequence = projection.turn_sequence_high_water;
@@ -2832,25 +2833,58 @@ pub(crate) fn restored_office_children(
     children.sort_by(|a, b| a.0.cmp(&b.0));
     children
 }
+fn delegated_status(terminal: &TurnOutcome, paused: Option<&str>) -> &'static str {
+    match terminal.state {
+        TurnState::Completed if paused.is_none() => "completed",
+        TurnState::Completed => "paused",
+        TurnState::Cancelled => "cancelled",
+        _ => "failed",
+    }
+}
+fn delegated_outcome(
+    child: &ChildSession,
+    id: &str,
+    turn: &str,
+    status: &str,
+    result: &str,
+    goal: bool,
+) -> openpaw_core::ToolCallOutcome {
+    openpaw_core::ToolCallOutcome {
+        media: Vec::new(),
+        is_error: status != "completed",
+        content: format!(
+            "子 Agent“{}” task_id={}，status={}：\n{}{}",
+            child.name,
+            id,
+            status,
+            result,
+            if goal {
+                "\nGoal 子任务已返回实际结果，尚未验收；由主 Agent 读取或检查后决定。"
+            } else {
+                ""
+            }
+        ),
+        structured: Some(
+            serde_json::json!({"task_id":id,"sessionId":id,"turnId":turn,"workspaceId":child.workspace_id,"workspaceName":child.name,"parentSessionId":child.parent_id,"status":status,"result":result}),
+        ),
+    }
+}
 fn delegated_result(
-    handle: &SessionHandle,
-    turn_id: &str,
+    owner: &str,
+    messages: &[openpaw_core::Message],
     terminal: &TurnOutcome,
     paused: Option<&str>,
 ) -> String {
     if let Some(reason) = paused.filter(|_| terminal.state == TurnState::Completed) {
         format!("子执行已暂停：{reason}。尚未完成，请在原聊天明确继续。")
     } else if terminal.state == TurnState::Completed {
-        handle
-            .message_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        messages
             .iter()
             .rev()
             .find(|message| {
                 message.role == openpaw_core::Role::Assistant
                     && message.uuid.as_ref().is_some_and(|id| {
-                        id.starts_with(&format!("msg_{}_{}_", handle.id, turn_id))
+                        id.starts_with(&format!("msg_{}_{}_", owner, terminal.turn_id))
                     })
             })
             .map(openpaw_core::Message::text)
@@ -3088,12 +3122,98 @@ fn recover_orphaned_turns_in_file(path: &std::path::Path) -> Result<usize, Sessi
     let read = journal::read_repaired(path).map_err(classify_session_error)?;
     let mut projection = restored_session_projection(&read.meta.id, &read.events)?;
     let mut writer = SessionWriter::open_append(path).map_err(classify_session_error)?;
-    recover_unknown_tools(&mut projection.execution_attempts, &mut writer)?;
-    recover_hanging_outcomes(&mut projection.turn_outcomes, &mut writer)
+    recover_session_facts(&read.meta.id, &read.events, &mut projection, &mut writer)
+}
+fn recover_session_facts(
+    owner: &str,
+    events: &[SessionEvent],
+    projection: &mut openpaw_store::transcript::Transcript,
+    writer: &mut SessionWriter,
+) -> Result<usize, SessionLoadError> {
+    use openpaw_core::user_input::UserQuestionState;
+    let questions =
+        crate::context::validated_questions(owner, events, projection.visible_messages(owner));
+    for mut question in questions
+        .iter()
+        .filter(|q| {
+            matches!(
+                q.state,
+                UserQuestionState::Queued | UserQuestionState::Waiting
+            )
+        })
+        .cloned()
+    {
+        question.state = UserQuestionState::Interrupted;
+        question.reason = Some("Host重启中断了原问题，请在原聊天明确继续。".into());
+        writer
+            .append(&openpaw_store::transcript::encode(
+                &serde_json::json!({"record":question}),
+                "user_question_v1",
+            ))
+            .map_err(classify_session_error)?;
+    }
+    if let Some(child) = session_child(events) {
+        let mut seen = HashSet::new();
+        for mut record in crate::context::child_executions(events)
+            .map_err(|_| SessionLoadError::Corrupt)?
+            .into_iter()
+            .rev()
+        {
+            if !seen.insert(record.child_turn_id.clone())
+                || record.stage != "accepted"
+                || record.child_session_id != owner
+                || record.parent_session_id != child.parent_id
+            {
+                continue;
+            }
+            let Some(turn) = projection.turn_outcomes.iter().find(|turn| {
+                turn.turn_id == record.child_turn_id
+                    && turn.user_message_id == record.child_user_message_id
+            }) else {
+                continue;
+            };
+            record.occurred_at = chrono::Utc::now().timestamp_millis();
+            if !turn.state.is_terminal()
+                || turn
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.code == "host_restarted")
+            {
+                record.stage = "interrupted".into();
+                record.status = Some("interrupted".into());
+            } else {
+                let paused = questions
+                    .iter()
+                    .find(|q| q.turn_id == turn.turn_id && q.state != UserQuestionState::Answered)
+                    .map(|q| q.reason.as_deref().unwrap_or("重启前未取得有效答案"));
+                let status = delegated_status(turn, paused);
+                let text = delegated_result(owner, &projection.messages, turn, paused);
+                record.stage = "result_saved".into();
+                record.status = Some(status.into());
+                record.outcome = Some(delegated_outcome(
+                    &child,
+                    owner,
+                    &turn.turn_id,
+                    status,
+                    &text,
+                    false,
+                ));
+            }
+            writer
+                .append(&openpaw_store::transcript::encode(
+                    &serde_json::json!({"record":record}),
+                    "child_execution_v1",
+                ))
+                .map_err(classify_session_error)?;
+        }
+    }
+    recover_unknown_tools(&mut projection.execution_attempts, writer, &questions)?;
+    recover_hanging_outcomes(&mut projection.turn_outcomes, writer)
 }
 fn recover_unknown_tools(
     attempts: &mut Vec<openpaw_store::execution_attempts::ExecutionAttemptV1>,
     writer: &mut SessionWriter,
+    questions: &[openpaw_core::user_input::UserQuestionRecord],
 ) -> Result<(), SessionLoadError> {
     let pending: Vec<_> = attempts
         .iter()
@@ -3124,6 +3244,24 @@ fn recover_unknown_tools(
         })
         .collect();
     for (turn_id, response_index, call, name) in pending {
+        let known = questions
+            .iter()
+            .find(|q| {
+                q.state == openpaw_core::user_input::UserQuestionState::Answered
+                    && q.turn_id == turn_id
+                    && q.response_index == response_index
+                    && q.tool_call_id == call
+                    && name == "request_user_input"
+            })
+            .filter(|_| {
+                attempts.iter().any(|r| {
+                    r.turn_id == turn_id
+                        && r.response_index == response_index
+                        && r.kind == "tool_start"
+                        && r.payload["call_id"] == call
+                })
+            });
+        let outcome = known.map_or_else(||openpaw_core::ToolCallOutcome::error("Host 重启后无法确认工具结果；可能已经产生副作用，未自动重试。"), |q|openpaw_core::ToolCallOutcome::ok(serde_json::json!({"question_id":q.question_id,"tool_call_id":q.tool_call_id,"scope":q.scope,"answer":q.answer}).to_string()));
         let sequence = attempts
             .iter()
             .filter(|r| r.turn_id == turn_id)
@@ -3137,7 +3275,7 @@ fn recover_unknown_tools(
             response_index,
             occurred_at: chrono::Utc::now().timestamp_millis(),
             kind: "tool_result".into(),
-            payload: serde_json::json!({"call_id":call,"name":name,"outcome":openpaw_core::ToolCallOutcome::error("Host 重启后无法确认工具结果；可能已经产生副作用，未自动重试。"),"disposition":"unknown","duration_ms":0}),
+            payload: serde_json::json!({"call_id":call,"name":name,"outcome":outcome,"disposition":if known.is_some(){"completed"}else{"unknown"},"duration_ms":0}),
         };
         openpaw_store::execution_attempts::validate(attempts, &record)
             .map_err(|_| SessionLoadError::Corrupt)?;
