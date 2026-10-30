@@ -155,6 +155,8 @@ pub struct SessionHandle {
     question: Arc<openpaw_engine::user_input::QuestionContext>,
     /// 共享中立展示协调器；当前题及根子归属仍由原回合核验。
     pub(crate) question_queue: Arc<openpaw_engine::user_input::QuestionQueue>,
+    /// Goal观察订阅代际；只协调连接接管与旧Drop取消，不创建执行状态或许可。
+    pub(crate) main_observer_generation: std::sync::Mutex<u64>,
     child_question_phase: std::sync::Mutex<
         Option<(
             String,
@@ -1971,6 +1973,7 @@ impl AppState {
             question,
             child_question_phase: std::sync::Mutex::new(None),
             question_queue: self.question_queue.clone(),
+            main_observer_generation: std::sync::Mutex::new(0),
             approvals,
             delegation,
             active: AtomicBool::new(false),

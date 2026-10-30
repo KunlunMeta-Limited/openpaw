@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use openpaw_core::{
     ToolCallOutcome, ToolCategory, ToolConcurrency, ToolExecutor, ToolHost, ToolHostValidator,
-    ToolSpec,
+    ToolInvocationContext, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -517,6 +517,9 @@ impl GoalContext {
             .iter()
             .position(|task| task.current && task.id == id)
             .ok_or("委派任务不属于当前 Goal 计划")?;
+        if question_paused_tasks(goal, &user.turn_id).contains(id) {
+            return Err("该分支问答已暂停，等待原聊天用户明确继续，不能同回合重新委派".into());
+        }
         if goal.tasks[index].status != "pending" {
             return Err("Goal 任务已被启动或已有产出，不能重复委派".into());
         }
@@ -1036,6 +1039,15 @@ impl GoalContext {
             .filter(|s| !s.trim().is_empty() && s.encode_utf16().count() <= 1000)
             .ok_or("必须提供变更原因")?;
         let action = input["action"].as_str().unwrap_or("");
+        let paused = question_paused_tasks(goal, &user.turn_id);
+        if input["task_id"]
+            .as_str()
+            .is_some_and(|id| paused.contains(id))
+        {
+            return Err(
+                "该分支问答已暂停，等待原聊天用户明确继续；不能同回合重检、执行或验收".into(),
+            );
+        }
         if input.get("objective").is_some() || input.get("acceptance_criteria").is_some() {
             goal.phase = "paused".into();
             goal.reason =
@@ -1059,6 +1071,29 @@ impl GoalContext {
         }
         if action == "replan" {
             let definitions = parse_plan_definitions(&input["tasks"])?;
+            for old in goal
+                .tasks
+                .iter()
+                .filter(|task| task.current && paused.contains(&task.id))
+            {
+                if definitions
+                    .iter()
+                    .find(|new| new.id == old.id)
+                    .is_none_or(|new| !same_task_definition(old, new))
+                    || definitions.iter().any(|new| {
+                        new.id != old.id
+                            && !goal.tasks.iter().any(|task| task.id == new.id)
+                            && (new.title == old.title
+                                || new.expected_result == old.expected_result
+                                || new.replaces.contains(&old.id))
+                    })
+                {
+                    return Err(
+                        "暂停分支及依赖等待用户明确继续，不能通过重规划、替换或新建等价任务绕过"
+                            .into(),
+                    );
+                }
+            }
             let mut previous = goal.tasks.clone();
             for task in previous
                 .iter_mut()
@@ -1327,7 +1362,20 @@ impl GoalContext {
         if !user.as_ref().is_some_and(|user| user.executing) {
             return None;
         }
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).records.last().filter(|goal| goal.phase == "active").map(|_| "Goal 仍有未完成工作。继续按当前依赖执行、检查产出或核对整体验收；普通回复结束不能代替目标完成，继续使用本回合剩余预算。".into())
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let goal = state.records.last().filter(|goal| goal.phase == "active")?;
+        let paused = question_paused_tasks(goal, &user.as_ref()?.turn_id);
+        if !paused.is_empty()
+            && !goal.tasks.iter().any(|task| {
+                task.current
+                    && !paused.contains(&task.id)
+                    && (matches!(task.status.as_str(), "running" | "produced" | "interrupted")
+                        || (task.status == "pending" && dependencies_satisfied(task, &goal.tasks)))
+            })
+        {
+            return None;
+        }
+        Some("Goal 仍有未完成工作。继续按当前依赖执行、检查产出或核对整体验收；普通回复结束不能代替目标完成，继续使用本回合剩余预算。".into())
     }
 
     /// 功能：判断本回合是否有真实用户授予的前台执行许可。
@@ -1477,6 +1525,7 @@ impl GoalContext {
             if matches!(
                 name,
                 "goal_read"
+                    | "request_user_input"
                     | "get_agent_status"
                     | "wait_agent"
                     | "goal_update"
@@ -1522,6 +1571,7 @@ impl GoalContext {
             || matches!(
                 name,
                 "goal_read"
+                    | "request_user_input"
                     | "goal_update"
                     | "read_file"
                     | "read_attachment"
@@ -1631,6 +1681,36 @@ fn same_task_definition(old: &GoalTask, new: &GoalTask) -> bool {
         && old.expected_result == new.expected_result
         && old.acceptance_criteria == new.acceptance_criteria
         && old.dependencies == new.dependencies
+}
+
+// 可信子终态只冻结原父回合的分支；新用户明确继续后沿既有产物复核规则处理。
+fn question_paused_tasks(goal: &GoalRecord, turn: &str) -> HashSet<String> {
+    let mut paused: HashSet<String> = goal
+        .history
+        .iter()
+        .filter(|entry| {
+            entry["action"] == "child_result"
+                && entry["status"] == "paused"
+                && entry["turn_id"] == turn
+        })
+        .filter_map(|entry| entry["task_id"].as_str().map(str::to_owned))
+        .collect();
+    loop {
+        let before = paused.len();
+        for task in goal.tasks.iter().filter(|task| task.current) {
+            if task
+                .dependencies
+                .iter()
+                .chain(&task.replaces)
+                .any(|id| paused.contains(id))
+            {
+                paused.insert(task.id.clone());
+            }
+        }
+        if paused.len() == before {
+            return paused;
+        }
+    }
 }
 
 fn merge_plan_definitions(
@@ -1933,6 +2013,23 @@ impl ToolExecutor for GoalToolHost {
         self.inner.list_tools().await
     }
     async fn call(&self, name: &str, args: Value) -> openpaw_core::Result<ToolCallOutcome> {
+        self.call_with_context(name, args, &ToolInvocationContext::default())
+            .await
+    }
+    /// 功能：实施Goal权限并向内层保留引擎实际调用身份。
+    /// 参数：name、args为工具输入，context为原回合及调用身份。
+    /// 返回：Goal结果或原工具结果。
+    /// 错误：沿用权限、原工具与可靠观察保存错误。
+    /// 状态：只由既有Goal更新和观察入口保存事实。
+    /// 并发与取消：保留原工具取消和调用串行约束。
+    /// 权限：调用身份不替代Goal确认或工具审批。
+    /// 关联：ToolExecutor、CHG-2026-0054。Stability: experimental。
+    async fn call_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        context: &ToolInvocationContext,
+    ) -> openpaw_core::Result<ToolCallOutcome> {
         if let Err(error) = self.context.allowed(name) {
             return Ok(ToolCallOutcome::error(error));
         }
@@ -1940,7 +2037,10 @@ impl ToolExecutor for GoalToolHost {
             "goal_read" => Ok(self.context.read()),
             "goal_update" => self.context.update(args),
             _ => {
-                let mut outcome = self.inner.call(name, args.clone()).await?;
+                let mut outcome = self
+                    .inner
+                    .call_with_context(name, args.clone(), context)
+                    .await?;
                 if let Err(error) = self.context.observe(name, args, &mut outcome) {
                     return Err(openpaw_core::Error::Session(error));
                 }

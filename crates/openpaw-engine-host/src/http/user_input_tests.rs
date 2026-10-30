@@ -1,4 +1,830 @@
 #[cfg(test)]
+mod goal_question_tests {
+    use super::*;
+
+    fn task(id: &str, dependencies: &[&str]) -> serde_json::Value {
+        serde_json::json!({"id":id,"title":format!("任务{id}"),"expected_result":format!("{id}.txt"),"acceptance_criteria":["文件可读"],"dependencies":dependencies})
+    }
+    fn tasks() -> serde_json::Value {
+        serde_json::json!([task("a", &[]), task("b", &[]), task("c", &["a"])])
+    }
+    fn chunk(index: usize, tool: Option<(&str, serde_json::Value)>) -> Response {
+        chunk_named(&format!("gq-{index}"), tool)
+    }
+    fn chunk_named(id: &str, tool: Option<(&str, serde_json::Value)>) -> Response {
+        let delta = match tool {
+            Some((name, args)) => {
+                serde_json::json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]})
+            }
+            None => serde_json::json!({"content":"当前仍待确认或补充条件"}),
+        };
+        let chunk = serde_json::json!({"choices":[{"delta":delta,"finish_reason":if delta["tool_calls"].is_array(){"tool_calls"}else{"stop"}}]});
+        (
+            [(header::CONTENT_TYPE, "text/event-stream")],
+            format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+        )
+            .into_response()
+    }
+    fn question() -> serde_json::Value {
+        serde_json::json!({"question":"请选择交付方式","options":[{"id":"option-a","label":"方案A"},{"id":"option-b","label":"方案B"}]})
+    }
+    pub(super) async fn model_response(
+        body: &serde_json::Value,
+        scenario: &str,
+        questions: &tokio::sync::Mutex<Vec<serde_json::Value>>,
+        _gate: &tokio::sync::Notify,
+    ) -> Response {
+        let messages = body["messages"].as_array().unwrap();
+        let start = messages
+            .iter()
+            .rposition(|m| {
+                m["role"] == "user"
+                    && m["content"].as_str().is_some_and(|s| {
+                        s.starts_with("/goal ") || s == "确认执行" || s.starts_with("goal-child-")
+                    })
+            })
+            .unwrap();
+        let text = messages[start]["content"].as_str().unwrap();
+        let results = messages[start..]
+            .iter()
+            .filter(|m| {
+                m["role"] == "tool"
+                    && !m["tool_call_id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("gq-extra-")
+            })
+            .collect::<Vec<_>>();
+        let current = results.iter().find_map(|m| {
+            serde_json::from_str::<serde_json::Value>(m["content"].as_str()?)
+                .ok()
+                .filter(|value| value["id"].is_string())
+        });
+        if text.starts_with("goal-child-") {
+            return chunk(
+                results.len(),
+                match (text, results.len()) {
+                    ("goal-child-a", 0) => Some(("request_user_input", question())),
+                    ("goal-child-a", 1) => Some((
+                        "bash",
+                        serde_json::json!({"command":"printf 'A\\n' >> a.txt"}),
+                    )),
+                    ("goal-child-b", 0) => Some((
+                        "write_file",
+                        serde_json::json!({"path":"b.txt","content":"独立B已交付"}),
+                    )),
+                    ("goal-child-bypass", 0) => Some((
+                        "write_file",
+                        serde_json::json!({"path":"bypass.txt","content":"不应在超时后重派"}),
+                    )),
+                    _ => None,
+                },
+            );
+        }
+        if text == "确认执行" || text == "/goal continue" {
+            let update = |action: &str, id: &str, extra: serde_json::Value| {
+                let mut args = serde_json::json!({"action":action,"task_id":id,"goal_id":current.as_ref().unwrap()["id"],"expected_version":1,"reason":"按真实结果检查当前任务"});
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                Some(("goal_update", args))
+            };
+            let evidence = |index: usize| {
+                let id = results[index]["content"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit("Goal observation: ")
+                    .next()
+                    .unwrap()
+                    .trim();
+                serde_json::json!({"evidence":[{"criterion":0,"observation_id":id,"conclusion":"真实文件逐项检查通过"}]})
+            };
+            let reference = |index: usize| {
+                serde_json::from_str::<serde_json::Value>(
+                    results[index]["content"]
+                        .as_str()
+                        .unwrap()
+                        .split("\nGoal observation:")
+                        .next()
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            // 显式等待可先返回waiting/running变化；继续事件等待到真实终态，再验收。
+            let awaited = if text == "/goal continue" && results.len() == 5 {
+                Some(("a", reference(3)))
+            } else if text != "/goal continue" && !scenario.contains("root") && results.len() == 7 {
+                Some(("a", reference(1)))
+            } else if !scenario.contains("root")
+                && ((scenario.ends_with("pause") && results.len() == 13)
+                    || (!scenario.ends_with("pause") && results.len() == 11))
+                && text != "/goal continue"
+            {
+                Some(("b", reference(3)))
+            } else {
+                None
+            };
+            if let Some((label, child)) = awaited {
+                let terminal = messages[start..].iter().any(|m| {
+                    m["role"] == "tool"
+                        && m["content"]
+                            .as_str()
+                            .and_then(|s| {
+                                serde_json::from_str::<serde_json::Value>(
+                                    s.split("\nGoal observation:").next().unwrap(),
+                                )
+                                .ok()
+                            })
+                            .is_some_and(|r| {
+                                r["session_id"] == child["session_id"]
+                                    && r["turn_id"] == child["turn_id"]
+                                    && matches!(
+                                        r["status"].as_str(),
+                                        Some("completed" | "paused" | "failed" | "cancelled")
+                                    )
+                            })
+                });
+                if !terminal {
+                    return chunk_named(
+                        &format!("gq-extra-{label}-{}", messages.len()),
+                        Some((
+                            "wait_agent",
+                            serde_json::json!({"session_id":child["session_id"],"turn_id":child["turn_id"],"timeout_ms":60000}),
+                        )),
+                    );
+                }
+            }
+            if scenario.contains("root") {
+                if scenario.ends_with("-orphan") && results.len() == 2 {
+                    std::future::pending::<()>().await;
+                }
+                return chunk(
+                    results.len(),
+                    match results.len() {
+                        0 => Some(("goal_read", serde_json::json!({}))),
+                        1 => Some(("request_user_input", question())),
+                        2 => update("block_task", "a", serde_json::json!({})),
+                        3 => update("block_task", "b", serde_json::json!({})),
+                        4 => update("block_task", "c", serde_json::json!({})),
+                        _ => None,
+                    },
+                );
+            }
+            if text == "/goal continue" {
+                let call = match results.len() {
+                    0 => Some(("goal_read", serde_json::json!({}))),
+                    1 => Some(("glob", serde_json::json!({"pattern":"a.txt"}))),
+                    2 => update(
+                        "recheck_task",
+                        "a",
+                        serde_json::json!({"status":"pending","result":"真实glob确认A尚无交付","observation_id":results[1]["content"].as_str().unwrap().rsplit("Goal observation: ").next().unwrap().trim()}),
+                    ),
+                    3 => Some((
+                        "start_agent",
+                        serde_json::json!({"task":"goal-child-a","name":"继续需求员A","goal_task_id":"a"}),
+                    )),
+                    4 => Some((
+                        "wait_agent",
+                        serde_json::json!({"session_id":reference(3)["session_id"],"turn_id":reference(3)["turn_id"],"timeout_ms":60000}),
+                    )),
+                    5 => update("start_task", "a", serde_json::json!({})),
+                    6 => Some(("read_file", serde_json::json!({"path":"a.txt"}))),
+                    7 => update("accept_task", "a", evidence(6)),
+                    8 => update("start_task", "c", serde_json::json!({})),
+                    9 => Some((
+                        "write_file",
+                        serde_json::json!({"path":"c.txt","content":"A验收后C才交付"}),
+                    )),
+                    10 => update(
+                        "record_result",
+                        "c",
+                        serde_json::json!({"result":"c.txt已实际交付，待验收"}),
+                    ),
+                    11 => Some(("read_file", serde_json::json!({"path":"c.txt"}))),
+                    12 => update("accept_task", "c", evidence(11)),
+                    13 => Some((
+                        "bash",
+                        serde_json::json!({"command":"cat a.txt b.txt c.txt"}),
+                    )),
+                    14 => update("accept_goal", "", evidence(13)),
+                    _ => None,
+                };
+                return chunk(results.len(), call);
+            }
+            if results.len() == 5 {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if questions.lock().await.iter().any(|m| {
+                            m["type"] == "decision.request" && m["decision"]["kind"] == "choice"
+                        }) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            let call = match results.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => Some((
+                    "start_agent",
+                    serde_json::json!({"task":"goal-child-a","name":"需求员A","goal_task_id":"a"}),
+                )),
+                2 => Some((
+                    "start_agent",
+                    serde_json::json!({"task":"goal-child-premature","name":"依赖C","goal_task_id":"c"}),
+                )),
+                3 => Some((
+                    "start_agent",
+                    serde_json::json!({"task":"goal-child-b","name":"资料员B","goal_task_id":"b"}),
+                )),
+                4 => Some(("goal_read", serde_json::json!({}))),
+                5 => Some((
+                    "get_agent_status",
+                    serde_json::json!({"session_id":reference(1)["session_id"],"turn_id":reference(1)["turn_id"]}),
+                )),
+                6 => Some((
+                    "wait_agent",
+                    serde_json::json!({"session_id":reference(1)["session_id"],"turn_id":reference(1)["turn_id"],"timeout_ms":60000}),
+                )),
+                7 if scenario.ends_with("pause") => {
+                    Some(("read_file", serde_json::json!({"path":"b.txt"})))
+                }
+                8 if scenario.ends_with("pause") => update(
+                    "recheck_task",
+                    "a",
+                    serde_json::json!({"status":"pending","result":"试图同回合重派", "observation_id":results[7]["content"].as_str().unwrap().rsplit("Goal observation: ").next().unwrap().trim()}),
+                ),
+                9 if scenario.ends_with("pause") => Some((
+                    "start_agent",
+                    serde_json::json!({"task":"goal-child-bypass","name":"错误重派","goal_task_id":"a"}),
+                )),
+                10 if scenario.ends_with("pause") => update(
+                    "replan",
+                    "",
+                    serde_json::json!({"tasks":[task("a",&[]),task("b",&[]),task("c",&[])]}),
+                ),
+                11 if scenario.ends_with("pause") => {
+                    update("start_task", "c", serde_json::json!({}))
+                }
+                12 if scenario.ends_with("pause") => Some((
+                    "write_file",
+                    serde_json::json!({"path":"c.txt","content":"不应绕过依赖"}),
+                )),
+                13 if scenario.ends_with("pause") => {
+                    update("start_task", "b", serde_json::json!({}))
+                }
+                14 if scenario.ends_with("pause") => {
+                    Some(("read_file", serde_json::json!({"path":"b.txt"})))
+                }
+                15 if scenario.ends_with("pause") => update("accept_task", "b", evidence(14)),
+                16 if scenario.ends_with("pause") => {
+                    let mut equivalent = task("d", &[]);
+                    equivalent["title"] = serde_json::json!("任务a");
+                    update(
+                        "replan",
+                        "",
+                        serde_json::json!({"tasks":[task("a",&[]),task("b",&[]),task("c",&["a"]),equivalent]}),
+                    )
+                }
+                17 if scenario.ends_with("pause") => {
+                    let mut replacement = task("d", &[]);
+                    replacement["replaces"] = serde_json::json!(["a"]);
+                    update(
+                        "replan",
+                        "",
+                        serde_json::json!({"tasks":[task("a",&[]),task("b",&[]),task("c",&["a"]),replacement]}),
+                    )
+                }
+                _ if scenario.ends_with("pause") => None,
+                7 => update("start_task", "a", serde_json::json!({})),
+                8 => update("accept_task", "a", evidence(5)),
+                9 => Some(("read_file", serde_json::json!({"path":"a.txt"}))),
+                10 => update("accept_task", "a", evidence(9)),
+                11 => update("start_task", "b", serde_json::json!({})),
+                12 => Some(("read_file", serde_json::json!({"path":"b.txt"}))),
+                13 => update("accept_task", "b", evidence(12)),
+                14 => update("start_task", "c", serde_json::json!({})),
+                15 => Some((
+                    "write_file",
+                    serde_json::json!({"path":"c.txt","content":"A验收后C才交付"}),
+                )),
+                16 => update(
+                    "record_result",
+                    "c",
+                    serde_json::json!({"result":"c.txt已实际交付"}),
+                ),
+                17 => Some(("read_file", serde_json::json!({"path":"c.txt"}))),
+                18 => update("accept_task", "c", evidence(17)),
+                19 => Some((
+                    "bash",
+                    serde_json::json!({"command":"cat a.txt b.txt c.txt"}),
+                )),
+                20 => update("accept_goal", "", evidence(19)),
+                _ => None,
+            };
+            return chunk(results.len(), call);
+        }
+        if scenario != "question-goal-plan" {
+            return chunk(
+                results.len(),
+                match results.len() {
+                    0 => Some(("goal_read", serde_json::json!({}))),
+                    1 => Some((
+                        "goal_update",
+                        serde_json::json!({"action":"set_plan","goal_id":current.as_ref().unwrap()["id"],"expected_version":0,"reason":"按独立产物拆解","acceptance_criteria":["全部文件可读"],"tasks":tasks()}),
+                    )),
+                    _ => None,
+                },
+            );
+        }
+        let call = match results.len() {
+            0 if body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == "request_user_input") =>
+            {
+                Some(("request_user_input", question()))
+            }
+            1 => Some(("goal_read", serde_json::json!({}))),
+            2 => Some((
+                "goal_update",
+                serde_json::json!({"action":"set_plan","goal_id":current.as_ref().unwrap()["id"],"expected_version":0,"reason":"根据明确回答规划","acceptance_criteria":["全部文件可读"],"tasks":tasks()}),
+            )),
+            3 => Some((
+                "write_file",
+                serde_json::json!({"path":"premature.txt","content":"普通答案不能授权交付"}),
+            )),
+            _ => None,
+        };
+        chunk(results.len(), call)
+    }
+    async fn request(fixture: &MainFixture, operation: serde_json::Value) -> Response {
+        let mut body = serde_json::json!({"version":"1.0","teamId":fixture.team,"conversationId":"goal-question"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(operation.as_object().unwrap().clone());
+        fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pawoffice/chat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+    async fn send(fixture: &MainFixture, turn: &str, text: &str) -> Response {
+        let response = request(fixture, serde_json::json!({"type":"history"})).await;
+        let history: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 2_000_000).await.unwrap())
+                .unwrap();
+        let mut messages = Vec::new();
+        for row in history["data"]["turns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["state"] == "complete")
+        {
+            messages.push(serde_json::json!({"role":"user","content":row["user"]}));
+            messages.push(serde_json::json!({"role":"assistant","content":row["assistant"]}));
+        }
+        messages.push(serde_json::json!({"role":"user","content":text}));
+        request(
+            fixture,
+            serde_json::json!({"type":"send","turnId":turn,"messages":messages}),
+        )
+        .await
+    }
+    async fn finish(response: Response) -> serde_json::Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(8),
+            to_bytes(response.into_body(), 2_000_000),
+        )
+        .await
+        .expect("Goal回合应有界结束")
+        .unwrap();
+        serde_json::from_str(std::str::from_utf8(&bytes).unwrap().lines().last().unwrap()).unwrap()
+    }
+    async fn goal(fixture: &MainFixture) -> serde_json::Value {
+        wait_goal(fixture, |_| true).await
+    }
+    async fn wait_goal(
+        fixture: &MainFixture,
+        accepts: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = fixture.seen.lock().await.iter().rev().find_map(|m| {
+                    let goal = m["snapshot"]["conversations"]
+                        .as_array()
+                        .and_then(|rows| rows.iter().find(|row| row["id"] == "goal-question"))
+                        .map(|row| &row["goal"])
+                        .unwrap_or(&m["snapshot"]["goal"]);
+                    goal["id"].is_string().then(|| goal.clone())
+                });
+                if let Some(current) = current.filter(|value| accepts(value)) {
+                    return current;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("主聊天应有界投影已提交Goal事实")
+    }
+    async fn wait_question(fixture: &MainFixture) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|m| m["type"] == "decision.request" && m["decision"]["kind"] == "choice")
+                    && fixture.workspace.path().join("b.txt").exists()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("独立B和A真实待答应取得进展");
+    }
+    async fn wait_presented(fixture: &MainFixture) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|m| m["type"] == "decision.request" && m["decision"]["kind"] == "choice")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("执行中的Goal应已真实待答");
+    }
+    async fn wait_turn(fixture: &MainFixture, state: &str) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let response = request(fixture, serde_json::json!({"type":"history"})).await;
+                let history: serde_json::Value = serde_json::from_slice(
+                    &to_bytes(response.into_body(), 2_000_000).await.unwrap(),
+                )
+                .unwrap();
+                if let Some(row) = history["data"]["turns"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["id"] == "execute" && row["state"] == state)
+                {
+                    return row.clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("原Goal回合应有界进入指定公开终态")
+    }
+    #[tokio::test]
+    async fn main_goal_question_root_answer_only_resumes_original_question() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-root-answer", "held-answer").await;
+        finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+        let pending = tokio::spawn(finish(send(&fixture, "execute", "确认执行").await));
+        wait_presented(&fixture).await;
+        fixture.release_model.notify_one();
+        assert_eq!(pending.await.unwrap()["state"], "complete");
+        assert_eq!(
+            wait_goal(&fixture, |g| g["phase"] == "blocked"
+                || g["phase"] == "paused")
+            .await["acceptedTaskCount"],
+            0
+        );
+        assert!(!fixture.workspace.path().join("a.txt").exists());
+        let models = fixture.model_seen.lock().await;
+        assert!(models
+            .iter()
+            .any(|body| body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "tool"
+                    && m["tool_call_id"] == "gq-1"
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("option-a")))));
+    }
+    #[tokio::test]
+    async fn main_goal_question_unobserved_answer_ends_disconnect_exemption() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-root-orphan", "held-answer").await;
+        finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+        let first = send(&fixture, "execute", "确认执行").await;
+        wait_presented(&fixture).await;
+        drop(first);
+        fixture.release_model.notify_one();
+        wait_turn(&fixture, "stopped").await;
+        assert_eq!(goal(&fixture).await["acceptedTaskCount"], 0);
+        assert!(!fixture.workspace.path().join("a.txt").exists());
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn main_goal_question_explicit_stop_overrides_child_disconnect_recovery() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-pause", "held-answer").await;
+        finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+        let first = send(&fixture, "execute", "确认执行").await;
+        wait_question(&fixture).await;
+        drop(first);
+        let cancelled = request(
+            &fixture,
+            serde_json::json!({"type":"cancel","turnId":"execute"}),
+        )
+        .await;
+        assert_eq!(cancelled.status(), StatusCode::OK);
+        fixture.release_model.notify_one();
+        wait_turn(&fixture, "stopped").await;
+        assert!(!fixture.workspace.path().join("a.txt").exists());
+        assert!(!fixture.workspace.path().join("c.txt").exists());
+        assert!(!fixture.workspace.path().join("bypass.txt").exists());
+        assert_eq!(
+            wait_goal(&fixture, |g| g["phase"] == "paused").await["acceptedTaskCount"],
+            0
+        );
+    }
+    #[tokio::test]
+    async fn main_goal_question_child_result_requires_actual_acceptance_before_dependencies() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-success", "held-answer").await;
+        finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+        let first = send(&fixture, "execute", "确认执行").await;
+        wait_question(&fixture).await;
+        assert_eq!(goal(&fixture).await["acceptedTaskCount"], 0);
+        assert!(!fixture.workspace.path().join("a.txt").exists());
+        assert!(!fixture.workspace.path().join("c.txt").exists());
+        let resumed = request(
+            &fixture,
+            serde_json::json!({"type":"resume","turnId":"execute"}),
+        )
+        .await;
+        drop(first);
+        let pending = tokio::spawn(finish(resumed));
+        fixture.release_model.notify_one();
+        assert_eq!(pending.await.unwrap()["state"], "complete");
+        assert_eq!(
+            wait_goal(&fixture, |g| g["phase"] == "completed").await["phase"],
+            "completed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("a.txt")).unwrap(),
+            "A\n"
+        );
+        let requests = fixture.model_seen.lock().await;
+        assert!(requests
+            .iter()
+            .any(|body| body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "tool"
+                    && m["tool_call_id"] == "gq-8"
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("验收依据")))));
+        assert!(!requests.iter().any(|body| body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["role"] == "user" && m["content"] == "goal-child-premature")));
+    }
+    #[tokio::test]
+    async fn main_goal_question_explicit_continuation_rechecks_and_preserves_independent_acceptance(
+    ) {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-continue-pause", "held-answer").await;
+        finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+        let first = tokio::spawn(finish(send(&fixture, "execute", "确认执行").await));
+        wait_question(&fixture).await;
+        fixture.question_clock.as_ref().unwrap().advance(300000);
+        first.await.unwrap();
+        assert_eq!(
+            wait_goal(&fixture, |g| g["phase"] == "paused").await["acceptedTaskCount"],
+            1
+        );
+        let second = tokio::spawn(finish(send(&fixture, "continue", "/goal continue").await));
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|m| {
+                        m["type"] == "decision.request" && m["decision"]["kind"] == "choice"
+                    })
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.release_model.notify_one();
+        assert_eq!(second.await.unwrap()["state"], "complete");
+        assert_eq!(
+            wait_goal(&fixture, |g| g["phase"] == "completed").await["phase"],
+            "completed"
+        );
+        assert_eq!(goal(&fixture).await["acceptedTaskCount"], 3);
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("a.txt")).unwrap(),
+            "A\n",
+            "明确继续只交付一次"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.workspace.path().join("b.txt")).unwrap(),
+            "独立B已交付"
+        );
+    }
+    #[tokio::test]
+    async fn main_goal_question_observation_reconnect_keeps_original_deadline_and_rejects_old_guards(
+    ) {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        for reconnect_first in [true, false] {
+            let fixture = main_fixture("question-goal-root-observer", "held-answer").await;
+            finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+            let first = send(&fixture, "execute", "确认执行").await;
+            wait_presented(&fixture).await;
+            let second = if reconnect_first {
+                let second = request(
+                    &fixture,
+                    serde_json::json!({"type":"resume","turnId":"execute"}),
+                )
+                .await;
+                drop(first);
+                second
+            } else {
+                drop(first);
+                request(
+                    &fixture,
+                    serde_json::json!({"type":"resume","turnId":"execute"}),
+                )
+                .await
+            };
+            fixture.question_clock.as_ref().unwrap().advance(300000);
+            let result = finish(second).await;
+            assert_eq!(
+                result["state"], "complete",
+                "旧观察者不能取消已重连同一回合，reconnect_first={reconnect_first}: {result}"
+            );
+            assert_eq!(goal(&fixture).await["phase"], "paused");
+            assert_eq!(
+                fixture
+                    .seen
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|m| m["type"] == "decision.request")
+                    .count(),
+                1
+            );
+        }
+    }
+    #[tokio::test]
+    async fn main_goal_question_expiry_keeps_independent_acceptance_and_rejects_same_turn_bypass() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-pause", "held-answer").await;
+        finish(send(&fixture, "plan", "/goal 交付三个文件").await).await;
+        let response = send(&fixture, "execute", "确认执行").await;
+        let pending = tokio::spawn(finish(response));
+        wait_question(&fixture).await;
+        assert!(!fixture.workspace.path().join("a.txt").exists());
+        assert!(!fixture.workspace.path().join("c.txt").exists());
+        fixture.question_clock.as_ref().unwrap().advance(300000);
+        let result = pending.await.unwrap();
+        assert_eq!(result["state"], "complete", "超时应真实暂停并汇总");
+        assert!(
+            !fixture.workspace.path().join("bypass.txt").exists(),
+            "未明确继续不能同回合重派"
+        );
+        assert!(
+            !fixture.workspace.path().join("c.txt").exists(),
+            "不能重规划移除暂停依赖"
+        );
+        let current = wait_goal(&fixture, |g| g["phase"] == "paused").await;
+        assert_eq!(
+            current["acceptedTaskCount"],
+            1,
+            "独立B验收必须保留：{current}\n模型末次输入：{}",
+            fixture.model_seen.lock().await.last().unwrap()
+        );
+        assert_eq!(current["phase"], "paused");
+        assert_eq!(
+            current["taskCount"], 3,
+            "暂停分支不能通过等价新任务或replaces绕过"
+        );
+        let requests = fixture.model_seen.lock().await;
+        for index in [10, 16, 17] {
+            assert!(
+                requests
+                    .iter()
+                    .any(|body| body["messages"].as_array().unwrap().iter().any(|m| m
+                        ["tool_call_id"]
+                        == format!("gq-{index}")
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|s| s.contains("不能通过重规划")))),
+                "重规划绕过{index}必须明确拒绝"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn main_goal_question_planning_accepts_answer_without_authorizing_delivery() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("question-goal-plan", "option-a").await;
+        assert_eq!(
+            finish(send(&fixture, "plan", "/goal 交付三个文件").await).await["state"],
+            "complete"
+        );
+        assert_eq!(
+            fixture
+                .seen
+                .lock()
+                .await
+                .iter()
+                .filter(|m| m["type"] == "decision.request")
+                .count(),
+            1,
+            "规划阶段应真实提问"
+        );
+        let current = goal(&fixture).await;
+        assert_eq!(current["phase"], "draft");
+        assert_eq!(current["taskCount"], 3);
+        assert!(!fixture.workspace.path().join("premature.txt").exists());
+        let models = fixture.model_seen.lock().await;
+        assert!(models
+            .iter()
+            .any(|body| body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "tool"
+                    && m["content"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("option-a")))));
+    }
+}
+
+#[cfg(test)]
 mod child_question_tests {
     use super::*;
 

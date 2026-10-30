@@ -494,14 +494,68 @@ fn main_conversation_context(turns: &[serde_json::Value]) -> Vec<MainChatMessage
 struct GoalStreamCancel {
     handle: Arc<SessionHandle>,
     turn: String,
+    generation: u64,
+}
+impl GoalStreamCancel {
+    fn cancel_if_current(handle: &SessionHandle, turn: &str, generation: u64) {
+        // 与新订阅领取代际串行，避免检查后被新观察接管再取消。
+        let current = handle
+            .main_observer_generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *current == generation {
+            handle.cancel_main_turn(turn);
+        }
+    }
 }
 impl Drop for GoalStreamCancel {
     fn drop(&mut self) {
-        self.handle.cancel_main_turn(&self.turn);
+        let pending = self.handle.pending_questions(&self.turn);
+        let Some(record) = pending
+            .into_iter()
+            .filter(|record| record.deadline_ms.is_some())
+            .min_by_key(|record| record.deadline_ms)
+        else {
+            Self::cancel_if_current(&self.handle, &self.turn, self.generation);
+            return;
+        };
+        let deadline = record.deadline_ms.expect("filtered original deadline");
+        let handle = self.handle.clone();
+        let turn = self.turn.clone();
+        let generation = self.generation;
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            Self::cancel_if_current(&handle, &turn, generation);
+            return;
+        };
+        runtime.spawn(async move {
+            loop {
+                if *handle
+                    .main_observer_generation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    != generation
+                {
+                    return;
+                }
+                if handle.question_queue.now_ms() >= deadline
+                    || !handle
+                        .pending_questions(&turn)
+                        .iter()
+                        .any(|current| current.question_id == record.question_id)
+                {
+                    Self::cancel_if_current(&handle, &turn, generation);
+                    return;
+                }
+                tokio::select! {
+                    _=handle.question_queue.wait_until(deadline)=>{},
+                    _=tokio::time::sleep(Duration::from_millis(100))=>{},
+                }
+            }
+        });
     }
 }
 
-// 每次订阅先发完整快照；Goal 观察流关闭取消确切原回合，普通聊天只结束观察。
+// 每次订阅先发完整快照；Goal仅在真实待答原期限内延后旧观察取消。
 fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response {
     let goal = handle.has_unfinished_goal();
     let goal_command = main_conversation_turns(&handle)
@@ -518,6 +572,14 @@ fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response 
                 .map(|outcome| GoalStreamCancel {
                     handle: handle.clone(),
                     turn: outcome.turn_id,
+                    generation: {
+                        let mut current = handle
+                            .main_observer_generation
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        *current = current.wrapping_add(1);
+                        *current
+                    },
                 })
         })
         .flatten();
@@ -571,7 +633,7 @@ fn main_conversation_stream(handle: Arc<SessionHandle>, id: String) -> Response 
 /// 返回：结构化 JSON 或以 snapshot 开始的 NDJSON。
 /// 错误：非法请求400、其他主对话409、未知轮次404、存储/停止失败503。
 /// 状态：send 经原接收事务执行；其余操作不启动模型。
-/// 并发与取消：准入串行；Goal 断流与 cancel 只取消已验证原回合，普通断流只结束观察。
+/// 并发与取消：准入串行；Goal真实待答仅在原期限内允许观察接管，cancel始终停止原回合；普通断流只结束观察。
 /// 权限：统一 Basic 鉴权；工作目录、会话与审批来自原登记。
 /// 关联：CHG-2026-0044、原版 chatOperationSchema。
 async fn main_conversation_chat(
@@ -2192,6 +2254,9 @@ mod tests {
             let gate = model_gate.clone();
             async move {
                 seen.lock().await.push(body.clone());
+                if scenario.starts_with("question-goal") {
+                    return goal_question_tests::model_response(&body,scenario,&questions,&gate).await;
+                }
                 if scenario.starts_with("question-queue") {
                     return question_queue_tests::model_response(&body,&questions,&gate).await;
                 }
@@ -2436,9 +2501,9 @@ mod tests {
             0,
         )
         .unwrap();
-        let question_clock = scenario
-            .starts_with("question-queue-clock")
-            .then(|| Arc::new(question_queue_tests::Clock::default()));
+        let question_clock = (scenario.starts_with("question-queue-clock")
+            || scenario.starts_with("question-goal"))
+        .then(|| Arc::new(question_queue_tests::Clock::default()));
         if let Some(clock) = &question_clock {
             Arc::get_mut(&mut state).unwrap().question_queue = Arc::new(
                 openpaw_engine::user_input::QuestionQueue::new(clock.clone()),
