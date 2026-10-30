@@ -1,5 +1,7 @@
 # CHG 索引
 
+- [CHG-2026-0054：用户提问与非阻塞委派](CHG-2026-0054-用户提问与非阻塞委派.md)：approved，本地九票及审查修复完成，ready-for-human。9ed3a7b的Host309、CLI26、双配置workspace严格Clippy、格式及六项xtask通过；Standards三项closed/新增0、Spec0。workspace993和原版浏览器五组属于9c候选；基线Core模块缺Stability仍失败、cargo-deny不可用，正式CODEOWNER/CI独立。11个实现树已清理，原版AI Office保持，15180仍运行用户演示9c4bb23。
+
 - [CHG-2026-0052：摘要采用服务商默认输出额度](CHG-2026-0052-摘要输出预算与失败提示.md)：approved，本地实施完成，ready-for-human。摘要按已知默认预留后省略max_tokens，普通请求额度保持；workspace993、Host串行246、CLI26及可执行门禁通过。包含2处None编译兼容接线，失败提示优化不纳入本期；cargo-deny不可用，CODEOWNER/CI独立。未部署15180。
 
 - [CHG-2026-0051：持久上下文压缩与原件回读](CHG-2026-0051-持久上下文压缩与原件回读.md)：approved，本地实施完成；workspace988、Host245（含context21）、CLI26及前端契约2项通过，两种feature严格静态检查与可用仓库门禁通过，Standards/Spec各0遗留。cargo-deny不可用、CODEOWNER/CI/真实模型独立；前端/依赖/额度未改，未推送或部署15180。
@@ -37,7 +39,7 @@
 
 | 变更编号 | 标题 | 状态 | 风险 | 负责人 | 接口数量 | 文件数量 |
 | --- | --- | --- | --- | --- | ---: | ---: |
-| CHG-2026-0054 | [用户提问与非阻塞委派](CHG-2026-0054-用户提问与非阻塞委派.md) | approved / 用户批准逐文件范围，九票TDD开始 | high | 用户批准；Codex实施 | 中立调用上下文、可信控制及已有聊天接线；无新增HTTP路由 | 见CHG逐文件表 |
+| CHG-2026-0054 | [用户提问与非阻塞委派](CHG-2026-0054-用户提问与非阻塞委派.md) | approved / 本地实施及审查修复完成，ready-for-human；基线stability限制保留 | high | 用户批准；Codex实施 | 中立调用上下文、可信控制及已有聊天接线；无新增HTTP路由 | 实际24；允许26 |
 | CHG-2026-0053 | [初始化成员布局](CHG-2026-0053-初始化成员布局.md) | approved / 本地实施、门禁通过；15180部署证据单独记录 | low | 用户授权；Codex实施 | 既有可选layoutId | 3 |
 | CHG-2026-0038 | [子会话并发审批与停止](CHG-2026-0038-子会话并发审批与停止.md) | approved / 实施中 | high | 用户批准；Codex 实施 | 沿用既有 HTTP/SSE | 5 |
 | CHG-2026-0035 | [明确子会话续办](CHG-2026-0035-明确子会话续办.md) | approved / 已实现、受控通过 | high | 用户批准；Codex 实施 | 可选 task_id、归档拒绝 | 5 |
