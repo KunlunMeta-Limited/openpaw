@@ -1082,7 +1082,10 @@ impl GoalContext {
                     .is_none_or(|new| !same_task_definition(old, new))
                     || definitions.iter().any(|new| {
                         new.id != old.id
-                            && !goal.tasks.iter().any(|task| task.id == new.id)
+                            && !goal
+                                .tasks
+                                .iter()
+                                .any(|task| task.id == new.id && same_task_definition(task, new))
                             && (new.title == old.title
                                 || new.expected_result == old.expected_result
                                 || new.replaces.contains(&old.id))

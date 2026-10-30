@@ -297,6 +297,15 @@ mod goal_question_tests {
                         serde_json::json!({"tasks":[task("a",&[]),task("b",&[]),task("c",&["a"]),replacement]}),
                     )
                 }
+                18 if scenario.ends_with("pause") => {
+                    let mut repurposed = task("b", &[]);
+                    repurposed["expected_result"] = serde_json::json!("a.txt");
+                    update(
+                        "replan",
+                        "",
+                        serde_json::json!({"tasks":[task("a",&[]),repurposed,task("c",&["a"])]}),
+                    )
+                }
                 _ if scenario.ends_with("pause") => None,
                 7 => update("start_task", "a", serde_json::json!({})),
                 8 => update("accept_task", "a", evidence(5)),
@@ -759,10 +768,8 @@ mod goal_question_tests {
         );
         let current = wait_goal(&fixture, |g| g["phase"] == "paused").await;
         assert_eq!(
-            current["acceptedTaskCount"],
-            1,
-            "独立B验收必须保留：{current}\n模型末次输入：{}",
-            fixture.model_seen.lock().await.last().unwrap()
+            current["acceptedTaskCount"], 1,
+            "独立B验收必须保留：{current}"
         );
         assert_eq!(current["phase"], "paused");
         assert_eq!(
@@ -770,7 +777,7 @@ mod goal_question_tests {
             "暂停分支不能通过等价新任务或replaces绕过"
         );
         let requests = fixture.model_seen.lock().await;
-        for index in [10, 16, 17] {
+        for index in [10, 16, 17, 18] {
             assert!(
                 requests
                     .iter()
