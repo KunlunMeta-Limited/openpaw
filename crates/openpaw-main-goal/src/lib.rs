@@ -875,9 +875,9 @@ impl GoalContext {
     pub fn review_displayed(&self, review: &PlanReview) -> Result<(), String> {
         self.check_cancelled()?;
         let user = self.user.lock().unwrap_or_else(|e| e.into_inner());
-        if !user
+        if user
             .as_ref()
-            .is_some_and(|user| user.turn_id == review.turn_id)
+            .is_none_or(|user| user.turn_id != review.turn_id)
         {
             return Err("审核回合已结束".into());
         }
