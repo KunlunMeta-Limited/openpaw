@@ -3,7 +3,7 @@
 //! 关联：CHG-2026-0054。
 use crate::{office::MainOffice, runtime::SessionHandle};
 use openpaw_core::{user_input::*, ToolInvocationContext};
-use openpaw_engine::user_input::QuestionRuntime;
+use openpaw_engine::user_input::{QuestionDisplayError, QuestionRuntime};
 use serde_json::json;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -44,7 +44,10 @@ impl QuestionRuntime for Adapter {
             .ok_or("提问会话已经结束")?
             .commit_question(record)
     }
-    async fn display(&self, record: &UserQuestionRecord) -> Result<UserQuestionAnswer, String> {
+    async fn display(
+        &self,
+        record: &UserQuestionRecord,
+    ) -> Result<UserQuestionAnswer, QuestionDisplayError> {
         let handle = self.handle.upgrade().ok_or("提问会话已经结束")?;
         let binding = self
             .office
@@ -93,7 +96,7 @@ impl QuestionRuntime for Adapter {
             let remaining = deadline.saturating_sub(now);
             let retry_at = now.saturating_add(1000);
             if remaining < 1000 {
-                return Err("问题已超时，请在原聊天明确继续".into());
+                return Err(QuestionDisplayError::Expired);
             }
             decision["id"] = json!(current.display_id);
             let request = json!({"type":"decision.request","teamId":team,"conversationId":conversation,"timeoutMs":remaining.min(300000),"decision":decision});
@@ -129,12 +132,12 @@ impl QuestionRuntime for Adapter {
                     Err(reason)
                         if matches!(reason.as_str(), "main 请求结果不明" | "main 响应中断") =>
                         {}
-                    Err(reason) => return Err(reason),
+                    Err(reason) => return Err(reason.into()),
                 }
                 handle.question_queue.wait_until(retry_at).await;
             }
             if deadline.saturating_sub(handle.question_queue.now_ms()) < 1000 {
-                return Err("问题已超时，请在原聊天明确继续".into());
+                return Err(QuestionDisplayError::Expired);
             }
             current.generation = current
                 .generation
@@ -178,9 +181,9 @@ fn parse_answer(
     team: &str,
     conversation: &str,
     display: &str,
-) -> Result<UserQuestionAnswer, String> {
+) -> Result<UserQuestionAnswer, QuestionDisplayError> {
     if status == 408 {
-        return Err("问题已超时，请在原聊天明确继续".into());
+        return Err(QuestionDisplayError::Expired);
     }
     if status != 200
         || data["teamId"] != team
@@ -194,12 +197,8 @@ fn parse_answer(
         label: data["label"].as_str().ok_or("答案缺少标签")?.into(),
         custom_text: data
             .get("customText")
-            .map(|value| {
-                value
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or("自定义答案格式无效")
-            })
-            .transpose()?,
+            .map(|value| value.as_str().ok_or("自定义答案格式无效"))
+            .transpose()?
+            .map(str::to_owned),
     })
 }

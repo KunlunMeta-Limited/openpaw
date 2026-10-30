@@ -1,5 +1,8 @@
 //! 功能：提供中立子执行等待及实际模型请求的并发资源所有权。
-//! 边界：入口提供已受理身份与执行结果；不读写会话，不认识Host、Office或Goal。
+//! 输入：可信入口提供已受理身份、执行阶段、终态结果及取消信号。
+//! 输出：AgentLoop取得有界等待结果，模型请求按共享名额取得并释放资源。
+//! 边界：不读写会话，不认识Host、Office或Goal，不由模型正文决定可信终态或执行权限。
+//! 关联：CHG-2026-0054；AgentLoop接续、runtime子执行及user_input可信等待。
 
 use async_trait::async_trait;
 use futures::{future::BoxFuture, stream::BoxStream, FutureExt, StreamExt};

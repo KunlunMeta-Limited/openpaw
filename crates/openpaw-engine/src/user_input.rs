@@ -13,6 +13,46 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// 功能：区分可信到期与展示中断，终态不由用户可读措辞决定。
+/// 字段/变体语义：Expired表示原题到期，Interrupted携带脱敏展示失败原因。
+/// 数据来源：可信展示适配器或原截止时钟。
+/// 数据去向：问题可靠终态和当前分支暂停说明。
+/// 约束：不携带答案、执行许可或新截止时间。
+/// 稳定性：experimental。
+/// 关联：CHG-2026-0054、QuestionRuntime。
+pub enum QuestionDisplayError {
+    /// 功能：可信原期限已到，或展示入口明确报告本题到期。
+    Expired,
+    /// 功能：未确认到期的一般展示失败，正文仅用于说明原因。
+    Interrupted(String),
+}
+impl From<String> for QuestionDisplayError {
+    /// 功能：把一般展示错误保留为中断原因。
+    /// 参数：reason为脱敏错误说明。
+    /// 返回：Interrupted失败分类。
+    /// 错误：无。
+    /// 状态：不修改问题记录。
+    /// 并发与取消：同步纯转换。
+    /// 权限：文字不能声明可信到期。
+    /// 关联：QuestionRuntime展示适配。
+    fn from(reason: String) -> Self {
+        Self::Interrupted(reason)
+    }
+}
+impl From<&str> for QuestionDisplayError {
+    /// 功能：把借用的一般展示错误转为拥有的中断原因。
+    /// 参数：reason为脱敏错误说明。
+    /// 返回：Interrupted失败分类。
+    /// 错误：无。
+    /// 状态：不修改问题记录。
+    /// 并发与取消：同步纯转换。
+    /// 权限：文字不能声明可信到期。
+    /// 关联：QuestionRuntime展示适配。
+    fn from(reason: &str) -> Self {
+        Self::Interrupted(reason.into())
+    }
+}
+
 /// 功能：可信入口提供的问题归属、可靠保存和展示效果。
 #[async_trait]
 pub trait QuestionRuntime: Send + Sync {
@@ -40,7 +80,7 @@ pub trait QuestionRuntime: Send + Sync {
     /// 功能：展示一题并取得用户明确提交的答案。
     /// 参数：record包含展示身份和原期限。
     /// 返回：原始结构化回答，仍须协调器校验。
-    /// 错误：展示失败或未答时返回脱敏原因。
+    /// 错误：可信到期返回Expired，其他失败返回Interrupted及脱敏原因。
     /// 状态：不自行接受或保存答案。
     /// 并发与取消：future丢弃关闭展示等待。
     /// 权限：不把问题回答视为工具审批。
@@ -48,7 +88,7 @@ pub trait QuestionRuntime: Send + Sync {
     async fn display(
         &self,
         record: &UserQuestionRecord,
-    ) -> std::result::Result<UserQuestionAnswer, String>;
+    ) -> std::result::Result<UserQuestionAnswer, QuestionDisplayError>;
 }
 
 /// 功能：只接收可信问答协调器的回合暂停原因。
@@ -353,11 +393,11 @@ impl QuestionContext {
         }
         let answer = tokio::select! {
             biased;
-            _ = self.queue.wait_until(deadline) => Err("问题已超时，请在原聊天明确继续".into()),
-            result = runtime.display(&record) => result.and_then(|answer|validate_answer(&record.request,answer)),
+            _ = self.queue.wait_until(deadline) => Err(QuestionDisplayError::Expired),
+            result = runtime.display(&record) => result.and_then(|answer|validate_answer(&record.request,answer).map_err(Into::into)),
         };
         let answer = if self.queue.now_ms() >= deadline {
-            Err("问题已超时，请在原聊天明确继续".into())
+            Err(QuestionDisplayError::Expired)
         } else {
             answer
         };
@@ -374,12 +414,17 @@ impl QuestionContext {
                 record.state = UserQuestionState::Answered;
                 record.answer = Some(answer);
             }
-            Err(reason) => {
-                record.state = if reason.contains("超时") {
-                    UserQuestionState::Expired
-                } else {
-                    UserQuestionState::Interrupted
+            Err(error) => {
+                let (state, reason) = match error {
+                    QuestionDisplayError::Expired => (
+                        UserQuestionState::Expired,
+                        "问题已超时，请在原聊天明确继续".into(),
+                    ),
+                    QuestionDisplayError::Interrupted(reason) => {
+                        (UserQuestionState::Interrupted, reason)
+                    }
                 };
+                record.state = state;
                 record.reason = Some(reason);
             }
         }

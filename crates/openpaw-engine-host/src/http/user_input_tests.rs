@@ -36,6 +36,14 @@ mod history_question_tests {
             })
             .collect()
     }
+    /// 功能：按真实历史模型输入生成本地压缩及原件回读响应。
+    /// 参数：body为模型请求，gate为子结果交付的测试门闩。
+    /// 返回：本地模型协议响应。
+    /// 错误：不满足fixture前提时断言失败。
+    /// 状态：只消费本地请求，必要时等待子结果放行。
+    /// 并发与取消：异步等待可取消，不访问真实模型。
+    /// 权限：不授予工具或原件读取权限。
+    /// 关联：CHG-2026-0054、history_question_tests。
     pub(super) async fn model_response(
         body: &serde_json::Value,
         gate: &tokio::sync::Notify,
@@ -1132,6 +1140,14 @@ mod restart_question_tests {
         )
             .into_response()
     }
+    /// 功能：按真实模型输入生成可靠重启事实验收脚本。
+    /// 参数：body为本地模型收到的请求。
+    /// 返回：对应场景的流式工具或文本响应。
+    /// 错误：不满足fixture前提时断言失败。
+    /// 状态：不直接修改会话或可靠记录。
+    /// 并发与取消：同步生成响应，不持有执行资源。
+    /// 权限：工具调用仍经真实Host校验。
+    /// 关联：CHG-2026-0054、restart_question_tests。
     pub(super) fn model_response(body: &serde_json::Value) -> Response {
         let messages = body["messages"].as_array().unwrap();
         let Some(source) = messages.iter().rposition(|m| {
@@ -2266,6 +2282,14 @@ mod goal_question_tests {
     fn question() -> serde_json::Value {
         serde_json::json!({"question":"请选择交付方式","options":[{"id":"option-a","label":"方案A"},{"id":"option-b","label":"方案B"}]})
     }
+    /// 功能：生成Goal提问及暂停边界的本地模型响应。
+    /// 参数：body为真实请求，scenario选择脚本，questions为Office观察，_gate为共享门闩。
+    /// 返回：与当前真实模型输入对应的流式响应。
+    /// 错误：不满足fixture前提时断言失败。
+    /// 状态：只生成模型效果，不自行验收Goal。
+    /// 并发与取消：等待本地观察可取消，不持有工作区锁。
+    /// 权限：问题回答不批准Goal或工具执行。
+    /// 关联：CHG-2026-0054、goal_question_tests。
     pub(super) async fn model_response(
         body: &serde_json::Value,
         scenario: &str,
@@ -3230,6 +3254,13 @@ mod question_recovery_tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
+    /// 功能：模拟单个活动页面的待答卡片及提交效果。
+    /// 字段/变体语义：visible记录卡片，replies保存答复通道，observations保留读取事实，read字段控制读取门闩。
+    /// 数据来源：本地Office请求和测试显式刷新／提交。
+    /// 数据去向：原版协议响应及真实Host恢复流程。
+    /// 约束：不修改问题期限或直接写可靠答案。
+    /// 稳定性：test-only。
+    /// 关联：CHG-2026-0054、question_recovery_tests。
     #[derive(Default)]
     pub(super) struct Display {
         visible: std::sync::Mutex<HashSet<String>>,
@@ -3239,6 +3270,13 @@ mod question_recovery_tests {
         read_waiting: tokio::sync::Notify,
         release_read: tokio::sync::Notify,
     }
+    /// 功能：绑定一次展示请求的本地可见生命周期。
+    /// 字段/变体语义：持有页面效果与本次展示身份。
+    /// 数据来源：Display::track。
+    /// 数据去向：Drop移除原展示身份。
+    /// 约束：旧POST丢弃只移除本代卡片，不提交答案。
+    /// 稳定性：test-only。
+    /// 关联：CHG-2026-0054、Display。
     pub(super) struct Visible(Arc<Display>, String);
     impl Drop for Visible {
         fn drop(&mut self) {
@@ -3246,6 +3284,14 @@ mod question_recovery_tests {
         }
     }
     impl Display {
+        /// 功能：在选定的Office读取边界挂起本地响应。
+        /// 参数：body为本地Office请求。
+        /// 返回：读取获准继续。
+        /// 错误：无。
+        /// 状态：通知读取已进入，等待测试显式放行。
+        /// 并发与取消：等待可取消，不持有互斥锁。
+        /// 权限：不更改卡片、答案或执行许可。
+        /// 关联：CHG-2026-0054、缺失观察与答案竞争测试。
         pub(super) async fn before_read(&self, body: &serde_json::Value) {
             if body["type"] == "office.read"
                 && body["teamId"].is_string()
@@ -3255,6 +3301,14 @@ mod question_recovery_tests {
                 self.release_read.notified().await;
             }
         }
+        /// 功能：登记本次提问在本地页面可见。
+        /// 参数：body为原Office请求。
+        /// 返回：提问请求的可见性guard，其他消息返回None。
+        /// 错误：缺少展示身份时断言失败。
+        /// 状态：插入本代展示身份。
+        /// 并发与取消：短同步锁，guard丢弃移除本代。
+        /// 权限：不代表用户已作答。
+        /// 关联：CHG-2026-0054、Visible。
         pub(super) fn track(self: &Arc<Self>, body: &serde_json::Value) -> Option<Visible> {
             if body["type"] != "decision.request" {
                 return None;
@@ -3263,6 +3317,14 @@ mod question_recovery_tests {
             self.visible.lock().unwrap().insert(id.clone());
             Some(Visible(self.clone(), id))
         }
+        /// 功能：返回本地页面当前可见的待答身份。
+        /// 参数：无。
+        /// 返回：当前可见身份集合的快照。
+        /// 错误：无。
+        /// 状态：追加本次读取观察记录。
+        /// 并发与取消：短同步锁，不等待网络。
+        /// 权限：只反映页面展示，不确认答案。
+        /// 关联：CHG-2026-0054、office.read恢复fixture。
         pub(super) fn pending(&self) -> Vec<String> {
             let pending = self
                 .visible
@@ -3286,6 +3348,14 @@ mod question_recovery_tests {
                 .send(choice)
                 .ok();
         }
+        /// 功能：等待本地用户提交并生成原版Office问答响应。
+        /// 参数：body为具有真实归属的提问请求。
+        /// 返回：明确答复、临时离线或断流效果。
+        /// 错误：通道关闭按fixture超时处理。
+        /// 状态：保存本代答复发送端，等待测试显式提交。
+        /// 并发与取消：异步等待可丢弃，不持锁等待。
+        /// 权限：不绕过真实Host答案和来源校验。
+        /// 关联：CHG-2026-0054、question_recovery_tests。
         pub(super) async fn response(&self, body: &serde_json::Value) -> Response {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             self.replies
@@ -3895,6 +3965,14 @@ mod child_question_tests {
         serde_json::json!({"index":index,"id":format!("child-question-{name}-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
     }
 
+    /// 功能：生成父子提问和独立兄弟继续执行的本地模型脚本。
+    /// 参数：body为真实模型请求，questions为Office观察，gate控制独立任务交付。
+    /// 返回：当前父子场景的流式响应。
+    /// 错误：不满足fixture前提时断言失败。
+    /// 状态：只生成模型效果，实际子执行仍由Host调度。
+    /// 并发与取消：本地门闩等待可取消，不暂停其他子任务。
+    /// 权限：不创建额外执行许可或默认答案。
+    /// 关联：CHG-2026-0054、child_question_tests。
     pub(super) async fn model_response(
         body: &serde_json::Value,
         questions: &tokio::sync::Mutex<Vec<serde_json::Value>>,
@@ -4443,6 +4521,14 @@ mod child_question_tests {
 mod user_input_tests {
     use super::*;
 
+    /// 功能：生成单题问答及答案接续的本地模型响应。
+    /// 参数：body为真实模型请求，scenario选择输入边界脚本。
+    /// 返回：流式提问、工具调用或最终文本。
+    /// 错误：不满足fixture前提时断言失败。
+    /// 状态：不直接写答案或问题状态。
+    /// 并发与取消：同步构造响应，不持执行资源。
+    /// 权限：真实工具执行仍走Host权限入口。
+    /// 关联：CHG-2026-0054、user_input_tests。
     pub(super) fn model_response(body: &serde_json::Value, scenario: &str) -> Response {
         let messages = body["messages"].as_array().unwrap();
         let result = messages
@@ -4486,6 +4572,14 @@ mod user_input_tests {
             .into_response()
     }
 
+    /// 功能：按原Office归属构造明确答案或到期响应。
+    /// 参数：body为真实提问请求，choice选择正常或非法答复脚本。
+    /// 返回：既有Office问答协议响应。
+    /// 错误：不满足fixture归属或长度前提时断言失败。
+    /// 状态：不直接保存可靠答案或放行执行。
+    /// 并发与取消：同步构造响应，迟到答复由真实Host处理。
+    /// 权限：非法脚本只用于验证Host拒绝边界。
+    /// 关联：CHG-2026-0054、user_input_tests与恢复fixture。
     pub(super) fn decision_response(body: &serde_json::Value, choice: &str) -> Response {
         assert!(
             body["decision"]["description"]
@@ -4498,6 +4592,9 @@ mod user_input_tests {
         );
         if choice == "timeout" {
             return (StatusCode::REQUEST_TIMEOUT,Json(serde_json::json!({"code":408,"msg":"Expired","data":{"reasonCode":"DECISION_TIMEOUT","details":{},"issues":[]}}))).into_response();
+        }
+        if choice == "display-failure" {
+            return (StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"code":500,"msg":"Display failed","data":{"reasonCode":"DISPLAY_FAILED","details":{},"issues":[]}}))).into_response();
         }
         let mut data = serde_json::json!({"teamId":body["teamId"],"conversationId":body["conversationId"],"decisionId":body["decision"]["id"],"choiceId":"option-a","label":"方案A"});
         match choice {
@@ -4699,6 +4796,7 @@ mod user_input_tests {
             "wrong-label",
             "wrong-conversation",
             "wrong-display",
+            "display-failure",
             "timeout",
         ] {
             let fixture = main_fixture("question-invalid", choice).await;
@@ -4712,6 +4810,29 @@ mod user_input_tests {
                 1,
                 "{choice}不能作为有效答案接续"
             );
+            let path = std::fs::read_dir(fixture.home.path().join("sessions"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let history = std::fs::read_to_string(path).unwrap();
+            let terminal = history
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event["type"] == "user_question_v1")
+                .last()
+                .unwrap();
+            assert_eq!(
+                terminal["record"]["state"],
+                if choice == "timeout" {
+                    "expired"
+                } else {
+                    "interrupted"
+                },
+                "{choice}的可靠终态必须来自可信失败种类"
+            );
+            assert!(terminal["record"]["answer"].is_null());
         }
     }
 
@@ -5001,6 +5122,14 @@ mod delegation_lifecycle_tests {
 mod async_delegation_tests {
     use super::*;
 
+    /// 功能：生成非阻塞派发和可信子终态的本地模型脚本。
+    /// 参数：body为真实模型请求，gate控制子任务释放。
+    /// 返回：与当前父子输入对应的流式响应。
+    /// 错误：不满足fixture前提时断言失败。
+    /// 状态：只生成模型效果，不直接登记受理或终态。
+    /// 并发与取消：门闩等待可取消，父子资源仍由真实Host管理。
+    /// 权限：启动回执不表示任务完成或验收。
+    /// 关联：CHG-2026-0054、async_delegation_tests。
     pub(super) async fn model_response(
         body: &serde_json::Value,
         gate: &tokio::sync::Notify,
@@ -5555,6 +5684,13 @@ mod async_delegation_tests {
 mod question_queue_tests {
     use super::*;
 
+    /// 功能：提供问题队列与截止等待共享的可控时钟。
+    /// 字段/变体语义：watch发送端保存当前Unix毫秒，默认1000。
+    /// 数据来源：测试显式advance。
+    /// 数据去向：真实QuestionQueue及原deadline等待。
+    /// 约束：只推进问题时钟，不修改预算或重新设置期限。
+    /// 稳定性：test-only。
+    /// 关联：CHG-2026-0054、question_queue_tests及恢复组合。
     pub(super) struct Clock(tokio::sync::watch::Sender<i64>);
     impl Default for Clock {
         fn default() -> Self {
@@ -5562,6 +5698,14 @@ mod question_queue_tests {
         }
     }
     impl Clock {
+        /// 功能：推进共享的可信问题时钟并唤醒截止等待。
+        /// 参数：ms为测试指定的推进毫秒。
+        /// 返回：无。
+        /// 错误：无。
+        /// 状态：增加当前时间，保留既有问题deadline。
+        /// 并发与取消：同步更新watch，等待方可取消。
+        /// 权限：不授予执行许可或接受答案。
+        /// 关联：CHG-2026-0054、QuestionClock。
         pub(super) fn advance(&self, ms: i64) {
             self.0.send_modify(|now| *now += ms);
         }
@@ -5586,6 +5730,14 @@ mod question_queue_tests {
         serde_json::json!({"index":index,"id":format!("queue-{name}-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}})
     }
 
+    /// 功能：生成FIFO问题、共享展示名额与暂停接续的本地模型脚本。
+    /// 参数：body为真实请求，questions为Office观察，gate控制独立子任务交付。
+    /// 返回：当前队列场景的流式响应。
+    /// 错误：不满足fixture前提时断言失败。
+    /// 状态：只生成请求，队列事实仍由真实协调器保存。
+    /// 并发与取消：本地等待可取消，不持展示名额或模型配额。
+    /// 权限：不以模型文字设置可信暂停或用户答案。
+    /// 关联：CHG-2026-0054、question_queue_tests。
     pub(super) async fn model_response(
         body: &serde_json::Value,
         questions: &tokio::sync::Mutex<Vec<serde_json::Value>>,

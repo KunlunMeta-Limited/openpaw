@@ -1,4 +1,8 @@
 //! 功能：定义与界面、网络和存储无关的单题问答事实。Stability: unstable.
+//! 输入：可信入口提供实际会话及调用归属，Engine校验问题和明确答案。
+//! 输出：同一中立记录供Host唯一writer保存、可靠恢复和只读历史投影。
+//! 边界：不展示卡片、不执行网络或存储，不把答案、历史或暂停事实作为工具授权。
+//! 关联：CHG-2026-0054；Engine user_input协调、Host question适配与context可靠投影。
 use serde::{Deserialize, Serialize};
 
 /// 功能：用户可选择的普通答案。Stability: unstable.
