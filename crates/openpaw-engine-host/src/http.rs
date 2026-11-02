@@ -2698,6 +2698,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_oversized_office_does_not_block_other_first_messages() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("emoji", "confirm").await;
+        let oversized = tempdir().unwrap();
+        fixture
+            .state
+            .main_office
+            .register(oversized.path())
+            .unwrap();
+        let registry = fixture.home.path().join("offices/registry.json");
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        let (heavy_team, entry) = saved
+            .as_object_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|(team, _)| *team != &fixture.team)
+            .unwrap();
+        let heavy_team = heavy_team.clone();
+        entry["snapshot"]["tasks"] = serde_json::json!((0..25).map(|task|serde_json::json!({"id":format!("old-{task}"),"assigneeId":"","title":"既有任务","status":"blocked","progress":0,"updatedAt":"2026-11-02T00:00:00Z","summary":"旧".repeat(960)})).collect::<Vec<_>>());
+        let preserved = entry.clone();
+        std::fs::write(&registry, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let state = AppState::new(fixture.state.config.clone());
+        let app = build_router(state.clone());
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pawoffice/workspaces")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"new-space"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&to_bytes(created.into_body(), 65536).await.unwrap()).unwrap();
+        for team in [
+            &fixture.team,
+            snapshot["workspace"]["id"].as_str().unwrap(),
+            &heavy_team,
+        ] {
+            let body = serde_json::json!({"version":"1.0","type":"send","teamId":team,"conversationId":"new-chat","turnId":"first","messages":[{"role":"user","content":"/compact"}]});
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/pawoffice/chat")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if team == heavy_team {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "本办公室真实超限仍须拒绝"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "其他办公室过大不能阻止首次聊天"
+                );
+                let bytes = to_bytes(response.into_body(), 10000).await.unwrap();
+                assert!(std::str::from_utf8(&bytes).unwrap().contains("无需整理"));
+                assert!(state
+                    .main_office
+                    .conversation_record(team, "new-chat")
+                    .unwrap()
+                    .unwrap()
+                    .session
+                    .is_some());
+            }
+        }
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+        assert_eq!(after[heavy_team], preserved, "不删除超限办公室或改写其任务");
+        assert!(fixture.model_seen.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn main_large_directory_allows_first_chat_in_existing_and_new_workspaces() {
         let _guard = PROVIDER_ENV_LOCK
             .get_or_init(|| tokio::sync::Mutex::new(()))
