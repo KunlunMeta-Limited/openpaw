@@ -1,6 +1,139 @@
 #[cfg(test)]
 mod goal_review_tests {
     use super::*;
+
+    /// 功能：生成真实选择、按答案交付及拒绝提前完成的本地模型步骤。
+    /// 参数：body为实际请求，scenario区分原有观察接线与新增选择约束。
+    /// 返回：标准流式工具调用或简短用户回复。
+    /// 错误：前置工具事实不符合脚本时断言失败。
+    /// 状态：只生成模型响应，不替Host保存答案或验收。
+    /// 并发与取消：无等待，真实提问等待由Host处理。
+    /// 权限：只使用隔离fixture，绝不请求真实模型或天气。
+    /// 关联：CHG-2026-0059；Stability: test-only。
+    pub(super) fn choice_model_response(body: &serde_json::Value, scenario: &str) -> Response {
+        let messages = body["messages"].as_array().unwrap();
+        let start = messages.iter().rposition(|m| m["role"] == "user" && m["content"].as_str().is_some_and(|s| s.starts_with("/goal ") || s == "确认执行")).unwrap();
+        let tools: Vec<_> = messages[start..].iter().filter(|m| m["role"] == "tool").collect();
+        let parsed = |m: &serde_json::Value| serde_json::from_str::<serde_json::Value>(m["content"].as_str().unwrap().split("\nGoal observation:").next().unwrap()).ok();
+        let goal = tools.iter().rev().filter_map(|m| parsed(m)).find(|v| v["id"].is_string()).unwrap_or_default();
+        let update = |action: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"goal_id":goal["id"],"expected_version":goal["plan_version"],"task_id":"display","reason":"核对用户真实选择及展示"});
+            args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        let required = scenario.ends_with("required");
+        if messages[start]["content"].as_str().unwrap().starts_with("/goal ") {
+            let mut task = serde_json::json!({"id":"display","title":"选择城市后展示天气","expected_result":"choice.txt","acceptance_criteria":["按用户答案展示所选城市"],"dependencies":[]});
+            if required { task["requires_user_input"] = serde_json::json!(true); }
+            return goal_tests::goal_fixture_chunk(match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => update("set_plan", serde_json::json!({"acceptance_criteria":["所选内容可读"],"tasks":[task]})),
+                _ => None,
+            }, tools.len());
+        }
+        if required && tools.len() == 2 {
+            return goal_tests::goal_fixture_chunk(update("record_result", serde_json::json!({"result":"武汉、长沙，请文字回复；尚未取得回答"})), tools.len());
+        }
+        let step = tools.len() - usize::from(required && tools.len() > 2);
+        let city = tools.iter().filter_map(|m| parsed(m)).find(|v| v["question_id"].is_string()).map(|v| {
+            if v["answer"]["choice_id"] == "custom" {v["answer"]["custom_text"].as_str().unwrap().to_owned()} else {v["answer"]["label"].as_str().unwrap().to_owned()}
+        }).unwrap_or_default();
+        let evidence = || {
+            let observation = tools.last().unwrap()["content"].as_str().unwrap().rsplit_once("Goal observation: ").unwrap().1;
+            serde_json::json!({"evidence":[{"criterion":0,"observation_id":observation,"conclusion":"实际读取与用户所选城市一致"}]})
+        };
+        let call = match step {
+            0 => Some(("goal_read", serde_json::json!({}))),
+            1 => update("start_task", serde_json::json!({})),
+            2 => Some(("request_user_input", serde_json::json!({"question":"查看哪个城市的天气？","options":[{"id":"option-a","label":"武汉"},{"id":"option-b","label":"长沙"}]}))),
+            3 => Some(("write_file", serde_json::json!({"path":"choice.txt","content":format!("所选城市：{city}；本地测试示例天气")}))),
+            4 => update("record_result", serde_json::json!({"result":format!("已按选择展示{city}")})),
+            5 | 7 => Some(("read_file", serde_json::json!({"path":"choice.txt"}))),
+            6 => update("accept_task", evidence()),
+            8 => update("accept_goal", evidence()),
+            _ => None,
+        };
+        if call.is_none() {
+            let chunk = serde_json::json!({"choices":[{"delta":{"content":format!("已展示{city}的示例天气。")},"finish_reason":"stop"}]});
+            return ([(header::CONTENT_TYPE,"text/event-stream")],format!("data: {chunk}\n\ndata: [DONE]\n\n")).into_response();
+        }
+        goal_tests::goal_fixture_chunk(call, tools.len())
+    }
+
+    #[tokio::test]
+    async fn goal_business_choice_is_observed_before_acceptance_and_final_is_concise() {
+        let _guard = PROVIDER_ENV_LOCK.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
+        let fixture = main_fixture("question-goal-choice-observe", "option-a").await;
+        goal_tests::goal_send(&fixture.app,&fixture.team,"choice","plan","/goal 查询武汉长沙天气，然后弹菜单让我选择查看哪个城市").await;
+        let answer = goal_tests::goal_send(&fixture.app,&fixture.team,"choice","execute","确认执行").await;
+        assert_eq!(answer["state"],"complete","{answer}");
+        let owner = fixture.state.main_office.conversation_record(&fixture.team,"choice").unwrap().unwrap().session.unwrap();
+        let goal = crate::runtime::latest_goal(fixture.home.path(),&owner).unwrap().unwrap();
+        let questions: Vec<_> = goal["observations"].as_array().unwrap().iter().filter(|v|v["tool"]=="request_user_input").collect();
+        assert_eq!(questions.len(),1,"真实菜单答案必须经过Goal观察接线，不能仅保存为普通问答");
+        assert_eq!(questions[0]["task_id"],"display");
+        assert_eq!(goal["phase"],"completed");
+        assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("choice.txt")).unwrap(),"所选城市：武汉；本地测试示例天气");
+        let text = answer["text"].as_str().unwrap();
+        assert!(text.contains("武汉") && !text.contains("验收依据") && !text.contains("obs-"),"收尾正文应简洁：{text}");
+        assert_eq!(fixture.state.get_typed(&owner).await.unwrap().turn_outcomes().len(),2,"仅有规划和用户明确确认两回合，业务菜单不得新增回合");
+    }
+
+    #[tokio::test]
+    async fn goal_choice_requires_business_answer_and_delivers_selected_or_custom_city() {
+        let _guard = PROVIDER_ENV_LOCK.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
+        for choice in ["option-a","custom","timeout"] {
+            let fixture = main_fixture("question-goal-choice-required",choice).await;
+            goal_tests::goal_send(&fixture.app,&fixture.team,"choice","plan","/goal 查武汉长沙天气，弹菜单选择后展示").await;
+            let answer = goal_tests::goal_send(&fixture.app,&fixture.team,"choice","execute","确认执行").await;
+            let owner = fixture.state.main_office.conversation_record(&fixture.team,"choice").unwrap().unwrap().session.unwrap();
+            let goal = crate::runtime::latest_goal(fixture.home.path(),&owner).unwrap().unwrap();
+            assert!(fixture.model_seen.lock().await.iter().flat_map(|body|body["messages"].as_array().unwrap()).any(|m|m["role"]=="tool" && m["content"].as_str().is_some_and(|s|s.starts_with("该任务必须先选中任务并调用request_user_input"))),"文字选项和固定计划回答不能提前完成任务");
+            let seen = fixture.seen.lock().await;
+            let menus: Vec<_> = seen.iter().filter(|m|m["type"]=="decision.request").collect();
+            assert_eq!(menus.len(),2,"计划菜单与业务菜单必须独立存在");
+            assert_eq!(menus[1]["decision"]["title"],"查看哪个城市的天气？");
+            drop(seen);
+            if choice == "timeout" {
+                assert_eq!(goal["phase"],"paused","{answer}");
+                assert_ne!(goal["tasks"][0]["status"],"accepted");
+                assert!(!fixture.workspace.path().join("choice.txt").exists());
+            } else {
+                assert_eq!(goal["phase"],"completed","{answer}");
+                let city = if choice == "custom" {"长沙"} else {"武汉"};
+                assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("choice.txt")).unwrap(),format!("所选城市：{city}；本地测试示例天气"));
+                assert!(answer["text"].as_str().unwrap().contains(city));
+                let read = openpaw_store::SessionReader::read(fixture.home.path().join("sessions").join(format!("{owner}.jsonl"))).unwrap();
+                let history = openpaw_store::transcript::replay(&owner,&read.events).unwrap();
+                assert_eq!(crate::context::validated_questions(&owner,&read.events,history.visible_messages(&owner)).len(),2,"可靠原件保留，正文精简不能丢失回答");
+                assert!(!goal["tasks"][0]["evidence"].as_array().unwrap().is_empty());
+            }
+            assert_eq!(fixture.state.get_typed(&owner).await.unwrap().turn_outcomes().len(),2);
+        }
+    }
+
+    #[tokio::test]
+    async fn stopping_goal_business_choice_does_not_accept_late_answer() {
+        let _guard = PROVIDER_ENV_LOCK.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
+        let fixture = main_fixture("question-goal-choice-required","held-answer").await;
+        goal_tests::goal_send(&fixture.app,&fixture.team,"choice","plan","/goal 查两个城市后弹菜单选择").await;
+        let owner = fixture.state.main_office.conversation_record(&fixture.team,"choice").unwrap().unwrap().session.unwrap();
+        let (app,team) = (fixture.app.clone(),fixture.team.clone());
+        let running = tokio::spawn(async move {goal_tests::goal_send(&app,&team,"choice","execute","确认执行").await});
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                if fixture.seen.lock().await.iter().any(|m|m["type"]=="decision.request" && m["decision"]["title"]=="查看哪个城市的天气？") {break;}
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        child_test_json(&fixture.app,"POST",&format!("/session/{owner}/abort"),serde_json::json!({})).await;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(5),running).await.unwrap().unwrap()["state"],"stopped");
+        fixture.release_model.notify_waiters();
+        let goal = crate::runtime::latest_goal(fixture.home.path(),&owner).unwrap().unwrap();
+        assert_ne!(goal["tasks"][0]["status"],"accepted");
+        assert!(!fixture.workspace.path().join("choice.txt").exists());
+        assert!(!goal["observations"].as_array().unwrap().iter().any(|o|o["question_definition"].is_array()));
+    }
     /// 功能：模拟用户针对真实固定菜单提交的答案。
     /// 参数：body为实际菜单，choice为合成选择，count为本地展示次数。
     /// 返回：保留实际问题和会话身份的Office响应。

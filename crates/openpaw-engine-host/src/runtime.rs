@@ -1698,20 +1698,16 @@ impl AppState {
         };
         let tool_host = crate::context::wrap(tool_host, &self.config.home, id, context_window);
         let goal = GoalContext::new(id);
+        let question = Arc::new(openpaw_engine::user_input::QuestionContext::new(
+            self.question_queue.clone(),
+        ));
+        let tool_host = openpaw_engine::user_input::wrap_tools(tool_host, question.clone());
         let tool_host: Arc<dyn openpaw_core::ToolHost> = if child {
             tool_host
         } else {
             Arc::new(GoalToolHost::new(tool_host, goal.clone()))
         };
-        let question = Arc::new(openpaw_engine::user_input::QuestionContext::new(
-            self.question_queue.clone(),
-        ));
-        (
-            delegation,
-            openpaw_engine::user_input::wrap_tools(tool_host, question.clone()),
-            goal,
-            question,
-        )
+        (delegation, tool_host, goal, question)
     }
     async fn load_existing(&self, id: &str) -> Result<Arc<SessionHandle>, SessionLoadError> {
         let path = self

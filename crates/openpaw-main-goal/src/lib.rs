@@ -127,6 +127,8 @@ struct GoalTask {
     expected_result: String,
     acceptance_criteria: Vec<String>,
     dependencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    requires_user_input: bool,
     #[serde(default)]
     replaces: Vec<String>,
     #[serde(default = "current_task")]
@@ -275,6 +277,8 @@ struct Observation {
     turn_id: String,
     #[serde(default)]
     is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    question_definition: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -803,9 +807,9 @@ impl GoalContext {
             return Some(format!("Goal 已停止。只允许读取、复核和根据本轮真实用户要求编辑计划或结束目标；人工暂停用manual_pause、明确恢复用manual_resume，携带task_id和user_excerpt引用本轮原文；恢复旧来源任务可解除其替换或拆分任务约束；不能写文件、shell、桌面动作或委派。修改目标或验收条件须引用 user_excerpt，保留仍有效已验收事实。补充条件时可用 recheck_task(task_id,status=pending或blocked,reason) 重检执行阻塞，条件不足仍保持 blocked；这由模型判断，无阻塞证据门槛。人工阻塞不可由普通重检解除。编辑完成后仍停止，只有原聊天 /goal continue 授予执行许可。当前事实：{}",self.model_view(json!(goal))));
         }
         if goal.phase != "draft" {
-            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：主Agent自己执行才用goal_update(action=start_task,task_id)；委派必须从pending直接start_agent(goal_task_id)，不要先start_task；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。record_result(result) 只表示产出未验证。独立任务优先 start_agent(goal_task_id=计划任务编号)，父继续独立工作，需要子结果时 wait_agent(session_id,turn_id)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付。wait_agent/get_agent_status 的交付或完成状态不作为验收依据；用 goal_read 找到可靠观察 reference，再 read_context_record 读取实际子结果，使用这次读取返回的 Goal observation 编号。预览需沿其原件引用继续读，长原件按页核对，不能把状态或摘要当作全文。上轮中断先读取实际原件再 recheck_task，不重复委派。读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。人工manual_blocked及其用户来源不可自动解除，continue、重检、移除依赖或新建等价任务均不能绕过；重规划保留原身份、replaces和人工来源，独立工作仍可推进。确实无法推进可 block_task(task_id,reason)，说明原因和所需条件，无工具尝试次数或阻塞证据门槛；受阻依赖等待，独立工作继续。continue 后先重检 blocked 任务，用 recheck_task(task_id,status=pending或blocked,reason) 提交模型判断，仍缺条件保持 blocked，满足才回 pending；人工阻塞不能由普通重检解除。已有原预算和取消约束保持。当前事实：{}",goal.id,self.model_view(json!(goal))));
+            return (!matches!(goal.phase.as_str(), "ended" | "completed")).then(|| format!("当前 Goal {}。先 goal_read（含持久执行事实）。仅在本次确认或显式继续授权回合按依赖推进：主Agent自己执行才用goal_update(action=start_task,task_id)；委派必须从pending直接start_agent(goal_task_id)，不要先start_task；中断或上一回合 produced 任务禁止原样重复。先读取实际产物及 execution_attempts，再用 recheck_task(task_id,observation_id,status=pending或produced,result) 引用本轮真实成功读取；确需补做才回 pending，完整产物直接 produced 并验收。保留仍有效 accepted 结果。用户要求选择时，计划相关任务必须requires_user_input=true并包含收到答案后展示的验收条件；由主Agent先start_task选中任务，再request_user_input弹真实菜单，取得回答后按选择交付，普通文字列项不算完成。计划确认不能代替业务选择。record_result(result) 只表示产出未验证。独立任务优先 start_agent(goal_task_id=计划任务编号)，父继续独立工作，需要子结果时 wait_agent(session_id,turn_id)，task_id 仍表示真实子会话；本回合子结果 produced 可用 start_task 选中只读验收，不能重复交付。wait_agent/get_agent_status 的交付或完成状态不作为验收依据；用 goal_read 找到可靠观察 reference，再 read_context_record 读取实际子结果，使用这次读取返回的 Goal observation 编号。预览需沿其原件引用继续读，长原件按页核对，不能把状态或摘要当作全文。上轮中断先读取实际原件再 recheck_task，不重复委派。读取实际交付物或运行检查后，accept_task 携带 evidence 数组，每个验收条件提供 criterion(从0起)、真实 observation_id 和 conclusion。工具结果中的 Goal observation 编号可追溯，不能编造或仅凭完成声明。所有任务 accepted 后另做整体检查，再 accept_goal，不能把任务100%当作整体完成。目标内可用 replan 提交完整当前任务定义（含 replaces 来源），增补、拆分、改写、替换和调整依赖；保留失败事实、有效验收和历史身份。不得提交 status/result/evidence/current 等运行事实。执行期间不得修改整体目标或验收条件；越界暂停等待用户编辑及显式继续。遇到普通失败先修复或重规划。人工manual_blocked及其用户来源不可自动解除，continue、重检、移除依赖或新建等价任务均不能绕过；重规划保留原身份、replaces和人工来源，独立工作仍可推进。确实无法推进可 block_task(task_id,reason)，说明原因和所需条件，无工具尝试次数或阻塞证据门槛；受阻依赖等待，独立工作继续。continue 后先重检 blocked 任务，用 recheck_task(task_id,status=pending或blocked,reason) 提交模型判断，仍缺条件保持 blocked，满足才回 pending；人工阻塞不能由普通重检解除。面向用户的回复简洁说明选择与结果、必要来源和时间，不输出obs编号或整份验收审计。已有原预算和取消约束保持。当前事实：{}",goal.id,self.model_view(json!(goal))));
         }
-        Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
+        Some(format!("当前处于 Goal 待确认规划阶段。整体目标：{}。先 goal_read，再用 goal_update(action=set_plan) 提交完整计划。每项任务必须有稳定 id、title、expected_result、acceptance_criteria、dependencies；按独立交付结果拆解，整体验收条件必须明确。用户要求提问、菜单或选择时，必须安排requires_user_input=true的主Agent任务，验收包含通过request_user_input取得真实答案并按选择展示，不得仅以列出选项为交付；数据收集可单独委派。用户自然语言修改时重交完整新版本，保留身份和必要历史。禁止执行交付工作、写文件、shell、桌面动作、委派或共享 Todo。明确结束旧目标才用 action=end，并提供原用户输入中的 user_excerpt；不得把结束冒充验收完成。最终完整计划由运行时展示，等待用户确认执行。",goal.objective))
     }
 
     fn queue_review(
@@ -1399,6 +1403,15 @@ impl GoalContext {
         }
         if action == "replan" {
             let definitions = parse_plan_definitions(&input["tasks"])?;
+            for old in goal.tasks.iter().filter(|task| {
+                task.current && task.requires_user_input && task.status != "accepted"
+            }) {
+                if !definitions.iter().any(|new| {
+                    new.requires_user_input && (new.id == old.id || new.replaces.contains(&old.id))
+                }) {
+                    return Err("重规划不能移除尚未满足的用户选择要求；请保留requires_user_input，需求改变须由原聊天用户停止后明确编辑".into());
+                }
+            }
             for old in goal
                 .tasks
                 .iter()
@@ -1485,6 +1498,14 @@ impl GoalContext {
                 .iter()
                 .position(|task| task.current && task.id == id)
                 .ok_or("任务不属于当前 Goal")?;
+            let answer = question_answer(goal, &goal.tasks[index]);
+            if goal.tasks[index].requires_user_input
+                && (matches!(action, "record_result" | "accept_task")
+                    || (action == "recheck_task" && input["status"] == "produced"))
+                && answer.is_none()
+            {
+                return Err("该任务必须先选中任务并调用request_user_input，收到可靠保存的回答后按选择交付；文字列项或计划确认不能代替业务选择".into());
+            }
             match action {
                 "block_task" => {
                     let task = &mut goal.tasks[index];
@@ -1578,6 +1599,16 @@ impl GoalContext {
                         Some(id),
                         goal.plan_version,
                     )?;
+                    if goal.tasks[index].requires_user_input
+                        && goal.tasks[index].evidence.iter().any(|evidence| {
+                            goal.observations
+                                .iter()
+                                .position(|observation| observation.id == evidence.observation_id)
+                                .is_none_or(|index| index <= answer.unwrap())
+                        })
+                    {
+                        return Err("选择任务需要取得答案后重新读取或检查所选交付物，回答本身和选择前的读取不能证明交付完成".into());
+                    }
                     goal.tasks[index].status = "accepted".into();
                 }
                 _ => {
@@ -1652,6 +1683,28 @@ impl GoalContext {
             return Ok(());
         };
         let id = format!("obs-{}", uuid::Uuid::new_v4().simple());
+        let answer: Value = serde_json::from_str(&outcome.content).unwrap_or(Value::Null);
+        let question_definition = (name == "request_user_input"
+            && !outcome.is_error
+            && answer["scope"]["parent_session_id"] == self.owner
+            && answer["scope"]["asking_session_id"] == self.owner
+            && answer["scope"]["source_user_message_id"] == user.message_id
+            && answer["question_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with(&format!("{}/{}/", self.owner, user.turn_id)))
+            && answer["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+            && answer["answer"]["choice_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()))
+        .then(|| {
+            goal.tasks
+                .iter()
+                .find(|task| task.current && Some(task.id.as_str()) == user.task_id.as_deref())
+                .map(task_definition)
+        })
+        .flatten();
         let verification = if name == "read_context_record" {
             let page: Value = serde_json::from_str(&outcome.content).unwrap_or(Value::Null);
             page["kind"] == "page"
@@ -1680,6 +1733,7 @@ impl GoalContext {
             plan_version: goal.plan_version,
             is_error: outcome.is_error,
             turn_id: user.turn_id.clone(),
+            question_definition,
         });
         self.commit(&next)?;
         *state = next;
@@ -1715,7 +1769,7 @@ impl GoalContext {
         {
             return None;
         }
-        Some("Goal 仍有未完成工作。继续按当前依赖执行、检查产出或核对整体验收；普通回复结束不能代替目标完成，继续使用本回合剩余预算。".into())
+        Some("Goal 仍有未完成工作。继续按当前依赖执行、检查产出或核对整体验收；普通回复结束不能代替目标完成。需用户选择的任务必须先选中并用request_user_input弹菜单，取得答案后按选择交付并核对，不能只列文字选项。继续使用本回合剩余预算。".into())
     }
 
     /// 功能：判断本回合是否有真实用户授予的前台执行许可。
@@ -1760,7 +1814,7 @@ impl GoalContext {
 
     /// 功能：生成已持久计划或执行验收事实的规范聊天展示。
     /// 参数：无。
-    /// 返回：计划全文或当前执行结果与可追溯验收结论。
+    /// 返回：待确认的完整计划，或简明进度及必要等待原因；验收原件仍保存。
     /// 错误：无。
     /// 状态：不会把生成文本当成已提交展示。
     /// 并发与取消：短锁快照。
@@ -1782,8 +1836,7 @@ impl GoalContext {
                 .filter(|task| task.current && task.status == "accepted")
                 .count();
             let mut text = format!(
-                "\n\nGoal {}：已验收 {accepted}/{} 项。{}\n",
-                goal.id,
+                "\n\n目标进度：已验收 {accepted}/{} 项。{}\n",
                 goal.tasks.iter().filter(|task| task.current).count(),
                 if goal.phase == "completed" {
                     "整体验收已通过"
@@ -1791,34 +1844,14 @@ impl GoalContext {
                     "整体尚未验收通过"
                 }
             );
-            text.push_str(&format!("变更原因：{}\n", goal.reason));
-            for entry in goal
-                .history
+            for task in goal
+                .tasks
                 .iter()
-                .filter(|entry| entry["action"] == "replan")
+                .filter(|task| task.current && !task.block_reason.is_empty())
             {
                 text.push_str(&format!(
-                    "重规划原因：{}\n",
-                    entry["reason"].as_str().unwrap_or("")
-                ));
-            }
-            for task in goal.tasks.iter().filter(|task| task.current) {
-                text.push_str(&format!(
-                    "\n任务 {}（{}）：{}\n",
-                    task.title, task.status, task.result
-                ));
-                for evidence in &task.evidence {
-                    text.push_str(&format!(
-                        "验收依据 {}：{}\n",
-                        evidence.observation_id, evidence.conclusion
-                    ));
-                }
-                text.push_str(&format!("{}\n", task_summary(task)));
-            }
-            for evidence in &goal.evidence {
-                text.push_str(&format!(
-                    "整体验收依据 {}：{}\n",
-                    evidence.observation_id, evidence.conclusion
+                    "等待条件：{}（{}）：{}\n",
+                    task.title, task.status, task.block_reason
                 ));
             }
             return Some(text);
@@ -2074,6 +2107,7 @@ fn parse_plan_definitions(input: &Value) -> Result<Vec<GoalTask>, String> {
                         "expected_result",
                         "acceptance_criteria",
                         "dependencies",
+                        "requires_user_input",
                         "replaces",
                     ]
                     .contains(&key.as_str())
@@ -2089,10 +2123,27 @@ fn parse_plan_definitions(input: &Value) -> Result<Vec<GoalTask>, String> {
 }
 
 fn same_task_definition(old: &GoalTask, new: &GoalTask) -> bool {
-    old.title == new.title
-        && old.expected_result == new.expected_result
-        && old.acceptance_criteria == new.acceptance_criteria
-        && old.dependencies == new.dependencies
+    task_definition(old) == task_definition(new)
+}
+
+fn task_definition(task: &GoalTask) -> Value {
+    json!([
+        task.title,
+        task.expected_result,
+        task.acceptance_criteria,
+        task.dependencies,
+        task.requires_user_input
+    ])
+}
+
+fn question_answer(goal: &GoalRecord, task: &GoalTask) -> Option<usize> {
+    let definition = task_definition(task);
+    goal.observations.iter().rposition(|observation| {
+        observation.task_id.as_deref() == Some(task.id.as_str())
+            && observation.tool == "request_user_input"
+            && !observation.is_error
+            && observation.question_definition.as_ref() == Some(&definition)
+    })
 }
 
 // 可信子终态只冻结原父回合的分支；新用户明确继续后沿既有产物复核规则处理。
@@ -2248,6 +2299,9 @@ fn task_summary(task: &GoalTask) -> String {
         }
     );
     summary.push_str(&format!("\n状态：{}", task.status));
+    if task.requires_user_input {
+        summary.push_str("\n用户选择：必须弹菜单，取得回答后按选择交付并验证。");
+    }
     if let Some(manual) = &task.manual {
         for source in &manual.sources {
             summary.push_str(&format!(
@@ -2507,13 +2561,13 @@ pub fn plan_tools() -> Vec<ToolSpec> {
             if name == "goal_read" {
                 "读取当前聊天 Goal 及完整计划版本"
             } else {
-                "规划用 set_plan/end；已停止用户编辑可manual_pause/manual_resume并引用user_excerpt；执行用 replan、start_task、record_result、accept_task、block_task；执行阻塞用recheck_task(status=pending或blocked,reason)由模型重检，无observation证据门槛，人工阻塞不可解除；replan仅提交任务定义，replaces记录替换/拆分来源；全任务通过后独立检查 accept_goal。更新携带 goal_id、expected_version、reason；验收 evidence 逐条件引用真实读取或检查编号；子结果先选中任务并用read_context_record回读原件，wait_agent状态不能直接验收"
+                "规划用 set_plan/end；已停止用户编辑可manual_pause/manual_resume并引用user_excerpt；执行用 replan、start_task、record_result、accept_task、block_task；执行阻塞用recheck_task(status=pending或blocked,reason)由模型重检，无observation证据门槛，人工阻塞不可解除；replan仅提交任务定义，replaces记录替换/拆分来源；全任务通过后独立检查 accept_goal。更新携带 goal_id、expected_version、reason；验收 evidence 逐条件引用真实读取或检查编号；子结果先选中任务并用read_context_record回读原件，wait_agent状态不能直接验收；用户要求选择的任务声明requires_user_input=true，主Agent选中后调用request_user_input；实际回答后交付并读取验证，文字选项/计划批准不算业务答案"
             },
         );
         spec.input_schema = if name == "goal_read" {
             json!({"type":"object","properties":{},"additionalProperties":false})
         } else {
-            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","manual_pause","manual_resume","replan","start_task","record_result","accept_task","accept_goal","recheck_task","block_task"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}},"replaces":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"status":{"enum":["pending","produced","blocked"]},"observation_id":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
+            json!({"type":"object","required":["action","goal_id","expected_version","reason"],"properties":{"action":{"enum":["set_plan","end","manual_pause","manual_resume","replan","start_task","record_result","accept_task","accept_goal","recheck_task","block_task"]},"goal_id":{"type":"string"},"expected_version":{"type":"integer"},"reason":{"type":"string"},"objective":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"tasks":{"type":"array","items":{"type":"object","required":["id","title","expected_result","acceptance_criteria","dependencies"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"expected_result":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"dependencies":{"type":"array","items":{"type":"string"}},"requires_user_input":{"type":"boolean","description":"用户要求菜单或选择时为true：必须取得真实提问工具答案后按选择交付；数据收集与此项分开"},"replaces":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}},"user_excerpt":{"type":"string"},"task_id":{"type":"string"},"result":{"type":"string"},"status":{"enum":["pending","produced","blocked"]},"observation_id":{"type":"string"},"evidence":{"type":"array","items":{"type":"object","required":["criterion","observation_id","conclusion"],"properties":{"criterion":{"type":"integer","minimum":0},"observation_id":{"type":"string"},"conclusion":{"type":"string"}},"additionalProperties":false}}},"additionalProperties":false})
         };
         spec.category = Some(ToolCategory::ReadOnly);
         spec.concurrency = Some(ToolConcurrency::NeverParallel);
@@ -2602,6 +2656,10 @@ mod tests {
     }
 
     fn confirmed_goal() -> (Arc<GoalContext>, Arc<RecordingRuntime>) {
+        confirmed_goal_with_input(false)
+    }
+
+    fn confirmed_goal_with_input(required: bool) -> (Arc<GoalContext>, Arc<RecordingRuntime>) {
         let context = GoalContext::new("session-a");
         let runtime = Arc::new(RecordingRuntime::default());
         context.attach(runtime.clone());
@@ -2613,13 +2671,17 @@ mod tests {
             .unwrap()
             .structured
             .unwrap();
+        let mut task = json!({"id":"report", "title":"生成报告", "expected_result":"report.txt",
+            "acceptance_criteria":["内容完整"], "dependencies":[]});
+        if required {
+            task["requires_user_input"] = json!(true);
+        }
         let plan = ready(host.call(
             "goal_update",
             json!({
                 "action":"set_plan", "goal_id":goal["id"], "expected_version":0,
                 "reason":"按报告交付拆解", "acceptance_criteria":["报告可读"],
-                "tasks":[{"id":"report", "title":"生成报告", "expected_result":"report.txt",
-                    "acceptance_criteria":["内容完整"], "dependencies":[]}]
+                "tasks":[task]
             }),
         ))
         .unwrap();
@@ -2630,6 +2692,151 @@ mod tests {
             .begin("turn-execute", "message-execute", "确认执行")
             .unwrap();
         (context, runtime)
+    }
+
+    #[test]
+    fn choice_task_requires_its_own_saved_answer_and_subsequent_product_check() {
+        for mode in 0..7 {
+            let (context, _) = confirmed_goal_with_input(true);
+            let update = |action: &str, extra: Value| {
+                let mut input = json!({"action":action,"goal_id":context.current().unwrap()["id"],"expected_version":1,"task_id":"report","reason":"真实选择验收"});
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                context.update(input, &Default::default())
+            };
+            if mode != 5 {
+                update("start_task", json!({})).unwrap();
+            }
+            assert!(update(
+                "record_result",
+                json!({"result":"已列文字选项，未取得答案"})
+            )
+            .is_err());
+            let mut body = json!({"question_id":"session-a/turn-execute/2/city","tool_call_id":"city","scope":{"parent_session_id":"session-a","asking_session_id":"session-a","source_user_message_id":"message-execute"},"answer":{"choice_id":"a","label":"武汉"}});
+            match mode {
+                2 => body["scope"]["asking_session_id"] = json!("another-session"),
+                3 => body["answer"] = Value::Null,
+                4 => body["question_id"] = json!("session-a/old-turn/2/city"),
+                _ => {}
+            }
+            let mut outcome = ToolCallOutcome::ok(body.to_string());
+            outcome.is_error = mode == 1;
+            context
+                .observe(
+                    if mode == 6 {
+                        "read_file"
+                    } else {
+                        "request_user_input"
+                    },
+                    json!({}),
+                    &mut outcome,
+                )
+                .unwrap();
+            if mode == 5 {
+                update("start_task", json!({})).unwrap();
+            }
+            let result = update("record_result", json!({"result":"已按选择展示武汉"}));
+            assert_eq!(result.is_ok(), mode == 0, "case {mode}");
+            if mode != 0 {
+                continue;
+            }
+            let question_id = context.current().unwrap()["observations"][0]["id"].clone();
+            assert!(update("accept_task",json!({"evidence":[{"criterion":0,"observation_id":question_id,"conclusion":"已选武汉"}]})).is_err(),"选择本身不能证明交付正确");
+            let mut product = ToolCallOutcome::ok("武汉示例天气");
+            context
+                .observe("read_file", json!({"path":"report.txt"}), &mut product)
+                .unwrap();
+            let id = context.current().unwrap()["observations"][1]["id"].clone();
+            update("accept_task",json!({"evidence":[{"criterion":0,"observation_id":id,"conclusion":"已核对所选武汉的内容"}]})).unwrap();
+        }
+    }
+
+    #[test]
+    fn replanning_cannot_remove_unanswered_choice_requirement() {
+        for mode in 0..3 {
+            let (context, _) = confirmed_goal_with_input(true);
+            let mut task = json!({"id":"report","title":"生成报告","expected_result":"report.txt","acceptance_criteria":["内容完整"],"dependencies":[]});
+            if mode > 0 {
+                task["id"] = json!("replacement");
+                task["replaces"] = json!(["report"]);
+            }
+            if mode == 2 {
+                task["requires_user_input"] = json!(true);
+            }
+            let result = context.update(json!({"action":"replan","goal_id":context.current().unwrap()["id"],"expected_version":1,"reason":"调整拆分","tasks":[task]}),&Default::default());
+            assert_eq!(result.is_ok(), mode == 2, "case {mode}");
+        }
+    }
+
+    #[test]
+    fn saved_choice_survives_restart_but_cannot_validate_changed_task_or_old_product() {
+        let (context, runtime) = confirmed_goal_with_input(true);
+        let update = |context: &GoalContext, action: &str, extra: Value| {
+            let goal = context.current().unwrap();
+            let mut input = json!({"action":action,"goal_id":goal["id"],"expected_version":goal["plan_version"],"task_id":"report","reason":"复核原选择和产物"});
+            input
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            context.update(input, &Default::default())
+        };
+        update(&context, "start_task", json!({})).unwrap();
+        let mut product = ToolCallOutcome::ok("选择前的报告");
+        context
+            .observe("read_file", json!({"path":"report.txt"}), &mut product)
+            .unwrap();
+        let old_product = context.current().unwrap()["observations"][0]["id"].clone();
+        let mut answer = ToolCallOutcome::ok(json!({"question_id":"session-a/turn-execute/2/city","tool_call_id":"city","scope":{"parent_session_id":"session-a","asking_session_id":"session-a","source_user_message_id":"message-execute"},"answer":{"choice_id":"a","label":"武汉"}}).to_string());
+        context
+            .observe("request_user_input", json!({}), &mut answer)
+            .unwrap();
+        update(&context, "record_result", json!({"result":"已按选择交付"})).unwrap();
+        assert!(update(&context,"accept_task",json!({"evidence":[{"criterion":0,"observation_id":old_product,"conclusion":"旧读取不能证明新交付"}]})).is_err());
+        context.finish();
+        let restored = GoalContext::new("session-a");
+        restored.attach(runtime.clone());
+        restored.restore(&runtime.events.lock().unwrap()).unwrap();
+        assert!(!restored.is_execution_turn());
+        restored
+            .begin("resume", "resume-message", "/goal continue")
+            .unwrap();
+        let mut product = ToolCallOutcome::ok("已选择武汉的报告");
+        restored
+            .observe("read_file", json!({"path":"report.txt"}), &mut product)
+            .unwrap();
+        let id = restored.current().unwrap()["observations"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["id"]
+            .clone();
+        update(
+            &restored,
+            "recheck_task",
+            json!({"status":"produced","result":"按原已保存选择复核","observation_id":id}),
+        )
+        .unwrap();
+        update(&restored,"accept_task",json!({"evidence":[{"criterion":0,"observation_id":id,"conclusion":"本轮核对正确交付"}]})).unwrap();
+        update(&restored,"replan",json!({"tasks":[{"id":"report","title":"选择另一种展示","expected_result":"report.txt","acceptance_criteria":["内容完整"],"dependencies":[],"requires_user_input":true}]})).unwrap();
+        update(&restored, "start_task", json!({})).unwrap();
+        assert!(update(
+            &restored,
+            "record_result",
+            json!({"result":"任务定义变更不能借用旧答案"})
+        )
+        .is_err());
+        assert_eq!(
+            restored.current().unwrap()["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|o| o["tool"] == "request_user_input")
+                .count(),
+            1,
+            "同定义恢复无需重复提问"
+        );
     }
 
     #[test]

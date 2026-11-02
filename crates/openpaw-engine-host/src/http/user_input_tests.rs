@@ -2296,6 +2296,9 @@ mod goal_question_tests {
         questions: &tokio::sync::Mutex<Vec<serde_json::Value>>,
         _gate: &tokio::sync::Notify,
     ) -> Response {
+        if scenario.starts_with("question-goal-choice") {
+            return goal_review_tests::choice_model_response(body, scenario);
+        }
         let messages = body["messages"].as_array().unwrap();
         let start = messages
             .iter()
@@ -4614,6 +4617,13 @@ mod user_input_tests {
             "wrong-conversation" => data["conversationId"] = serde_json::json!("different"),
             "wrong-display" => data["decisionId"] = serde_json::json!("different"),
             _ => {}
+        }
+        if body["decision"]["title"] == "查看哪个城市的天气？" {
+            if data["choiceId"] == "custom" {
+                data["customText"] = serde_json::json!("长沙");
+            } else if data["choiceId"] == "option-a" {
+                data["label"] = serde_json::json!("武汉");
+            }
         }
         assert!(
             data["teamId"].is_string()
