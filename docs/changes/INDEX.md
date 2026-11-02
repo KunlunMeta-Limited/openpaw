@@ -1,6 +1,6 @@
 # CHG 索引
 
-- [CHG-2026-0060：Goal待批准计划面板预览](CHG-2026-0060-Goal待批准计划面板预览.md)：本地implemented／ready-for-human，业务bda8171；待批准计划先上面板，批准后原回合继续，新版本等待时queued。Host321/workspace1008/CLI26及13项本地门禁通过，Host15216/15400、Goal2580/2600，原版前端动画探针通过；AI Office、依赖和额度保持，未部署15180，正式CODEOWNER/CI独立。
+- [CHG-2026-0060：Goal待批准计划面板预览](CHG-2026-0060-Goal待批准计划面板预览.md)：implemented／ready-for-human，业务bda8171；待批准计划先上面板，批准后原回合继续，新版本等待时queued。Host321/workspace1008/CLI26及13项本地门禁通过，Host15216/15400、Goal2580/2600。用户追加部署授权后已上线15180，8办公室/21组历史与绑定/34资源/新会话compact及四服务健康通过；原版AI Office、数据、依赖和额度保持，正式CODEOWNER/CI独立。
 
 - [CHG-2026-0058：办公室容量隔离与新会话恢复](CHG-2026-0058-办公室容量隔离与新会话恢复.md)：implemented／ready-for-human，业务0ad6050；Host316／workspace1005／CLI26及13项本地门禁通过。全量原数据副本的5办公室发布与首条聊天通过，15180已恢复正式原挂载，16组历史／2个首条聊天／34资源及四服务健康验证成功；原版前端、64KiB与额度保持，临时展示数据及回退保留。正式CODEOWNER／CI独立。
 
