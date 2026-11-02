@@ -1,6 +1,6 @@
 # CHG 索引
 
-- [CHG-2026-0061：Goal预算收尾与普通聊天展示](CHG-2026-0061-Goal预算收尾与普通聊天展示.md)：approved，用户批准后端逐文件范围；修复128轮Host预算、验收接续、中断原因与普通提问展示，实施中。前端保持原版，不部署15180、不恢复旧Goal、不提高额度。
+- [CHG-2026-0061：Goal预算收尾与普通聊天展示](CHG-2026-0061-Goal预算收尾与普通聊天展示.md)：implemented／ready-for-human，代码be7d148；Host322/workspace1010/CLI26及13类本地门禁通过。128轮Host预算、整体验收指导、中断原因、普通回合隔离及四项摘要已修复；前端原版、三条阶段协议与额度保持，不部署15180、不恢复旧Goal，正式CODEOWNER/CI独立。
 
 - [CHG-2026-0060：Goal待批准计划面板预览](CHG-2026-0060-Goal待批准计划面板预览.md)：implemented／ready-for-human，业务bda8171；待批准计划先上面板，批准后原回合继续，新版本等待时queued。Host321/workspace1008/CLI26及13项本地门禁通过，Host15216/15400、Goal2580/2600。用户追加部署授权后已上线15180，8办公室/21组历史与绑定/34资源/新会话compact及四服务健康通过；原版AI Office、数据、依赖和额度保持，正式CODEOWNER/CI独立。
 
