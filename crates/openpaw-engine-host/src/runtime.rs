@@ -404,7 +404,7 @@ impl SessionHandle {
     }
     /// 功能：向原会话 Goal 复核提供已有持久工具执行事实。
     /// 参数：无。
-    /// 返回：真实执行记录的只读快照。
+    /// 返回：工具执行与预算终答事实的只读快照。
     /// 错误：无。
     /// 状态：不产生工具动作或模型请求。
     /// 并发与取消：只持执行记录读锁，不等待 session。
@@ -417,13 +417,13 @@ impl SessionHandle {
             .unwrap_or_else(|e| e.into_inner());
         serde_json::json!(facts
             .iter()
-            .filter(
-                |fact| matches!(fact.kind.as_str(), "tool_start" | "tool_result")
+            .filter(|fact| (fact.kind == "response"
+                && fact.payload["termination"] == "iteration_budget")
+                || matches!(fact.kind.as_str(), "tool_start" | "tool_result")
                     && !matches!(
                         fact.payload["name"].as_str(),
                         Some("goal_read" | "goal_update")
-                    )
-            )
+                    ))
             .collect::<Vec<_>>())
     }
     /// 功能：判断主聊天观察流是否受未结束 Goal 的停止规则约束。
@@ -2917,6 +2917,7 @@ fn configured_agent(
     goal: Arc<GoalContext>,
 ) -> Result<AgentLoop, String> {
     let mut agent = AgentLoop::new(provider)
+        .with_budget(openpaw_core::IterationBudget::new_elastic(8, 128, 1))
         .with_end_turn_continuation(Arc::new(move || goal.continuation()))
         .with_model(model)
         .with_tool_host(tool_host)

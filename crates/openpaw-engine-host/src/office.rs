@@ -100,7 +100,8 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
         let dependencies = task["dependencies"].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("、");
         let waiting = task["status"] == "pending" && task["dependencies"].as_array().into_iter().flatten().any(|dep|tasks.iter().any(|task|task["id"] == *dep && task["status"] != "accepted"));
         let reason = if waiting {format!("等待依赖：{dependencies}")} else {task["block_reason"].as_str().unwrap_or("").into()};
-        let summary = format!("阻塞原因：{reason}\n预期结果：{}\n验收条件：{criteria}\n依赖：{}\n实际产出：{}\n验收依据：{}",task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies},task["result"].as_str().unwrap_or("尚未产出"),if task["status"] == "accepted" {"已根据真实工具观察逐项核对，完整依据见聊天"} else {"未验证，不计为通过"});
+        let label = if matches!(task["status"].as_str(),Some("interrupted"|"produced")) {"中断/待复核说明"} else {"等待条件"};
+        let summary = format!("{label}：{}\n预期结果：{}\n验收条件：{criteria}\n依赖：{}\n实际产出：{}\n验收依据：{}",if reason.is_empty() {"无"}else{&reason},task["expected_result"].as_str().unwrap_or(""),if dependencies.is_empty() {"无"} else {&dependencies},task["result"].as_str().unwrap_or("尚未产出"),if task["status"] == "accepted" {"已根据真实工具观察逐项核对，完整依据见聊天"} else {"未验证，不计为通过"});
         let source = task["manual"]["sources"].as_array().into_iter().flatten().map(|source| format!("用户人工暂停（来源任务 {}）：{}",source["task_id"].as_str().unwrap_or(""),source["user_excerpt"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("；");
         let summary = if source.is_empty() {summary} else {format!("{source}\n{summary}")};
         let summary = if summary.encode_utf16().count() > 1000 { format!("{}…完整条件与依赖见聊天计划。",projection_text(&summary,960)) } else { summary };
@@ -1090,12 +1091,12 @@ impl MainOffice {
             let awaiting = snapshot["whiteboard"]["status"] == "queued";
             let mut summary = if awaiting {
                 format!(
-                    "计划 v{} 待批准；批准后开始执行。已验收 {}/{} 项。",
+                    "计划 v{} 待批准；批准后开始执行。已验收 {}/{} 项。阶段最多展示前3项。",
                     goal["planVersion"], goal["acceptedTaskCount"], goal["taskCount"]
                 )
             } else {
                 format!(
-                    "已验收 {}/{} 项。白板为时间动画，Goal整体验收后统一100%。",
+                    "已验收 {}/{} 项。阶段最多展示前3项，时间动画在Goal整体验收后统一100%。",
                     goal["acceptedTaskCount"], goal["taskCount"]
                 )
             };
@@ -1112,6 +1113,12 @@ impl MainOffice {
                 }
             };
             let mut detail = format!("# {}\n\n目标状态：{phase}；已验收 {}/{} 项。\n\n{}\n\n任务全部完成后仍需独立整体验收。\n\n", snapshot["whiteboard"]["title"].as_str().unwrap_or("目标"), goal["acceptedTaskCount"], goal["taskCount"], goal["reason"].as_str().unwrap_or(""));
+            if matches!(goal["phase"].as_str(), Some("paused" | "blocked")) {
+                summary.push_str(&format!(
+                    "\n{}",
+                    projection_text(goal["reason"].as_str().unwrap_or("等待显式继续"), 40)
+                ));
+            }
             let tasks = snapshot["tasks"].as_array_mut().expect("owned Goal tasks");
             for (index, task) in tasks.iter_mut().enumerate() {
                 task.as_object_mut()
@@ -1122,11 +1129,11 @@ impl MainOffice {
                     .unwrap_or("")
                     .replace(['\n', '\r'], " ");
                 let progress = task["progress"].as_u64().unwrap_or(0);
-                if index < 3 {
+                if index < 4 {
                     summary.push_str(&format!(
-                        " {}. {}：{progress}%。",
+                        "\n{}. {}：{progress}%。",
                         index + 1,
-                        projection_text(&title, 48)
+                        projection_text(&title, 28)
                     ));
                 }
                 detail.push_str(&format!(
@@ -1134,6 +1141,9 @@ impl MainOffice {
                     index + 1,
                     task["summary"].as_str().unwrap_or("")
                 ));
+            }
+            if tasks.len() > 4 {
+                summary.push_str("\n更多任务及未完成原因见任务列表。");
             }
             let board = snapshot["whiteboard"]
                 .as_object_mut()
@@ -3649,6 +3659,10 @@ mod tests {
             assert_eq!(board["steps"].as_array().unwrap().len(), 3);
             assert_eq!(board["status"], "running");
             assert!(board["summary"].as_str().unwrap().contains("时间动画"));
+            let summary = board["summary"].as_str().unwrap();
+            assert!(summary.contains("1/5") && summary.contains("前3项"));
+            assert!(summary.contains("\n4. 任务4：0%"));
+            assert!(summary.encode_utf16().count() <= 300);
             let detail = board["detail"].as_str().unwrap();
             assert!(detail.contains("任务5 — 0%"));
             assert!(detail.contains("等待整体验收"));

@@ -4533,6 +4533,9 @@ mod user_input_tests {
     /// 权限：真实工具执行仍走Host权限入口。
     /// 关联：CHG-2026-0054、user_input_tests。
     pub(super) fn model_response(body: &serde_json::Value, scenario: &str) -> Response {
+        if scenario == "question-original" && body["stream"] == true {
+            return goal_tests::original_model_response(body);
+        }
         let messages = body["messages"].as_array().unwrap();
         let result = messages
             .iter()
@@ -5164,7 +5167,7 @@ mod async_delegation_tests {
                 return StatusCode::UNAUTHORIZED.into_response();
             }
             let chunk = if (first_user == "父预算耗尽"
-                || (first_user == "父最后预算结束" && tools < 25))
+                || (first_user == "父最后预算结束" && tools < 128))
                 && !body["tools"].as_array().unwrap().is_empty()
             {
                 serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("budget-{tools}"),"type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":"tool_calls"}]})

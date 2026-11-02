@@ -731,7 +731,7 @@ impl AgentLoop {
                 recorder.as_ref(),
                 response_index,
                 "response",
-                serde_json::json!({"content":resp.content}),
+                serde_json::json!({"content":resp.content,"stop_reason":resp.stop_reason}),
             )?;
             // ⑦ 累加用量（饱和加法，见 Usage 文档）并更新 token 预算
             let usage = resp.usage;
@@ -1128,7 +1128,7 @@ impl AgentLoop {
             recording.0,
             recording.1,
             "response",
-            serde_json::json!({"content":resp.content}),
+            serde_json::json!({"content":resp.content,"stop_reason":resp.stop_reason,"termination":"iteration_budget"}),
         )?;
         for event in buffered_events {
             event_sink(event);
@@ -2553,14 +2553,40 @@ mod tests {
             }));
         let mut session = Session::new("bounded", "bounded");
         session.messages.push(Message::user_text("work"));
+        let facts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = facts.clone();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            agent.run_turn(&mut session, None, &[], &mut |_| {}),
+            crate::turn_execution::run_turn(
+                &agent,
+                &mut session,
+                &[],
+                &mut |_| {},
+                crate::turn_execution::TurnOptions {
+                    recorder: Some(Arc::new(move |fact| {
+                        observed.lock().unwrap().push(fact);
+                        Ok(())
+                    })),
+                    ..Default::default()
+                },
+            ),
         )
         .await
-        .unwrap()
         .unwrap();
-        assert_eq!(result, StopReason::EndTurn);
+        assert_eq!(result.result.unwrap(), StopReason::EndTurn);
+        let facts = facts.lock().unwrap();
+        let responses: Vec<_> = facts
+            .iter()
+            .filter(|fact| fact.kind == "response")
+            .collect();
+        assert_eq!(responses.len(), 3);
+        assert!(responses
+            .iter()
+            .all(|fact| fact.payload["stop_reason"] == "end_turn"));
+        assert!(responses[..2]
+            .iter()
+            .all(|fact| fact.payload.get("termination").is_none()));
+        assert_eq!(responses[2].payload["termination"], "iteration_budget");
         assert_eq!(
             provider.calls.load(Ordering::SeqCst),
             3,

@@ -82,9 +82,23 @@ mod goal_tests {
         );
     }
 
-    // 使用现有模型边界，经过真实Host、子执行和原件reader，不伪造检查结果。
-    fn original_model_response(body: &serde_json::Value) -> Response {
+    /// 功能：通过本地模型边界生成长目标及原件读取步骤。
+    /// 参数：body为真实Host发出的模型请求。
+    /// 返回：fixture流式响应。
+    /// 错误：调用顺序不符时断言失败。
+    /// 状态：不伪造Goal验收或用户答案。
+    /// 并发与取消：沿用真实Host执行路径。
+    /// 权限：不访问外网或正式数据。
+    /// 关联：CHG0061长回合回归。
+    pub(super) fn original_model_response(body: &serde_json::Value) -> Response {
         let messages = body["messages"].as_array().unwrap();
+        if !body["tools"].as_array().is_some_and(|tools| !tools.is_empty()) {
+            return goal_fixture_chunk(None, 0);
+        }
+        if let Some(index) = messages.iter().rposition(|m| m["role"] == "user" && m["content"] == "读取README，不修改文件") {
+            return goal_fixture_chunk((!messages[index..].iter().any(|m|m["role"]=="tool")).then(||("read_file",serde_json::json!({"path":"README.md"}))), 0);
+        }
+        let long = messages.iter().any(|m| m["content"].as_str().is_some_and(|s| s.contains("goal-original-long")));
         let latest = messages
             .iter()
             .rposition(|m| {
@@ -165,12 +179,37 @@ mod goal_tests {
                 0 => Some(("goal_read", serde_json::json!({}))),
                 1 => Some((
                     "goal_update",
-                    serde_json::json!({"action":"set_plan","goal_id":current["id"],"expected_version":0,"reason":"独立子交付","acceptance_criteria":["两份子产物齐备"],"tasks":[
+                    serde_json::json!({"action":"set_plan","goal_id":current["id"],"expected_version":0,"reason":"独立子交付","acceptance_criteria":["两份子产物齐备"],"tasks":if long {serde_json::json!([
+                        {"id":"a","title":"甲","expected_result":"甲文本","acceptance_criteria":["甲文本可回读"],"dependencies":[]},
+                        {"id":"b","title":"乙","expected_result":"乙文本","acceptance_criteria":["乙文本可回读"],"dependencies":[]},
+                        {"id":"report","title":"选择城市","expected_result":"真实选择","acceptance_criteria":["已取得选择"],"dependencies":["a","b"],"requires_user_input":true},
+                        {"id":"display","title":"展示第四项","expected_result":"选择后的甲文本","acceptance_criteria":["与选择一致"],"dependencies":["report"]}
+                    ])}else{serde_json::json!([
                         {"id":"a","title":"甲","expected_result":"甲文本","acceptance_criteria":["甲文本可回读"],"dependencies":[]},
                         {"id":"b","title":"乙","expected_result":"乙文本","acceptance_criteria":["乙文本可回读"],"dependencies":[]},
                         {"id":"report","title":"整合","expected_result":"等待选择","acceptance_criteria":["已选择"],"dependencies":["a","b"]}
-                    ]}),
+                    ])}}),
                 )),
+                _ => None,
+            }
+        } else if long && tools.len() >= 15 {
+            let n = tools.len();
+            match n {
+                15 => Some(("request_user_input",serde_json::json!({"question":"查看哪个城市的天气？","options":[{"id":"option-a","label":"武汉"},{"id":"option-b","label":"长沙"}]}))),
+                16 => update("record_result","report",serde_json::json!({"result":"用户已选择武汉"})),
+                17 => Some(("read_context_record",serde_json::json!({"reference":current["observations"].as_array().unwrap().iter().find(|o|o["tool"]=="request_user_input").unwrap()["reference"],"limit":4096}))),
+                18 => update("accept_task","report",evidence(17)),
+                19 => update("start_task","display",serde_json::json!({})),
+                _ if body["tools"].as_array().unwrap().is_empty() => None,
+                _ if n < 35 || messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("goal-original-long-budget"))) => Some(("read_file",serde_json::json!({"path":"README.md"}))),
+                35 => update("record_result","display",serde_json::json!({"result":"按武汉选择展示真实甲子结果"})),
+                36 | 39 => {
+                    if n==39 {assert!(messages.iter().any(|m|m["content"].as_str().is_some_and(|s|s.contains("whole_goal"))),"失败后应明确指导独立整体检查");}
+                    Some(("read_context_record",serde_json::json!({"reference":input(9)["reference"],"limit":4096})))
+                }
+                37 => update("accept_task","display",evidence(36)),
+                38 => update("accept_goal","",evidence(9)),
+                40 => update("accept_goal","",evidence(39)),
                 _ => None,
             }
         } else {
@@ -202,6 +241,36 @@ mod goal_tests {
             }
         };
         goal_fixture_chunk(call, tools.len())
+    }
+
+    #[tokio::test]
+    async fn finalization61_long_goal_finishes_fourth_task_and_reports_real_budget_stop() {
+        let _guard = PROVIDER_ENV_LOCK.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
+        for budget in [false,true] {
+            let fixture = main_fixture("question-original","option-a").await;
+            let text = if budget {"/goal goal-original-long-budget 两份子交付选择后展示"}else{"/goal goal-original-long 两份子交付选择后展示"};
+            goal_send(&fixture.app,&fixture.team,"long","plan",text).await;
+            let answer=goal_send(&fixture.app,&fixture.team,"long","execute","确认执行").await;
+            let owner=fixture.state.main_office.conversation_record(&fixture.team,"long").unwrap().unwrap().session.unwrap();
+            let goal=crate::runtime::latest_goal(fixture.home.path(),&owner).unwrap().unwrap();
+            assert_eq!(goal["tasks"].as_array().unwrap().len(),4);
+            if budget {
+                assert_eq!(goal["tasks"][3]["status"],"interrupted");
+                assert!(goal["tasks"][3]["block_reason"].as_str().unwrap().contains("工具轮次"),"{goal}");
+                assert!(goal["reason"].as_str().unwrap().contains("工具轮次"));
+                assert!(fixture.model_seen.lock().await.iter().filter(|r|r["tools"].as_array().is_some_and(|tools|!tools.is_empty())).count()>=129);
+            } else {
+                assert_eq!(goal["phase"],"completed","{answer}");
+                assert!(goal["tasks"].as_array().unwrap().iter().all(|t|t["status"]=="accepted"));
+                let seen=fixture.model_seen.lock().await;
+                assert!(seen.len()>40);
+                assert_eq!(seen.iter().filter(|r|r["messages"].as_array().unwrap().iter().any(|m|m["content"].as_str().is_some_and(|s|s.starts_with("goal-original-child-")))).count(),2);
+            }
+            let before=goal.clone();
+            let reply=goal_send(&fixture.app,&fixture.team,"long","ordinary","读取README，不修改文件").await;
+            assert!(!reply["text"].as_str().unwrap().contains("完整计划"));
+            assert_eq!(crate::runtime::latest_goal(fixture.home.path(),&owner).unwrap().unwrap(),before);
+        }
     }
 
     fn assert_goal_task_board(snapshot: &serde_json::Value) {
