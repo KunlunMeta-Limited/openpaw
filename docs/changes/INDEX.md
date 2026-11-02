@@ -106,4 +106,4 @@ Q1–Q5 已确认，迁移、本地回归及 cargo-deny 0.20.2 依赖审计完�
 
 - [CHG-2026-0056：Goal确认菜单与委派交接](CHG-2026-0056-Goal确认菜单与委派交接.md)：用户逐文件与Host15400／Goal2600追加范围本地完成，最终代码f19f3c6。Host311／workspace1003／CLI26、双配置严格Clippy、可执行门禁及原版浏览器两组通过；并发窗口P1已修并复审关闭。Host15158／Goal2505，AI Office原版、不部署15180，正式CODEOWNER／CI与基线限制独立，详见CHG第11节。
 
-- [CHG-2026-0059：Goal执行选择与简洁收尾](CHG-2026-0059-Goal执行选择与简洁收尾.md)：用户逐文件批准并本地完成；候选b00a2fe的Host319/workspace1008/CLI26及13项门禁通过，Host15189/15400、Goal2580/2600，原版AI Office、依赖和额度保持；ready-for-human，未部署15180。
+- [CHG-2026-0059：Goal执行选择与简洁收尾](CHG-2026-0059-Goal执行选择与简洁收尾.md)：本地implemented／ready-for-human，候选b00a2fe的Host319/workspace1008/CLI26及13项门禁通过，Host15189/15400、Goal2580/2600；用户追加部署授权后已更新15180，仅替换Host，8办公室/20组历史与绑定/34资源/新会话compact及四服务健康通过。原版AI Office、正式数据、依赖和额度保持，正式CODEOWNER/CI独立。
