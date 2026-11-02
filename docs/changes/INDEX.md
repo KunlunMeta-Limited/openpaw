@@ -1,5 +1,7 @@
 # CHG 索引
 
+- [CHG-2026-0057：子结果原件回读与Goal验收衔接](CHG-2026-0057-子结果原件回读与Goal验收衔接.md)：approved，用户批准三处业务／测试文件范围，实施中。保留原版前端、额度与依赖，不部署15180。
+
 - [CHG-2026-0055：普通委派参数边界](CHG-2026-0055-普通委派参数边界.md)：本地implemented／ready-for-human，代码3785672；三处获批业务文件、Goal6／workspace996／Host309／CLI26及四组原版浏览器隔离联调通过，Goal保护保留。正式CODEOWNER/CI与既有基线限制独立；未修改前端或部署15180。
 
 - [CHG-2026-0054：用户提问与非阻塞委派](CHG-2026-0054-用户提问与非阻塞委派.md)：approved，本地九票及审查修复完成，ready-for-human。9ed3a7b的Host309、CLI26、双配置workspace严格Clippy、格式及六项xtask通过；Standards三项closed/新增0、Spec0。workspace993和原版浏览器五组属于9c候选；基线Core模块缺Stability仍失败、cargo-deny不可用，正式CODEOWNER/CI独立。11个实现树已清理，原版AI Office保持，15180仍运行用户演示9c4bb23。

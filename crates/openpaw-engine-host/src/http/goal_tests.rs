@@ -2,6 +2,208 @@
 mod goal_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn main_goal_verifies_text_children_through_scoped_original_pages() {
+        let _guard = PROVIDER_ENV_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let fixture = main_fixture("goal-delegate", "confirm").await;
+        goal_send(
+            &fixture.app,
+            &fixture.team,
+            "original",
+            "plan",
+            "/goal goal-original 读取两份子交付后整合",
+        )
+        .await;
+        let answer = goal_send(
+            &fixture.app,
+            &fixture.team,
+            "original",
+            "execute",
+            "确认执行",
+        )
+        .await;
+        let requests = fixture.model_seen.lock().await;
+        let results: Vec<_> = requests
+            .iter()
+            .flat_map(|r| r["messages"].as_array().unwrap())
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(
+            results.iter().any(|s| s.contains("\"kind\":\"page\"")
+                && s.contains("合成子结果")
+                && s.contains("Goal observation:")),
+            "真实原件读取必须产生可验收的Goal观察"
+        );
+        assert!(
+            answer["text"].as_str().unwrap().contains("已验收 2/3"),
+            "两份真实纯文本产出应验收成功：{answer}"
+        );
+        assert!(
+            results.iter().any(|s| s.contains("依赖尚未验收")),
+            "子返回时依赖仍未验收"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|s| s.contains("wait_agent") && s.contains("read_context_record")),
+            "状态观察应给出具体复核指引"
+        );
+        assert!(
+            results.iter().any(|s| s.contains("不属于当前会话")),
+            "跨会话引用不能成为检查依据"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "user"
+                        && m["content"]
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("goal-original-child-"))))
+                .count(),
+            2,
+            "读取原件不能重新执行子任务"
+        );
+        assert!(
+            !requests.iter().any(|r| r["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+                .any(|c| c["function"]["name"] == "write_file")),
+            "纯文本结果不必额外写文件"
+        );
+    }
+
+    // 使用现有模型边界，经过真实Host、子执行和原件reader，不伪造检查结果。
+    fn original_model_response(body: &serde_json::Value) -> Response {
+        let messages = body["messages"].as_array().unwrap();
+        let latest = messages
+            .iter()
+            .rposition(|m| {
+                m["role"] == "user"
+                    && m["content"].as_str().is_some_and(|s| {
+                        s == "确认执行"
+                            || s.starts_with("/goal goal-original")
+                            || s.starts_with("goal-original-child-")
+                    })
+            })
+            .unwrap();
+        let text = messages[latest]["content"].as_str().unwrap();
+        if text.starts_with("goal-original-child-") {
+            let chunk = serde_json::json!({"choices":[{"delta":{"content":format!("合成子结果：{text}")},"finish_reason":"stop"}]});
+            return (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response();
+        }
+        let tools: Vec<_> = messages[latest..]
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        let current = tools
+            .iter()
+            .rev()
+            .filter_map(|m| m["content"].as_str())
+            .filter_map(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .find(|v| v["id"].is_string())
+            .unwrap_or_default();
+        let update = |action: &str, task: &str, extra: serde_json::Value| {
+            let mut args = serde_json::json!({"action":action,"task_id":task,"goal_id":current["id"],"expected_version":current["plan_version"],"reason":"核对纯文本子交付"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            Some(("goal_update", args))
+        };
+        let input = |index: usize| {
+            serde_json::from_str::<serde_json::Value>(
+                tools[index]["content"]
+                    .as_str()
+                    .unwrap()
+                    .split("\nGoal observation:")
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let evidence = |index: usize| serde_json::json!({"evidence":[{"criterion":0,"observation_id":tools[index]["content"].as_str().unwrap().rsplit_once("Goal observation: ").map_or("missing",|(_,id)|id.trim()),"conclusion":"已读取并核对真实子产物"}]});
+        let page = |id: &str, foreign: bool| {
+            let mut reference = current["observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| {
+                    o["tool"] == "wait_agent"
+                        && o["input"]["session_id"]
+                            == input(if id == "a" { 1 } else { 2 })["session_id"]
+                })
+                .unwrap()["reference"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            if foreign {
+                let mut key: serde_json::Value =
+                    serde_json::from_str(reference.strip_prefix("ctx:v1:").unwrap()).unwrap();
+                key[0] = serde_json::json!("foreign-owner");
+                reference = format!("ctx:v1:{key}");
+            }
+            Some((
+                "read_context_record",
+                serde_json::json!({"reference":reference,"limit":4096}),
+            ))
+        };
+        let call = if text.starts_with("/goal") {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                1 => Some((
+                    "goal_update",
+                    serde_json::json!({"action":"set_plan","goal_id":current["id"],"expected_version":0,"reason":"独立子交付","acceptance_criteria":["两份子产物齐备"],"tasks":[
+                        {"id":"a","title":"甲","expected_result":"甲文本","acceptance_criteria":["甲文本可回读"],"dependencies":[]},
+                        {"id":"b","title":"乙","expected_result":"乙文本","acceptance_criteria":["乙文本可回读"],"dependencies":[]},
+                        {"id":"report","title":"整合","expected_result":"等待选择","acceptance_criteria":["已选择"],"dependencies":["a","b"]}
+                    ]}),
+                )),
+                _ => None,
+            }
+        } else {
+            match tools.len() {
+                0 => Some(("goal_read", serde_json::json!({}))),
+                n @ (1 | 2) => Some((
+                    "start_agent",
+                    serde_json::json!({"name":if n==1 {"甲"}else{"乙"},"task":format!("goal-original-child-{n}"),"goal_task_id":if n==1 {"a"}else{"b"}}),
+                )),
+                n @ (3 | 4) => Some((
+                    "wait_agent",
+                    serde_json::json!({"session_id":input(n-2)["session_id"],"turn_id":input(n-2)["turn_id"],"timeout_ms":60000}),
+                )),
+                5 | 14 => update("start_task", "report", serde_json::json!({})),
+                6 => update("start_task", "a", serde_json::json!({})),
+                7 => update("accept_task", "a", evidence(3)),
+                8 => page("a", true),
+                9 => page("a", false),
+                10 => update("accept_task", "a", evidence(9)),
+                11 => update("start_task", "b", serde_json::json!({})),
+                12 => page("b", false),
+                13 => update("accept_task", "b", evidence(12)),
+                15 => update(
+                    "block_task",
+                    "report",
+                    serde_json::json!({"reason":"合成测试等待外部选择"}),
+                ),
+                _ => None,
+            }
+        };
+        goal_fixture_chunk(call, tools.len())
+    }
+
     fn assert_goal_task_board(snapshot: &serde_json::Value) {
         if !snapshot["goal"]["id"].is_string() {
             return;
@@ -172,14 +374,8 @@ mod goal_tests {
                     "整体标准改为调整后的资料准确",
                 )
                 .await;
-                answer = goal_send(
-                    &fixture.app,
-                    &fixture.team,
-                    "proof",
-                    "continue",
-                    "确认执行",
-                )
-                .await;
+                answer =
+                    goal_send(&fixture.app, &fixture.team, "proof", "continue", "确认执行").await;
             }
             assert!(
                 answer["text"].as_str().unwrap().contains("整体验收已通过"),
@@ -266,7 +462,10 @@ mod goal_tests {
         } else if text.starts_with("整体标准改为") {
             match tools.len() {
                 0 => Some(("goal_read", serde_json::json!({}))),
-                1 => Some(("bash",serde_json::json!({"command":"printf paused-bypass"}))),
+                1 => Some((
+                    "bash",
+                    serde_json::json!({"command":"printf paused-bypass"}),
+                )),
                 2 => update(
                     "set_plan",
                     "",
@@ -274,7 +473,9 @@ mod goal_tests {
                 ),
                 _ => None,
             }
-        } else if text == "/goal continue" || (editing && text == "确认执行" && current["plan_version"].as_u64().unwrap_or(0) > 1) {
+        } else if text == "/goal continue"
+            || (editing && text == "确认执行" && current["plan_version"].as_u64().unwrap_or(0) > 1)
+        {
             match tools.len() {
                 0 => Some(("goal_read", serde_json::json!({}))),
                 1 => {
@@ -1077,7 +1278,7 @@ mod goal_tests {
                     .await
                     .unwrap()
                     .1;
-                if conversation_view(&snapshot["snapshot"],"manual")["tasks"]
+                if conversation_view(&snapshot["snapshot"], "manual")["tasks"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1090,7 +1291,7 @@ mod goal_tests {
         })
         .await
         .expect("异步当前计划投影应到达既有任务区");
-        let held = conversation_view(&snapshot["snapshot"],"manual")["tasks"]
+        let held = conversation_view(&snapshot["snapshot"], "manual")["tasks"]
             .as_array()
             .unwrap()
             .iter()
@@ -1102,8 +1303,15 @@ mod goal_tests {
             "既有摘要应说明人工来源"
         );
         let calls = fixture.model_seen.lock().await.len();
-        let restarted_state = restart_question_tests::rebuild(&fixture,fixture.home.path());
-        restarted_state.main_office.message(serde_json::json!({"type":"office.capabilities"}),Duration::from_secs(5)).await.unwrap();
+        let restarted_state = restart_question_tests::rebuild(&fixture, fixture.home.path());
+        restarted_state
+            .main_office
+            .message(
+                serde_json::json!({"type":"office.capabilities"}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
         let restarted = build_router(restarted_state);
         assert_eq!(
             goal_request(
@@ -1442,9 +1650,14 @@ mod goal_tests {
                     )
                     .await
                     .unwrap();
-                if observed_goal(&read,"cancel-parallel")["phase"] == "paused" {
-                    assert_eq!(observed_goal(&read,"cancel-parallel")["acceptedTaskCount"], 0);
-                    let tasks = conversation_view(&read["snapshot"],"cancel-parallel")["tasks"].as_array().unwrap();
+                if observed_goal(&read, "cancel-parallel")["phase"] == "paused" {
+                    assert_eq!(
+                        observed_goal(&read, "cancel-parallel")["acceptedTaskCount"],
+                        0
+                    );
+                    let tasks = conversation_view(&read["snapshot"], "cancel-parallel")["tasks"]
+                        .as_array()
+                        .unwrap();
                     assert_eq!(tasks.len(), 3);
                     assert_eq!(
                         tasks
@@ -1535,7 +1748,7 @@ mod goal_tests {
                     )
                     .await
                     .unwrap();
-                if conversation_view(&read["snapshot"],"parallel")["tasks"]
+                if conversation_view(&read["snapshot"], "parallel")["tasks"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1550,7 +1763,9 @@ mod goal_tests {
         })
         .await
         .expect("异步 Office 投影应同步真实子任务归属");
-        let tasks = conversation_view(&read["snapshot"],"parallel")["tasks"].as_array().unwrap();
+        let tasks = conversation_view(&read["snapshot"], "parallel")["tasks"]
+            .as_array()
+            .unwrap();
         assert_eq!(tasks.len(), 3, "Goal 委派不生成重复 exec-* 任务");
         assert_eq!(
             tasks
@@ -1597,7 +1812,8 @@ mod goal_tests {
             .await
             .unwrap();
         assert_eq!(
-            observed_goal(&read,"parallel")["acceptedTaskCount"], 0,
+            observed_goal(&read, "parallel")["acceptedTaskCount"],
+            0,
             "子返回不等于验收"
         );
         fixture.release_model.notify_one();
@@ -1664,6 +1880,13 @@ mod goal_tests {
         gate: &tokio::sync::Notify,
     ) -> Response {
         let messages = body["messages"].as_array().unwrap();
+        if messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|s| s.contains("goal-original"))
+        }) {
+            return original_model_response(body);
+        }
         let latest = messages.iter().rposition(|m| m["role"] == "user").unwrap();
         let tools: Vec<_> = messages[latest..]
             .iter()
@@ -2796,7 +3019,8 @@ mod goal_tests {
             };
             return goal_fixture_chunk(call, tools.len());
         }
-        let resuming = text == "/goal continue" || (text == "确认执行" && current["plan_version"].as_u64().unwrap_or(0) > 1);
+        let resuming = text == "/goal continue"
+            || (text == "确认执行" && current["plan_version"].as_u64().unwrap_or(0) > 1);
         if resuming && tools.len() == 3 {
             assert!(
                 tools[2]["content"]
@@ -2881,9 +3105,12 @@ mod goal_tests {
         message: &'a serde_json::Value,
         conversation: &str,
     ) -> &'a serde_json::Value {
-        &conversation_view(&message["snapshot"],conversation)["goal"]
+        &conversation_view(&message["snapshot"], conversation)["goal"]
     }
-    fn conversation_view<'a>(snapshot: &'a serde_json::Value, conversation: &str) -> &'a serde_json::Value {
+    fn conversation_view<'a>(
+        snapshot: &'a serde_json::Value,
+        conversation: &str,
+    ) -> &'a serde_json::Value {
         snapshot["conversations"]
             .as_array()
             .and_then(|rows| rows.iter().find(|row| row["id"] == conversation))
@@ -3194,7 +3421,10 @@ mod goal_tests {
         let call = match tools.len() {
             0 => Some(("goal_read", serde_json::json!({}))),
             // 新固定菜单会在保存计划后等待；将原越权探针前移，仍验证宿主拒绝。
-            1 => Some(("write_file",serde_json::json!({"path":"premature.txt","content":"must not execute"}))),
+            1 => Some((
+                "write_file",
+                serde_json::json!({"path":"premature.txt","content":"must not execute"}),
+            )),
             2 => {
                 let current: serde_json::Value =
                     serde_json::from_str(tools[0]["content"].as_str().unwrap())
@@ -3328,7 +3558,10 @@ mod goal_tests {
     /// 并发与取消：独立构造响应，无等待。
     /// 权限：仅供测试，不访问真实模型。
     /// 关联：Goal 与固定审核菜单集成回归。Stability: experimental。
-    pub(super) fn goal_fixture_chunk(call: Option<(&str, serde_json::Value)>, index: usize) -> Response {
+    pub(super) fn goal_fixture_chunk(
+        call: Option<(&str, serde_json::Value)>,
+        index: usize,
+    ) -> Response {
         let chunk = if let Some((name, args)) = call {
             serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("goal-{index}"),"type":"function","function":{"name":name,"arguments":args.to_string()}}]},"finish_reason":"tool_calls"}]})
         } else {

@@ -1696,6 +1696,7 @@ impl AppState {
                 self.ai_pc.clone(),
             )
         };
+        let tool_host = crate::context::wrap(tool_host, &self.config.home, id, context_window);
         let goal = GoalContext::new(id);
         let tool_host: Arc<dyn openpaw_core::ToolHost> = if child {
             tool_host
@@ -1707,10 +1708,7 @@ impl AppState {
         ));
         (
             delegation,
-            openpaw_engine::user_input::wrap_tools(
-                crate::context::wrap(tool_host, &self.config.home, id, context_window),
-                question.clone(),
-            ),
+            openpaw_engine::user_input::wrap_tools(tool_host, question.clone()),
             goal,
             question,
         )
