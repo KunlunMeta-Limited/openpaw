@@ -76,6 +76,14 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
         .collect();
     let phase = goal["phase"].as_str().unwrap_or("draft");
     let ended = phase == "ended";
+    let pending_approval = !matches!(phase, "ended" | "completed")
+        && goal["plan_version"].as_u64().unwrap_or(0)
+            > goal["confirmed_version"].as_u64().unwrap_or(0);
+    let tagline = if pending_approval {
+        format!("计划 v{} 待批准", goal["plan_version"])
+    } else {
+        projection_text(goal["reason"].as_str().unwrap_or(""), 40)
+    };
     let count = tasks.len();
     let accepted = tasks
         .iter()
@@ -103,12 +111,13 @@ fn apply_goal_projection(snapshot: &mut Value, goal: &Value) {
     let status = match phase {
         "completed" => "completed",
         "ended" => "failed",
-        "active" => "running",
+        "active" if !pending_approval => "running",
+        "active" => "queued",
         "paused" | "blocked" => "blocked",
         _ => "queued",
     };
     let steps: Vec<_> = tasks.iter().take(3).map(|task| serde_json::json!({"id":format!("{}-{}",goal["id"].as_str().unwrap_or(""),task["id"].as_str().unwrap_or("")),"title":projection_text(task["title"].as_str().unwrap_or(""),160),"progress":if task["status"] == "accepted" {100} else {0}})).collect();
-    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":status,"tagline":projection_text(goal["reason"].as_str().unwrap_or(""),40),"description":format!("已验收 {accepted}/{count} 项；白板展示前{}项，完整任务与验收条件见任务列表和聊天计划",steps.len()),"note":if phase == "draft" {"计划待确认；每项验收完成后显示100%"} else {"任务全部通过仍需独立整体验收"},"link":{"label":"","url":""},"progressMode":"reported","steps":steps});
+    snapshot["whiteboard"] = serde_json::json!({"template":"task-board-v1","title":projection_text(goal["objective"].as_str().unwrap_or(""),160),"status":status,"tagline":tagline,"description":format!("已验收 {accepted}/{count} 项；白板展示前{}项，完整任务与验收条件见任务列表和聊天计划",steps.len()),"note":if pending_approval {"批准后才开始执行；修改后需重新批准"} else {"任务全部通过仍需独立整体验收"},"link":{"label":"","url":""},"progressMode":"reported","steps":steps});
 }
 
 // 人物外观的名字属于展示名册；子会话职责和任务名称保留在原执行事实中。
@@ -1078,17 +1087,29 @@ impl MainOffice {
             else {
                 return;
             };
-            let mut summary = format!(
-                "已验收 {}/{} 项。白板为时间动画，Goal整体验收后统一100%。",
-                goal["acceptedTaskCount"], goal["taskCount"]
-            );
-            let phase = match goal["phase"].as_str() {
-                Some("active") => "执行中",
-                Some("paused") => "已暂停",
-                Some("blocked") => "等待条件",
-                Some("completed") => "整体验收通过",
-                Some("ended") => "已终止",
-                _ => "计划待确认",
+            let awaiting = snapshot["whiteboard"]["status"] == "queued";
+            let mut summary = if awaiting {
+                format!(
+                    "计划 v{} 待批准；批准后开始执行。已验收 {}/{} 项。",
+                    goal["planVersion"], goal["acceptedTaskCount"], goal["taskCount"]
+                )
+            } else {
+                format!(
+                    "已验收 {}/{} 项。白板为时间动画，Goal整体验收后统一100%。",
+                    goal["acceptedTaskCount"], goal["taskCount"]
+                )
+            };
+            let phase = if awaiting {
+                "计划待批准"
+            } else {
+                match goal["phase"].as_str() {
+                    Some("active") => "执行中",
+                    Some("paused") => "已暂停",
+                    Some("blocked") => "等待条件",
+                    Some("completed") => "整体验收通过",
+                    Some("ended") => "已终止",
+                    _ => "计划待确认",
+                }
             };
             let mut detail = format!("# {}\n\n目标状态：{phase}；已验收 {}/{} 项。\n\n{}\n\n任务全部完成后仍需独立整体验收。\n\n", snapshot["whiteboard"]["title"].as_str().unwrap_or("目标"), goal["acceptedTaskCount"], goal["taskCount"], goal["reason"].as_str().unwrap_or(""));
             let tasks = snapshot["tasks"].as_array_mut().expect("owned Goal tasks");
@@ -3672,6 +3693,42 @@ mod tests {
                     serde_json::to_vec(&wire).unwrap(),
                 )
                 .unwrap();
+            }
+        }
+        // 重规划可以保留active业务阶段；未批准的新版本只改变展示，不清空验收事实。
+        for (phase, status) in [
+            ("active", "queued"),
+            ("paused", "blocked"),
+            ("blocked", "blocked"),
+            ("ended", "failed"),
+            ("completed", "completed"),
+        ] {
+            let mut revised = goal.clone();
+            revised["phase"] = phase.into();
+            revised["plan_version"] = 2.into();
+            let mut projected = snapshot.clone();
+            apply_goal_projection(&mut projected, &revised);
+            let wire = office.display_snapshot(projected);
+            assert_eq!(wire["whiteboard"]["status"], status);
+            assert_eq!(
+                wire["tasks"][0]["status"],
+                if phase == "ended" {
+                    "failed"
+                } else {
+                    "completed"
+                }
+            );
+            assert_eq!(wire["tasks"][0]["progress"], 100);
+            assert_eq!(wire["whiteboard"]["steps"][0]["progress"], 100);
+            if phase == "active" {
+                assert!(wire["whiteboard"]["summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("计划 v2 待批准"));
+                assert!(wire["whiteboard"]["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("目标状态：计划待批准"));
             }
         }
         assert_eq!(std::fs::read(&office.path).unwrap(), persisted);

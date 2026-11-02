@@ -222,6 +222,79 @@ mod goal_review_tests {
     fn decisions_count(choice:&str)->usize {if choice == "custom-first" {2}else{1}}
 
     #[tokio::test]
+    async fn goal_plan_is_visible_before_approval_and_only_runs_after_answer() {
+        let _guard = PROVIDER_ENV_LOCK.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
+        let fixture = main_fixture("goal-menu-preview", "held-review").await;
+        let (app,team) = (fixture.app.clone(),fixture.team.clone());
+        let running = tokio::spawn(async move {goal_tests::goal_send(&app,&team,"preview","plan","/goal 保存可验收测试文件").await});
+        tokio::time::timeout(Duration::from_secs(5),async {
+            loop {
+                if fixture.seen.lock().await.iter().any(|m|m["type"]=="decision.request") {break;}
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let preview = tokio::time::timeout(Duration::from_secs(3),async {
+            loop {
+                let (_,read) = fixture.state.main_office.message(serde_json::json!({"type":"office.read","teamId":fixture.team}),Duration::from_secs(1)).await.unwrap();
+                if let Some(view) = read["snapshot"]["conversations"].as_array().and_then(|rows|rows.iter().find(|row|row["id"]=="preview" && row["goal"]["planVersion"]==1)) {
+                    break view.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await;
+        if preview.is_err() {
+            let owner = fixture.state.main_office.conversation_record(&fixture.team,"preview").unwrap().unwrap().session.unwrap();
+            child_test_json(&fixture.app,"POST",&format!("/session/{owner}/abort"),serde_json::json!({})).await;
+            running.await.unwrap();
+        } else {
+            let preview = preview.as_ref().unwrap();
+            assert_eq!(preview["whiteboard"]["status"],"queued");
+            assert_eq!(preview["whiteboard"]["steps"][0]["title"],"保存测试文件");
+            assert_eq!(preview["whiteboard"]["steps"][0]["progress"],0);
+            assert_eq!(preview["tasks"][0]["status"],"queued");
+            assert_eq!(fixture.model_seen.lock().await.len(),2,"等待批准时不请求执行模型");
+            assert!(!fixture.workspace.path().join("review-demo.txt").exists());
+            fixture.release_model.notify_one();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(8),running).await.unwrap().unwrap()["state"],"complete");
+            assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("review-demo.txt")).unwrap(),"MENU_REVIEW_OK");
+        }
+        assert!(preview.is_ok(),"用户尚未回答审核菜单时，真实Office面板必须已经展示计划v1");
+    }
+
+    #[tokio::test]
+    async fn goal_replan_is_visible_and_frozen_until_second_answer() {
+        let _guard = PROVIDER_ENV_LOCK.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
+        let fixture = main_fixture("goal-menu-replan", "held-review").await;
+        let (app,team) = (fixture.app.clone(),fixture.team.clone());
+        let running = tokio::spawn(async move {goal_tests::goal_send(&app,&team,"preview","plan","/goal 保存可验收测试文件").await});
+        for (version,title) in [(1,"保存测试文件"),(2,"修订测试文件")] {
+            tokio::time::timeout(Duration::from_secs(5),async {
+                loop {
+                    if fixture.seen.lock().await.iter().filter(|m|m["type"]=="decision.request").count() >= version {break;}
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            let view = tokio::time::timeout(Duration::from_secs(3),async {
+                loop {
+                    let (_,read) = fixture.state.main_office.message(serde_json::json!({"type":"office.read","teamId":fixture.team}),Duration::from_secs(1)).await.unwrap();
+                    if let Some(view) = read["snapshot"]["conversations"].as_array().and_then(|rows|rows.iter().find(|row|row["id"]=="preview" && row["goal"]["planVersion"]==version)) {break view.clone();}
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("审核期间必须显示当前计划版本");
+            assert_eq!(view["whiteboard"]["status"],"queued","未批准的v{version}不能播放执行动画");
+            assert!(view["whiteboard"]["tagline"].as_str().unwrap().contains("待批准"));
+            assert_eq!(view["whiteboard"]["steps"][0]["title"],title);
+            assert_eq!(view["whiteboard"]["steps"][0]["progress"],0);
+            assert!(!fixture.workspace.path().join("review-demo.txt").exists());
+            fixture.release_model.notify_one();
+        }
+        assert_eq!(tokio::time::timeout(Duration::from_secs(8),running).await.unwrap().unwrap()["state"],"complete");
+        let owner = fixture.state.main_office.conversation_record(&fixture.team,"preview").unwrap().unwrap().session.unwrap();
+        assert_eq!(fixture.state.get_typed(&owner).await.unwrap().turn_outcomes().len(),1,"两次审核沿同一回合继续");
+        assert_eq!(std::fs::read_to_string(fixture.workspace.path().join("review-demo.txt")).unwrap(),"MENU_REVIEW_OK");
+    }
+
+    #[tokio::test]
     async fn goal_review_replan_requires_second_answer_and_stop_restart_never_replays_permission() {
         let _guard = PROVIDER_ENV_LOCK.get_or_init(||tokio::sync::Mutex::new(())).lock().await;
         for choice in ["execute","execute-then-modify"] {

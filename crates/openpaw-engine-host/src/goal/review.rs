@@ -14,10 +14,10 @@ use std::{path::PathBuf, sync::Arc};
 /// 参数：handle为可信会话，goal/question为原上下文，path为原件路径，base为不含Goal的原系统提示。
 /// 返回：无待审核时无动作的可选交互准备回调。
 /// 错误：展示、记录或审核失效时原回合安全暂停或失败。
-/// 状态：规范计划由Engine先发布，问答由唯一writer保存。
+/// 状态：规范计划由Engine先发布，等待前及结算后投影面板，问答由唯一writer保存。
 /// 并发与取消：等待复用原取消，未持有Session锁外的长期锁。
 /// 权限：只使用后端固定问题及本次真实保存的答案。
-/// 关联：TurnOptions；Stability: experimental。
+/// 关联：TurnOptions、CHG-2026-0060；Stability: experimental。
 pub(crate) fn coordination(
     handle: Arc<SessionHandle>,
     goal: Arc<GoalContext>,
@@ -38,6 +38,9 @@ pub(crate) fn coordination(
             presentation: review.plan.clone(),
             resolve: Box::pin(async move {
                 goal.review_displayed(&review).map_err(Error::Session)?;
+                if let Some(snapshot) = goal.current() {
+                    handle.office.project_goal(&handle.id, snapshot);
+                }
                 let context = ToolInvocationContext {
                     turn_id: Some(review.turn_id.clone()),
                     response_index: review.response_index,
@@ -69,6 +72,9 @@ pub(crate) fn coordination(
                 let action = goal
                     .settle_review(&review, record.as_ref())
                     .map_err(Error::Session)?;
+                if let Some(snapshot) = goal.current() {
+                    handle.office.project_goal(&handle.id, snapshot);
+                }
                 if matches!(action.as_str(), "execute" | "custom") {
                     let mut tools: Vec<ToolSpec> = handle.tools.clone();
                     tools.extend(openpaw_main_goal::plan_tools());
