@@ -92,7 +92,7 @@ mod goal_tests {
     /// 关联：CHG0061长回合回归。
     pub(super) fn original_model_response(body: &serde_json::Value) -> Response {
         let messages = body["messages"].as_array().unwrap();
-        if !body["tools"].as_array().is_some_and(|tools| !tools.is_empty()) {
+        if body["tools"].as_array().is_none_or(|tools| tools.is_empty()) {
             return goal_fixture_chunk(None, 0);
         }
         if let Some(index) = messages.iter().rposition(|m| m["role"] == "user" && m["content"] == "读取README，不修改文件") {
