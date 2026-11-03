@@ -435,13 +435,16 @@ async fn d07_real_engine_approval_reaches_original_bash_environment() {
         .with_tool_host(Arc::new(openpaw_tools::ToolRegistry::new(dir.path())))
         .with_approval_manager(Arc::new(AutoApproveManager)))
     .await;
-    assert!(events.iter().any(|e| matches!(
-        e,
-        AgentEvent::ToolResult {
-            is_error: false,
-            ..
-        }
-    )));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolResult {
+                is_error: false,
+                ..
+            }
+        )),
+        "实际命令审批/执行事件：{events:#?}"
+    );
     assert!(std::fs::read_to_string(dir.path().join("result.txt"))
         .unwrap()
         .contains("approved-engine"));
