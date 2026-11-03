@@ -112,15 +112,18 @@ test('fresh installations get different service keys', t => {
   assert.notEqual(fs.readFileSync(a.key, 'utf8'), fs.readFileSync(b.key, 'utf8'));
 });
 
-test('actual platform wrapper exposes setup and rejects incomplete input without leaking secrets', t => {
+test('actual platform wrapper exposes setup and rejects incomplete input without leaking secrets', { timeout: 45000 }, t => {
   const dir = temporary(t);
   const win = process.platform === 'win32';
   const wrapper = path.resolve(__dirname, '..', `openpaw-office.${win ? 'ps1' : 'sh'}`);
-  const args = win ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', wrapper, 'setup'] : [wrapper, 'setup'];
+  const args = win ? ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', wrapper, 'setup'] : [wrapper, 'setup'];
   const result = cp.spawnSync(win ? 'powershell.exe' : 'bash', args, {
     input: 'openai\nmodel\nhttps://example.com/v1\nsetup-test-secret\nINVALID\n',
-    env: { ...process.env, OPENPAW_SETUP_HOME: dir }, encoding: 'utf8', timeout: 8000,
+    // Windows的冷PowerShell启动与杀进程耗时不能使用Linux子进程的8秒预算。
+    // 这不是交互延迟验收；仍要求实际进入权限校验，而不能靠超时算作拒绝。
+    env: { ...process.env, OPENPAW_SETUP_HOME: dir }, encoding: 'utf8', timeout: win ? 30000 : 8000,
   });
+  assert.ifError(result.error);
   assert.notEqual(result.status, 0);
   assert.ok(!`${result.stdout}${result.stderr}`.includes('setup-test-secret'));
   // 此测试在具备Rust/Git/Node的原生CI运行，实际验证到权限输入拒绝。
