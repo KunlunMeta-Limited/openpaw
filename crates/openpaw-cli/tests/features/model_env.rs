@@ -169,6 +169,9 @@ fn actual_provider_http_uses_file_credentials_endpoint_and_selected_model() {
                     Err(e) => panic!("{e}"),
                 }
             };
+            // Windows接受的socket可继承监听器的非阻塞模式；恢复阻塞后，
+            // 下面原有的读取期限才能控制请求等待，而非立即返回WouldBlock。
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
