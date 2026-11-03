@@ -408,6 +408,12 @@ Office已安全快进到fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518，用户两份�
 
 **验证、影响和回退。**测短任务在首个新快照即completed、同人物FIFO、多个来源、暂忙后恢复、永久拒绝、重复快照、刷新/切换不补播。真实浏览器逐项对照assignment与实际visit接受/终态，不把HTTP200当动画播放。仅影响展示，既有协议/权限/账本不变，无迁移；回退Bridge及测试。当前只是集中候选，Office仍未批准、未实施。OpenPaw来源参数纠错只能减少错误主角色派发，不能代替此项。
 
+**2026-11-03 多对话责任复核（D150；仍未批准、不实施）。**在未修改的5d21cf2生产构建中，用两个独立浏览器同时选A；分别通过带conversationId的Host式relay、正常task.assigned启动A动画，然后仅将第一个浏览器切到B。两种来源均复现：B任务标题和白板已正确切换，但A已接受的visit还在该页面运行。对该页面B作用域发送已知旧commandId的受控取消后，A残留立即停止、B工作展示恢复，另一个仍在A的浏览器保持原动画。两个浏览器的同一assignment生成不同的随机dashboard-* commandId，不能由Host凭同一事件推算；当前协议也没有浏览器选择通知或该页活动ID目录。不能据此要求Host取消同团队全部动画，否则会误伤另一个页面。
+
+**责任和待审方向。**OfficeTeamSession.setConversation仅切数据源/dashboard/白板，未清理该页之前接受的旧作用域活动；OfficeIntegrationSession只过滤新接收命令，sceneBridge生成的活动缺少可用于切换清理的会话归属。现有业务快照不需要更改。候选须在原TeamSession/IntegrationSession/sceneBridge及对应测试中保存本页活动与会话的关联，选择变化时只取消本页旧会话仍在途/排队的业务动画；不能删除其他浏览器/会话的后台Run，不取消与会话无关的场景活动，不补播历史，不增加“动画结束才执行”门禁。此为R27范围补充统计，未授权Office修改。Host私有relay可减少部分残留，但现有接口无法完整覆盖浏览器随机创建的assignment活动，因此不能承诺OpenPaw单侧完整解决。此前447项委派未发现错scope只是已审范围结论，不证明Host所有路径均无缺陷。
+
+**证据。**`/home/cheng/.openpaw/verification/conversation-scope-recheck-20261103/report.json`两种来源的六项因果断言均通过；relay/assignment子目录含两个浏览器前后导出快照、截图及trace，0模型发送、0页面异常，正式服务与Office工程均未改。详细复核见同目录《多对话责任与修复边界.md》。
+
 ### R28：人物头顶动作被旧任务和单行裁切遮住（候选，未实施）
 
 2026-10-28补充区分后端缺口：新文章会话的公开快照接近64,000字节，Host旧compact_protected_details连running/queued/blocked的summary也删除，使详情显示“暂无说明”；原CHG0007 §12.110 D117仅修Host这项容量裁剪，保留有界真实动作，不能以此宣称本申请的旧卡选择或常态单行裁切已修。正式在途任务不强停，候选测试与正式部署必须分别核实。R25/R27/R28仍待统一人工审查，Office未改。

@@ -31,6 +31,7 @@ fn config(base: &std::path::Path) -> HostConfig {
         run_timeout_secs: 60,
         stream_idle_secs: 10,
         tool_timeout_secs: 60,
+        auto_approve_tools: Vec::new(),
         approval_timeout_secs: 30,
     }
 }

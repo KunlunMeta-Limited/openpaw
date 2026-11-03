@@ -7,7 +7,7 @@
   "scripts": {
     "prepare:office": "node prepare-office.mjs",
     "check": "tsc --noEmit",
-    "test": "node --test --test-timeout=10000 office.test.mjs sdk.test.ts"
+    "test": "node --test --test-timeout=10000 office.test.mjs sdk.test.ts ../../scripts/tests/office-setup.test.cjs"
   },
   "devDependencies": {
     "@opencode-ai/sdk": "1.18.15",

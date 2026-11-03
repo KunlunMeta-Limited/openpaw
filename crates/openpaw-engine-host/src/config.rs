@@ -114,6 +114,14 @@ pub struct HostConfig {
     /// 稳定性：T3新增中性字段。
     /// 关联：需求/设计DES-OP-006。
     pub tools: Vec<String>,
+    /// 用途：用户在本机一次授权后持续生效的文件工具列表。
+    /// 字段：Vec<String>，缺省为空，仍逐次人工确认。
+    /// 来源去向：可信Host配置到原HostApproval，不接受模型或浏览器更改。
+    /// 约束：只含已启用的文件/媒体写工具，根隔离和准确输入审计不变；移除后重启撤回。
+    /// 稳定性：可选配置，旧TOML保持原审批语义。
+    /// 关联：CHG-2026-0007第12.142节D153；REQ-OP-013；DES-OP-006。
+    #[serde(default)]
+    pub auto_approve_tools: Vec<String>,
     #[serde(default = "total")]
     /// 用途：Run总预算秒数，到期仍等待实际清理。
     /// 字段：u64，宿主类型字段。
@@ -326,6 +334,25 @@ impl HostConfig {
         ];
         if self.tools.iter().any(|t| !allowed.contains(&t.as_str())) {
             return Err(HostError::new("unsupported", "工具白名单包含未支持项"));
+        }
+        let file_tools = [
+            "write_file",
+            "edit_file",
+            "notebook_edit",
+            "generate_image",
+            "render_visual",
+        ];
+        let unique: std::collections::HashSet<_> = self.auto_approve_tools.iter().collect();
+        if unique.len() != self.auto_approve_tools.len()
+            || self
+                .auto_approve_tools
+                .iter()
+                .any(|t| !file_tools.contains(&t.as_str()) || !self.tools.contains(t))
+        {
+            return Err(HostError::new(
+                "invalid_input",
+                "预授权工具必须是不重复且已启用的文件或媒体写工具",
+            ));
         }
         if let Some(agents) = &self.agents {
             agents.validate(self)?;

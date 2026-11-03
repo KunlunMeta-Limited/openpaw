@@ -348,18 +348,18 @@ fn access(row: &Value, dir: &FsPath) -> HostResult<String> {
         row["artifact"].as_str().unwrap_or(""),
     ))
 }
-fn url(row: &Value, dir: &FsPath, delivery: bool) -> HostResult<String> {
+fn url(row: &Value, dir: &FsPath, suffix: &str) -> HostResult<String> {
     Ok(format!(
         "{}/office/artifacts/{}{}?access={}",
         row["origin"].as_str().unwrap_or(""),
         row["version"].as_str().unwrap_or(""),
-        if delivery { "/delivery" } else { "" },
+        suffix,
         access(row, dir)?
     ))
 }
 fn artifact(row: &Value, dir: &FsPath) -> HostResult<Value> {
     Ok(
-        json!({"id":row["artifact"],"versionId":row["version"],"version":format!("v{}",row["number"]),"runId":row["delivery"],"title":row["title"],"kind":if row["mime"].as_str().unwrap_or("").starts_with("image/"){"image"}else{"document"},"mimeType":row["mime"],"sha256":row["hash"],"producedAt":row["at"],"url":url(row,dir,false)?}),
+        json!({"id":row["artifact"],"versionId":row["version"],"version":format!("v{}",row["number"]),"runId":row["delivery"],"title":row["title"],"kind":if row["mime"].as_str().unwrap_or("").starts_with("image/"){"image"}else{"document"},"mimeType":row["mime"],"sha256":row["hash"],"producedAt":row["at"],"url":url(row,dir,"")?}),
     )
 }
 // The preview is derived separately; raw bytes/hash/download remain exactly as written.
@@ -402,7 +402,7 @@ fn preview(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Option<Value
         for candidate in [target.to_owned(), format!("./{target}")] {
             let needle = format!("]({candidate})");
             if rendered.contains(&needle) {
-                rendered = rendered.replace(&needle, &format!("]({})", url(image, dir, false)?));
+                rendered = rendered.replace(&needle, &format!("]({})", url(image, dir, "")?));
                 replaced = true;
             }
         }
@@ -449,14 +449,30 @@ pub(crate) fn delivery(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<
         json!({"id":row["delivery"],"sequence":row["sequence"],"turnId":row["turn"],"title":row["title"],"createdAt":row["at"],"result":result}),
     )
 }
+// 目录仅改变展示身份；原始交付、捕获时点图文和版本访问能力均不变。
+fn catalog_id(version: &str) -> String {
+    format!("catalog-{version}")
+}
+fn catalog(mut original: Value, version: &str) -> Value {
+    let id = catalog_id(version);
+    original["id"] = json!(id);
+    original["turnId"] = json!("");
+    original["result"]["runId"] = json!(id);
+    if let Some(artifacts) = original["result"]["artifacts"].as_array_mut() {
+        for artifact in artifacts {
+            artifact["runId"] = json!(id);
+        }
+    }
+    original
+}
 /// 功能：将准确会话产物接入当前白板与历史目录。
 /// 参数：db为原Store；scope为可信会话；board为原业务白板。
 /// 返回：保持任务事实并附加官方文件汇总。
 /// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：最多8当前文件及20历史目录；仅展示窗口有界，不删版本。
+/// 状态：最多8当前文件及20历史目录；同轮同文件只关联最新聊天摘要，旧版本不删除。
 /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
 /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+/// 关联：CHG-2026-0007第12.124节r30及12.141节r32；REQ-OP-014；DES-OP-007。
 pub(crate) fn project(
     db: &crate::store::Db,
     scope: &crate::ClientScope,
@@ -500,7 +516,18 @@ pub(crate) fn project(
     } else {
         dto::bounded(&format!("{prior_note}；{note}"), 300)
     });
-    board["deliveries"]=json!(rows.iter().take(20).map(|row|Ok(json!({"id":row["delivery"],"sequence":row["sequence"],"turnId":row["turn"],"title":row["title"],"createdAt":row["at"],"snapshotUrl":url(row,&dir,true)?}))).collect::<HostResult<Vec<Value>>>()?);
+    // rows已按准确会话过滤并按序号倒排；不同轮次、不同文件不得合并。
+    let mut turns = std::collections::HashSet::new();
+    board["deliveries"] = json!(rows.iter().take(20).map(|row| {
+        let latest = turns.insert((row["turn"].as_str().unwrap_or(""), row["artifact"].as_str().unwrap_or("")));
+        Ok(json!({
+            "id": if latest { row["delivery"].clone() } else { json!(catalog_id(row["version"].as_str().unwrap_or(""))) },
+            "sequence": row["sequence"],
+            "turnId": if latest { row["turn"].clone() } else { json!("") },
+            "title": row["title"], "createdAt": row["at"],
+            "snapshotUrl": url(row, &dir, if latest { "/delivery" } else { "/catalog" })?
+        }))
+    }).collect::<HostResult<Vec<Value>>>()?);
     Ok(())
 }
 
@@ -517,13 +544,17 @@ struct FileState {
 /// 状态：只读或发布派生版本，不修改原工具及会话。
 /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
 /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+/// 关联：CHG-2026-0007第12.124节r30及12.141节r32；REQ-OP-014；DES-OP-007。
 pub(crate) fn router(host: Host, config: OfficeConfig, address: SocketAddr) -> Router {
     Router::new()
         .route("/office/artifacts/{version}", get(raw).options(options))
         .route(
             "/office/artifacts/{version}/delivery",
             get(historical).options(options),
+        )
+        .route(
+            "/office/artifacts/{version}/catalog",
+            get(catalog_view).options(options),
         )
         .with_state(FileState {
             host,
@@ -614,7 +645,7 @@ async fn raw(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    serve(state, version, query, headers, false).await
+    serve(state, version, query, headers, FileView::Raw).await
 }
 async fn historical(
     State(state): State<FileState>,
@@ -622,14 +653,28 @@ async fn historical(
     RawQuery(query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
-    serve(state, version, query, headers, true).await
+    serve(state, version, query, headers, FileView::Delivery).await
+}
+async fn catalog_view(
+    State(state): State<FileState>,
+    Path(version): Path<String>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    serve(state, version, query, headers, FileView::Catalog).await
+}
+#[derive(Clone, Copy)]
+enum FileView {
+    Raw,
+    Delivery,
+    Catalog,
 }
 async fn serve(
     state: FileState,
     version: String,
     query: Option<String>,
     headers: HeaderMap,
-    delivery: bool,
+    view: FileView,
 ) -> Response {
     let origin = match source(&state, &headers) {
         Ok(s) => s,
@@ -657,7 +702,18 @@ async fn serve(
         .host
         .inner
         .store
-        .call_priority(move |db| db.artifact_read(&version, &access, delivery))
+        .call_priority(move |db| {
+            let (bytes, mime) =
+                db.artifact_read(&version, &access, !matches!(view, FileView::Raw))?;
+            if matches!(view, FileView::Catalog) {
+                let original = serde_json::from_slice(&bytes).map_err(HostError::storage)?;
+                let bytes =
+                    serde_json::to_vec(&catalog(original, &version)).map_err(HostError::storage)?;
+                Ok((bytes, mime))
+            } else {
+                Ok((bytes, mime))
+            }
+        })
         .await;
     match result {
         Ok((bytes, mime)) => {
@@ -754,6 +810,23 @@ mod tests {
         let mut next = rows.clone();
         next.insert(0, image(4, "newer-image"));
         assert_eq!(delivery(&doc, &next, dir).unwrap(), old);
+        let history = catalog(d.clone(), "v-doc");
+        assert_eq!(history["id"], "catalog-v-doc");
+        assert_eq!(history["turnId"], "");
+        assert_eq!(history["result"]["runId"], history["id"]);
+        assert_eq!(history["result"]["artifacts"][0]["runId"], history["id"]);
+        assert_eq!(history["result"]["sections"], old["result"]["sections"]);
+        for key in ["id", "versionId", "url", "sha256", "producedAt"] {
+            assert_eq!(
+                history["result"]["artifacts"][0][key],
+                old["result"]["artifacts"][0][key]
+            );
+        }
+        assert_eq!(
+            history,
+            catalog(delivery(&doc, &next, dir).unwrap(), "v-doc")
+        );
+        assert_eq!(d, old, "catalog must not mutate the original delivery");
     }
     #[test]
     fn d143_dot_relative_images_use_captured_versions_without_broadening_links() {
@@ -827,6 +900,22 @@ mod tests {
                 text: "实际修改第二版".into(),
             },
             MockMode::Fixed("第二版保存。".into()),
+            MockMode::ToolUse {
+                tool_name: "edit_file".into(),
+                input: json!({"path":"version.md","old_string":"second","new_string":"third"}),
+                text: "同轮修订第三版".into(),
+            },
+            MockMode::ToolUse {
+                tool_name: "edit_file".into(),
+                input: json!({"path":"version.md","old_string":"third","new_string":"fourth"}),
+                text: "同轮修订第四版".into(),
+            },
+            MockMode::ToolUse {
+                tool_name: "write_file".into(),
+                input: json!({"path":"other.md","content":"独立第二文件"}),
+                text: "同轮保存不同文件".into(),
+            },
+            MockMode::Fixed("两文件已保存。".into()),
         ];
         let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::scripted(steps)))
             .await
@@ -1004,6 +1093,129 @@ mod tests {
             })
             .await
             .unwrap();
+        execute(&host, &scope, &binding.session_id, "turn-third").await;
+        let snapshot = super::super::projection::prepare(&host, &config, "office-1")
+            .await
+            .unwrap();
+        let board = &snapshot["conversations"][0]["whiteboard"];
+        let deliveries = board["deliveries"].as_array().unwrap();
+        assert_eq!(board["result"]["artifacts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            deliveries.len(),
+            5,
+            "all immutable versions remain discoverable"
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|d| d["turnId"] == "turn-first")
+                .count(),
+            1
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|d| d["turnId"] == "turn-second")
+                .count(),
+            1
+        );
+        assert_eq!(
+            deliveries
+                .iter()
+                .filter(|d| d["turnId"] == "turn-third")
+                .count(),
+            2,
+            "one summary per file in this turn"
+        );
+        let historical = deliveries.iter().find(|d| d["turnId"] == "").unwrap();
+        let catalog_url = historical["snapshotUrl"].as_str().unwrap().to_owned();
+        let response = client
+            .get(&catalog_url)
+            .header("origin", "http://127.0.0.1:8765")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "http://127.0.0.1:8765"
+        );
+        let catalog_bytes = response.bytes().await.unwrap();
+        let catalog_value: Value = serde_json::from_slice(&catalog_bytes).unwrap();
+        for key in ["id", "sequence", "turnId"] {
+            assert_eq!(
+                catalog_value[key], historical[key],
+                "lazy response identity must match descriptor"
+            );
+        }
+        assert_eq!(catalog_value["result"]["runId"], historical["id"]);
+        let third = &catalog_value["result"]["artifacts"][0];
+        assert_eq!(third["runId"], historical["id"]);
+        assert_eq!(
+            client
+                .get(third["url"].as_str().unwrap())
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "# third\n"
+        );
+        let original_third_url = catalog_url.replace("/catalog?", "/delivery?");
+        let original_third_bytes = client
+            .get(&original_third_url)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let original_third: Value = serde_json::from_slice(&original_third_bytes).unwrap();
+        assert_eq!(original_third["turnId"], "turn-third");
+        assert_ne!(original_third["id"], historical["id"]);
+        for key in ["id", "versionId", "url", "sha256"] {
+            assert_eq!(third[key], original_third["result"]["artifacts"][0][key]);
+        }
+        for bad_url in [
+            catalog_url.replace("access=", "access=00"),
+            format!("{catalog_url}&extra=1"),
+        ] {
+            assert_eq!(client.get(bad_url).send().await.unwrap().status(), 403);
+        }
+        assert_eq!(
+            client
+                .get(&catalog_url)
+                .header("origin", "http://evil.invalid")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert_eq!(
+            client
+                .get(&catalog_url)
+                .header("host", "evil.invalid")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= 65536);
+        assert_eq!(
+            client
+                .get(old_delivery["snapshotUrl"].as_str().unwrap())
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap(),
+            old
+        );
         host.shutdown().await.unwrap();
         task.abort();
         let _ = task.await;
@@ -1045,6 +1257,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(old, immutable);
+        assert_eq!(
+            client
+                .get(&catalog_url)
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            catalog_bytes
+        );
+        assert_eq!(
+            client
+                .get(&original_third_url)
+                .send()
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+            original_third_bytes
+        );
         // A different configured conversation has no version directory and cannot obtain another scope's capability.
         let foreign = ClientScope {
             conversation_id: "foreign".into(),
@@ -1104,6 +1338,16 @@ mod tests {
         std::fs::remove_file(sparse).unwrap();
         host.delete_session(&scope).await.unwrap();
         assert_eq!(client.get(first_url).send().await.unwrap().status(), 403);
+        assert_eq!(client.get(&catalog_url).send().await.unwrap().status(), 403);
+        assert_eq!(
+            client
+                .get(&original_third_url)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
         assert!(root.join("version.md").exists());
         let count = rusqlite::Connection::open(cfg.home.join("engine-host/host.db"))
             .unwrap()

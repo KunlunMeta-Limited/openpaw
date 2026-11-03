@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # OpenPaw + PawOffice 本机编排入口。
-# 用法：scripts/openpaw-office.sh build|start|stop|status [--force]
+# 用法：scripts/openpaw-office.sh setup|build|start|stop|status [--force]
 # 配置通过环境变量覆盖：
 #   OPENPAW_ENV_FILE       默认 $HOME/.openpaw/.env
 #   OPENPAW_HOST_CONFIG    默认 $HOME/.openpaw/engine-host-office.toml
 #   OPENPAW_OFFICE_SOURCE  默认仓库旁的 ai-office-react
 #   OPENPAW_RUN_DIR        默认 $XDG_RUNTIME_DIR/openpaw-office 或 /tmp/openpaw-office-$UID
-#   PAWOFFICE_API_KEY      仅进程环境使用，不写入文件或日志
+#   OPENPAW_SETUP_HOME     默认 $HOME/.openpaw；本机配置与数据
+#   OPENPAW_OFFICE_KEY_FILE 默认 $OPENPAW_SETUP_HOME/.office-service-key
 
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 USER_HOME="${HOME:?HOME is required}"
-ENV_FILE="${OPENPAW_ENV_FILE:-$USER_HOME/.openpaw/.env}"
-HOST_CONFIG="${OPENPAW_HOST_CONFIG:-$USER_HOME/.openpaw/engine-host-office.toml}"
+SETUP_HOME="${OPENPAW_SETUP_HOME:-$USER_HOME/.openpaw}"
+ENV_FILE="${OPENPAW_ENV_FILE:-$SETUP_HOME/.env}"
+HOST_CONFIG="${OPENPAW_HOST_CONFIG:-$SETUP_HOME/engine-host-office.toml}"
+KEY_FILE="${OPENPAW_OFFICE_KEY_FILE:-$SETUP_HOME/.office-service-key}"
 OFFICE_SOURCE="${OPENPAW_OFFICE_SOURCE:-$(cd "$ROOT/.." && pwd)/ai-office-react}"
 RUN_DIR="${OPENPAW_RUN_DIR:-${XDG_RUNTIME_DIR:-/tmp}/openpaw-office-${UID:-$(id -u)}}"
 HOST_PORT="${OPENPAW_HOST_PORT:-32885}"
@@ -40,7 +43,12 @@ read_pid() {
     printf '%s\n' "$pid"
 }
 
-pid_alive() { kill -0 "$1" 2>/dev/null; }
+pid_alive() {
+    kill -0 "$1" 2>/dev/null || return 1
+    if [[ -r "/proc/$1/status" ]]; then
+        ! grep -q '^State:.*Z' "/proc/$1/status" || return 1
+    fi
+}
 
 pid_matches() {
     local pid="$1" expected="$2" cmdline
@@ -60,8 +68,10 @@ health_ok() {
 }
 
 wait_health() {
-    local port="$1" label="$2" i
-    for i in $(seq 1 60); do
+    local port="$1" label="$2" pid_file="$3" expected="$4" deadline=$((SECONDS + 120)) pid
+    while (( SECONDS < deadline )); do
+        pid="$(read_pid "$pid_file" 2>/dev/null || true)"
+        [[ -n "$pid" ]] && pid_matches "$pid" "$expected" || return 1
         health_ok "$port" && { note "$label healthy on 127.0.0.1:$port"; return 0; }
         sleep 0.5
     done
@@ -78,10 +88,14 @@ provider_is_echo() {
 }
 
 validate_inputs() {
-    [[ -f "$HOST_CONFIG" ]] || die "Host配置不存在：$HOST_CONFIG（设置 OPENPAW_HOST_CONFIG）"
-    [[ -f "$ENV_FILE" ]] || die "模型.env不存在：$ENV_FILE（设置 OPENPAW_ENV_FILE）"
+    [[ -f "$HOST_CONFIG" ]] || die "Host配置不存在：$HOST_CONFIG（先运行 scripts/openpaw-office.sh setup，或设置 OPENPAW_HOST_CONFIG）"
+    [[ -f "$ENV_FILE" ]] || die "模型.env不存在：$ENV_FILE（先运行 setup，或设置 OPENPAW_ENV_FILE）"
     [[ -d "$OFFICE_SOURCE" ]] || die "Office源码目录不存在：$OFFICE_SOURCE（设置 OPENPAW_OFFICE_SOURCE）"
-    [[ -n "${PAWOFFICE_API_KEY:-}" ]] || die "未设置 PAWOFFICE_API_KEY；密钥不能写入脚本或仓库"
+    if [[ -z "${PAWOFFICE_API_KEY:-}" && -f "$KEY_FILE" ]]; then
+        PAWOFFICE_API_KEY="$(cat "$KEY_FILE")"
+    fi
+    [[ -n "${PAWOFFICE_API_KEY:-}" && "$PAWOFFICE_API_KEY" != *$'\n'* && "$PAWOFFICE_API_KEY" != *$'\r'* ]] \
+        || die "缺少有效Office服务密钥；先运行setup，或设置PAWOFFICE_API_KEY/OPENPAW_OFFICE_KEY_FILE"
     if provider_is_echo; then
         die "拒绝以 Echo 启动 Office；请从Host配置删除 provider=echo，并在.env配置真实Provider"
     fi
@@ -129,9 +143,10 @@ start() {
     port_busy "$HOST_PORT" && die "Host端口已被占用：$HOST_PORT"
 
     start_one "Office" "$OFFICE_PID_FILE" "server/dist/index.js" "$OFFICE_LOG" \
-        env PAWOFFICE_API_KEY="$PAWOFFICE_API_KEY" PAWOFFICE_STATIC_ROOT="$OFFICE_SOURCE/dist" \
+        env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u OPENPAW_IMAGE_API_KEY \
+        PAWOFFICE_API_KEY="$PAWOFFICE_API_KEY" PAWOFFICE_STATIC_ROOT="$OFFICE_SOURCE/dist" \
         PORT="$OFFICE_PORT" "$OFFICE_NODE" "$OFFICE_SOURCE/server/dist/index.js"
-    if ! wait_health "$OFFICE_PORT" "Office"; then
+    if ! wait_health "$OFFICE_PORT" "Office" "$OFFICE_PID_FILE" "server/dist/index.js"; then
         stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" "server/dist/index.js" 10 0 || true
         die "Office健康检查失败；日志：$OFFICE_LOG"
     fi
@@ -140,12 +155,12 @@ start() {
         env PAWOFFICE_API_KEY="$PAWOFFICE_API_KEY" \
         OPENPAW_HOST_DIAGNOSTICS="${OPENPAW_HOST_DIAGNOSTICS:-0}" \
         "$HOST_BIN" --env-file "$ENV_FILE" engine-host --config "$HOST_CONFIG" --port "$HOST_PORT"
-    if ! wait_health "$HOST_PORT" "Host"; then
+    if ! wait_health "$HOST_PORT" "Host" "$HOST_PID_FILE" "engine-host"; then
         stop_one "Host" "$HOST_PID_FILE" "$HOST_LOG" "engine-host" 10 0 || true
         stop_one "Office" "$OFFICE_PID_FILE" "$OFFICE_LOG" "server/dist/index.js" 10 0 || true
         die "Host健康检查失败；日志：$HOST_LOG"
     fi
-    note "all services started; logs: $OFFICE_LOG and $HOST_LOG"
+    note "all services started; http://127.0.0.1:$OFFICE_PORT/office/; logs: $OFFICE_LOG and $HOST_LOG"
 }
 
 stop_one() {
@@ -206,8 +221,9 @@ status() {
     done
 }
 
-usage() { echo "用法：$0 {build|start|stop [--force]|status}"; }
+usage() { echo "用法：$0 {setup|build|start|stop [--force]|status}"; }
 case "${1:-}" in
+    setup) shift; [[ $# -eq 0 ]] || die "setup 不接受额外参数"; command -v "$OFFICE_NODE" >/dev/null 2>&1 || die "请先安装Node.js 24 LTS：https://nodejs.org"; exec "$OFFICE_NODE" "$ROOT/scripts/office-setup.cjs" ;;
     build) shift; [[ $# -eq 0 ]] || die "build 不接受额外参数"; build ;;
     start) shift; [[ $# -eq 0 ]] || die "start 不接受额外参数"; start ;;
     stop) shift; stop "${1:-}" ;;

@@ -39,6 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_timeout_secs: 30,
         stream_idle_secs: 10,
         tool_timeout_secs: 10,
+        auto_approve_tools: Vec::new(),
         approval_timeout_secs: 10,
     };
     let provider = MockProvider::scripted(vec![

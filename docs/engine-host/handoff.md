@@ -1,3 +1,12 @@
+## 2026-11-03 工程迁移与断电前修改恢复（当前基线）
+
+用户已批准工程迁移及按清单清理。共享规则以当前仓库根和准确版本为准，允许独立clone/worktree，不再限定任何人的绝对开发目录。旧日期章节和证据路径保留历史语境，不作为新开发路径约束。当前脚本从自身位置定位OpenPaw，Office默认取同级ai-office-react；模型.env、Host配置、会话库与工作文件仍由使用者本机配置决定，本次不迁移正式数据。
+
+断电前r32/r33代码从原始快照与补丁严格恢复，7文件与原code-manifest SHA256一致；r32六份文档按原补丁恢复并逐一核对原manifest。r33最终文档只有hash、没有完整原件，以下为依据原实施报告重建的事实补记，不声称逐字恢复。r33顶层auto_approve_tools支持对已启用的write_file/edit_file/render_visual按可信配置持久预授权；默认为空，撤销后重启生效。准确输入、会话/工作根隔离、拒绝/取消与逐次审计保留。r32聊天每轮每文件保留最新摘要，原版本、图片、下载和比较仍从只读catalog读取。普通与持续Run复用同一审批/Store链路，无领域定制。Office产品不改，R27等申请仍以集中台账待审状态为准。
+
+迁移验证与正式运行以本轮新证据为准，不沿用断电前绿灯；setup命令尚未实现，现有脚本仅有build/start/stop/status，不能将迁移完成当作交接向导已完成。
+
+
 2026-10-27 当前入口：Office 已原样更新并部署 `ff9f6b7d6447665be459f077109c6224789e5f3c`；两份用户架构文档保留，无自定义 Office 修改。OpenPaw 主开发目录和分支不变，候选 `724836175d08d4ab637f32c33dc0437ab3ebda9a` 已部署真实 DeepSeek；运行端口 8765/32885，PID/健康以 `scripts/openpaw-office.sh status` 为准。原 CHG-2026-0007 §12.82—12.83 为本轮范围和真实发现 D97—D100。
 
 2026-10-27 D101当前补修：同原会话地图册实际暴露64KiB受保护可选详情阻断审批；原失败保留，修复和先红后绿见CHG0007 §12.84。最终候选、实际部署、完整27项及同会话真实重验以 `/home/cheng/.cache/openpaw-office-upstream-20261027/closure.json` 绑定，不把此前7248361首轮通过当地图册已通过。Office仍仅原样上游ff9f6b7，R16/R19/R22/R24仍待审。
@@ -40,7 +49,7 @@ D71详情延迟补修见原0007第12.32节：原生产36次ui请求最长9.285�
 
 T5 PR #11最终f276b00972f77d67d31e1d9b6862edb4c38111ef，已于20:46:12（Asia/Shanghai）合入f22cca18d3667ded5dfed35d06085b260cc5a32d。用户会话确认通过；GitHub reviews为空，不虚构平台Approve。M5当前批准交付范围完成，Windows原生仍暂缓，机器delivery双平台条件不改、不假记passed。
 
-唯一开发目录/Office/openpaw已从最新集成基线建立feat/engine-host-t6；三份原用户文档保持未提交，Office两份原架构文档的用户改动保留；fa6ae1f上游追加章节已合并，原用户patch逐hunk核对一致，不能要求整文件hash仍等于旧版本。每轮核对HEAD/status、fetch并核实前序合入；本Tx在此开发，不在artifacts/验证clone开发。T6精确方案见[0007第4/9/10节](../changes/CHG-2026-0007.md)：先六人物/精准详情→真实父子Run编排/任务交接→原官方续接/多页/持久边界/容量→完整产品复验。准确r2-product-agents已获实施授权，源码/测试在本目录；交付仍待准确候选完整验证与用户验收，不创建PR。新增检查点/依赖及最新上游冻结变更的授权独立，见0007第12.1—12.3节。
+历史T6工作副本曾从集成基线建立feat/engine-host-t6；当前工作副本以本轮HEAD/status核验为准，目录由开发者选择；三份原用户文档保持未提交，Office两份原架构文档的用户改动保留；fa6ae1f上游追加章节已合并，原用户patch逐hunk核对一致，不能要求整文件hash仍等于旧版本。每轮核对HEAD/status、fetch并核实前序合入；本Tx在此开发，不在artifacts/验证clone开发。T6精确方案见[0007第4/9/10节](../changes/CHG-2026-0007.md)：先六人物/精准详情→真实父子Run编排/任务交接→原官方续接/多页/持久边界/容量→完整产品复验。准确r2-product-agents已获实施授权，源码/测试在本目录；交付仍待准确候选完整验证与用户验收，不创建PR。新增检查点/依赖及最新上游冻结变更的授权独立，见0007第12.1—12.3节。
 
 当前原演示仍为http://127.0.0.1:8765/office/与Host41949，已测实现0df3282，主目录合入f22cca1的生产源码相同；runtime-t5.json保留程序hash/路径，不伪称运行了文档提交号。原home、workspace、官方.env原位保留。T5最终f276b00的完整27/27和固定Office产品53条分别见/home/cheng/.cache/t5-pr-full-20261023-f/report.json、t5-pr-product-20261023-f/report.json，原8765真实DeepSeek证据入口仍为t5-live-weather-20261023-h-resume；这些是前序证据，不是T6实测。
 
@@ -188,7 +197,7 @@ Host命令保持openpaw engine-host --config /absolute/path/host.toml。TOML明�
 
 1. 安装/构建：`cargo build --locked -p openpaw-cli --features engine-host,sidecar`。模型只需填写原生`OPENPAW_HOME/.env`或`~/.openpaw/.env`，模板见仓库`.env.example`；`openpaw config show`只显示有效配置和密钥有无。不要把密钥发聊天或放入VITE_*。
 2. 复制`host-config.example.toml`到本机自选路径，修改home、roots、slots并启用示例office段。要沿用.env须删去示例的显式provider="echo"；其余模型字段也可省略。T4只开放read_file/glob/grep/todo_list/think，配置写工具明确拒绝；旧无office配置仍只有健康服务。
-3. Office密钥是独立的官方`PAWOFFICE_API_KEY`系统环境，Host和Fastify使用同一值；模型密钥仍只在原生.env中。默认本机演示可使用公开的`pawoffice-demo-key`，正式部署使用受保护的服务环境配置；不把Office密钥当模型密钥，也不把二者输出到诊断。
+3. Office密钥是独立的官方`PAWOFFICE_API_KEY`系统环境，Host和Fastify使用同一值；模型密钥仍只在原生.env中。本机演示与正式部署均使用独立的本机服务密钥，经受保护的服务环境注入；不把Office密钥当模型密钥，也不把二者输出到诊断。
 4. 启动Host：`openpaw engine-host --config /absolute/path/host.toml --port 41949`。随机端口模式`--port 0`可从发现行读实际地址；生产可使用同源代理固定公开路径。独立部署只监听loopback，来源须与office.allowed_origins精确匹配；代理须正确转发来源与上游Host。
 5. Office保持冻结源码只读，在隔离副本构建。**构建之前**设置公开`VITE_PAWOFFICE_CHAT_URL=http://127.0.0.1:41949/office/chat`，再执行原`npm ci`与`npm run build:full`。Fastify按官方PORT/HOST/PAWOFFICE_API_KEY启动`node server/dist/index.js`。只在构建后设置VITE变量不会改变静态页面；浏览器需刷新载入新构建。
 6. 页面发送消息后，真实请求经过Host→原引擎→Provider；工具请求执行原工具。业务同步独立通过官方messages，不能从health200推断页面已应用快照。`applied`与`cached`在宿主日志和host_office_projection.sync_state分开登记，完整seq/内容在外发前持久化；halted代表冲突/认证/协议问题，先人工核对所有者/数据，不盲目删库或抬序号。
@@ -400,10 +409,12 @@ Host 配置中的 `provider` 为空时由官方 `.env` 的 `OPENPAW_PROVIDER` �
 在 OpenPaw 目录执行：
 
 ```bash
-export OPENPAW_ENV_FILE=/home/cheng/.openpaw/.env
-export OPENPAW_HOST_CONFIG=/tmp/openpaw-live-deepseek.toml
-export OPENPAW_OFFICE_SOURCE=/media/cheng/新加卷/workSpace/Office/ai-office-react
-export PAWOFFICE_API_KEY=pawoffice-demo-key
+export OPENPAW_ENV_FILE="$HOME/.openpaw/.env"
+export OPENPAW_HOST_CONFIG="$HOME/.openpaw/engine-host-office.toml"
+# Office 默认使用本仓库的同级 ai-office-react；不同布局再设置 OPENPAW_OFFICE_SOURCE。
+# 使用与 Host [office].api_key_env 对应的本机服务密钥，避免写入仓库或命令历史。
+read -r -s -p "Office 服务密钥: " PAWOFFICE_API_KEY; echo
+export PAWOFFICE_API_KEY
 scripts/openpaw-office.sh build
 scripts/openpaw-office.sh start
 scripts/openpaw-office.sh status
@@ -419,7 +430,7 @@ PowerShell 5.1 或更高版本执行：
 ```powershell
 $env:OPENPAW_ENV_FILE = "$HOME\.openpaw\.env"
 $env:OPENPAW_HOST_CONFIG = "$HOME\.openpaw\engine-host-office.toml"
-$env:OPENPAW_OFFICE_SOURCE = "C:\workspace\Office\ai-office-react"
+$env:OPENPAW_OFFICE_SOURCE = Join-Path (Split-Path (Get-Location).Path -Parent) "ai-office-react"
 $env:PAWOFFICE_API_KEY = "本机服务密钥"
 .\scripts\openpaw-office.ps1 build
 .\scripts\openpaw-office.ps1 start
@@ -436,3 +447,11 @@ PowerShell 入口与 Linux 使用同一配置字段，日志和 PID 默认位于
 ## 2026-10-27 r13当前工作
 
 主开发目录仍/Office/openpaw。Office原样更新ff9f6b7并已在8765运行，用户两文档不变；Host D97—D99候选实施中，具体方案0007 §12.82。修复参数装配、无输出有界恢复、真实活动摘要及新版白板详情；不改自定义Office源码、不扩权限。证据与备份在/home/cheng/.cache/openpaw-office-upstream-20261027/。成员忙碌色R24、数值曲线R22、到达ACK R16仍待审；不能将上游FIFO当严格Agent执行门禁。交付/PR仍pending。
+
+
+2026-11-03，r32实施交接：用户已批准CHG0007 §12.141，只改OpenPaw。聊天每轮每文件仅最新摘要；读取旧版仍从成果阅读器的文档版本/比较进入，原版本链接不变。源文件在唯一主目录；正式8765尚未切换，验证报告见/home/cheng/.openpaw/verification/conversation-scope-recheck-20261103。多对话旧动画残留已有双浏览器因果证据，列R27继续暂缓，不能误记已修复；Git写操作处于NTFS内核D状态，未产生新提交/推送。
+
+
+## 新电脑setup交接
+
+首次安装可执行scripts/openpaw-office.sh setup，Windows执行powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\openpaw-office.ps1 setup。完整步骤、私有路径/权限选择、配置编辑及限制见setup.md。默认从空白数据开始，不复制本机业务home。实际验证结果见主CHG §12.143和验证记录最新补记。

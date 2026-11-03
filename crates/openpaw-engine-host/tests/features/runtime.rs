@@ -36,6 +36,7 @@ fn config(base: &std::path::Path) -> HostConfig {
         run_timeout_secs: 15,
         stream_idle_secs: 10,
         tool_timeout_secs: 10,
+        auto_approve_tools: Vec::new(),
         approval_timeout_secs: 5,
     }
 }
@@ -363,6 +364,258 @@ async fn h03_exact_approval_duplicate_and_real_tool_states() {
     assert_eq!(history.items.len(), 2);
     host.shutdown().await.unwrap();
 }
+#[tokio::test]
+async fn d153_trusted_file_policy_is_audited_persistent_and_revocable() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cfg = config(base.path());
+    cfg.tools.push("edit_file".into());
+    cfg.auto_approve_tools = vec!["write_file".into(), "edit_file".into()];
+    let root = cfg.roots["project"].clone();
+    let modes = vec![
+        MockMode::ToolUse {
+            tool_name: "write_file".into(),
+            input: json!({"path":"report.txt","content":"revision-one"}),
+            text: "save".into(),
+        },
+        MockMode::ToolUse {
+            tool_name: "edit_file".into(),
+            input: json!({"path":"report.txt","old_string":"one","new_string":"two"}),
+            text: "revise".into(),
+        },
+        MockMode::ToolUse {
+            tool_name: "edit_file".into(),
+            input: json!({"path":"report.txt","old_string":"two","new_string":"three"}),
+            text: "revise".into(),
+        },
+        MockMode::Fixed("done".into()),
+    ];
+    let host = Host::with_provider(cfg.clone(), Arc::new(MockProvider::scripted(modes)))
+        .await
+        .unwrap();
+    let s = scope(1);
+    let b = host.open_session(s.clone()).await.unwrap();
+    let run = host
+        .submit_run(&s, &b.session_id, "连续修订普通任务".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    let view = host.get_run(&s, &run.run_id).await.unwrap();
+    assert_eq!(view.state, RunState::Completed, "{:?}", view.error);
+    assert_eq!(view.tools.len(), 3);
+    assert!(view.tools.iter().all(|t| t.state == "completed"));
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.txt")).unwrap(),
+        "revision-three"
+    );
+    assert!(host.pending_approvals(&s).await.unwrap().is_empty());
+    let db = rusqlite::Connection::open(cfg.home.join("engine-host/host.db")).unwrap();
+    let approvals: Vec<ApprovalView> = db
+        .prepare("SELECT data FROM host_approvals WHERE run=?1")
+        .unwrap()
+        .query_map([&run.run_id], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| serde_json::from_str(&r.unwrap()).unwrap())
+        .collect();
+    assert_eq!(approvals.len(), 3);
+    assert!(approvals
+        .iter()
+        .all(|a| a.status == "approved" && a.consumed));
+    assert_eq!(
+        approvals
+            .iter()
+            .map(|a| &a.binding.call_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3
+    );
+    let audit: i64 = db.query_row("SELECT count(*) FROM host_events WHERE kind='approval_policy' AND json_extract(reference,'$.source')='trusted_tool_policy'", [], |r| r.get(0)).unwrap();
+    assert_eq!(audit, 3);
+    drop(db);
+    assert!(
+        host.decide_approval(
+            &s,
+            &approvals[0].approval_id,
+            approvals[0].revision,
+            approvals[0].binding.clone(),
+            true
+        )
+        .await
+        .is_err(),
+        "已消费调用不能重放"
+    );
+    host.shutdown().await.unwrap();
+    drop(host);
+    // 同一持久配置重启仍生效；既有审批不会被重放。
+    let host = Host::with_provider(cfg.clone(), writer()).await.unwrap();
+    let second = host
+        .submit_run(&s, &b.session_id, "重启后保存".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    assert_eq!(
+        host.get_run(&s, &second.run_id).await.unwrap().state,
+        RunState::Completed
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.txt")).unwrap(),
+        "approved report"
+    );
+    host.shutdown().await.unwrap();
+    drop(host);
+    cfg.auto_approve_tools.clear();
+    let host = Host::with_provider(cfg, writer()).await.unwrap();
+    host.submit_run(&s, &b.session_id, "撤回预授权后保存".into())
+        .await
+        .unwrap();
+    let a = pending(&host, &s).await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.txt")).unwrap(),
+        "approved report"
+    );
+    host.decide_approval(&s, &a.approval_id, a.revision, a.binding, false)
+        .await
+        .unwrap();
+    host.wait_idle().await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.txt")).unwrap(),
+        "approved report"
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn d153_unlisted_tool_and_cancelled_resource_wait_stay_restricted() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cfg = config(base.path());
+    cfg.tools.push("edit_file".into());
+    cfg.auto_approve_tools = vec!["write_file".into()];
+    let root = cfg.roots["project"].clone();
+    std::fs::write(root.join("report.txt"), "before").unwrap();
+    let host = Host::with_provider(
+        cfg.clone(),
+        Arc::new(MockProvider::scripted(vec![
+            MockMode::ToolUse {
+                tool_name: "edit_file".into(),
+                input: json!({"path":"report.txt","old_string":"before","new_string":"forbidden"}),
+                text: "edit".into(),
+            },
+            MockMode::Fixed("done".into()),
+        ])),
+    )
+    .await
+    .unwrap();
+    let s = scope(1);
+    let b = host.open_session(s.clone()).await.unwrap();
+    host.submit_run(&s, &b.session_id, "未授权的工具".into())
+        .await
+        .unwrap();
+    let a = pending(&host, &s).await;
+    assert_eq!(a.binding.tool_name, "edit_file");
+    host.decide_approval(&s, &a.approval_id, a.revision, a.binding, false)
+        .await
+        .unwrap();
+    host.wait_idle().await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.txt")).unwrap(),
+        "before"
+    );
+    host.shutdown().await.unwrap();
+    drop(host);
+    let host = Host::with_provider(cfg, writer()).await.unwrap();
+    let lock = openpaw_sandbox::file_lock::try_lock_exclusive(
+        &root.join(".openpaw/engine-host-resource.lock"),
+    )
+    .unwrap();
+    let run = host
+        .submit_run(&s, &b.session_id, "资源等待期间停止".into())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    host.cancel_run(&s, &run.run_id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), host.wait_idle())
+        .await
+        .unwrap();
+    drop(lock);
+    assert_eq!(
+        host.get_run(&s, &run.run_id).await.unwrap().state,
+        RunState::Cancelled
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.txt")).unwrap(),
+        "before"
+    );
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn d153_trusted_write_never_grants_outside_root_access() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cfg = config(base.path());
+    cfg.auto_approve_tools = vec!["write_file".into()];
+    let outside = base.path().join("outside.txt");
+    let host = Host::with_provider(
+        cfg,
+        Arc::new(MockProvider::scripted(vec![
+            MockMode::ToolUse {
+                tool_name: "write_file".into(),
+                input: json!({"path":"../outside.txt","content":"must not write"}),
+                text: "write".into(),
+            },
+            MockMode::Fixed("done".into()),
+        ])),
+    )
+    .await
+    .unwrap();
+    let s = scope(1);
+    let b = host.open_session(s.clone()).await.unwrap();
+    let run = host
+        .submit_run(&s, &b.session_id, "越界写入必须拒绝".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+        .await
+        .unwrap();
+    assert!(!outside.exists());
+    assert!(host.pending_approvals(&s).await.unwrap().is_empty());
+    let view = host.get_run(&s, &run.run_id).await.unwrap();
+    assert!(view.tools.is_empty() || view.tools.iter().all(|t| t.state != "completed"));
+    host.shutdown().await.unwrap();
+}
+
+#[test]
+fn d153_trusted_policy_config_rejects_unknown_duplicate_and_disabled_tools() {
+    let base = tempfile::tempdir().unwrap();
+    let mut cfg = config(base.path());
+    for names in [
+        vec!["bash"],
+        vec!["write_file", "write_file"],
+        vec!["render_visual"],
+        vec!["invented_tool"],
+    ] {
+        cfg.auto_approve_tools = names.into_iter().map(str::to_owned).collect();
+        assert_eq!(cfg.validate().unwrap_err().kind, "invalid_input");
+    }
+    cfg.auto_approve_tools = vec!["write_file".into()];
+    cfg.validate().unwrap();
+    let value = serde_json::to_value(&cfg).unwrap();
+    let mut old = value.clone();
+    old.as_object_mut().unwrap().remove("auto_approve_tools");
+    assert!(serde_json::from_value::<HostConfig>(old)
+        .unwrap()
+        .auto_approve_tools
+        .is_empty());
+    assert_eq!(
+        serde_json::from_value::<HostConfig>(value)
+            .unwrap()
+            .auto_approve_tools,
+        cfg.auto_approve_tools
+    );
+}
+
 #[tokio::test]
 async fn h04_denial_expiry_and_cancel_never_write() {
     for mode in ["denied", "expired", "cancelled"] {
@@ -971,11 +1224,15 @@ async fn d102_actual_request_matches_whole_file_and_patch_capabilities() {
     for tools in [
         vec!["read_file"],
         vec!["read_file", "write_file"],
+        vec!["read_file", "edit_file"],
         vec!["read_file", "write_file", "edit_file"],
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let mut cfg = config(tmp.path());
         cfg.tools = tools.iter().map(|s| (*s).to_owned()).collect();
+        if tools.len() == 3 {
+            cfg.auto_approve_tools = vec!["write_file".into(), "edit_file".into()];
+        }
         let capture = Arc::new(ContextProvider(std::sync::Mutex::new(Vec::new())));
         let host = Host::with_provider(cfg, capture.clone()).await.unwrap();
         let s = scope(1);
@@ -998,6 +1255,13 @@ async fn d102_actual_request_matches_whole_file_and_patch_capabilities() {
             );
             let context = r.system.as_deref().unwrap();
             assert_eq!(
+                context.contains("本轮可信文件工具预授权：write_file, edit_file"),
+                tools.len() == 3
+            );
+            if tools.len() == 3 {
+                assert!(context.contains("不要求用户再次点击或在聊天批准"));
+            }
+            assert_eq!(
                 context.contains("仅有整文件写入能力"),
                 tools.contains(&"write_file") && !tools.contains(&"edit_file")
             );
@@ -1005,6 +1269,12 @@ async fn d102_actual_request_matches_whole_file_and_patch_capabilities() {
                 context.contains("使用现有edit_file做有界精确替换"),
                 tools.contains(&"edit_file")
             );
+            let can_revise = tools.contains(&"write_file") || tools.contains(&"edit_file");
+            assert_eq!(context.contains("先汇总本轮有依据的修订意见"), can_revise);
+            if can_revise {
+                assert!(context.contains("同一变更不得换表述重新申请"));
+                assert!(context.contains("审核结论不能代替事实依据"));
+            }
             if tools.contains(&"write_file") && !tools.contains(&"edit_file") {
                 assert!(context.contains("独立章节文件与入口索引"));
                 assert!(context.contains("不要重写整篇"));

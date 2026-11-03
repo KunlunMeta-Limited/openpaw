@@ -1,7 +1,7 @@
 //! 职责：实现原ApprovalManager的持久、精确绑定与一次消费。
 //! 输入输出：原引擎请求到pending事实及人工决定。
 //! 依赖：Host单写Store、原资源锁与调用上下文。
-//! 禁止职责：不建立永久授权，不在等待用户期间持根锁。
+//! 禁止职责：不由模型授予权限，不在等待用户期间持根锁；只复用可信配置与准确调用审批。
 use crate::{resource::Root, store::Store, types::*};
 use async_trait::async_trait;
 use openpaw_core::{ApprovalManager, ApprovalRequest, ApprovalResponse, ToolCallBinding};
@@ -97,6 +97,7 @@ pub(crate) struct HostApproval {
     /// 关联：需求/设计DES-OP-006。
     pub(crate) timeout: Duration,
     before: Mutex<HashMap<String, Option<Precondition>>>,
+    auto_approve_tools: Vec<String>,
     continuous: Option<Arc<crate::orchestration::Group>>,
 }
 impl HostApproval {
@@ -120,6 +121,7 @@ impl HostApproval {
             control,
             timeout,
             before: Mutex::new(HashMap::new()),
+            auto_approve_tools: Vec::new(),
             continuous: None,
         }
     }
@@ -136,6 +138,18 @@ impl HostApproval {
         group: Option<Arc<crate::orchestration::Group>>,
     ) -> Self {
         self.continuous = group;
+        self
+    }
+    /// 功能：注入用户明确配置的文件工具预授权。
+    /// 参数：tools为Host启动校验后的工具名列表，空列表维持逐次确认。
+    /// 返回：复用原生命周期的审批器。
+    /// 错误：无；配置合法性由原HostConfig统一校验。
+    /// 状态：每次仍保存准确调用审批和一次消费，不创建独立授权表。
+    /// 并发与取消：原取消token和根资源锁规则不变，停止后不新增授权。
+    /// 权限：仅可信本机配置的已启用文件工具，不能越过工作根或原安全拒绝。
+    /// 关联：CHG-2026-0007第12.142节D153；REQ-OP-013；DES-OP-006。
+    pub(crate) fn with_tool_policy(mut self, tools: Vec<String>) -> Self {
+        self.auto_approve_tools = tools;
         self
     }
     fn automatic(&self, b: &ToolCallBinding) -> bool {
@@ -298,7 +312,9 @@ impl HostApproval {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let query_id = id.clone();
         let timeout_ms = i64::try_from(self.timeout.as_millis()).unwrap_or(i64::MAX);
-        let automatic = self.automatic(&binding);
+        let configured = self.auto_approve_tools.contains(&binding.tool_name);
+        let automatic = configured || self.automatic(&binding);
+        let auto_cancel = self.control.cancel.clone();
         let auto_group = self.continuous.clone();
         self.store
             .call_priority(move |db| {
@@ -309,9 +325,20 @@ impl HostApproval {
                 }) {
                     return Err(HostError::new("approval_conflict", "重复工具调用ID"));
                 }
-                let automatic=automatic && auto_group.as_ref().is_some_and(|g|!g.cancel.is_cancelled()&&g.continuous.lock().unwrap_or_else(|e|e.into_inner()).active);
+                let continuous_active = auto_group.as_ref().is_some_and(|group| {
+                    !group.cancel.is_cancelled()
+                        && group.continuous.lock().unwrap_or_else(|e| e.into_inner()).active
+                });
+                let automatic = automatic
+                    && !auto_cancel.is_cancelled()
+                    && (configured || continuous_active);
                 if automatic {
-                    db.bump("approval_policy",&serde_json::json!({"version":1,"run_id":binding.run_id,"call_id":binding.call_id,"decision":"approved","source":"continuous_output_policy"}).to_string())?;
+                    let source = if configured {
+                        "trusted_tool_policy"
+                    } else {
+                        "continuous_output_policy"
+                    };
+                    db.bump("approval_policy",&serde_json::json!({"version":1,"run_id":binding.run_id,"call_id":binding.call_id,"decision":"approved","source":source}).to_string())?;
                 }
                 db.save_approval(ApprovalView {
                     approval_id: id,

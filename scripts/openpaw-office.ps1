@@ -1,28 +1,34 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
   本机编排 OpenPaw engine-host 与 PawOffice Node 服务。
 .DESCRIPTION
-  与 openpaw-office.sh 保持相同的 build/start/stop/status 语义。
+  与 openpaw-office.sh 保持相同的 setup/build/start/stop/status 语义。
   只使用本机配置；不会复制 .env、打印密钥或删除运行数据。
   Windows 原生运行本轮仅提供入口，验收状态仍以 handoff.md 为准。
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('build', 'start', 'stop', 'status')]
+    [ValidateSet('setup', 'build', 'start', 'stop', 'status')]
     [string] $Command = 'status',
     [switch] $Force
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+# PowerShell5.1默认OEM编码会破坏中文路径/交互输入，原生程序统一UTF-8。
+$OutputEncoding = New-Object System.Text.UTF8Encoding $false
+[Console]::InputEncoding = $OutputEncoding
+[Console]::OutputEncoding = $OutputEncoding
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $UserHome = [Environment]::GetFolderPath('UserProfile')
 if ([string]::IsNullOrWhiteSpace($UserHome)) { $UserHome = $HOME }
-$EnvFile = if ($env:OPENPAW_ENV_FILE) { $env:OPENPAW_ENV_FILE } else { Join-Path $UserHome '.openpaw\.env' }
-$HostConfig = if ($env:OPENPAW_HOST_CONFIG) { $env:OPENPAW_HOST_CONFIG } else { Join-Path $UserHome '.openpaw\engine-host-office.toml' }
+$SetupHome = if ($env:OPENPAW_SETUP_HOME) { $env:OPENPAW_SETUP_HOME } else { Join-Path $UserHome '.openpaw' }
+$EnvFile = if ($env:OPENPAW_ENV_FILE) { $env:OPENPAW_ENV_FILE } else { Join-Path $SetupHome '.env' }
+$HostConfig = if ($env:OPENPAW_HOST_CONFIG) { $env:OPENPAW_HOST_CONFIG } else { Join-Path $SetupHome 'engine-host-office.toml' }
+$KeyFile = if ($env:OPENPAW_OFFICE_KEY_FILE) { $env:OPENPAW_OFFICE_KEY_FILE } else { Join-Path $SetupHome '.office-service-key' }
 $OfficeSource = if ($env:OPENPAW_OFFICE_SOURCE) { $env:OPENPAW_OFFICE_SOURCE } else { Join-Path (Split-Path $Root -Parent) 'ai-office-react' }
 $RunDir = if ($env:OPENPAW_RUN_DIR) { $env:OPENPAW_RUN_DIR } else { Join-Path $env:LOCALAPPDATA 'OpenPaw\office-runtime' }
 $HostPort = if ($env:OPENPAW_HOST_PORT) { [int]$env:OPENPAW_HOST_PORT } else { 32885 }
@@ -76,14 +82,19 @@ function Validate-Inputs {
     if (-not (Test-Path -LiteralPath $HostConfig -PathType Leaf)) { Fail "Host配置不存在：$HostConfig（设置 OPENPAW_HOST_CONFIG）" }
     if (-not (Test-Path -LiteralPath $EnvFile -PathType Leaf)) { Fail "模型.env不存在：$EnvFile（设置 OPENPAW_ENV_FILE）" }
     if (-not (Test-Path -LiteralPath $OfficeSource -PathType Container)) { Fail "Office源码目录不存在：$OfficeSource（设置 OPENPAW_OFFICE_SOURCE）" }
-    if ([string]::IsNullOrWhiteSpace($env:PAWOFFICE_API_KEY)) { Fail '未设置 PAWOFFICE_API_KEY；密钥不能写入脚本或仓库' }
+    if ([string]::IsNullOrWhiteSpace($env:PAWOFFICE_API_KEY) -and (Test-Path -LiteralPath $KeyFile -PathType Leaf)) { $env:PAWOFFICE_API_KEY = (Get-Content -LiteralPath $KeyFile -Raw).Trim() }
+    if ([string]::IsNullOrWhiteSpace($env:PAWOFFICE_API_KEY) -or $env:PAWOFFICE_API_KEY -match '[\r\n]') { Fail '缺少有效Office服务密钥；先运行setup，或设置PAWOFFICE_API_KEY/OPENPAW_OFFICE_KEY_FILE' }
     $provider = Get-TomlValue $HostConfig 'provider'
     if ([string]::IsNullOrWhiteSpace($provider)) { $provider = (Get-EnvValue $EnvFile 'OPENPAW_PROVIDER').ToLowerInvariant() }
     if ([string]::IsNullOrWhiteSpace($provider) -or $provider -eq 'echo') { Fail '拒绝以 Echo 启动 Office；请在.env配置真实Provider' }
 }
 
 function Wait-Health([int] $Port, [string] $Label) {
-    for ($i = 0; $i -lt 60; $i++) {
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $pidPath = if ($Label -eq 'Host') { $HostPidFile } else { $OfficePidFile }
+        $processId = Read-Pid $pidPath
+        if (-not $processId -or -not (Get-ProcessSafe $processId)) { break }
         try {
             $response = Invoke-WebRequest -UseBasicParsing -Uri ("http://127.0.0.1:{0}/health" -f $Port) -TimeoutSec 2
             if ($response.StatusCode -eq 200) { Write-Host ("openpaw-office: {0} healthy on 127.0.0.1:{1}" -f $Label, $Port); return }
@@ -115,7 +126,9 @@ function Start-ServiceProcess([string] $Label, [string] $PidPath, [string] $LogP
     $old = @{}
     foreach ($key in $Environment.Keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key, 'Process'); [Environment]::SetEnvironmentVariable($key, [string]$Environment[$key], 'Process') }
     try {
-        $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $Root -RedirectStandardOutput $LogPath -RedirectStandardError ($LogPath + '.err') -PassThru
+        # Start-Process会把数组拼接；按Windows argv规则引用空格、引号和末尾反斜杠。
+        $quoted = $Arguments | ForEach-Object { '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"' }
+        $process = Start-Process -FilePath $FilePath -ArgumentList ($quoted -join ' ') -WorkingDirectory $Root -RedirectStandardOutput $LogPath -RedirectStandardError ($LogPath + '.err') -PassThru
     } finally {
         foreach ($key in $Environment.Keys) { [Environment]::SetEnvironmentVariable($key, $old[$key], 'Process') }
     }
@@ -144,7 +157,7 @@ function Start-Services {
     if (-not (Test-Path -LiteralPath $HostBinary -PathType Leaf)) { Fail "Host二进制不存在，请先执行 build：$HostBinary" }
     if (-not (Test-Path -LiteralPath (Join-Path $OfficeSource 'server\dist\index.js') -PathType Leaf)) { Fail 'Office生产服务不存在，请先执行 build' }
     Assert-PortFree $OfficePort 'Office'; Assert-PortFree $HostPort 'Host'
-    Start-ServiceProcess 'Office' $OfficePidFile $OfficeLog $Node @((Join-Path $OfficeSource 'server\dist\index.js')) @{ PAWOFFICE_API_KEY = $env:PAWOFFICE_API_KEY; PAWOFFICE_STATIC_ROOT = (Join-Path $OfficeSource 'dist'); PORT = $OfficePort }
+    Start-ServiceProcess 'Office' $OfficePidFile $OfficeLog $Node @((Join-Path $OfficeSource 'server\dist\index.js')) @{ PAWOFFICE_API_KEY = $env:PAWOFFICE_API_KEY; PAWOFFICE_STATIC_ROOT = (Join-Path $OfficeSource 'dist'); PORT = $OfficePort; OPENAI_API_KEY = ''; ANTHROPIC_API_KEY = ''; OPENPAW_IMAGE_API_KEY = '' }
     try { Wait-Health $OfficePort 'Office'; Start-ServiceProcess 'Host' $HostPidFile $HostLog $HostBinary @('--env-file', $EnvFile, 'engine-host', '--config', $HostConfig, '--port', [string]$HostPort) @{ PAWOFFICE_API_KEY = $env:PAWOFFICE_API_KEY }; Wait-Health $HostPort 'Host' } catch { Stop-One 'Host' $HostPidFile 'engine-host' 10 $true; Stop-One 'Office' $OfficePidFile 'server\dist\index.js' 10 $true; throw }
     Write-Host "openpaw-office: all services started; logs: $OfficeLog and $HostLog"
 }
@@ -161,6 +174,7 @@ function Status {
 
 try {
     switch ($Command) {
+        'setup' { if (-not (Get-Command $Node -ErrorAction SilentlyContinue)) { Fail '请先安装Node.js 24 LTS：https://nodejs.org' }; & $Node (Join-Path $Root 'scripts\office-setup.cjs'); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }
         'build' { Build }
         'start' { Start-Services }
         'stop' { Ensure-RunDir; $failed = $false; try { Stop-One 'Host' $HostPidFile 'engine-host' 60 $Force.IsPresent } catch { Write-Error $_; $failed = $true }; try { Stop-One 'Office' $OfficePidFile 'server\dist\index.js' 30 $Force.IsPresent } catch { Write-Error $_; $failed = $true }; if ($failed) { exit 1 } }
