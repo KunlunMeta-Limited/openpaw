@@ -283,8 +283,15 @@ async fn d11_windows_drive_case_alias_and_verbatim_paths_share_todos() {
 #[cfg(windows)]
 #[tokio::test]
 async fn d11_windows_junction_to_other_workspace_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    use std::os::windows::process::CommandExt;
+    let dir = tempfile::Builder::new()
+        .prefix("junction 工作区 ")
+        .tempdir()
+        .unwrap();
+    let outside = tempfile::Builder::new()
+        .prefix("outside 外部 ")
+        .tempdir()
+        .unwrap();
     let junction = dir.path().join(".openpaw");
     // /J目录junction不需要symlink权限；只操作本测试临时目录，不配置系统共享。
     let script = format!(
@@ -293,7 +300,9 @@ async fn d11_windows_junction_to_other_workspace_is_rejected() {
         outside.path().display()
     );
     let output = std::process::Command::new("cmd.exe")
-        .args(["/D", "/V:OFF", "/S", "/C", &script])
+        // cmd不使用MSCRT的反斜杠引号规则，脚本必须保留原生双引号。
+        .args(["/D", "/V:OFF", "/S", "/C"])
+        .raw_arg(format!("\"{script}\""))
         .output()
         .unwrap();
     assert!(
