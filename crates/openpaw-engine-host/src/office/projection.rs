@@ -3,7 +3,7 @@
 //! 依赖：原Store、官方client、单办公室协调任务。
 //! 禁止职责：不伪造进度、工具开始或多Agent，不复制会话账本。
 use super::{client::Client, dto, OfficeConfig};
-use crate::{ClientScope, Host, HostError, HostResult, RunState};
+use crate::{ClientScope, Host, HostError, HostResult, RunState, RunView};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,6 +19,9 @@ use tokio_util::sync::CancellationToken;
 /// 稳定性：Office协议兼容常量；调整必须同步协议夹具和验收。
 /// 关联：需求/设计REQ-OP-011；DES-OP-007。
 pub(super) const OFFICE_MESSAGE_LIMIT: usize = 64_000;
+
+// 正常窗口为新任务、交接与错误说明预留16,000字节；核心事实可超过软目标。
+const OFFICE_MESSAGE_TARGET: usize = 48_000;
 
 /// 用途：限制从历史会话中寻找可继续展示的业务候选数量。
 /// 字段：最近Run候选窗口大小。
@@ -138,6 +141,11 @@ impl Coordinator {
         config: OfficeConfig,
         address: std::net::SocketAddr,
     ) -> HostResult<Self> {
+        let origin = format!("http://{address}");
+        host.inner
+            .store
+            .call_priority(move |db| db.artifact_origin(&origin))
+            .await?;
         let client = std::sync::Arc::new(Client::new(&config)?);
         let stop = CancellationToken::new();
         let (ui_refresh, _) = tokio::sync::broadcast::channel(32);
@@ -231,24 +239,17 @@ impl Coordinator {
                             _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
                         }
                     }
-                    let team_for_due = team.clone();
-                    let (revision, handoff_due) = host
+                    let revision = host
                         .inner
                         .store
                         .call(move |db| {
-                            let revision = db.revision()?;
-                            let due = db
-                                .office_projection_handoff_until
-                                .get(&team_for_due)
-                                .is_some_and(|until| *until <= chrono::Utc::now());
-                            Ok((Some(revision), due))
+                            Ok(Some(db.revision()?))
                         })
                         .await
-                        .unwrap_or((None, false));
+                        .unwrap_or(None);
                     let now=tokio::time::Instant::now();
                     let refresh=previous_status.is_empty()
                         || revision!=last_revision
-                        || handoff_due
                         // Office 回执可能在Host事实不变时变化（离线恢复、seq冲突、
                         // 服务端重启），保留原一秒外发复核；prepare的revision快路径
                         // 确保这不会重新扫描完整账本。
@@ -406,6 +407,46 @@ pub(super) fn actor(tool: &str) -> (&'static str, &'static str) {
         _ => ("office-lead", "office-lead"),
     }
 }
+// 普通固定计划保留当前步骤和前一步；持续任务的窗口另按真实在途子Run选择。
+fn whiteboard_window<'a>(
+    tasks: &'a [Value],
+    active: &BTreeSet<String>,
+    unbounded: bool,
+) -> Vec<&'a Value> {
+    let children = tasks.get(1..).unwrap_or_default();
+    if unbounded {
+        // blocked也可能只是已结束旧执行的待核验状态，不能据此当作在途。
+        // active由原子Run终态判断，不从标题、时长或展示百分比推断。
+        let mut indices: Vec<_> = children
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task["id"].as_str().is_some_and(|id| active.contains(id)))
+            .map(|(index, task)| (index, task["status"] == "queued"))
+            .collect();
+        indices.sort_by_key(|&(index, queued)| (queued, index));
+        let mut selected: Vec<_> = indices
+            .into_iter()
+            .take(3)
+            .map(|(index, _)| index)
+            .collect();
+        for index in (0..children.len()).rev() {
+            if selected.len() >= 3 {
+                break;
+            }
+            if !selected.contains(&index) {
+                selected.push(index);
+            }
+        }
+        selected.sort_unstable();
+        return selected.into_iter().map(|index| &children[index]).collect();
+    }
+    let relative = children.iter().position(|t| t["status"] != "completed");
+    let first = relative
+        .map(|index| index.saturating_sub(1))
+        .unwrap_or(tasks.len().saturating_sub(4));
+    children.iter().skip(first).take(3).collect()
+}
+
 fn task(
     id: String,
     title: String,
@@ -460,6 +501,8 @@ fn public_tool_activity(binding: &openpaw_core::ToolCallBinding) -> String {
         "web_search" => ("正在检索公开资料", None),
         "read_file" => ("正在读取", file()),
         "write_file" | "edit_file" => ("正在保存", file()),
+        "render_visual" => ("正在绘制图表", file()),
+        "generate_image" => ("正在生成图片", file()),
         "glob" | "grep" => ("正在查找工作区资料", None),
         "delegate_task" => ("正在协调同事完成分工", None),
         "think" => ("正在分析整理", None),
@@ -470,7 +513,23 @@ fn public_tool_activity(binding: &openpaw_core::ToolCallBinding) -> String {
         .unwrap_or_else(|| label.into())
 }
 
-// 与任务数组同源；长文本不承担消息事实存储，预算不足可去掉可选详情。
+fn observed_tool_activity(binding: &openpaw_core::ToolCallBinding, run: &RunView) -> String {
+    let text = public_tool_activity(binding);
+    if run
+        .tools
+        .iter()
+        .any(|t| t.call_id == binding.call_id && t.state == "completed")
+    {
+        format!(
+            "刚完成：{}；正在组织下一步",
+            text.strip_prefix("正在").unwrap_or(&text)
+        )
+    } else {
+        text
+    }
+}
+
+// 与任务数组同源；长文本不承担消息事实存储，受保护会话预算不足时保留短版。
 fn whiteboard_detail(title: &str, tasks: &[Value]) -> String {
     let mut text = format!(
         "# {}\n\n## 当前目标\n\n{}\n\n## 任务进度\n\n以下百分比表示后端已核验进度。\n",
@@ -478,7 +537,8 @@ fn whiteboard_detail(title: &str, tasks: &[Value]) -> String {
         tasks
             .first()
             .and_then(|t| t["summary"].as_str())
-            .unwrap_or("")
+            .filter(|summary| !summary.trim().is_empty())
+            .unwrap_or(title)
     );
     for task in tasks.iter().take(25) {
         let state = match task["status"].as_str() {
@@ -510,12 +570,165 @@ fn whiteboard_detail(title: &str, tasks: &[Value]) -> String {
     dto::bounded(&text, 4000)
 }
 
+// 新阅读器只展示已有任务事实，不把Run结束等同于文件交付或内容验收。
+// 保留旧Markdown供较小窗口回退；结构化块在预算不足时整块移除。
+fn structured_board(board: &mut Value, tasks: &[Value]) {
+    let mut rows: Vec<_> = tasks.iter().skip(1).rev().collect();
+    rows.sort_by_key(|task| match task["status"].as_str() {
+        Some("running") => 0,
+        Some("blocked") => 1,
+        Some("queued") => 2,
+        Some("failed") => 3,
+        _ => 4,
+    });
+    rows.truncate(12);
+    let rows = if rows.is_empty() {
+        tasks.iter().take(1).collect()
+    } else {
+        rows
+    };
+    let task_rows: Vec<_> = rows.iter().map(|task| {
+        let owner = task["assigneeId"].as_str()
+            .and_then(|id| crate::agents::ROLES.iter().find(|role| role.employee == id))
+            .map(|role| role.name).unwrap_or("待分配");
+        let state = match task["status"].as_str() {
+            Some("completed") => "done", Some("running") => "doing",
+            Some("blocked" | "failed") => "blocked", _ => "todo",
+        };
+        json!({"id":task["id"],"title":dto::bounded(task["title"].as_str().unwrap_or("任务"),80),
+            "owner":owner,"status":state,"progress":task["progress"],
+            "note":dto::bounded(task["summary"].as_str().unwrap_or(""),80)})
+    }).collect();
+    let text = dto::bounded(
+        &whiteboard_detail(board["title"].as_str().unwrap_or(""), tasks),
+        4000,
+    );
+    board["detailSections"] = json!([{"id":"execution-facts","title":"任务执行记录",
+        "blocks":[{"type":"text","text":text}]}]);
+    let completed = tasks
+        .iter()
+        .skip(1)
+        .filter(|task| task["status"] == "completed")
+        .count();
+    // draft明确表示执行过程。没有产物证据时不虚构ready/verified或下载地址。
+    board["result"] = json!({"title":board["title"],"status":"draft",
+        "summary":board["summary"],"tasks":task_rows,
+        "metrics":[{"id":"completed-tasks","label":"已完成执行步骤","value":completed.to_string(),"unit":"项"}],
+        "note":"此处为真实任务过程；执行完成不代表文件已交付或内容已验收。文件路径及完整工具记录可在成员详情查询。"});
+    if let Some(steps) = board["steps"].as_array_mut() {
+        for step in steps {
+            if let Some(task) = tasks.iter().find(|task| task["id"] == step["id"]) {
+                step["state"] = json!(match task["status"].as_str() {
+                    Some("completed") => "done",
+                    Some("running" | "blocked") => "active",
+                    _ => "pending",
+                });
+            }
+        }
+    }
+}
+
+fn compact_structured_board(conversation: &mut Value) -> bool {
+    if let Some(board) = conversation["whiteboard"].as_object_mut() {
+        // 不能逐字截断版本文件或历史交付；本轮仅移除可由任务事实重建的过程块。
+        if board.get("result").is_some_and(|result| {
+            result["artifacts"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+        }) {
+            // 原件/交付身份不可截断；先去掉可重新只读读取的增强图文和过程块。
+            if board.remove("detailSections").is_some() {
+                return true;
+            }
+            if let Some(result) = board.get_mut("result").and_then(Value::as_object_mut) {
+                for key in ["sections", "tasks", "metrics"] {
+                    if result.remove(key).is_some() {
+                        return true;
+                    }
+                }
+            }
+            // 目录已由产物投影限制为20条，正文通过snapshotUrl按需读取。
+            // 删除目录会让当前文件失去图文预览及版本比较入口，不能视为重复正文裁掉。
+            return false;
+        }
+        for key in ["detailSections", "result"] {
+            if board.remove(key).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// 保留主目标与最近成果，按完整任务排版而非截断Markdown；不创建第二份状态。
+// 无标题的旧模板不能凭空增加detail，兼容其原有展示契约。
+fn whiteboard_tasks(conversation: &Value) -> Option<&[Value]> {
+    let title = conversation["whiteboard"]["title"].as_str()?;
+    let tasks = conversation["tasks"].as_array()?;
+    // 普通追问与业务历史共用任务数组，但白板仍属于最近业务Run。
+    // 回补不能把新闲聊或其他Run的卡片混入它的目标和进度。
+    let from_step = conversation["whiteboard"]["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|step| {
+            let index = tasks.iter().position(|task| task["id"] == step["id"])?;
+            tasks[..=index]
+                .iter()
+                .rposition(|task| task["id"].as_str().is_some_and(|id| id.starts_with("run:")))
+        });
+    // 步骤ID优先于可重复的用户标题；无步骤的旧目标才使用原标题兼容。
+    let first = from_step
+        .or_else(|| {
+            tasks.iter().position(|task| {
+                task["id"].as_str().is_some_and(|id| id.starts_with("run:"))
+                    && dto::bounded(task["title"].as_str().unwrap_or(""), 32) == title
+                    && task["status"] == conversation["whiteboard"]["status"]
+            })
+        })
+        .unwrap_or(0);
+    let end = tasks
+        .iter()
+        .enumerate()
+        .skip(first + 1)
+        .find(|(_, task)| task["id"].as_str().is_some_and(|id| id.starts_with("run:")))
+        .map_or(tasks.len(), |(i, _)| i);
+    Some(&tasks[first..end])
+}
+
+fn bounded_whiteboard_detail(conversation: &Value, count: usize) -> Option<String> {
+    let title = conversation["whiteboard"]["title"].as_str()?;
+    let tasks = whiteboard_tasks(conversation)?;
+    if title.is_empty() || tasks.is_empty() {
+        return None;
+    }
+    let start = tasks.len().saturating_sub(count.saturating_sub(1)).max(1);
+    let mut compact: Vec<_> = tasks
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i == 0 || *i >= start)
+        .map(|(_, task)| {
+            let mut task = task.clone();
+            task["title"] = json!(dto::bounded(task["title"].as_str().unwrap_or(""), 32));
+            if let Some(object) = task.as_object_mut() {
+                object.remove("summary");
+            }
+            task
+        })
+        .collect();
+    compact[0]["summary"] = json!(dto::bounded(title, 80));
+    Some(whiteboard_detail(title, &compact))
+}
+
 /// 压缩旧业务会话的可选展示字段。
 ///
 /// 任务、进度、白板状态和成员 ID 是历史回看的核心事实，不能因 Office
 /// 快照预算被清空；交接事件、职责长文本和说明性字段属于可重建展示，
 /// 可以先移除。返回值表示本次是否实际缩小了对象。
 fn compact_business_conversation(conversation: &mut Value) -> bool {
+    if compact_structured_board(conversation) {
+        return true;
+    }
     if let Some(events) = conversation["events"].as_array_mut() {
         if !events.is_empty() {
             events.clear();
@@ -611,9 +824,25 @@ fn compact_protected_details(
     for index in order {
         let edit = conversation_size_edit(conversations, index)?;
         let conversation = &mut conversations[index];
+        if compact_structured_board(conversation) {
+            return Ok(Some(edit));
+        }
+        let short_detail = bounded_whiteboard_detail(conversation, 3);
         if let Some(board) = conversation["whiteboard"].as_object_mut() {
-            // detail 是任务事实的重复排版；容量不足时可从任务中心/原详情读取。
-            for key in ["detail", "summary", "description", "tagline", "note"] {
+            // Office用非空detail决定新版阅读器入口；不能为省空间整块清空。
+            // 最短版仍绑定同一任务状态/进度，已缩短后继续压其他说明字段。
+            if let Some(detail) = board.get("detail").and_then(Value::as_str) {
+                let short = short_detail.as_deref().unwrap_or("");
+                if serde_json::to_vec(short).map_err(HostError::storage)?.len()
+                    < serde_json::to_vec(detail)
+                        .map_err(HostError::storage)?
+                        .len()
+                {
+                    board.insert("detail".into(), json!(short));
+                    return Ok(Some(edit));
+                }
+            }
+            for key in ["summary", "description", "tagline", "note"] {
                 if board
                     .get(key)
                     .and_then(Value::as_str)
@@ -636,11 +865,20 @@ fn compact_protected_details(
         }
         if let Some(tasks) = conversation["tasks"].as_array_mut() {
             for task in tasks {
-                if task
-                    .as_object_mut()
-                    .is_some_and(|t| t.remove("summary").is_some())
-                {
-                    return Ok(Some(edit));
+                if matches!(task["status"].as_str(), Some("completed" | "failed")) {
+                    if task
+                        .as_object_mut()
+                        .is_some_and(|t| t.remove("summary").is_some())
+                    {
+                        return Ok(Some(edit));
+                    }
+                } else if let Some(summary) = task["summary"].as_str() {
+                    // 活动作业只在有工具事实时更新，不能被旧历史挤成无说明。
+                    // 保留短动作/等待原因；仍超限交由已公开历史裁剪或明确报错。
+                    if summary.encode_utf16().count() > 96 {
+                        task["summary"] = json!(dto::bounded(summary, 96));
+                        return Ok(Some(edit));
+                    }
                 }
             }
         }
@@ -685,7 +923,7 @@ fn compact_protected_details(
     Ok(None)
 }
 
-/// 对普通快照和逐人交接变体使用相同的最后预算边界；核心不能容纳仍明确失败。
+/// 对完整事实快照使用最后预算边界；核心不能容纳仍明确失败。
 fn fit_protected_snapshot_details(
     team: &str,
     snapshot: &mut Value,
@@ -711,154 +949,330 @@ fn fit_protected_snapshot_details(
     Ok(snapshot_fits_office_message(team, snapshot))
 }
 
-/// 压缩最旧的可裁剪业务投影；已无可选字段时移除其展示入口。
-/// 受保护、活动及在途交接会话不进入 eligible；原始账本不受影响。
-/// 每次返回 true 都必须缩小目录，不能让已压缩到底的第一项阻塞后续历史。
-fn compact_business_history(
-    conversations: &mut Vec<Value>,
-    eligible: &BTreeSet<String>,
+// 仅从原委派、事实版本与上次持久快照计算，不跟踪动画进度。
+#[derive(Default)]
+struct PublishedHistory {
+    anchors: BTreeSet<String>,
+    terminal_tasks: BTreeSet<String>,
+}
+
+// 已公开事件才可退到账本查询；保留末次已见分派作为历史锚点。
+// 锚点不是全队开工前缀，更不表示HTTP接受或动画完成。
+fn compact_seen_history(
+    snapshot: &mut Value,
+    prior: &Value,
     priorities: &BTreeMap<String, u64>,
-) -> bool {
-    let candidate = conversations
-        .iter()
-        .enumerate()
-        .filter(|(_, conversation)| {
-            eligible.contains(conversation["id"].as_str().unwrap_or_default())
-        })
-        .min_by_key(|(_, conversation)| {
-            priorities.get(conversation["id"].as_str().unwrap_or_default())
-        })
-        .map(|(index, _)| index);
-    let Some(index) = candidate else {
-        return false;
+    published: &PublishedHistory,
+) -> HostResult<Option<ConversationSizeEdit>> {
+    let Some(conversations) = snapshot["conversations"].as_array_mut() else {
+        return Ok(None);
     };
+    let mut order: Vec<_> = (0..conversations.len()).collect();
+    order.sort_by_key(|&i| {
+        priorities
+            .get(conversations[i]["id"].as_str().unwrap_or_default())
+            .copied()
+            .unwrap_or_default()
+    });
+    for index in order {
+        let edit = conversation_size_edit(conversations, index)?;
+        let conversation = &mut conversations[index];
+        let Some(old) = prior["conversations"]
+            .as_array()
+            .and_then(|all| all.iter().find(|c| c["id"] == conversation["id"]))
+        else {
+            continue;
+        };
+        let seen: BTreeSet<_> = old["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e["id"].as_str())
+            .collect();
+        let old_task_states: BTreeMap<_, _> = old["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| Some((t["id"].as_str()?, t["status"].as_str()?)))
+            .collect();
+        // 重建会再次读到已归档事实；只按此前已公开的终态任务移除
+        // 它们，游标由原Delegation顺序计算，随机ID/相同时间都不参与排序。
+        // 只有已公开的终态任务事件可以退回历史查询。当前任务的等待、
+        // 开始及最新动作不能仅因上次快照出现过就被当作旧历史。
+        let terminal_ids: BTreeSet<_> = conversation["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| matches!(t["status"].as_str(), Some("completed" | "failed")))
+            .filter_map(|t| t["id"].as_str().map(str::to_owned))
+            .collect();
+        // 当前人物窗口会主动移走终态卡；卡片缺席不代表其已公开事件仍在途。
+        // 只采用原账本确认的终态集合，同时保护仍可见的活动卡与首次公开结果。
+        let visible_ids: BTreeSet<_> = conversation["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["id"].as_str().map(str::to_owned))
+            .collect();
+        if let Some(events) = conversation["events"].as_array_mut() {
+            if let Some(i) = events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    e["id"].as_str().is_some_and(|id| {
+                        e["taskId"].as_str().is_some_and(|task| {
+                            (terminal_ids.contains(task) || !visible_ids.contains(task))
+                                && published.terminal_tasks.contains(task)
+                        }) && (seen.contains(id)
+                            || e["taskId"].as_str().is_some_and(|task| {
+                                published.terminal_tasks.contains(task)
+                                    && old_task_states.get(task).is_none_or(|state| {
+                                        matches!(*state, "completed" | "failed")
+                                    })
+                            }))
+                            && !published.anchors.contains(id)
+                    })
+                })
+                .min_by_key(|(_, e)| {
+                    (
+                        // 已归档事件重建后的观察时间不是新业务事实；先移出这些
+                        // 不在上次窗口中的旧事件，再按时间收缩仍展示的历史。
+                        e["id"].as_str().is_some_and(|id| seen.contains(id)),
+                        e["occurredAt"].as_str(),
+                        e["id"].as_str(),
+                    )
+                })
+                .map(|(i, _)| i)
+            {
+                events.remove(i);
+                return Ok(Some(edit));
+            }
+        }
+        // 长期持续Run的已完成卡片也必须有界。保留最近24项、全部非终态、
+        // 白板引用和每位成员最新一项；较早成果仍由原成员历史/任务详情读取。
+        let protected: BTreeSet<String> = conversation["whiteboard"]["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|step| step["id"].as_str().map(str::to_owned))
+            .chain(
+                conversation["events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["taskId"].as_str().map(str::to_owned)),
+            )
+            .collect();
+        if let Some(tasks) = conversation["tasks"].as_array_mut() {
+            let terminal: Vec<_> = tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| matches!(t["status"].as_str(), Some("completed" | "failed")))
+                .map(|(i, _)| i)
+                .collect();
+            if terminal.len() <= 24 {
+                continue;
+            }
+            let recent: BTreeSet<_> = terminal.iter().rev().take(24).copied().collect();
+            let latest_by_actor: BTreeSet<_> = tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| t["assigneeId"].as_str().map(|actor| (actor, i)))
+                .collect::<BTreeMap<_, _>>()
+                .into_values()
+                .collect();
+            if let Some(index) = terminal.into_iter().find(|i| {
+                let t = &tasks[*i];
+                !recent.contains(i)
+                    && !latest_by_actor.contains(i)
+                    && !protected.contains(t["id"].as_str().unwrap_or_default())
+                    && !t["id"].as_str().is_some_and(|id| id.starts_with("run:"))
+                    && t["id"]
+                        .as_str()
+                        .is_some_and(|id| published.terminal_tasks.contains(id))
+            }) {
+                tasks.remove(index);
+                return Ok(Some(edit));
+            }
+        }
+    }
+    Ok(None)
+}
+// 新版阅读器的可选过程块重复了原任务事实，先释放这些字节，再收缩真实动态。
+// 否则少量文件元数据就可能让当前团队的开始/完成动态先退场，而旧详情仍占预算。
+fn compact_optional_board_history(
+    snapshot: &mut Value,
+    priorities: &BTreeMap<String, u64>,
+) -> HostResult<Option<ConversationSizeEdit>> {
+    let conversations = snapshot["conversations"]
+        .as_array_mut()
+        .expect("conversation array");
+    let mut order: Vec<_> = (0..conversations.len()).collect();
+    order.sort_by_key(|&i| {
+        priorities
+            .get(conversations[i]["id"].as_str().unwrap_or_default())
+            .copied()
+            .unwrap_or_default()
+    });
+    for index in order {
+        let edit = conversation_size_edit(conversations, index)?;
+        if compact_structured_board(&mut conversations[index]) {
+            return Ok(Some(edit));
+        }
+    }
+    Ok(None)
+}
+// 可选旧过程先退场，再收缩已公开终态；当前说明最后缩短，硬界不放宽。
+fn compact_history_to_target(
+    team: &str,
+    snapshot: &mut Value,
+    prior: Option<&Value>,
+    priorities: &BTreeMap<String, u64>,
+    published: &PublishedHistory,
+) -> HostResult<()> {
+    let mut bytes =
+        serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot}))
+            .map_err(HostError::storage)?
+            .len();
+    while bytes > OFFICE_MESSAGE_TARGET {
+        let edit = if let Some(edit) = compact_optional_board_history(snapshot, priorities)? {
+            Some(edit)
+        } else if let Some(prior) = prior {
+            compact_seen_history(snapshot, prior, priorities, published)?
+        } else {
+            None
+        };
+        let Some(edit) = edit else {
+            break;
+        };
+        bytes = message_size_after_edit(snapshot, bytes, edit)?;
+    }
+    // 最近终态卡片达到保留底线后，仍可收缩重复的历史说明；否则重启
+    // 重建会恢复这些长摘要，虽未撞硬界却持续占满为新交接预留的空间。
+    // 复用原受保护字段裁剪，当前动作、身份、状态和进度仍保留。
+    while bytes > OFFICE_MESSAGE_TARGET {
+        let Some(edit) = compact_protected_details(
+            snapshot["conversations"]
+                .as_array_mut()
+                .expect("conversation array"),
+            priorities,
+        )?
+        else {
+            break;
+        };
+        bytes = message_size_after_edit(snapshot, bytes, edit)?;
+    }
+    Ok(())
+}
+
+fn fit_snapshot_with_history(
+    team: &str,
+    snapshot: &mut Value,
+    prior: Option<&Value>,
+    priorities: &BTreeMap<String, u64>,
+    published: &PublishedHistory,
+) -> HostResult<bool> {
+    compact_history_to_target(team, snapshot, prior, priorities, published)?;
+    if fit_protected_snapshot_details(team, snapshot, priorities)? {
+        refill_whiteboard_details(team, snapshot, priorities)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+// 裁掉已公开历史后可能重新空出预算。只扩展仍有详情的会话，优先最新，
+// 不复活已归档入口；每次用真实JSON封套差额计量，给seq增长留足整数位。
+fn refill_whiteboard_details(
+    team: &str,
+    snapshot: &mut Value,
+    priorities: &BTreeMap<String, u64>,
+) -> HostResult<()> {
+    let mut bytes =
+        serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot}))
+            .map_err(HostError::storage)?
+            .len();
+    let mut order: Vec<_> = (0..snapshot["conversations"].as_array().map_or(0, Vec::len)).collect();
+    order.sort_by_key(|&i| {
+        std::cmp::Reverse(
+            priorities
+                .get(
+                    snapshot["conversations"][i]["id"]
+                        .as_str()
+                        .unwrap_or_default(),
+                )
+                .copied()
+                .unwrap_or_default(),
+        )
+    });
+    for index in order {
+        let conversation = &snapshot["conversations"][index];
+        let Some(current) = conversation["whiteboard"]["detail"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let (Some(title), Some(tasks)) = (
+            conversation["whiteboard"]["title"].as_str(),
+            whiteboard_tasks(conversation),
+        ) else {
+            continue;
+        };
+        let mut candidates = vec![whiteboard_detail(title, tasks)];
+        for count in [12, 6, 3] {
+            if let Some(detail) = bounded_whiteboard_detail(conversation, count) {
+                candidates.push(detail);
+            }
+        }
+        // 只回补本算法的短版；未裁剪的既有详情保持原业务归属与文字。
+        if !candidates.iter().skip(1).any(|detail| detail == current) {
+            continue;
+        }
+        let current = current.to_owned();
+        let current_bytes = serde_json::to_vec(&current)
+            .map_err(HostError::storage)?
+            .len();
+        for detail in candidates {
+            if serde_json::to_vec(&detail)
+                .map_err(HostError::storage)?
+                .len()
+                <= current_bytes
+            {
+                continue;
+            }
+            let conversations = snapshot["conversations"]
+                .as_array_mut()
+                .expect("conversation array");
+            let edit = conversation_size_edit(conversations, index)?;
+            conversations[index]["whiteboard"]["detail"] = json!(detail);
+            let next_bytes = message_size_after_edit(snapshot, bytes, edit)?;
+            if next_bytes <= OFFICE_MESSAGE_TARGET.saturating_sub(16) {
+                bytes = next_bytes;
+                break;
+            }
+            snapshot["conversations"][index]["whiteboard"]["detail"] = json!(current);
+        }
+    }
+    Ok(())
+}
+
+/// 压缩最旧的可裁剪业务投影；已无可选字段时移除其展示入口。
+/// 调用方先排除受保护、活动及新交接会话；原始账本不受影响。
+/// 每次必须缩小目录，不能让已压缩到底的第一项阻塞后续历史。
+fn compact_business_history(conversations: &mut Vec<Value>, index: usize) {
     if !compact_business_conversation(&mut conversations[index]) {
         conversations.remove(index);
     }
-    true
 }
 
 /// 判断终态Run是否已经属于此前成功投影的历史。
 ///
-/// `None` 表示尚无成功投影基线；首次看到的终态Run仍需经过逐人交接。
-/// 只有Run revision不晚于上一次成功投影版本时，才可以直接恢复全部交接，
-/// 避免Host重启或历史裁剪后重复播放已经消费过的动画。
+/// `None` 表示尚无此前投影的事实基线；不能据此归档新交接。
+/// 该判断只用于压缩已公开历史，不表示浏览器已接收或播放动画。
 fn is_historical_terminal(run_revision: u64, previous_source_revision: Option<u64>) -> bool {
     previous_source_revision.is_some_and(|revision| run_revision <= revision)
 }
 
-/// 一次真实委派的展示更新；父卡、生命周期与白板归属不可脱离原Run。
-/// 仅进程内排队，不新增持久格式或Office协议字段。
-#[derive(Clone)]
-struct HandoffItem {
-    conversation: String,
-    parent_id: String,
-    child_ids: BTreeSet<String>,
-    task: Value,
-    assignment: Value,
-    lifecycle: Vec<Value>,
-    can_complete: bool,
-    updates_whiteboard: bool,
-}
-
-/// 将真实委派及其生命周期公开到原父任务，不能靠动画推断业务完成。
-fn apply_handoff_item(conversation: &mut Value, item: &HandoffItem, final_item: bool) {
-    if let Some(tasks) = conversation["tasks"].as_array_mut() {
-        tasks.retain(|existing| existing["id"] != item.task["id"]);
-        tasks.push(item.task.clone());
-    }
-    if let Some(events) = conversation["events"].as_array_mut() {
-        for event in std::iter::once(&item.assignment).chain(item.lifecycle.iter()) {
-            if !events.iter().any(|existing| existing["id"] == event["id"]) {
-                events.push(event.clone());
-            }
-        }
-        events.sort_by(|a, b| {
-            b["occurredAt"]
-                .as_str()
-                .cmp(&a["occurredAt"].as_str())
-                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-        });
-    }
-    let Some(tasks) = conversation["tasks"].as_array_mut() else {
-        return;
-    };
-    let completed = tasks
-        .iter()
-        .filter(|task| {
-            task["id"]
-                .as_str()
-                .is_some_and(|id| item.child_ids.contains(id))
-                && task["status"] == "completed"
-        })
-        .count();
-    let total = item.child_ids.len();
-    let Some(main) = tasks.iter_mut().find(|task| task["id"] == item.parent_id) else {
-        return;
-    };
-    // 只有原Run正常结束、业务计划及所有子结果均已核验，才允许公开完成。
-    // 普通blocked可指审批、未核验或取消清理，不能一概当作动画等待。
-    if main["status"] == "blocked" && item.can_complete {
-        if final_item && total > 0 && completed == total {
-            main["status"] = json!("completed");
-            main["progress"] = json!(100);
-            main["summary"] = json!("本次目标已完成");
-        } else {
-            main["progress"] = json!(completed * 100 / (total + 1));
-        }
-    }
-    if !item.updates_whiteboard {
-        return;
-    }
-    let main = main.clone();
-    let mut steps = Vec::new();
-    for task in tasks
-        .iter()
-        .filter(|task| {
-            task["id"]
-                .as_str()
-                .is_some_and(|id| item.child_ids.contains(id))
-        })
-        .rev()
-        .take(3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
-        let label = match task["status"].as_str() {
-            Some("completed") => "已完成",
-            Some("running") => "处理中",
-            Some("blocked") => "等待确认",
-            Some("failed") => "未完成",
-            _ => "待处理",
-        };
-        steps.push(json!({
-            "id": task["id"],
-            "title": dto::bounded(&format!("{} · {label}", dto::bounded(task["title"].as_str().unwrap_or(""), 24)), 40),
-            "progress": task["progress"],
-        }));
-    }
-    let description = if main["status"] == "completed" {
-        format!(
-            "已确认完成 {completed}/{total} 步；{}",
-            main["summary"].as_str().unwrap_or("本次目标已完成")
-        )
-    } else {
-        format!(
-            "已确认完成 {completed} 项；{}",
-            main["summary"].as_str().unwrap_or("正在处理你的请求")
-        )
-    };
-    let detail = whiteboard_detail(main["title"].as_str().unwrap_or(""), tasks);
-    conversation["whiteboard"] = json!({
-        "template": "task-board-v1",
-        "title": dto::bounded(main["title"].as_str().unwrap_or(""), 32),
-        "status": main["status"], "tagline": "",
-        "description": dto::bounded(&description, 300), "summary": dto::bounded(&description, 300),
-        "detail": detail, "note": "",
-        "link": {"label": "", "url": ""}, "steps": steps,
-    });
-}
 /// 功能：读取事实、生成有界完整快照并在变更时分配持久版本。
 /// 参数：host为共享服务，config为Office配置，team为固定办公室。
 /// 返回：已保存的规范化完整快照。
@@ -875,7 +1289,7 @@ pub(super) async fn prepare(host: &Host, config: &OfficeConfig, team: &str) -> H
 /// 参数：host为共享运行服务，config为Office配置，team为已授权办公室。
 /// 返回：从持久事实构建或推进后的规范快照。
 /// 错误：Store、作用域、协议容量或快照序列错误会直接返回Host错误。
-/// 状态：只推进已确认交接窗口；不改变Run、工具或审批事实。
+/// 状态：只投影真实任务与接手事实；不改变Run、工具或审批事实。
 /// 并发与取消：调用方持有UI优先协调；Store操作可由上层取消，网络不在此函数内执行。
 /// 权限：仅读取team允许的会话和工作区，不跨办公室复用快照。
 /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
@@ -920,91 +1334,28 @@ async fn prepare_internal(
     let diagnostics_team = team.clone();
     let ui_busy = host.inner.office_ui_busy.clone();
     let terminal_runs = host.inner.office_terminal_runs.clone();
-    let handoff_queue = host.inner.office_handoff_queue.clone();
+    let activity_window = config.activity_window;
+    let collaboration = host
+        .inner
+        .config
+        .agents
+        .as_ref()
+        .is_some_and(|agents| agents.enabled);
     let result = host.inner.store.call(move|db|{
         let diagnostics = std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some();
         let fact_started = std::time::Instant::now();
         let source_revision = db.revision()?;
-        // 用上一次成功投影的事实版本区分“本轮新完成的Run”和重启后
-        // 已经展示过的旧终态。不能用本次扫描的source_revision比较：
-        // 当前扫描本来就包含刚完成Run的revision，会把新交接误判成历史，
-        // 从而一次性公开所有人物任务，人物动画尚未到位时任务就显示完成。
         let previous_source_revision = db.office_projection_source.get(&team).copied();
-        let handoff_due = db
-            .office_projection_handoff_until
-            .get(&team)
-            .is_some_and(|until| *until <= chrono::Utc::now());
-        if diagnostics {
-            eprintln!(
-                "engine-host diagnostics projection-source team={} current={} cached={:?} handoff={}",
-                team,
-                source_revision,
-                db.office_projection_source.get(&team),
-                handoff_due
-            );
-        }
-        // 交接窗口只改变“哪些已确认事实可以展示”，不改变Run事实。首次
-        // 扫描时已把后续交接快照预计算到内存队列；到期后直接推进一个快照，
-        // 避免人物点击与全量账本扫描竞争同一Store队列。
-        if handoff_due
-            && db.office_projection_source.get(&team).copied() == Some(source_revision)
-        {
-            let queued = handoff_queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get_mut(&team)
-                .and_then(|items| items.first().cloned());
-            if let Some(next) = queued {
-                let mut remove = false;
-                let mut snapshot = next;
-                let has_more = handoff_queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&team)
-                    .is_some_and(|items| items.len() > 1);
-                let prior_state = db
-                    .office_projection(&team)?
-                    .map(|(_, state)| state)
-                    .unwrap_or_else(|| "pending".into());
-                let seq = db
-                    .office_projection(&team)?
-                    .and_then(|(value, _)| value["seq"].as_u64())
-                    .ok_or_else(|| HostError::new("sequence_conflict", "交接快照缺少序号"))?;
-                let next_seq = seq
-                    .checked_add(1)
-                    .filter(|n| *n < 9007199254740991)
-                    .ok_or_else(|| HostError::new("sequence_conflict", "Office序号已达安全整数上限"))?;
-                snapshot["seq"] = json!(next_seq);
-                db.save_office_projection(&team, &snapshot, &prior_state)?;
-                if has_more {
-                    db.office_projection_handoff_until.insert(
-                        team.clone(),
-                        chrono::Utc::now() + chrono::Duration::milliseconds(2200),
-                    );
-                } else {
-                    remove = true;
-                    db.office_projection_handoff_until.remove(&team);
-                }
-                {
-                    let mut queue = handoff_queue
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(items) = queue.get_mut(&team) {
-                        items.remove(0);
-                        if remove {
-                            queue.remove(&team);
-                        }
-                    }
-                }
-                db.office_projection_source.insert(team.clone(), source_revision);
-                return Ok(snapshot);
-            }
-        }
-        if db.office_projection_source.get(&team).copied() == Some(source_revision)
-            && !handoff_due
-        {
+        let reusable = match previous_source_revision {
+            Some(previous) => previous == source_revision || !db.office_projection_changed(&team, previous)?,
+            None => false,
+        };
+        if reusable {
             if let Some((snapshot, _)) = db.office_projection(&team)? {
                 if snapshot_fits_office_message(&team, &snapshot) {
+                    // 无关办公室的事实已检查，推进全局水位避免重复扫描；
+                    // 本办公室的开始、工具、进度与终态仍使快照立即失效。
+                    db.office_projection_source.insert(team.clone(), source_revision);
                     return Ok(snapshot);
                 }
             }
@@ -1046,8 +1397,9 @@ async fn prepare_internal(
         // 只属于历史展示，容量不足时可从目录移除，完整事实仍在账本中。
         let mut protected_conversations=std::collections::BTreeSet::new();
         let mut active_conversations=std::collections::BTreeSet::new();
-        let mut handoff_pending_any = false;
-        let mut handoff_items: Vec<HandoffItem> = Vec::new();
+        // 新交接所在会话不可被历史目录预算裁掉，动画调度由Office负责。
+        let mut handoff_conversations = BTreeSet::new();
+        let mut published = PublishedHistory::default();
         for binding in bindings {
             if !allow_ui_busy && ui_busy.load(std::sync::atomic::Ordering::Acquire) != 0 {
                 return Err(HostError::new("projection_deferred", "Office UI动作优先，延后投影扫描"));
@@ -1112,15 +1464,23 @@ async fn prepare_internal(
             let r=read_run(run_id)?;
             let (_,input)=db.run_input(&r)?;
             let main_id=format!("run:{}",r.run_id);
-            let plan=db.progress(&r.run_id)?;
+            let continuous=db.continuous_state(&r.run_id)?;
+            // 无终点的主目标没有固定分母。保留原计划供详情核查，但不能让
+            // 启动期未更新的步骤遮住后续事项；有限任务及子Run仍验原计划。
+            let unbounded=continuous.as_ref().is_some_and(|c|c.started&&c.completion_condition.is_none());
+            let plan=if unbounded {None}else{db.progress(&r.run_id)?};
             let (steps,mut percent)=crate::task_progress::project(plan.clone(),&r)?;
-            let business_complete = percent == 100;
-            let handoff_start = handoff_items.len();
-            let mut run_child_ids = BTreeSet::new();
-            let mut all_children_verified = true;
+            let mut active_child_ids = BTreeSet::new();
             let mut all_child_failed = false;
             let mut all_child_blocked = false;
             let delegations=db.delegations(&r.run_id)?;
+            let public_end = delegations.iter().rposition(|d|prior_conv
+                .and_then(|c|c["events"].as_array()).is_some_and(|events|
+                    events.iter().any(|e|e["id"]==format!("assign:{}",d.task_id))));
+            if let Some(end)=public_end {
+                published.anchors.insert(format!("assign:{}",delegations[end].task_id));
+            }
+
             let mut assignments=db.office_task_assignments(&r.run_id)?;
             // 开始时多个连续委派可能暂挂同一步；主角色后来用准确证据核验不同
             // 业务步骤时，展示引用采用唯一明确证据，不能再生一张重复委派卡。
@@ -1163,81 +1523,28 @@ async fn prepare_internal(
             let display_calls:BTreeSet<_>=delegations.iter()
                 .filter(|d|!recovered.contains(&d.call_id))
                 .map(|d|d.call_id.clone()).collect();
-            // Office 的 visit 动画是一次一个动作。若同一快照同时暴露多个
-            // task.assigned，前端会在忙状态下拒绝后续动作，却已经把后续任务
-            // 显示出来。按真实投影版本逐个放行：上一交接事件至少已经在一个
-            // 快照周期中被客户端看到并经过动画时长后，才公开下一张任务卡。
-            // 这里不猜测业务完成，也不增加协议字段；事件仍使用官方既有字段。
-            let handoff_gap = chrono::Duration::milliseconds(2200);
-            let mut handoff_ready = BTreeSet::new();
-            // 冷启动已有持久快照只恢复事实，不重播旧终态；首次初始化没有
-            // 快照时仍逐人交接。在途窗口即使因其他Run更新而重建，也不能
-            // 因revision已经被扫描过就跳过尚未公开的成员。
-            let pending_window = db.office_projection_handoff_until.contains_key(&team)
-                && prior_conv.and_then(|c| c["tasks"].as_array()).is_some_and(|tasks| {
-                    tasks.iter().any(|task| task["id"] == main_id
-                        )
-                });
-            let history_revision = previous_source_revision.or_else(|| prior.map(|_| source_revision));
-            let resume_completed_handoff = r.state.is_terminal() && !pending_window
-                && is_historical_terminal(r.revision, history_revision);
-            if resume_completed_handoff {
-                handoff_ready.extend(display_calls.iter().cloned());
-            } else {
-                let visible_events: Vec<_> = delegations.iter()
-                    .filter(|d| display_calls.contains(&d.call_id))
-                    .filter_map(|d| prior_conv.and_then(|c|c["events"].as_array())
-                        .and_then(|events| events.iter().find(|event| event["id"] == format!("assign:{}",d.task_id)))
-                        .map(|event| (d.call_id.clone(), event)))
-                    .collect();
-                handoff_ready.extend(visible_events.iter().map(|(call,_)|call.clone()));
-                let window_open = db.office_projection_handoff_until.get(&team)
-                    .is_none_or(|until| *until <= chrono::Utc::now());
-                let can_reveal = window_open && visible_events.iter().filter_map(|(_,event)|event["occurredAt"].as_str())
-                    .filter_map(|at|chrono::DateTime::parse_from_rfc3339(at).ok())
-                    .max().is_none_or(|at|chrono::Utc::now()-at.with_timezone(&chrono::Utc)>=handoff_gap);
-                if can_reveal {
-                    // 一次重建至多放行一位新成员，不能用同一个过期时间
-                    // 连续放行整组；已有assignment永远保留稳定ID/时间。
-                    if let Some(next) = delegations.iter().find(|d|display_calls.contains(&d.call_id)&&!handoff_ready.contains(&d.call_id)) {
-                        handoff_ready.insert(next.call_id.clone());
-                    }
-                }
-            }
-            for d in &delegations {
+            for (delegation_index,d) in delegations.iter().enumerate() {
                 let role=crate::agents::role(&d.role_id).ok_or_else(||HostError::new("storage_unavailable","委派引用未知角色"))?;
                 let show_card=display_calls.contains(&d.call_id);
                 let child=match read_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
-                let handoff_visible = handoff_ready.contains(&d.call_id);
-                let handoff_hidden = show_card && !handoff_visible;
-                if handoff_hidden {
-                    // 保留上一版本已经发出的事件，避免等待动画时历史闪退；
-                    // 但不再次公开任务卡或执行状态，直到前一交接完成展示窗口。
-                    if let Some(events) = prior_conv.and_then(|v| v["events"].as_array()) {
-                        child_events.extend(events.iter().filter(|event| {
-                            event["taskId"] == d.task_id
-                        }).cloned());
-                    }
-                }
                 let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
                 let superseded=recovered.contains(&d.call_id);
                 let done=state=="completed";
                 // 正式业务卡以父计划的准确委派验收为准；子执行计划是未验收时的阶段展示。
                 // 文件验收仍由原Store核验实际子写入/路径，不能凭正文或终态跳过。
                 let (child_steps_view, child_percent)=match &child {
-                    Some(c)=>crate::task_progress::project(db.progress(&c.run_id)?,c)?,
+                    Some(c)=>crate::task_progress::execution_project(db.progress(&c.run_id)?,c)?,
                     None=>(Vec::new(),0),
                 };
                 let verified=done && plan.as_ref().map(|p|p["steps"].as_array().into_iter().flatten().any(|s|
                     s["state"]=="completed" && s["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id))
-                )).unwrap_or(r.state==RunState::Completed && child_percent==100);
-                // 进度统计业务核验，不统计动画排队；无证据不按时间虚增。
-                if show_card { completed_children += u64::from(verified); }
+                )).unwrap_or(child_percent==100);
                 let summary=if let Some(c)=&child {
-                    if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {super::turns::message(c)}
+                    if state=="queued" {"已接受任务，等待成员依次执行".into()}
+                    else if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {super::turns::message(c)}
                     else if state=="blocked" {"等待确认、资源或清理".into()}
                     else if let Some(binding)=db.office_tool_activity(c)? {
-                        format!("{}；已核验进度{child_percent}%",public_tool_activity(&binding))
+                        format!("{}{}；已核验进度{child_percent}%",observed_tool_activity(&binding,c),child_steps_view.iter().find(|s|s["status"]=="running").and_then(|s|s["title"].as_str()).map(|title|format!("；正在{title}")).unwrap_or_default())
                     }
                     else if let Some(step)=child_steps_view.iter().find(|s|s["status"]=="running") {
                         format!("正在{}；已核验进度{child_percent}%",step["title"].as_str().unwrap_or("处理任务"))
@@ -1250,7 +1557,20 @@ async fn prepare_internal(
                         }.into()
                     } else {"正在分析并组织下一步；尚无新增核验进度".into()}
                 } else if r.state.is_terminal() {"委派中断，未接受执行；不会自动重放".into()} else {"已登记委派，等待接受执行".into()};
-                let mut item=task(d.task_id.clone(),d.title.clone(),if done&&!verified{"blocked"}else{state},if done&&!verified{"独立执行已结束，结果待主角色核验".into()}else{summary},&old,&now,if verified{100}else{child_percent});
+                // 子卡表示该同事的执行；父计划另行表示业务验收，不能因父漏报
+                // 把已保存正文的有限执行降回0%。未核验的真实文件仍保留blocked。
+                let execution_complete=done && (verified || child_percent==100);
+                // 父可用当前业务步骤的真实独立工具证据验收，而不必重复引用每次委派。
+                // 只有别人的委派证据仍不能替该同事验收；父计划独立取最小进度。
+                let independent_acceptance=plan.as_ref().is_some_and(|p| {
+                    p["steps"].as_array().into_iter().flatten().enumerate().any(|(index,step)|
+                        assignments.get(&d.call_id).is_none_or(|assigned|*assigned==index)
+                        && step["state"]=="completed"
+                        && step["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|
+                            r.tools.iter().any(|tool|id==&tool.call_id && tool.tool_name!="delegate_task" && tool.state=="completed"))))
+                });
+                if show_card { completed_children += u64::from(execution_complete && (verified || independent_acceptance)); }
+                let mut item=task(d.task_id.clone(),d.title.clone(),if done&&!execution_complete{"blocked"}else{state},if done&&!execution_complete{"独立执行已结束，文件步骤仍待核验".into()}else if execution_complete&&!verified{format!("执行已完成，父目标待验收；{summary}")}else{summary},&old,&now,if execution_complete{100}else{child_percent});
                 item["assigneeId"]=json!(role.employee);
                 // 开始关联只是待核验提示；只有确认后的一对一证据才复用业务卡片。
                 let linked=assignments.get(&d.call_id).copied().filter(|i| {
@@ -1263,9 +1583,23 @@ async fn prepare_internal(
                     item["id"]=step["id"].clone();item["title"]=step["title"].clone();
                 }
                 let task_id=item["id"].clone();
+                let existing_assignment=prior_conv.and_then(|v|v["events"].as_array())
+                    .and_then(|events|events.iter().find(|event|event["id"]==format!("assign:{}",d.task_id)));
+                // 跨角色接手不是全队FIFO前缀。只有确切旧事件，或锚点之前
+                // 已投影过的终态，才可归档；上次仍queued的卡不能据此被裁掉。
+                let was_published=existing_assignment.is_some() || public_end.is_some_and(|end| delegation_index<=end)
+                    && child.as_ref().is_some_and(|c| c.state.is_terminal()
+                        && (is_historical_terminal(c.revision,previous_source_revision)
+                            || previous_source_revision.is_none() && old.get(task_id.as_str().unwrap())
+                                .is_none_or(|t|matches!(t["status"].as_str(),Some("completed"|"failed")))));
+                if was_published && child.as_ref().is_some_and(|c|c.state.is_terminal()) {
+                    published.terminal_tasks.insert(task_id.as_str().unwrap().to_owned());
+                }
+
                 if show_card && !superseded {
-                    run_child_ids.insert(item["id"].as_str().unwrap().to_owned());
-                    all_children_verified &= item["status"] == "completed";
+                    if child.as_ref().is_some_and(|c| !c.state.is_terminal()) || state=="queued" {
+                        active_child_ids.insert(item["id"].as_str().unwrap().to_owned());
+                    }
                     all_child_failed |= item["status"] == "failed";
                     all_child_blocked |= item["status"] == "blocked";
                 }
@@ -1276,7 +1610,7 @@ async fn prepare_internal(
                     let phases=[
                         ("started","task.started",c.state==RunState::Running,"观察到独立执行"),
                         ("blocked","task.blocked",!c.state.is_terminal()&&state=="blocked","曾观察到等待确认、资源或清理"),
-                        ("completed","task.completed",!superseded&&item["status"]=="completed","已核验完成"),
+                        ("completed","task.completed",!superseded&&item["status"]=="completed",if verified {"已核验完成"}else{"执行完成，父目标待验收"}),
                         ("result","note",done&&item["status"]!="completed","独立执行已结束；业务步骤须由主角色核验"),
                         ("incomplete","note",c.state.is_terminal()&&!done,"此尝试未完成；真实结果保留在成员历史"),
                     ];
@@ -1286,49 +1620,53 @@ async fn prepare_internal(
                         if !observed&&existing.is_none() {continue;}
                         lifecycle.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
                     }
-                    if !show_card || handoff_visible { child_events.extend(lifecycle.clone()); }
+                    child_events.extend(lifecycle);
                 }
-                if show_card && !superseded && handoff_visible {
+                if show_card && !superseded {
                     if let Some(index)=linked {child_steps.insert(index,item.clone());} else {child_tasks.push(item.clone());}
                 }
-                if child.is_some() {
-                let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|events|events.iter().find(|event|event["id"]==format!("assign:{}",d.task_id)));
-                let mut assignment=existing.cloned().unwrap_or_else(||json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":now,"taskId":task_id,"employeeId":role.employee,"fromEmployeeId":"office-lead"}));
+                // Accepted仍在真实成员许可队列。排队卡已可见，但接手事件只在
+                // 实际运行后发布；取消前未开工且无执行证据的任务不伪造交接。
+                let mut started=child.as_ref().is_some_and(|c| matches!(c.state,RunState::Running|RunState::Completed)
+                    || !c.text.is_empty() || !c.tools.is_empty());
+                // 首次Provider请求失败也可能没有正文/工具；只有原账本的
+                // RunStarted才能与未出队就取消/超时的任务区分。只在缺少
+                // 现成执行证据且没有既有assignment的终态分支读取原Reader。
+                if !started && existing_assignment.is_none() {
+                    if let Some(c)=child.as_ref().filter(|c|c.state.is_terminal()) {
+                        started=db.events(&c.session_id)?.iter().any(|event|matches!(event,
+                            openpaw_core::SessionEvent::RunStarted{run_id} if run_id==&c.run_id));
+                    }
+                }
+                if started || existing_assignment.is_some() {
+                let existing=existing_assignment;
+                let from=d.source_task_id.as_ref().and_then(|id|delegations.iter().find(|previous|&previous.task_id==id)).and_then(|previous|crate::agents::role(&previous.role_id)).map_or("office-lead",|role|role.employee);
+                let mut assignment=existing.cloned().unwrap_or_else(||json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":now,"taskId":task_id,"employeeId":role.employee,"fromEmployeeId":from}));
                 // 精确业务证据后来把委派卡归并为唯一业务步骤时，事件仍是
                 // 同一次交接，但必须指向当前稳定任务ID，不能挂回临时卡。
                 // 事件ID和首次时间保持不变，因此不会重播拜访动画。
                 assignment["taskId"]=task_id;
-                if handoff_hidden && !superseded {
-                    // 记录完整的下一步任务与交接事件。它们仍来自真实子Run，
-                    // 这里只是延迟公开；后续快照会按角色顺序一次加入一项。
-                    handoff_items.push(HandoffItem {
-                        conversation: binding.scope.conversation_id.clone(),
-                        parent_id: main_id.clone(), child_ids: BTreeSet::new(),
-                        task: item.clone(), assignment: assignment.clone(), lifecycle,
-                        can_complete: false, updates_whiteboard: run_id == board_id,
-                    });
-                } else if !show_card || handoff_visible {
-                    child_events.push(assignment);
+                if !was_published {handoff_conversations.insert(binding.scope.conversation_id.clone());}
+                child_events.push(assignment);
                 }
-                }
-            }
-            for item in &mut handoff_items[handoff_start..] {
-                item.child_ids = run_child_ids.clone();
-                item.can_complete = r.state == RunState::Completed && business_complete && all_children_verified;
             }
             if !delegations.is_empty() {
                 let required_children=display_calls.len() as u64;
-                let handoff_pending=display_calls.iter().any(|call| !handoff_ready.contains(call));
                 let delivered=r.state==RunState::Completed && completed_children==required_children;
                 let child_percent=(completed_children+u64::from(delivered))*100/(required_children+1);
                 percent=if steps.is_empty() {child_percent}else{percent.min(child_percent)};
-                handoff_pending_any |= handoff_pending;
             }
+            if continuous.as_ref().is_some_and(|c|c.started) && !delegations.is_empty() && plan.is_none() {
+                // 持续目标没有一个可预测的最终分母；只展示当前已有委派的
+                // 真实核验比例。新事项会扩大分母，旧成果保留独立100%卡片。
+                percent=completed_children*100/display_calls.len().max(1) as u64;
+            }
+            // 当前批次全部完成不等于主目标已结束；只有可靠Completed允许整体100%。
+            if r.state != RunState::Completed {percent=percent.min(99);}
             let child_blocked=all_child_blocked || child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="blocked");
             let child_failed=all_child_failed || child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="failed");
             if r.state==RunState::Completed && child_blocked {percent=percent.min(99);}
-            let handoff_pending = display_calls.iter().any(|call| !handoff_ready.contains(call));
-            let active_tool_summary = db.office_tool_activity(&r)?.map(|binding| public_tool_activity(&binding));
+            let active_tool_summary = db.office_tool_activity(&r)?.map(|binding| observed_tool_activity(&binding,&r));
             let summary=match r.state {
                 RunState::Cancelled=>"已停止，实际操作已清理".to_owned(),
                 RunState::Interrupted=>"处理被中断，已完成事项保留".to_owned(),
@@ -1337,18 +1675,26 @@ async fn prepare_internal(
                 RunState::Completed if child_failed=>"回复已结束；仍有未恢复的子任务失败，已完成部分保留".to_owned(),
                 RunState::Completed if percent<100=>"回复已结束；已完成部分保留，其余待核验或继续处理".to_owned(),
                 RunState::Completed=>"本次目标已完成".to_owned(),
-                _ if child_blocked=>"子任务等待确认、核验或可用资源".to_owned(),
+                _ if !unbounded && child_blocked && !child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="running")=>"子任务等待确认、核验或可用资源".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
                 _=>child_tasks.iter().chain(child_steps.values()).find(|t|t["status"]=="running")
-                    .map(|t|format!("{}；已核验总进度{percent}%",t["summary"].as_str().unwrap_or("团队正在处理")))
+                    .map(|t|{
+                        // 主卡展示团队概况，子卡仍展示本人动作；聚合时保留可信
+                        // 负责人，避免把同事的读取/写入误显示为主角色亲自执行。
+                        let owner=t["assigneeId"].as_str()
+                            .and_then(|id|crate::agents::ROLES.iter().find(|role|role.employee==id))
+                            .map(|role|role.name).unwrap_or("同事");
+                        format!("团队进展 · {owner}：{}；已核验总进度{percent}%",t["summary"].as_str().unwrap_or("正在处理"))
+                    })
                     .or_else(||active_tool_summary.map(|summary|format!("{summary}；已核验进度{percent}%")))
                     .or_else(||steps.iter().find(|s|s["status"]=="running").map(|s|
                         format!("正在{}；已核验进度{percent}%",s["title"].as_str().unwrap_or("处理任务"))))
                     .unwrap_or_else(||"正在分析并组织下一步；尚无新增核验进度".to_owned()),
             };
-            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
-            let mut tasks=vec![task(main_id,dto::bounded(&input,80),main_state,summary.clone(),&old,&now,percent)];
+            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (!unbounded && child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let business_title = input.lines().find(|line| !line.trim().is_empty()).unwrap_or(&input).trim();
+            let mut tasks=vec![task(main_id,dto::bounded(business_title,80),main_state,summary.clone(),&old,&now,percent)];
             for (index,step) in steps.into_iter().enumerate() {
                 if let Some(child)=child_steps.remove(&index) {tasks.push(child);continue;}
                 tasks.push(task(step["id"].as_str().unwrap().into(),step["title"].as_str().unwrap().into(),step["status"].as_str().unwrap(),step["summary"].as_str().unwrap().into(),&old,&now,step["progress"].as_u64().unwrap()));
@@ -1359,7 +1705,7 @@ async fn prepare_internal(
             for t in r.tools.iter().filter(|t|t.tool_name!="report_progress") {
                 // 保留原内部调用关联号供历史详情追踪，公开任务不再使用逐call卡片。
                 let _call_reference=db.office_call_id(&r.run_id,&t.call_id)?;
-                if !delegations.is_empty() {continue;} // 协作交接只来自真实委派，主角色核验工具不重复派发同一步。
+                if collaboration || !delegations.is_empty() {continue;} // 真实Agent保持Run归属，不能按工具类型虚构另一成员执行。
                 let (who,_)=actor(&t.tool_name);
                 if who=="office-lead" || !db.office_call_started(&r.run_id,&t.call_id)? {continue;}
                 let current=assignments.get(&t.call_id).map(|i|i+1).filter(|i|*i<tasks.len()).unwrap_or(0);
@@ -1388,27 +1734,43 @@ async fn prepare_internal(
                 // 白板最多三个步骤（Office 官方 schema 限制）。优先保留当前步骤
                 // 及其前一个已完成步骤，全部结束时保留最后三个结果；不能因为
                 // 新步骤出现就把刚完成的成果全部挤掉。
-                let relative=tasks[1..].iter().position(|t|t["status"]!="completed");
-                let first=relative.map(|index| index.saturating_sub(1)).unwrap_or(tasks.len().saturating_sub(4));
-                tasks[1..].iter().skip(first).take(3).map(|t| {
+                whiteboard_window(&tasks,&active_child_ids,unbounded).into_iter().map(|t| {
                     let label=match t["status"].as_str(){Some("completed")=>"已完成",Some("running")=>"处理中",Some("blocked")=>"等待确认",Some("failed")=>"未完成",_=>"待处理"};
                     json!({"id":t["id"],"title":dto::bounded(&format!("{} · {label}",dto::bounded(t["title"].as_str().unwrap(),24)),40),"progress":t["progress"]})
                 }).collect()
             } else {vec![json!({"id":"goal","title":dto::bounded(&summary,80),"progress":percent})]};
             let completed=tasks.iter().skip(1).filter(|t|t["status"]=="completed").count();
-            let description=if !delegations.is_empty() && handoff_pending {
-                format!("已确认完成 {completed_children} 项；{summary}")
-            } else if tasks.len()>1 {
+            let description=if tasks.len()>1 {
                 format!("已确认完成 {completed}/{} 步；{summary}",tasks.len()-1)
             } else {summary};
-            let whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,300),"summary":dto::bounded(&description,300),"detail":whiteboard_detail(selected["title"].as_str().unwrap_or(""),&tasks),"note":"","link":{"label":"","url":""},"steps":board_steps});
+            let mut whiteboard=json!({"template":"task-board-v1","title":dto::bounded(selected["title"].as_str().unwrap_or(""),32),"status":selected["status"],"tagline":"","description":dto::bounded(&description,300),"summary":dto::bounded(&description,300),"detail":whiteboard_detail(selected["title"].as_str().unwrap_or(""),&tasks),"note":"","link":{"label":"","url":""},"steps":board_steps});
+            structured_board(&mut whiteboard,&tasks);
+            let artifact_warnings=db.artifact_warnings(&r.run_id)?;
+            if !artifact_warnings.is_empty(){whiteboard["result"]["note"]=json!(dto::bounded(&format!("文件版本捕获警告：{}；原工作区写入保留，不提供缺失版本的预览/下载。",artifact_warnings.join("；")),300));}
             if run_id==board_id {retained_whiteboard=whiteboard;}
+            if activity_window {
+                // 先构造完整业务白板，再裁人物当前窗口。业务未验收不等于执行仍在途。
+                tasks.retain(|t| if !delegations.is_empty() && t["assigneeId"]!="office-lead" {
+                    active_child_ids.contains(t["id"].as_str().unwrap_or(""))
+                } else {
+                    !r.state.is_terminal() && !matches!(t["status"].as_str(),Some("completed"|"failed"))
+                });
+                // 原Office将title渲染为业务粗体、summary渲染为灰色动作。
+                // 活动窗口只裁终态，不覆盖业务名称，也不把长目标挤到动作前面。
+                for t in &mut tasks {
+                    if let Some(previous)=old.get(t["id"].as_str().unwrap_or("")) {
+                        let mut comparable=previous.clone();comparable["updatedAt"]=t["updatedAt"].clone();
+                        if comparable==*t {t["updatedAt"]=previous["updatedAt"].clone();}
+                    }
+                }
+            }
             retained_tasks.extend(tasks);
             retained_events.extend(events);
             }
             retained_events.sort_by(|a,b|b["occurredAt"].as_str().cmp(&a["occurredAt"].as_str()).then_with(||a["id"].as_str().cmp(&b["id"].as_str())));
             priorities.insert(binding.scope.conversation_id.clone(),latest.revision);
             if latest.state.is_terminal() {terminal_conversations.insert(binding.scope.conversation_id.clone());}
+            super::artifacts::project(db,&binding.scope,&mut retained_whiteboard)?;
             // 常驻人物和成员来自同一可信目录，未启用角色也能说明真实状态。
             conversations.push(json!({"id":binding.scope.conversation_id,"title":title,
                 "employees":employees,
@@ -1447,11 +1809,9 @@ async fn prepare_internal(
         }
         conversations.sort_by(|a,b|a["id"].as_str().cmp(&b["id"].as_str()));
         let mut snapshot=json!({"schemaVersion":"1.0","seq":prior.map(|v|v["seq"].clone()).unwrap_or(json!(1)),"workspace":{"id":team,"name":name},"conversations":conversations,"system":{"cpuPercent":-1,"memoryPercent":-1,"networkKbps":-1}});
-        let handoff_conversations: BTreeSet<String> = handoff_items
-            .iter()
-            .map(|item| item.conversation.clone())
-            .collect();
-        // 整办公室64KiB预算；按事实版本先缩旧终态详情，保留活动业务卡及全部成员。
+        // 先主动收缩已公开终态历史，避免等到硬界才牺牲当前动作/白板。
+        compact_history_to_target(&team, &mut snapshot, prior, &priorities, &published)?;
+        // 整办公室硬预算；当前必要事实可以超过正常目标，不能超过完整封套硬界。
         // 历史增长时逐字段裁剪仍遵循原策略，但每步只序列化被修改的会话。
         // 完整目录只计量一次，避免每次删除一个字段都复制/编码整个办公室。
         let mut message_size=serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot})).map_err(HostError::storage)?.len();
@@ -1476,31 +1836,27 @@ async fn prepare_internal(
                 let fallback = fallback.or_else(|| convs.iter().enumerate()
                     .filter(|(_,c)| terminal_conversations.contains(c["id"].as_str().unwrap_or(""))
                         && !protected_conversations.contains(c["id"].as_str().unwrap_or(""))
-                        && business_conversations.contains(c["id"].as_str().unwrap_or(""))
-                        && !handoff_conversations.contains(c["id"].as_str().unwrap_or("")))
+                        // 窗口外已结束业务的交接属于历史：其锚点可能已随
+                        // 上次裁剪退出目录，重建不能再把旧assignment钉成新交接。
+                        // 当前活动、最近四组业务及最新会话已由protected集合排除。
+                        && business_conversations.contains(c["id"].as_str().unwrap_or("")))
                     .min_by_key(|(_,c)| priorities.get(c["id"].as_str().unwrap_or(""))));
                 let Some((index,_))=fallback else {
                     // 不能因最近窗口/活动会话均受保护就阻断审批菜单；只压缩
                     // 可选说明，保留全部任务、六成员和交接核心事实。
                     let conversation_count = convs.len();
-                    if fit_protected_snapshot_details(&team, &mut snapshot, &priorities)? { break; }
+                    if fit_snapshot_with_history(&team, &mut snapshot, prior, &priorities, &published)? { break; }
                     if diagnostics {
                         eprintln!("engine-host diagnostics projection clip exhausted team={} conversations={} terminal={} handoff={}", team, conversation_count, terminal_conversations.len(), handoff_conversations.len());
                     }
                     return Err(HostError::new("protocol_error","Office完整会话目录超限"));
                 };
                 previous_edit=Some(conversation_size_edit(convs,index)?);
-                let c=&mut convs[index];
-                if business_conversations.contains(c["id"].as_str().unwrap_or("")) {
-                    if compact_business_conversation(c) {
-                        continue;
-                    }
-                    // 已经压缩到最小展示形态的旧业务会话不能继续阻塞
-                    // Office 64 KiB 封套。它的完整任务、白板和工具事实仍
-                    // 在账本中，且最近窗口已由 protected_conversations 保留。
-                    convs.remove(index);
+                if business_conversations.contains(convs[index]["id"].as_str().unwrap_or("")) {
+                    compact_business_history(convs, index);
                     continue;
                 }
+                let c=&mut convs[index];
                 if !c["whiteboard"].is_null() {
                     c["whiteboard"] = Value::Null;
                     continue;
@@ -1550,216 +1906,8 @@ async fn prepare_internal(
             }
             c["title"]=json!(dto::bounded(c["title"].as_str().unwrap_or(""),24));
         }
-        // 交接变体会在当前快照上逐项加入同事任务和 assignment 事件。普通
-        // 目录只需满足当前 envelope；交接目录还必须为“最终一项”预留空间，
-        // 否则第一个人物能显示而后续人物会因为一次超限被整批丢弃。
-        // 只在确实存在交接且预览变体超限时进行额外整理，避免改变普通历史
-        // 目录的保留策略。详情查询仍从Run事实读取被压缩的旧历史。
-        if !handoff_items.is_empty() {
-            let compactable_business: BTreeSet<_> = business_conversations
-                .intersection(&terminal_conversations)
-                .filter(|id| !handoff_conversations.contains(*id) && !protected_conversations.contains(*id))
-                .cloned()
-                .collect();
-            let mut preview = snapshot.clone();
-            for item in &handoff_items {
-                if let Some(conv) = preview["conversations"]
-                    .as_array_mut()
-                    .and_then(|all| all.iter_mut().find(|c| c["id"] == item.conversation))
-                {
-                    apply_handoff_item(conv, item, false);
-                }
-            }
-            while !snapshot_fits_office_message(&team, &preview) {
-                let mut changed = false;
-                // 先删除旧终态会话中的详情，保留成员身份和会话入口；这比
-                // 删除当前会话的任务卡安全，也使人物点击仍能通过作用域校验。
-                let conversation_view = snapshot["conversations"]
-                    .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                if let Some((index, _)) = conversation_view
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, conversation)| {
-                        terminal_conversations.contains(
-                            conversation["id"].as_str().unwrap_or_default(),
-                        ) && !handoff_conversations
-                            .contains(conversation["id"].as_str().unwrap_or_default())
-                            && !business_conversations
-                                .contains(conversation["id"].as_str().unwrap_or_default())
-                            && (conversation["tasks"].as_array().is_some_and(|tasks| !tasks.is_empty())
-                                || conversation["events"].as_array().is_some_and(|events| !events.is_empty())
-                                || !conversation["whiteboard"].is_null())
-                    })
-                    .min_by_key(|(_, conversation)| {
-                        priorities
-                            .get(conversation["id"].as_str().unwrap_or_default())
-                            .copied()
-                            .unwrap_or_default()
-                    })
-                {
-                    let conversation = &mut snapshot["conversations"]
-                        .as_array_mut()
-                        .expect("conversation array")[index];
-                    conversation["tasks"] = json!([]);
-                    conversation["events"] = json!([]);
-                    conversation["whiteboard"] = Value::Null;
-                    changed = true;
-                }
-                if !changed {
-                    // 旧终态会话的可选详情已经清空仍然超限时，移除最旧的
-                    // 会话对象。当前会话和最近交接会话永远受保护；完整历史
-                    // 仍可从 detail-v1 查询，不能把预算错误转化为投影失败。
-                    let conversation_view = snapshot["conversations"]
-                        .as_array()
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    if let Some(index) = conversation_view
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, conversation)| {
-                            terminal_conversations.contains(
-                                conversation["id"].as_str().unwrap_or_default(),
-                            ) && !handoff_conversations
-                                .contains(conversation["id"].as_str().unwrap_or_default())
-                                && !business_conversations
-                                    .contains(conversation["id"].as_str().unwrap_or_default())
-                        })
-                        .min_by_key(|(_, conversation)| {
-                            priorities
-                                .get(conversation["id"].as_str().unwrap_or_default())
-                                .copied()
-                                .unwrap_or_default()
-                        })
-                        .map(|(index, _)| index)
-                    {
-                        snapshot["conversations"]
-                            .as_array_mut()
-                            .expect("conversation array")
-                            .remove(index);
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    changed = compact_business_history(
-                        snapshot["conversations"].as_array_mut().expect("conversation array"),
-                        &compactable_business,
-                        &priorities,
-                    );
-                }
-                if !changed && fit_protected_snapshot_details(&team, &mut preview, &priorities)? {
-                    // 最终变体加入的任务/说明也必须走同一安全压缩；不删交接。
-                    break;
-                }
-                if !changed {
-                    // 最后仅压缩当前会话的非 assignment 活动事件。交接链所需
-                    // 的 assignment 时间戳必须保留，否则下一窗口无法判断约定
-                    // 展示间隔是否已经结束；该间隔不代表收到人物到达确认。
-                    let mut removed_event = false;
-                    if let Some(conversations) = snapshot["conversations"].as_array_mut() {
-                        for conversation in conversations {
-                            if !handoff_conversations
-                                .contains(conversation["id"].as_str().unwrap_or_default())
-                            {
-                                continue;
-                            }
-                            if let Some(events) = conversation["events"].as_array_mut() {
-                                if let Some(index) = events.iter().rposition(|event| {
-                                    event["kind"] != "task.assigned"
-                                }) {
-                                    events.remove(index);
-                                    removed_event = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if !removed_event {
-                        if diagnostics {
-                            eprintln!("engine-host diagnostics handoff clip exhausted team={} conversations={} handoff_items={} size={}", team, snapshot["conversations"].as_array().map_or(0, Vec::len), handoff_items.len(), serde_json::to_vec(&json!({"type":"office.snapshot","teamId":team,"snapshot":preview})).map_or(0, |v| v.len()));
-                        }
-                        return Err(HostError::new(
-                            "protocol_error",
-                            "Office交接快照在保留当前任务后仍超过64KiB",
-                        ));
-                    }
-                }
-                preview = snapshot.clone();
-                for item in &handoff_items {
-                    if let Some(conv) = preview["conversations"]
-                        .as_array_mut()
-                        .and_then(|all| all.iter_mut().find(|c| c["id"] == item.conversation))
-                    {
-                    apply_handoff_item(conv, item, false);
-                    }
-                }
-            }
-        }
-        // 把本次真实扫描中尚未公开的交接项预组装成逐步快照。每个变体
-        // 同时推进各会话的一项，按展示窗口逐人公开，不把时间间隔当成
-        // 人物到达确认，也不让后续窗口再次读取全部Run/JSONL。
-        if !handoff_items.is_empty() {
-            let mut remaining: BTreeMap<String, Vec<HandoffItem>> = BTreeMap::new();
-            for item in handoff_items {
-                remaining.entry(item.conversation.clone()).or_default().push(item);
-            }
-            let mut current = snapshot.clone();
-            let mut variants = Vec::new();
-            let mut overflowed = false;
-            loop {
-                let mut progressed = false;
-                for items in remaining.values_mut() {
-                    let Some(item) = items.first().cloned() else { continue; };
-                    let Some(conv) = current["conversations"]
-                        .as_array_mut()
-                        .and_then(|all| all.iter_mut().find(|c| c["id"] == item.conversation))
-                    else { continue; };
-                    let final_item = !items.iter().skip(1).any(|next| next.parent_id == item.parent_id);
-                    apply_handoff_item(conv, &item, final_item);
-                    items.remove(0);
-                    progressed = true;
-                }
-                if !progressed {
-                    break;
-                }
-                if !fit_protected_snapshot_details(&team, &mut current, &priorities)? {
-                    // The base projection has already been clipped to the
-                    // Office envelope. A handoff event can add enough detail
-                    // to exceed it; keep the bounded base and do not enqueue
-                    // an invalid variant that would halt syncing.
-                    overflowed = true;
-                    break;
-                }
-                variants.push(current.clone());
-                if remaining.values().all(Vec::is_empty) { break; }
-            }
-            if overflowed || variants.is_empty() {
-                handoff_pending_any = false;
-                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
-            } else {
-                handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).insert(team.clone(), variants);
-            }
-        } else {
-            handoff_queue.lock().unwrap_or_else(|e| e.into_inner()).remove(&team);
-        }
-        let update_handoff_window = |db: &mut crate::store::Db| {
-            let now = chrono::Utc::now();
-            if handoff_pending_any {
-                if db
-                    .office_projection_handoff_until
-                    .get(&team)
-                    .is_none_or(|until| *until <= now)
-                {
-                    db.office_projection_handoff_until
-                        .insert(team.clone(), now + chrono::Duration::milliseconds(2200));
-                }
-            } else {
-                db.office_projection_handoff_until.remove(&team);
-            }
-        };
+        refill_whiteboard_details(&team, &mut snapshot, &priorities)?;
         if prior==Some(&snapshot) {
-            update_handoff_window(db);
             db.office_projection_source.insert(team.clone(), source_revision);
             return Ok(snapshot);
         }
@@ -1769,7 +1917,6 @@ async fn prepare_internal(
         }
         let state=if previous.as_ref().is_some_and(|(_,s)|s=="halted"){ "halted" }else{"pending"};
         db.save_office_projection(&team,&snapshot,state)?;
-        update_handoff_window(db);
         db.office_projection_source.insert(team, source_revision);
         Ok(snapshot)
     }).await;
@@ -1834,7 +1981,28 @@ async fn sync_internal(
     if !super::workspaces::active(host, config, team).await? {
         return Ok("reserved".into());
     }
-    let snapshot = prepare_internal(host, config, team, allow_ui_busy).await?;
+    // 发送失败后先重试同一持久版本，不能让下一次事实重建覆盖尚未发出的交接。
+    // 可信UI同步仍须构建其删除/审批之后的准确状态，沿用原专用外发门。
+    let pending = if allow_ui_busy {
+        None
+    } else {
+        let team = team.to_owned();
+        host.inner
+            .store
+            .call(move |db| {
+                Ok(db
+                    .office_projection(&team)?
+                    .filter(|(snapshot, state)| {
+                        state == "pending" && snapshot_fits_office_message(&team, snapshot)
+                    })
+                    .map(|(snapshot, _)| snapshot))
+            })
+            .await?
+    };
+    let snapshot = match pending {
+        Some(snapshot) => snapshot,
+        None => prepare_internal(host, config, team, allow_ui_busy).await?,
+    };
     // `halted` is an in-process latch for a confirmed external sequence
     // conflict. A persisted halted row may represent a recoverable protocol
     // or cache failure from an older Host, so it must not block restart.
@@ -1857,22 +2025,42 @@ async fn sync_internal(
             ));
         }
     }
-    let (_, directory) = client.post(json!({"type":"office.read"})).await?;
-    let initialized = directory["offices"]
+    // 聊天地址是配置而非每帧业务数据。每个Client首次确认一次；Office
+    // 重启丢失办公室时，下方精确404分支携带chat重新初始化，不能靠每秒全目录
+    // 查询来侦测缓存。快照本身仍每轮发送并严格核对seq/状态，不降低刷新频率。
+    client.register_chat(address).await?;
+    let counts = snapshot["conversations"]
         .as_array()
-        .is_some_and(|a| a.iter().any(|o| o["id"] == team));
-    if !initialized {
-        client
-            .post(json!({"type":"offices.initialize","offices":[snapshot],"chat":{"url":format!("http://{address}/office/chat")}}))
-            .await?;
+        .into_iter()
+        .flatten()
+        .fold((0, 0), |(tasks, events), c| {
+            (
+                tasks + c["tasks"].as_array().map_or(0, Vec::len),
+                events + c["events"].as_array().map_or(0, Vec::len),
+            )
+        });
+    let request = json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot});
+    let bytes = serde_json::to_vec(&request)
+        .map_err(HostError::storage)?
+        .len();
+    let receipt = match client.post(request.clone()).await {
+        Err(error) if error.kind == "office_uninitialized" => {
+            // 只有官方明确丢失此办公室才初始化；认证/网络/序号冲突不走此分支。
+            // 初始化确认不是最终快照回执，仍重发完全相同的版本完成核对。
+            client.post(json!({"type":"offices.initialize","offices":[snapshot],"chat":{"url":format!("http://{address}/office/chat")}})).await?;
+            client.post(request).await
+        }
+        result => result,
+    };
+    if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() || receipt.is_err() {
+        let result = receipt
+            .as_ref()
+            .map(|(_, r)| r["status"].as_str().unwrap_or("pending"))
+            .unwrap_or_else(|e| e.kind.as_str());
+        eprintln!("engine-host Office snapshot team={} seq={} bytes={} target={} limit={} tasks={} events={} result={}",
+            team, snapshot["seq"],bytes,OFFICE_MESSAGE_TARGET,OFFICE_MESSAGE_LIMIT,counts.0,counts.1,result);
     }
-    // chat.url是Office进程内状态；重新注册幂等，Node重启后不依赖浏览器重建。
-    if initialized {
-        client.post(json!({"type":"offices.initialize","offices":[],"chat":{"url":format!("http://{address}/office/chat")}})).await?;
-    }
-    let (_, receipt) = client
-        .post(json!({"type":"office.snapshot","teamId":team,"snapshot":snapshot}))
-        .await?;
+    let (_, receipt) = receipt?;
     let state = receipt["status"].as_str().unwrap_or("pending").to_owned();
     if state == "ignored" && receipt["reasonCode"] == "STALE_SEQ" {
         return Err(HostError::new(
@@ -1909,6 +2097,614 @@ async fn sync_internal(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn d142_old_terminal_handoffs_do_not_pin_unbounded_artifact_catalogues() {
+        use openpaw_llm::{MockMode, MockProvider};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({
+            "home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},
+            "provider":"echo","tools":["read_file","write_file"],"agents":{"enabled":true}
+        }))
+        .unwrap();
+        let mut script = Vec::new();
+        for _ in 0..7 {
+            script.extend([
+                MockMode::ToolUse { tool_name:"delegate_task".into(), input:json!({
+                    "role_id":"research","title":"核验交付资料","instructions":"核验资料","acceptance":"返回结果"
+                }),text:String::new() },
+                MockMode::Fixed("核验完成".into()),
+                MockMode::Fixed("汇总完成".into()),
+            ]);
+        }
+        script.push(MockMode::ToolUse {
+            tool_name: "write_file".into(),
+            input: json!({"path":"pending.md","content":"等待原审批"}),
+            text: String::new(),
+        });
+        script.push(MockMode::Fixed("保存完成".into()));
+        let host = Host::with_provider(config, Arc::new(MockProvider::scripted(script)))
+            .await
+            .unwrap();
+        let office = OfficeConfig {
+            activity_window: true,
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "UNUSED".into(),
+            allowed_origins: vec![],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        let mut scopes = Vec::new();
+        for index in 0..7 {
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: format!("history-{index}"),
+            };
+            let binding = host.open_session(scope.clone()).await.unwrap();
+            let run = host
+                .submit_run(
+                    &scope,
+                    &binding.session_id,
+                    format!("核验第{index}组交付资料"),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+                .await
+                .unwrap();
+            let run_id = run.run_id.clone();
+            // 本回归只测目录预算；Store发布真实blob作为有界版本夹具，不假称模型写作。
+            host.inner
+                .store
+                .call(move |db| {
+                    db.artifact_origin("http://127.0.0.1:12345")?;
+                    for version in 0..20 {
+                        let binding = openpaw_core::ToolCallBinding {
+                            run_id: run_id.clone(),
+                            call_id: format!("version-{version}"),
+                            tool_name: "write_file".into(),
+                            input: json!({}),
+                        };
+                        db.capture_artifact(
+                            &binding,
+                            &format!("outputs/history-{index}/file-{}.md", version % 8),
+                            "text/markdown",
+                            format!("第{version}版真实字节").as_bytes(),
+                        )?;
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let snapshot = prepare(&host, &office, "office-1")
+                .await
+                .expect("已结束旧交接不得阻塞后续产物快照");
+            assert!(snapshot_fits_office_message("office-1", &snapshot));
+            let current = snapshot["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == scope.conversation_id)
+                .unwrap();
+            assert_eq!(
+                current["whiteboard"]["result"]["artifacts"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                8
+            );
+            assert_eq!(
+                current["whiteboard"]["deliveries"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                20
+            );
+            scopes.push(scope);
+        }
+        // 新活动会话的真实写入审批仍必须可见；不能以删除在途任务腾容量。
+        let scope = ClientScope {
+            conversation_id: "current".into(),
+            ..scopes[0].clone()
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(&scope, &binding.session_id, "保存需人工确认的资料".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !host
+                    .snapshot_and_subscribe(&scope)
+                    .await
+                    .unwrap()
+                    .0
+                    .pending_approvals
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for restart in [false, true] {
+            if restart {
+                host.inner
+                    .store
+                    .call(|db| {
+                        db.office_projection_source.clear();
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+            }
+            let snapshot = prepare(&host, &office, "office-1")
+                .await
+                .expect("历史重建及恢复不能堵塞当前审批");
+            assert!(snapshot_fits_office_message("office-1", &snapshot));
+            let current = snapshot["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "current")
+                .unwrap();
+            assert_eq!(current["tasks"][0]["id"], format!("run:{}", run.run_id));
+            assert_eq!(current["tasks"][0]["status"], "blocked");
+            assert_eq!(current["employees"].as_array().unwrap().len(), 6);
+            for scope in scopes
+                .iter()
+                .rev()
+                .take(MAX_PROTECTED_BUSINESS_CONVERSATIONS)
+            {
+                assert!(snapshot["conversations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["id"] == scope.conversation_id));
+            }
+            for scope in &scopes {
+                let scope = scope.clone();
+                assert_eq!(
+                    host.inner
+                        .store
+                        .call(move |db| Ok(db.artifacts(&scope)?.0.len()))
+                        .await
+                        .unwrap(),
+                    20,
+                    "退出窗口不能删除原版本"
+                );
+            }
+        }
+        assert!(!root.join("pending.md").exists());
+        host.cancel_run(&scope, &run.run_id).await.unwrap();
+        host.wait_idle().await;
+        host.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn d138_reader_uses_actual_execution_facts_without_fabricating_deliverables() {
+        let tasks = vec![
+            json!({"id":"goal","title":"总目标","status":"running","progress":50,"summary":"实际执行中","assigneeId":"office-lead"}),
+            json!({"id":"done","title":"读取资料","status":"completed","progress":100,"summary":"读取成功","assigneeId":"data-agent"}),
+            json!({"id":"active","title":"编写说明","status":"running","progress":25,"summary":"正在写入","assigneeId":"app-agent"}),
+            json!({"id":"failed","title":"核查来源","status":"failed","progress":0,"summary":"请求失败","assigneeId":"code-agent"}),
+        ];
+        let mut board = json!({"title":"总目标","status":"running","summary":"实际执行中",
+            "steps":[{"id":"done","progress":100},{"id":"active","progress":25},{"id":"failed","progress":0}]});
+        structured_board(&mut board, &tasks);
+        assert_eq!(board["steps"][0]["state"], "done");
+        assert_eq!(board["steps"][1]["state"], "active");
+        assert_eq!(board["steps"][2]["state"], "pending");
+        assert_eq!(board["result"]["tasks"][0]["status"], "doing");
+        assert_eq!(board["result"]["tasks"][1]["status"], "blocked");
+        assert_eq!(board["result"]["tasks"][2]["progress"], 100);
+        assert_eq!(board["result"]["status"], "draft");
+        assert!(board["result"].get("artifacts").is_none());
+        assert!(board.get("deliveries").is_none());
+        assert_eq!(board["result"]["metrics"][0]["value"], "1");
+        assert_eq!(board["detailSections"][0]["blocks"][0]["type"], "text");
+        assert!(
+            board["result"].get("sections").is_none(),
+            "同一执行详情不在过程页重复两次"
+        );
+        let before = board.clone();
+        structured_board(&mut board, &tasks);
+        assert_eq!(before, board);
+    }
+
+    #[test]
+    fn r30_budget_keeps_current_versions_and_never_mutates_history_records() {
+        let artifacts = json!([{"id":"file","versionId":"version2","sha256":"b".repeat(64),"url":"http://127.0.0.1:1/v2"}]);
+        let old = json!({"id":"delivery1","sequence":1,"createdAt":"2026-10-30T00:00:00Z","snapshotUrl":"http://127.0.0.1:1/d1"});
+        let new = json!({"id":"delivery2","sequence":2,"createdAt":"2026-10-30T00:00:01Z","snapshotUrl":"http://127.0.0.1:1/d2"});
+        let mut conversation = json!({"tasks":[{"id":"running","status":"running"}],"events":[{"id":"unpublished-handoff"}],"whiteboard":{"result":{"artifacts":artifacts,"sections":[{"large":"optional"}]},"deliveries":[new.clone(),old.clone()]}});
+        while compact_structured_board(&mut conversation) {}
+        assert_eq!(conversation["whiteboard"]["result"]["artifacts"], artifacts);
+        assert_eq!(conversation["whiteboard"]["deliveries"], json!([new, old]));
+        assert_eq!(conversation["tasks"][0]["id"], "running");
+        assert_eq!(conversation["events"][0]["id"], "unpublished-handoff");
+    }
+
+    #[test]
+    fn d138_optional_reader_content_yields_budget_before_core_tasks_and_events() {
+        let tasks = vec![
+            json!({"id":"goal","title":"目标","status":"completed","progress":100,"summary":"已执行","assigneeId":"office-lead"}),
+        ];
+        let mut board = json!({"title":"目标","status":"completed","summary":"已执行","steps":[]});
+        structured_board(&mut board, &tasks);
+        assert_eq!(
+            board["result"]["status"], "draft",
+            "执行完成不能冒充成果验收"
+        );
+        let mut conversation =
+            json!({"id":"c","tasks":tasks,"events":[{"id":"untouched"}],"whiteboard":board});
+        let facts = conversation.clone();
+        assert!(compact_structured_board(&mut conversation));
+        assert!(compact_structured_board(&mut conversation));
+        assert!(!compact_structured_board(&mut conversation));
+        assert_eq!(conversation["tasks"], facts["tasks"]);
+        assert_eq!(conversation["events"], facts["events"]);
+        assert_eq!(
+            conversation["whiteboard"]["summary"],
+            facts["whiteboard"]["summary"]
+        );
+    }
+
+    #[test]
+    fn d120_retained_terminal_cards_do_not_reserve_unbounded_explanations() {
+        let tasks: Vec<_> = (0..24)
+            .map(|i| {
+                json!({
+                    "id":format!("step:old:{i}"),"title":format!("第{i}项归档成果"),
+                    "status":"completed","progress":100,"assigneeId":"code-agent",
+                    "summary":"完整结果仍保留在原账本，重复摘要不应占满新交接空间。".repeat(40),
+                    "updatedAt":"2026-10-28T00:00:00Z"
+                })
+            })
+            .chain(std::iter::once(
+                json!({"id":"run:current","title":"当前目标",
+            "status":"running","progress":42,"assigneeId":"office-lead",
+            "summary":"正在读取当前资料，等待同事完成核查"}),
+            ))
+            .collect();
+        let prior = json!({"schemaVersion":"1.0","seq":1100,"workspace":{"id":"office-1"},
+            "conversations":[{"id":"c","employees":[{"id":"office-lead","name":"王明"}],
+            "tasks":tasks,"events":[],"whiteboard":{"title":"当前目标","status":"running",
+                "detail":"当前目标详情","steps":[{"id":"run:current","title":"当前目标","progress":42}]}}]});
+        let mut snapshot = prior.clone();
+        compact_history_to_target(
+            "office-1",
+            &mut snapshot,
+            Some(&prior),
+            &BTreeMap::new(),
+            &PublishedHistory::default(),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(
+            &json!({"type":"office.snapshot","teamId":"office-1","snapshot":snapshot}),
+        )
+        .unwrap()
+        .len();
+        assert!(
+            bytes <= OFFICE_MESSAGE_TARGET,
+            "终态卡保留底线不应阻止可选说明收缩：{bytes}"
+        );
+        let current = &snapshot["conversations"][0];
+        assert_eq!(current["tasks"].as_array().unwrap().len(), 25);
+        assert_eq!(current["tasks"][24], prior["conversations"][0]["tasks"][24]);
+        assert_eq!(current["employees"], prior["conversations"][0]["employees"]);
+        assert_eq!(
+            current["whiteboard"]["steps"],
+            prior["conversations"][0]["whiteboard"]["steps"]
+        );
+        for task in current["tasks"].as_array().unwrap().iter().take(24) {
+            assert_eq!(task["status"], "completed");
+            assert_eq!(task["progress"], 100);
+        }
+    }
+
+    #[test]
+    fn d120_normal_budget_archives_history_before_current_explanations() {
+        let conversations: Vec<_> = [35, 52].into_iter().enumerate().map(|(c, count)| {
+            let tasks: Vec<_> = (0..count).map(|i| json!({
+                "id":format!("task-{c}-{i}"),"title":format!("第{i}项独立材料整理"),
+                "status":if i==count-1 {"running"} else {"completed"},
+                "progress":if i==count-1 {42} else {100},"assigneeId":"code-agent",
+                "summary":if i==count-1 {"正在读取当前资料；已核验42%"} else {"已有成果保留，可查看历史详情"},
+                "updatedAt":format!("2026-10-28T00:{i:02}:00Z")
+            })).collect();
+            let events: Vec<_> = (0..count).flat_map(|i| ["task.assigned", "task.completed"].into_iter().map(move |kind| json!({
+                "id":format!("{kind}:{c}:{i}"),"taskId":format!("task-{c}-{i}"),"kind":kind,
+                "employeeId":"code-agent","fromEmployeeId":"office-lead",
+                "summary":"已经公开的任务事件，完整成果继续保存在原始账本中",
+                "occurredAt":format!("2026-10-28T00:{i:02}:00Z")
+            }))).collect();
+            json!({"id":format!("c-{c}"),"title":"多任务持续协作",
+                "employees":[{"id":"code-agent","name":"李研","sceneActorId":"code-agent","role":"检索核验","online":true}],
+                "tasks":tasks,"events":events,"whiteboard":{"title":"当前目标","summary":"当前目标说明必须先于旧事件保留","detail":"当前可读白板详情","steps":[{"id":format!("task-{c}-{}",count-1),"progress":42}]}})
+        }).collect();
+        let prior = json!({"schemaVersion":"1.0","seq":1099,"workspace":{"id":"office-1","name":"预算回归"},"conversations":conversations});
+        let priorities = BTreeMap::from([("c-0".into(), 0), ("c-1".into(), 1)]);
+        let published = PublishedHistory {
+            anchors: ["task.assigned:0:34", "task.assigned:1:51"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            terminal_tasks: [35, 52]
+                .into_iter()
+                .enumerate()
+                .flat_map(|(c, n)| (0..n - 1).map(move |i| format!("task-{c}-{i}")))
+                .collect(),
+        };
+        let mut snapshot = prior.clone();
+        assert!(fit_snapshot_with_history(
+            "office-1",
+            &mut snapshot,
+            Some(&prior),
+            &priorities,
+            &published
+        )
+        .unwrap());
+        let bytes = serde_json::to_vec(
+            &json!({"type":"office.snapshot","teamId":"office-1","snapshot":snapshot}),
+        )
+        .unwrap()
+        .len();
+        assert!(
+            bytes <= 48_000,
+            "有足够旧终态历史时应保留正常预算，实际{bytes}"
+        );
+        for (index, c) in snapshot["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(c["employees"], prior["conversations"][index]["employees"]);
+            assert_eq!(c["whiteboard"], prior["conversations"][index]["whiteboard"]);
+            assert_eq!(
+                c["tasks"].as_array().unwrap().last(),
+                prior["conversations"][index]["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+            );
+        }
+        let fitted = snapshot.clone();
+        assert!(fit_snapshot_with_history(
+            "office-1",
+            &mut snapshot,
+            Some(&fitted),
+            &priorities,
+            &published
+        )
+        .unwrap());
+        assert_eq!(snapshot, fitted, "正常窗口不应每次继续裁剪");
+        // 原账本重建会再次产生被归档事件；没有上次首次观察时间的旧结果
+        // 不能凭新的观察时间挤掉保留下来的近期窗口。
+        let mut rebuilt = prior.clone();
+        for conversation in rebuilt["conversations"].as_array_mut().unwrap() {
+            let seen = fitted["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == conversation["id"])
+                .unwrap();
+            for event in conversation["events"].as_array_mut().unwrap() {
+                if !seen["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["id"] == event["id"])
+                {
+                    event["occurredAt"] = json!("2026-10-28T23:59:59Z");
+                }
+            }
+        }
+        assert!(fit_snapshot_with_history(
+            "office-1",
+            &mut rebuilt,
+            Some(&fitted),
+            &priorities,
+            &published
+        )
+        .unwrap());
+        assert_eq!(
+            rebuilt, fitted,
+            "已归档旧事件不能因新的观察时间重新进入窗口"
+        );
+    }
+
+    #[test]
+    fn d127_hidden_terminal_cards_do_not_pin_unbounded_events_after_stop() {
+        let events: Vec<_> = (0..180)
+            .flat_map(|i| {
+                ["task.assigned", "task.completed"]
+                    .into_iter()
+                    .map(move |kind| {
+                        json!({
+                            "id":format!("{kind}:{i}"),"taskId":format!("old-{i}"),"kind":kind,
+                            "employeeId":"code-agent","fromEmployeeId":"office-lead",
+                            "summary":"已公开的真实成果，完整历史仍保存在原始账本中",
+                            "occurredAt":"2026-10-29T05:00:00Z"
+                        })
+                    })
+            })
+            .collect();
+        let prior = json!({"schemaVersion":"1.0","seq":1295,"workspace":{"id":"office-1","name":"停止后空闲"},
+            "conversations":[{"id":"c","title":"持续协作","employees":[{"id":"office-lead","name":"王明"}],
+            "tasks":[{"id":"run:parent","status":"running"}],"events":events,
+            "whiteboard":{"title":"持续协作","detail":"真实成果与停止原因","steps":[]}}]});
+        let mut snapshot = prior.clone();
+        snapshot["conversations"][0]["tasks"] = json!([]);
+        snapshot["conversations"][0]["whiteboard"]["status"] = json!("failed");
+        let published = PublishedHistory {
+            anchors: BTreeSet::from(["task.assigned:179".into()]),
+            terminal_tasks: (0..180).map(|i| format!("old-{i}")).collect(),
+        };
+        let priorities = BTreeMap::new();
+        assert!(
+            fit_snapshot_with_history(
+                "office-1",
+                &mut snapshot,
+                Some(&prior),
+                &priorities,
+                &published
+            )
+            .unwrap(),
+            "人物当前窗口没有终态卡时，已公开历史也必须能归档，以发出停止终态"
+        );
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+        assert!(snapshot["conversations"][0]["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            snapshot["conversations"][0]["whiteboard"]["status"],
+            "failed"
+        );
+        assert!(snapshot["conversations"][0]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == "task.assigned:179"));
+        let stable = snapshot.clone();
+        compact_history_to_target(
+            "office-1",
+            &mut snapshot,
+            Some(&stable),
+            &priorities,
+            &published,
+        )
+        .unwrap();
+        assert_eq!(snapshot, stable, "已压缩窗口重复处理不得抖动或重放");
+    }
+
+    #[test]
+    fn d127_hidden_first_terminal_and_visible_wait_remain_until_published() {
+        let mut current = json!({"conversations":[{"id":"c","tasks":[{"id":"wait","status":"blocked"}],
+            "events":[{"id":"done:new","taskId":"new","kind":"task.completed","occurredAt":"2026-10-29T05:01:00Z"},
+            {"id":"wait:event","taskId":"wait","kind":"task.blocked","occurredAt":"2026-10-29T05:01:00Z"}],"whiteboard":{"steps":[]}}]});
+        let mut old = current.clone();
+        old["conversations"][0]["tasks"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id":"new","status":"running"}));
+        old["conversations"][0]["events"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let published = PublishedHistory {
+            terminal_tasks: BTreeSet::from(["new".into()]),
+            ..Default::default()
+        };
+        let before = current.clone();
+        assert!(
+            compact_seen_history(&mut current, &old, &BTreeMap::new(), &published)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            current, before,
+            "终态首次公开前不能因人物卡已退场而丢失新结果"
+        );
+        let old = current.clone();
+        assert!(
+            compact_seen_history(&mut current, &old, &BTreeMap::new(), &published)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            current["conversations"][0]["events"],
+            json!([old["conversations"][0]["events"][1]])
+        );
+    }
+
+    #[test]
+    fn d120_new_terminal_event_and_live_waits_are_not_old_history() {
+        let mut current = json!({"conversations":[{"id":"c","tasks":[
+            {"id":"new","status":"completed"},{"id":"wait","status":"blocked"}],"events":[
+            {"id":"done:new","taskId":"new","kind":"task.completed","occurredAt":"2026-10-28T00:01:00Z"},
+            {"id":"wait:event","taskId":"wait","kind":"task.blocked","occurredAt":"2026-10-28T00:01:00Z"}],"whiteboard":{"steps":[]}}]});
+        let mut old = current.clone();
+        old["conversations"][0]["tasks"][0]["status"] = json!("running");
+        old["conversations"][0]["events"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        let published = PublishedHistory {
+            terminal_tasks: BTreeSet::from(["new".into()]),
+            ..Default::default()
+        };
+        let priorities = BTreeMap::new();
+        let before = current.clone();
+        assert!(
+            compact_seen_history(&mut current, &old, &priorities, &published)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(current, before, "新终态结果及当前等待必须先公开");
+        let old = current.clone();
+        assert!(
+            compact_seen_history(&mut current, &old, &priorities, &published)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(current["conversations"][0]["events"][0]["id"], "wait:event");
+    }
+
+    #[test]
+    fn d120_soft_target_yields_to_unpublished_core_but_hard_boundary_does_not() {
+        let tasks:Vec<_>=(0..90).map(|i|json!({"id":format!("new-{i}"),"title":"当前任务",
+            "status":"running","summary":"正在读取资料".repeat(30),"progress":42,"assigneeId":"code-agent"})).collect();
+        let mut snapshot = json!({"schemaVersion":"1.0","seq":1,"workspace":{"id":"office-1"},
+            "conversations":[{"id":"c","employees":[],"tasks":tasks,"events":[],"whiteboard":{}}]});
+        let old = snapshot.clone();
+        let priorities = BTreeMap::new();
+        assert!(fit_snapshot_with_history(
+            "office-1",
+            &mut snapshot,
+            Some(&old),
+            &priorities,
+            &PublishedHistory::default()
+        )
+        .unwrap());
+        assert_eq!(
+            snapshot["conversations"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            90
+        );
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+        for t in snapshot["conversations"][0]["tasks"].as_array().unwrap() {
+            assert!(!t["summary"].as_str().unwrap().is_empty());
+            assert_eq!(t["progress"], 42);
+        }
+        snapshot["conversations"][0]["tasks"] = json!((0..10)
+            .flat_map(|_| old["conversations"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned())
+            .collect::<Vec<_>>());
+        assert!(
+            !fit_snapshot_with_history(
+                "office-1",
+                &mut snapshot,
+                Some(&old),
+                &priorities,
+                &PublishedHistory::default()
+            )
+            .unwrap(),
+            "核心无法容纳时明确失败，不丢弃活动任务"
+        );
+    }
+
     #[test]
     fn d98_activity_targets_do_not_expose_urls_credentials_or_parent_paths() {
         let binding = |name: &str, input| openpaw_core::ToolCallBinding {
@@ -1956,6 +2752,362 @@ mod tests {
     }
     use super::*;
     use crate::{ClientScope, HostConfig};
+
+    #[tokio::test]
+    async fn d131_active_main_tool_keeps_its_real_owner() {
+        for collaboration in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":collaboration}})).unwrap();
+            let host =
+                Host::with_provider(config, Arc::new(openpaw_llm::MockProvider::fixed("unused")))
+                    .await
+                    .unwrap();
+            let binding = host
+                .open_session(ClientScope {
+                    namespace: "office".into(),
+                    slot_id: "office-1".into(),
+                    conversation_id: "ownership".into(),
+                })
+                .await
+                .unwrap();
+            let session_id = binding.session_id.clone();
+            host.inner.store.call(move |db| {
+                let offset = db.events(&binding.session_id)?.len();
+                db.append(&binding.session_id, openpaw_core::SessionEvent::Message(openpaw_core::Message::user_text("核对工作资料")))?;
+                db.append(&binding.session_id, openpaw_core::SessionEvent::RunStarted {run_id:"owner-run".into()})?;
+                db.append(&binding.session_id, openpaw_core::SessionEvent::ToolCallStart {call_id:"owner-read".into(), tool_name:"read_file".into()})?;
+                db.save_run(RunView {run_id:"owner-run".into(),session_id:binding.session_id,state:RunState::Running,revision:0,text:String::new(),error:None,tools:vec![],text_truncated:false}, offset)?;
+                db.bump("tool_started", &json!({"run_id":"owner-run","call_id":"owner-read","tool_name":"read_file","input":{"path":"first.md"}}).to_string())?;
+                Ok(())
+            }).await.unwrap();
+            let office = OfficeConfig {
+                activity_window: true,
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "UNUSED".into(),
+                allowed_origins: vec![],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            let tasks = snapshot["conversations"][0]["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0]["status"], "running");
+            assert_eq!(
+                tasks[0]["assigneeId"],
+                if collaboration {
+                    "office-lead"
+                } else {
+                    "file-agent"
+                },
+                "协作模式不能因工具类型更换实际运行负责人"
+            );
+            if collaboration {
+                assert!(
+                    snapshot["conversations"][0]["events"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty(),
+                    "未委派不能制造另一成员接手事实"
+                );
+            }
+            let details = crate::office::details::render(
+                &host,
+                &ClientScope {
+                    namespace: "office".into(),
+                    slot_id: "office-1".into(),
+                    conversation_id: "ownership".into(),
+                },
+                &session_id,
+                "owner-member",
+                json!({"kind":"member","employeeId":"file-agent","actorId":"file-agent"}),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                details["content"]["fields"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| {
+                        f["label"] == "当前状态"
+                            && f["value"]
+                                == if collaboration {
+                                    "尚无此成员的独立任务"
+                                } else {
+                                    "正在处理已关联的会话操作"
+                                }
+                    }),
+                "成员详情必须与真实负责人及协作模式一致：{details}"
+            );
+            if collaboration {
+                assert!(
+                    !details["content"]["fields"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f["label"] == "已关联操作"),
+                    "不能把主Run工具计入未委派成员详情"
+                );
+            }
+            host.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn r30_optional_reader_history_yields_before_observed_team_events() {
+        let mut conversations: Vec<_> = (0..24).map(|i| json!({
+            "id":format!("old-{i}"),"tasks":[],"events":[],
+            "whiteboard":{"title":"旧目标","detailSections":[{"kind":"custom","id":"details","title":"过程","blocks":[{"type":"text","text":"旧过程说明".repeat(160)}]}]}
+        })).collect();
+        let tasks: Vec<_> = (0..5).map(|i| json!({"id":format!("t-{i}"),"assigneeId":format!("member-{i}"),"status":"completed","progress":100})).collect();
+        let events: Vec<_> = (0..5).flat_map(|i| ["task.assigned","task.started","task.completed"].into_iter().enumerate().map(move |(phase,kind)| json!({"id":format!("{kind}:{i}"),"kind":kind,"taskId":format!("t-{i}"),"summary":"真实观察到的团队执行事实","occurredAt":format!("2026-10-30T08:00:0{phase}Z")}))).collect();
+        conversations.push(
+            json!({"id":"current","tasks":tasks,"events":events,"whiteboard":{"title":"团队目标"}}),
+        );
+        let mut snapshot = json!({"conversations":conversations});
+        let original = snapshot.clone();
+        let priorities: BTreeMap<_, _> = (0..24)
+            .map(|i| (format!("old-{i}"), i))
+            .chain(std::iter::once(("current".into(), 25)))
+            .collect();
+        let published = PublishedHistory {
+            anchors: BTreeSet::new(),
+            terminal_tasks: (0..5).map(|i| format!("t-{i}")).collect(),
+        };
+        assert!(
+            serde_json::to_vec(
+                &json!({"type":"office.snapshot","teamId":"office-1","snapshot":snapshot})
+            )
+            .unwrap()
+            .len()
+                > OFFICE_MESSAGE_TARGET
+        );
+        compact_history_to_target(
+            "office-1",
+            &mut snapshot,
+            Some(&original),
+            &priorities,
+            &published,
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_vec(
+                &json!({"type":"office.snapshot","teamId":"office-1","snapshot":snapshot})
+            )
+            .unwrap()
+            .len()
+                <= OFFICE_MESSAGE_TARGET
+        );
+        assert_eq!(
+            snapshot["conversations"][24], original["conversations"][24],
+            "可选旧阅读器过程不应挤掉当前五人的已公开动态和任务"
+        );
+        assert_ne!(snapshot["conversations"][0], original["conversations"][0]);
+    }
+
+    #[test]
+    fn d114_four_long_conversations_keep_markdown_under_snapshot_pressure() {
+        let conversations: Vec<_> = (0..4).map(|c| {
+            let tasks: Vec<_> = (0..12).map(|i| json!({
+                "id":format!("task-{c}-{i}"),
+                "title":format!("第{i}项{}", "核实资料并保存真实成果😀\"".repeat(3)),
+                "status":if i==0 {"failed"} else {"completed"},
+                "progress":if i==0 {37} else {100},
+                "assigneeId":if i==0 {"office-lead"} else {"review-agent"},
+                "summary":"真实说明与来源核验\n".repeat(40)
+            })).collect();
+            json!({"id":format!("c-{c}"),"title":"真实长会话", "employees":[],"tasks":tasks,
+                "events":[{"id":format!("assignment-{c}"),"kind":"task.assigned","taskId":format!("task-{c}-0"),"summary":"尚未公开的交接"}],
+                "whiteboard":{"template":"task-board-v1","title":"核实资料并保存成果","status":"failed","summary":"本轮未完成",
+                    "detail":whiteboard_detail("核实资料并保存成果", &tasks),
+                    "steps":[{"id":format!("task-{c}-0"),"title":"主任务","progress":37}]}})
+        }).collect();
+        let mut snapshot = json!({"schemaVersion":"1.0","seq":41,"workspace":{"id":"office-1"},"conversations":conversations});
+        let original = snapshot.clone();
+        let priorities = (0..4).map(|i| (format!("c-{i}"), i)).collect();
+        assert!(!snapshot_fits_office_message("office-1", &snapshot));
+        assert!(fit_snapshot_with_history(
+            "office-1",
+            &mut snapshot,
+            None,
+            &priorities,
+            &PublishedHistory::default()
+        )
+        .unwrap());
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+        for (i, conversation) in snapshot["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let detail = conversation["whiteboard"]["detail"].as_str().unwrap();
+            assert!(detail.starts_with("# "), "长会话详情不能被清空而回退旧白板");
+            assert!(detail.contains("王明 · 未完成 · 37%"));
+            assert!(detail.contains("刘市 · 已完成 · 100%"));
+            assert_eq!(
+                conversation["events"],
+                original["conversations"][i]["events"]
+            );
+            assert_eq!(
+                conversation["whiteboard"]["steps"],
+                original["conversations"][i]["whiteboard"]["steps"]
+            );
+            for (a, b) in conversation["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(original["conversations"][i]["tasks"].as_array().unwrap())
+            {
+                for key in ["id", "title", "status", "progress", "assigneeId"] {
+                    assert_eq!(a[key], b[key]);
+                }
+            }
+        }
+        let fitted = snapshot.clone();
+        assert!(fit_snapshot_with_history(
+            "office-1",
+            &mut snapshot,
+            Some(&fitted),
+            &priorities,
+            &PublishedHistory::default()
+        )
+        .unwrap());
+        assert_eq!(snapshot, fitted, "详情回补与重复拟合不能抖动");
+    }
+
+    #[test]
+    fn d114_refill_uses_remaining_envelope_without_mixing_other_runs() {
+        let mut tasks =
+            vec![json!({"id":"run:chat","title":"核验成果","status":"completed","progress":100})];
+        tasks.push(json!({"id":"run:business","title":"核验成果","status":"completed","progress":100,"assigneeId":"office-lead"}));
+        tasks.extend((0..12).map(|i| json!({"id":format!("step:business:{i}"),"title":format!("成果第{i}部分"),"status":"completed","progress":100,"assigneeId":"review-agent","summary":"真实成果说明"})));
+        tasks.push(json!({"id":"run:older","title":"无关的旧业务","status":"failed","progress":0}));
+        let mut conversation = json!({"id":"current","tasks":tasks,"whiteboard":{"title":"核验成果","status":"completed","detail":"","steps":[{"id":"step:business:0"}]}});
+        let short = bounded_whiteboard_detail(&conversation, 3).unwrap();
+        assert!(
+            short.contains("刘市 · 已完成 · 100%"),
+            "同名普通追问不能取代步骤ID对应的业务Run"
+        );
+        assert!(!short.contains("无关的旧业务"));
+        conversation["whiteboard"]["detail"] = json!(short);
+        let mut snapshot = json!({"schemaVersion":"1.0","workspace":{"id":"office-1"},"seq":9007199254740990_u64,"conversations":[conversation,{"id":"archived","tasks":[],"whiteboard":{"title":"旧入口","detail":""}}]});
+        let priorities = BTreeMap::from([("current".into(), 2), ("archived".into(), 1)]);
+        let bytes = serde_json::to_vec(
+            &json!({"type":"office.snapshot","teamId":"office-1","snapshot":snapshot}),
+        )
+        .unwrap()
+        .len();
+        snapshot["padding"] = json!("x".repeat(OFFICE_MESSAGE_LIMIT - bytes - 40));
+        let before = snapshot.clone();
+        refill_whiteboard_details("office-1", &mut snapshot, &priorities).unwrap();
+        assert_eq!(snapshot, before, "余量不足不能挤掉其他内容");
+        snapshot.as_object_mut().unwrap().remove("padding");
+        refill_whiteboard_details("office-1", &mut snapshot, &priorities).unwrap();
+        let detail = snapshot["conversations"][0]["whiteboard"]["detail"]
+            .as_str()
+            .unwrap();
+        assert!(detail.contains("成果第0部分") && detail.contains("成果第11部分"));
+        assert!(
+            detail.contains("## 当前目标\n\n核验成果\n\n"),
+            "说明被裁剪后，当前目标仍须可读"
+        );
+        assert!(!detail.contains("不要改变业务成果") && !detail.contains("无关的旧业务"));
+        assert_eq!(
+            snapshot["conversations"][0]["tasks"],
+            before["conversations"][0]["tasks"]
+        );
+        assert_eq!(snapshot["conversations"][1]["whiteboard"]["detail"], "");
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+        let restored = snapshot.clone();
+        refill_whiteboard_details("office-1", &mut snapshot, &priorities).unwrap();
+        assert_eq!(snapshot, restored);
+    }
+
+    #[test]
+    fn d118_unbounded_wall_tracks_live_work_without_relabelling_old_blocked() {
+        let tasks = vec![
+            json!({"id":"parent","status":"running","progress":75}),
+            json!({"id":"old-done","status":"completed","progress":100}),
+            json!({"id":"old-unverified","status":"blocked","progress":50}),
+            json!({"id":"recent-done","status":"completed","progress":100}),
+            json!({"id":"live-writing","status":"running","progress":40}),
+            json!({"id":"live-approval","status":"blocked","progress":25}),
+            json!({"id":"queued","status":"queued","progress":0}),
+        ];
+        let original = tasks.clone();
+        let active = ["live-writing", "live-approval", "queued"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let ids = |window: Vec<&Value>| {
+            window
+                .iter()
+                .map(|t| t["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(whiteboard_window(&tasks, &active, true)),
+            ["live-writing", "live-approval", "queued"]
+        );
+        assert_eq!(
+            ids(whiteboard_window(&tasks, &active, false)),
+            ["old-done", "old-unverified", "recent-done"],
+            "有限计划不能改变原验收窗口"
+        );
+        let only_writer = ["live-writing".to_owned()].into_iter().collect();
+        assert!(
+            ids(whiteboard_window(&tasks, &only_writer, true)).contains(&"live-writing".to_owned())
+        );
+        assert_eq!(
+            ids(whiteboard_window(&tasks, &BTreeSet::new(), true)),
+            ["live-writing", "live-approval", "queued"],
+            "无在途时保留最近三项原状态"
+        );
+        assert!(whiteboard_window(&tasks[..1], &active, true).is_empty());
+        assert_eq!(tasks, original, "窗口选择不改历史失败/待核验和进度事实");
+    }
+
+    #[test]
+    fn d117_snapshot_pressure_keeps_current_action_and_trims_terminal_detail() {
+        let current = "正在核对来源正文 https://example.org/spec；已核验进度25%";
+        let queued = "已登记委派，等待接受执行";
+        let mut snapshot = json!({
+            "schemaVersion":"1.0", "seq":1, "workspace":{"id":"office-1"},
+            "conversations":[{
+                "id":"current", "employees":[], "events":[], "whiteboard":{"title":"当前任务","detail":""},
+                "tasks":[
+                    {"id":"old","status":"completed","progress":100,"summary":"已归档历史详情".repeat(5000)},
+                    {"id":"live","status":"running","progress":25,"summary":current},
+                    {"id":"wait","status":"queued","progress":0,"summary":queued},
+                    {"id":"approval","status":"blocked","progress":50,"summary":"等待对本次写入操作的确认😀".repeat(100)}
+                ]
+            }]
+        });
+        // 已公开的旧结果可以压缩，当前执行/等待说明不能因为可选而一起消失。
+        assert!(!snapshot_fits_office_message("office-1", &snapshot));
+        assert!(
+            fit_protected_snapshot_details("office-1", &mut snapshot, &BTreeMap::new()).unwrap()
+        );
+        let conversations = snapshot["conversations"].as_array_mut().unwrap();
+        while compact_protected_details(conversations, &BTreeMap::new())
+            .unwrap()
+            .is_some()
+        {}
+        let tasks = &snapshot["conversations"][0]["tasks"];
+        assert!(tasks[0].get("summary").is_none());
+        assert_eq!(tasks[1]["summary"], current, "不能裁掉正在执行的真实动作");
+        assert_eq!(tasks[2]["summary"], queued, "排队不是无声卡死");
+        let waiting = tasks[3]["summary"].as_str().expect("审批说明仍须可见");
+        assert!(!waiting.is_empty());
+        assert!(waiting.encode_utf16().count() <= 96);
+        assert_eq!(tasks[1]["status"], "running");
+        assert_eq!(tasks[1]["progress"], 25);
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+    }
 
     #[test]
     fn incremental_message_budget_matches_full_encoding_through_compaction_and_removal() {
@@ -2068,6 +3220,122 @@ mod tests {
     }
 
     #[test]
+    fn d111_seen_history_cannot_block_six_new_handoffs_or_error_state() {
+        let conversations:Vec<_>=(0..4).map(|c| {
+            let tasks:Vec<_>=(0..32).map(|i|json!({"id":format!("task-{c}-{i}"),"title":format!("真实任务{i}"),"status":"completed","progress":100,"assigneeId":"code-agent","updatedAt":"2026-10-28T00:00:00Z"})).collect();
+            let events:Vec<_>=(0..32).flat_map(|i| ["task.assigned","task.completed"].map(move |kind|json!({"id":format!("{kind}:{c}:{i}"),"taskId":format!("task-{c}-{i}"),"employeeId":"code-agent","fromEmployeeId":"office-lead","kind":kind,"occurredAt":format!("2026-10-28T00:{i:02}:00Z"),"summary":"已保存且可从原账本查询的真实任务结果"}))).collect();
+            json!({"id":format!("c-{c}"),"title":"历史与当前共存","employees":[{"id":"code-agent","name":"李研","sceneActorId":"code-agent","online":true}],"tasks":tasks,"events":events,"whiteboard":{"steps":[]}})
+        }).collect();
+        let mut prior = json!({"schemaVersion":"1.0","seq":21,"workspace":{"id":"office-1","name":"真实测试"},"conversations":conversations});
+        let mut snapshot = prior.clone();
+        for i in 32..38 {
+            snapshot["conversations"][3]["tasks"].as_array_mut().unwrap().push(json!({"id":format!("new-{i}"),"title":"尚未同步的交接","status":"queued","progress":0,"assigneeId":"app-agent"}));
+            snapshot["conversations"][3]["events"].as_array_mut().unwrap().push(json!({"id":format!("assign:new-{i}"),"taskId":format!("new-{i}"),"kind":"task.assigned","employeeId":"app-agent","fromEmployeeId":"code-agent","occurredAt":format!("2026-10-28T01:{i}:00Z"),"summary":"新交接不能因历史占满而丢弃"}));
+        }
+        snapshot["conversations"][3]["tasks"].as_array_mut().unwrap().push(json!({"id":"run:failed","title":"网络故障真实终态","status":"failed","progress":31,"assigneeId":"office-lead"}));
+        let published = PublishedHistory {
+            anchors: (0..4).map(|c| format!("task.assigned:{c}:31")).collect(),
+            terminal_tasks: (0..4)
+                .flat_map(|c| (0..32).map(move |i| format!("task-{c}-{i}")))
+                .collect(),
+        };
+        let rebuilt = snapshot.clone();
+        for container in [&mut prior, &mut snapshot] {
+            for conv in container["conversations"].as_array_mut().unwrap() {
+                for event in conv["events"].as_array_mut().unwrap() {
+                    event["occurredAt"] = json!("2026-10-28T00:00:00Z");
+                }
+                conv["events"]
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+            }
+        }
+        let priorities = (0..4).map(|i| (format!("c-{i}"), i)).collect();
+        assert!(!snapshot_fits_office_message("office-1", &snapshot));
+        assert!(
+            fit_snapshot_with_history(
+                "office-1",
+                &mut snapshot,
+                Some(&prior),
+                &priorities,
+                &published
+            )
+            .unwrap(),
+            "已公开历史不能让新交接与错误终态停更"
+        );
+        assert!(snapshot_fits_office_message("office-1", &snapshot));
+        for id in &published.anchors {
+            assert!(
+                snapshot["conversations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["id"] == *id)),
+                "原委派顺序的最后公开项必须保留，不受同时间/倒序ID影响"
+            );
+        }
+
+        let current = &snapshot["conversations"][3];
+        for i in 32..38 {
+            assert!(current["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == format!("new-{i}") && t["status"] == "queued"));
+            assert!(current["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == format!("assign:new-{i}")));
+        }
+        assert!(current["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == "run:failed" && t["status"] == "failed"));
+        for (i, c) in snapshot["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(c["employees"], prior["conversations"][i]["employees"]);
+        }
+        // 当前已经公开后作为下次裁剪依据，不能依赖删除账本或提升封套上限。
+        prior = snapshot.clone();
+        assert!(fit_snapshot_with_history(
+            "office-1",
+            &mut snapshot,
+            Some(&prior),
+            &priorities,
+            &published
+        )
+        .unwrap());
+        assert_eq!(snapshot, prior);
+        for _ in 0..3 {
+            let mut next = rebuilt.clone();
+            assert!(
+                fit_snapshot_with_history(
+                    "office-1",
+                    &mut next,
+                    Some(&prior),
+                    &priorities,
+                    &published
+                )
+                .unwrap(),
+                "已归档事实重建后不能再次堵塞"
+            );
+            assert!(snapshot_fits_office_message("office-1", &next));
+            prior = next;
+        }
+    }
+
+    #[test]
     fn d101_protected_multiturn_optional_details_cannot_block_approval_snapshot() {
         let members: Vec<_> = crate::agents::ROLES
             .iter()
@@ -2166,14 +3434,11 @@ mod tests {
         newer["events"] = json!([{"id":"old-activity","summary":"可裁剪历史"}]);
         let protected = json!({"id":"current","tasks":[{"id":"real-current","status":"completed","progress":100}]});
         let mut conversations = vec![minimal.clone(), newer, protected.clone()];
-        let eligible = ["oldest".into(), "newer".into()].into_iter().collect();
-        let priorities = [("oldest".into(), 1), ("newer".into(), 2)]
-            .into_iter()
-            .collect();
         assert!(!compact_business_conversation(&mut minimal.clone()));
         let mut prior_size = serde_json::to_vec(&conversations).unwrap().len();
         let mut iterations = 0;
-        while compact_business_history(&mut conversations, &eligible, &priorities) {
+        while conversations.len() > 1 {
+            compact_business_history(&mut conversations, 0);
             let size = serde_json::to_vec(&conversations).unwrap().len();
             assert!(size < prior_size, "每次必须释放真实预算");
             prior_size = size;
@@ -2185,105 +3450,8 @@ mod tests {
         assert_eq!(conversations, vec![protected]);
     }
 
-    fn handoff_fixture(total: usize) -> HandoffItem {
-        let mut child_ids: BTreeSet<_> = ["delegation:research", "delegation:food"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        for i in 2..total {
-            child_ids.insert(format!("delegation:{i}"));
-        }
-        HandoffItem {
-            conversation: "trip".into(),
-            parent_id: "run:lead".into(),
-            child_ids,
-            task: json!({"id":"delegation:food","title":"查美食","status":"completed","progress":100,"summary":"美食已完成"}),
-            assignment: json!({"id":"assign:food","kind":"task.assigned"}),
-            lifecycle: vec![
-                json!({"id":"activity:food:completed","kind":"task.completed","taskId":"delegation:food"}),
-            ],
-            can_complete: true,
-            updates_whiteboard: true,
-        }
-    }
-
-    #[test]
-    fn final_handoff_promotes_completed_lead_card() {
-        let mut conversation = json!({
-            "tasks": [
-                {"id":"run:lead","title":"旅游攻略","status":"blocked","progress":83,"summary":"回复已结束；正在依次展示后续成员交接"},
-                {"id":"delegation:research","title":"查路线","status":"completed","progress":100,"summary":"路线已完成"}
-            ],
-            "events": []
-        });
-        apply_handoff_item(&mut conversation, &handoff_fixture(2), true);
-        assert_eq!(conversation["tasks"][0]["status"], "completed");
-        assert_eq!(conversation["tasks"][0]["progress"], 100);
-        assert_eq!(conversation["whiteboard"]["status"], "completed");
-        assert_eq!(
-            conversation["whiteboard"]["description"],
-            "已确认完成 2/2 步；本次目标已完成"
-        );
-    }
-
-    #[test]
-    fn intermediate_handoff_updates_lead_progress_without_finishing_early() {
-        let mut conversation = json!({
-            "tasks": [
-                {"id":"run:lead","title":"旅游攻略","status":"blocked","progress":16,"summary":"回复已结束；正在依次展示后续成员交接"},
-                {"id":"delegation:research","title":"查路线","status":"completed","progress":100,"summary":"路线已完成"}
-            ],
-            "events": []
-        });
-        apply_handoff_item(&mut conversation, &handoff_fixture(5), false);
-        assert_eq!(conversation["tasks"][0]["status"], "blocked");
-        assert_eq!(conversation["tasks"][0]["progress"], 33);
-        assert_eq!(conversation["whiteboard"]["status"], "blocked");
-        assert_eq!(
-            conversation["whiteboard"]["description"],
-            "已确认完成 2 项；回复已结束；正在依次展示后续成员交接"
-        );
-    }
-
-    #[test]
-    fn queued_handoff_keeps_lifecycle_deduplicated_and_updates_only_its_parent() {
-        let mut conversation = json!({"tasks":[
-            {"id":"run:new","status":"running","progress":0,"summary":"当前追问"},
-            {"id":"run:lead","status":"blocked","progress":33,"summary":"交接中"},
-            {"id":"delegation:research","status":"completed","progress":100}
-        ],"events":[],"whiteboard":{"title":"当前追问","status":"running"}});
-        let current = conversation["tasks"][0].clone();
-        let board = conversation["whiteboard"].clone();
-        let mut item = handoff_fixture(2);
-        item.updates_whiteboard = false;
-        apply_handoff_item(&mut conversation, &item, true);
-        apply_handoff_item(&mut conversation, &item, true);
-        assert_eq!(conversation["tasks"][0], current);
-        assert_eq!(conversation["tasks"][1]["status"], "completed");
-        assert_eq!(conversation["whiteboard"], board);
-        assert_eq!(conversation["events"].as_array().unwrap().len(), 2);
-        assert!(conversation["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["kind"] == "task.completed"));
-    }
-
-    #[test]
-    fn queued_handoff_never_promotes_unverified_failed_or_cancelled_parent() {
-        for state in ["blocked", "failed", "cancelled"] {
-            let parent = json!({"id":"run:lead","title":"核查","status":state,"progress":50,"summary":"保留真实状态"});
-            let mut conversation = json!({"tasks":[parent.clone(),{"id":"delegation:research","status":"completed","progress":100}],"events":[]});
-            let mut item = handoff_fixture(2);
-            item.can_complete = false;
-            apply_handoff_item(&mut conversation, &item, true);
-            assert_eq!(conversation["tasks"][0], parent);
-            assert_eq!(conversation["whiteboard"]["status"], state);
-        }
-    }
-
     #[tokio::test]
-    async fn pending_handoff_survives_new_revision_and_restart_without_replaying() {
+    async fn completed_delegations_survive_new_revision_and_restart_without_replaying() {
         use openpaw_llm::mock::{MockMode, MockProvider};
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -2324,6 +3492,7 @@ mod tests {
             RunState::Completed
         );
         let office = OfficeConfig {
+            activity_window: false,
             base_url: "http://127.0.0.1:9".into(),
             api_key_env: "UNUSED".into(),
             allowed_origins: vec![],
@@ -2340,8 +3509,8 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        assert_eq!(trip(&first)["tasks"].as_array().unwrap().len(), 2);
-        // 新绑定增加事实revision，但没有新的协作事实，不应跳过尚未公开成员。
+        assert_eq!(trip(&first)["tasks"].as_array().unwrap().len(), 3);
+        // 新绑定增加事实revision，但没有新的协作事实，不应重写交接。
         host.open_session(ClientScope {
             conversation_id: "unrelated".into(),
             ..scope.clone()
@@ -2349,18 +3518,7 @@ mod tests {
         .await
         .unwrap();
         let rebuilt = prepare(&host, &office, "office-1").await.unwrap();
-        assert_eq!(trip(&rebuilt)["tasks"].as_array().unwrap().len(), 2);
-        host.inner
-            .store
-            .call(|db| {
-                db.office_projection_handoff_until.insert(
-                    "office-1".into(),
-                    chrono::Utc::now() - chrono::Duration::seconds(1),
-                );
-                Ok(())
-            })
-            .await
-            .unwrap();
+        assert_eq!(trip(&rebuilt)["tasks"].as_array().unwrap().len(), 3);
         let final_snapshot = prepare(&host, &office, "office-1").await.unwrap();
         let final_trip = trip(&final_snapshot);
         assert_eq!(final_trip["tasks"][0]["status"], "completed");
@@ -2373,20 +3531,17 @@ mod tests {
                 .count(),
             2
         );
-        // 模拟重启丢失进程内基线/队列，持久快照中的旧终态不重新排队。
+        // 模拟重启丢失进程内基线，持久快照中的旧交接保持身份。
         host.inner
             .store
             .call(|db| {
                 db.office_projection_source.clear();
-                db.office_projection_handoff_until.clear();
                 Ok(())
             })
             .await
             .unwrap();
-        host.inner.office_handoff_queue.lock().unwrap().clear();
         let restored = prepare(&host, &office, "office-1").await.unwrap();
         assert_eq!(trip(&restored)["tasks"][0]["status"], "completed");
-        assert!(host.inner.office_handoff_queue.lock().unwrap().is_empty());
         let assignments = |c: &Value| {
             c["events"]
                 .as_array()
@@ -2417,11 +3572,466 @@ mod tests {
     }
 
     #[test]
-    fn newly_completed_run_keeps_sequential_handoff_window() {
+    fn terminal_history_requires_an_actual_previous_fact_revision() {
         assert!(!is_historical_terminal(12, None));
         assert!(!is_historical_terminal(12, Some(11)));
         assert!(is_historical_terminal(12, Some(12)));
         assert!(is_historical_terminal(11, Some(12)));
+    }
+
+    #[tokio::test]
+    async fn d123_queued_cards_are_visible_but_handoffs_follow_actual_execution() {
+        d123_verify_execution_queue(["organize", "organize", "organize"], false).await;
+    }
+
+    #[tokio::test]
+    async fn d123_cross_role_start_does_not_publish_another_members_queued_handoff() {
+        d123_verify_execution_queue(["organize", "organize", "audit"], false).await;
+    }
+
+    #[tokio::test]
+    async fn d123_cancelling_queued_work_does_not_invent_a_handoff() {
+        d123_verify_execution_queue(["organize", "organize", "organize"], true).await;
+    }
+
+    async fn d123_verify_execution_queue(roles: [&str; 3], cancel: bool) {
+        use openpaw_core::LlmProvider;
+        use openpaw_llm::{MockMode, MockProvider};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Gate {
+            parent: MockProvider,
+            parent_requests: AtomicUsize,
+            parent_release: tokio::sync::Semaphore,
+            entered: [AtomicUsize; 3],
+            release: [tokio::sync::Semaphore; 3],
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for Gate {
+            async fn complete(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+                self.parent.complete(request).await
+            }
+            async fn stream(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    openpaw_core::Result<openpaw_core::StreamEvent>,
+                >,
+            > {
+                let child = request
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.content)
+                    .find_map(|block| {
+                        let openpaw_core::ContentBlock::Text { text } = block else {
+                            return None;
+                        };
+                        text.lines().find_map(|line| {
+                            line.strip_prefix("要求：d123-child-")
+                                .and_then(|i| i.parse::<usize>().ok())
+                        })
+                    });
+                if let Some(index) = child {
+                    self.entered[index].fetch_add(1, Ordering::SeqCst);
+                    self.release[index].acquire().await.unwrap().forget();
+                    return MockProvider::fixed(format!("独立成果{index}已完成"))
+                        .stream(request)
+                        .await;
+                }
+                if self.parent_requests.fetch_add(1, Ordering::SeqCst) == 3 {
+                    self.parent_release.acquire().await.unwrap().forget();
+                }
+                self.parent.stream(request).await
+            }
+            fn capabilities(&self) -> openpaw_core::Capabilities {
+                self.parent.capabilities()
+            }
+            fn default_model(&self) -> &str {
+                self.parent.default_model()
+            }
+            fn name(&self) -> &str {
+                "d123-execution-gate"
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":[],"agents":{"enabled":true}})).unwrap();
+        let provider = Arc::new(Gate {
+            parent: MockProvider::scripted((0..3).map(|i| MockMode::ToolUse {
+                tool_name: "delegate_task".into(),
+                input: json!({"role_id":roles[i],"title":format!("独立待办{i}"),"instructions":format!("d123-child-{i}"),"acceptance":"返回真实有限成果","wait_for_completion":false}),
+                text: String::new(),
+            }).chain(std::iter::once(MockMode::Fixed("三份真实成果已收齐".into()))).collect()),
+            parent_requests: AtomicUsize::new(0),
+            parent_release: tokio::sync::Semaphore::new(0),
+            entered: std::array::from_fn(|_| AtomicUsize::new(0)),
+            release: std::array::from_fn(|_| tokio::sync::Semaphore::new(0)),
+        });
+        let host = Host::with_provider(config, provider.clone()).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "d123".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let parent = host
+            .submit_run(&scope, &binding.session_id, "依次处理三个独立待办".into())
+            .await
+            .unwrap();
+        let initial: BTreeSet<_> = roles
+            .iter()
+            .enumerate()
+            .filter(|(index, role)| !roles[..*index].contains(role))
+            .map(|(index, _)| index)
+            .collect();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while provider.parent_requests.load(Ordering::SeqCst) < 4
+                || initial
+                    .iter()
+                    .any(|&index| provider.entered[index].load(Ordering::SeqCst) == 0)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let office = OfficeConfig {
+            activity_window: false,
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "UNUSED".into(),
+            allowed_origins: vec![],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        let conversation = |s: &Value| {
+            s["conversations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == "d123")
+                .unwrap()
+                .clone()
+        };
+        let assignments = |c: &Value| {
+            c["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "task.assigned")
+                .map(|e| {
+                    (
+                        e["id"].as_str().unwrap().to_owned(),
+                        e["occurredAt"].clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let first = prepare(&host, &office, "office-1").await.unwrap();
+        let c = conversation(&first);
+        assert_eq!(
+            c["tasks"].as_array().unwrap().len(),
+            4,
+            "三个真实委派卡须立即可见，不能等待动画定时器"
+        );
+        assert_eq!(
+            c["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t["status"] == "queued")
+                .count(),
+            3 - initial.len()
+        );
+        let mut previous = assignments(&c);
+        assert_eq!(
+            previous.len(),
+            initial.len(),
+            "尚在成员FIFO等待的任务不能提前消费交接"
+        );
+        let unchanged = prepare(&host, &office, "office-1").await.unwrap();
+        assert_eq!(unchanged, first, "没有事实变化不能靠时间推进交接");
+        // 在队列尚未出队时清掉重启可丢失的基线，也不能凭后续角色的事件
+        // 推断中间排队任务已经交接。旧事件身份和时间必须保持。
+        host.open_session(ClientScope {
+            conversation_id: "d123-unrelated-active".into(),
+            ..scope.clone()
+        })
+        .await
+        .unwrap();
+        host.inner
+            .store
+            .call(|db| {
+                db.office_projection_source.clear();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            assignments(&conversation(
+                &prepare(&host, &office, "office-1").await.unwrap()
+            )),
+            previous
+        );
+        if cancel {
+            host.cancel_run(&scope, &parent.run_id).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+                .await
+                .unwrap();
+            let cancelled = prepare(&host, &office, "office-1").await.unwrap();
+            assert_eq!(
+                assignments(&conversation(&cancelled)),
+                previous,
+                "未实际开工的取消项不得生成交接"
+            );
+            assert_eq!(provider.entered[1].load(Ordering::SeqCst), 0);
+            assert_eq!(provider.entered[2].load(Ordering::SeqCst), 0);
+            host.shutdown().await.unwrap();
+            return;
+        }
+        for index in 0..3 {
+            provider.release[index].add_permits(1);
+            let next = (index + 1..3).find(|&next| roles[next] == roles[index]);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let id = parent.run_id.clone();
+                    let done = host
+                        .inner
+                        .store
+                        .call(move |db| {
+                            let d = db.delegations(&id)?;
+                            Ok(db.get_run_projection(&d[index].child_run)?.state
+                                == RunState::Completed)
+                        })
+                        .await
+                        .unwrap();
+                    if done
+                        && next.is_none_or(|next| provider.entered[next].load(Ordering::SeqCst) > 0)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            let current = assignments(&conversation(&snapshot));
+            let actual_started = provider
+                .entered
+                .iter()
+                .filter(|count| count.load(Ordering::SeqCst) > 0)
+                .count();
+            assert_eq!(
+                current.len(),
+                actual_started,
+                "交接必须逐项对应真实模型入口，不能根据委派前缀猜测"
+            );
+            for (id, time) in &previous {
+                assert_eq!(current.get(id), Some(time), "已有交接身份及时间不能重写");
+            }
+            previous = current;
+        }
+        provider.parent_release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let final_snapshot = prepare(&host, &office, "office-1").await.unwrap();
+        assert!(conversation(&final_snapshot)["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["status"] == "completed" && t["progress"] == 100));
+        assert_eq!(assignments(&conversation(&final_snapshot)), previous);
+        host.open_session(ClientScope {
+            conversation_id: "unrelated-d123".into(),
+            ..scope.clone()
+        })
+        .await
+        .unwrap();
+        let rebuilt = prepare(&host, &office, "office-1").await.unwrap();
+        assert_eq!(assignments(&conversation(&rebuilt)), previous);
+        host.inner
+            .store
+            .call(|db| {
+                db.office_projection_source.clear();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let restored = prepare(&host, &office, "office-1").await.unwrap();
+        assert_eq!(assignments(&conversation(&restored)), previous);
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn d115_unbounded_work_does_not_reuse_initial_plan_or_rewrite_its_evidence() {
+        use openpaw_llm::{MockMode, MockProvider};
+        struct Gate {
+            inner: MockProvider,
+            requests: std::sync::atomic::AtomicUsize,
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl openpaw_core::LlmProvider for Gate {
+            async fn complete(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+                self.inner.complete(request).await
+            }
+            async fn stream(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    openpaw_core::Result<openpaw_core::StreamEvent>,
+                >,
+            > {
+                if self
+                    .requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 2
+                {
+                    self.entered.notify_one();
+                    self.release.acquire().await.unwrap().forget();
+                }
+                self.inner.stream(request).await
+            }
+            fn capabilities(&self) -> openpaw_core::Capabilities {
+                self.inner.capabilities()
+            }
+            fn default_model(&self) -> &str {
+                self.inner.default_model()
+            }
+            fn name(&self) -> &str {
+                "d115-stage-gate"
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":[],"agents":{"enabled":true}})).unwrap();
+        let provider = std::sync::Arc::new(Gate {
+            inner: MockProvider::scripted(vec![
+                MockMode::ToolUse {
+                    tool_name: "delegate_task".into(),
+                    input: json!({"role_id":"organize","title":"整理已给定材料","instructions":"只整理本任务数据","acceptance":"有限文本"}),
+                    text: String::new(),
+                },
+                MockMode::Fixed("已完成本项材料整理，不声称写文件".into()),
+                MockMode::Fixed("下一阶段".into()),
+            ]),
+            requests: std::sync::atomic::AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let host = Host::with_provider(config, provider.clone()).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "d115-continuous".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(
+                &scope,
+                &binding.session_id,
+                "持续处理独立事项直到停止".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+            .await
+            .unwrap();
+        let id = run.run_id.clone();
+        // 模拟真实旧记录：启动期固定计划没有更新，但有限子执行已有可靠成果。
+        // 不用模型最终文字或回写成功来“修好”这些待核验事实。
+        host.inner.store.call(move |db| {
+            db.bump("run_progress", &json!({"run_id":id,"steps":[{"id":"initial","title":"启动期固定步骤","state":"in_progress","evidenceCallIds":[]}]}).to_string())?;
+            let state = crate::continuous::State { version:1, run_id:id, started:true, active:true, goal:"持续处理独立事项直到停止".into(), ..Default::default() };
+            db.bump("continuous_task", &serde_json::to_string(&state).map_err(HostError::storage)?)?;
+            Ok(())
+        }).await.unwrap();
+        let office = OfficeConfig {
+            activity_window: false,
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "UNUSED".into(),
+            allowed_origins: vec![],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+        let tasks = snapshot["conversations"][0]["tasks"].as_array().unwrap();
+        assert_eq!(
+            tasks.len(),
+            2,
+            "无限主目标不能重新展示启动期固定步骤；真实子任务必须保留"
+        );
+        assert_eq!(
+            tasks[0]["status"], "running",
+            "阶段成果不等于整个持续目标完成"
+        );
+        assert_eq!(
+            tasks[0]["progress"], 99,
+            "保留已有子成果，主目标未结束不能提前100%"
+        );
+        assert_eq!(tasks[1]["status"], "completed");
+        assert_eq!(tasks[1]["progress"], 100);
+        let id = run.run_id.clone();
+        host.inner.store.call(move |db| {
+            let d = db.delegations(&id)?.remove(0);
+            db.bump("run_progress", &json!({"run_id":d.child_run,"steps":[{"id":"unverified","title":"保存 outputs/unverified.md","state":"pending","evidenceCallIds":[]}]}).to_string())?;
+            Ok(())
+        }).await.unwrap();
+        let blocked = prepare(&host, &office, "office-1").await.unwrap();
+        assert_eq!(
+            blocked["conversations"][0]["tasks"][0]["status"], "running",
+            "历史子计划待核验不能伪称整个持续主Run阻塞"
+        );
+        assert_eq!(
+            blocked["conversations"][0]["tasks"][1]["status"], "blocked",
+            "不能把缺少真实文件证据的子执行改为成功"
+        );
+        let id = run.run_id.clone();
+        host.inner
+            .store
+            .call(move |db| {
+                assert_eq!(
+                    db.progress(&id)?.unwrap()["steps"][0]["state"],
+                    "in_progress"
+                );
+                let mut state = db.continuous_state(&id)?.unwrap();
+                state.completion_condition = Some("有限任务完成并验收".into());
+                db.bump(
+                    "continuous_task",
+                    &serde_json::to_string(&state).map_err(HostError::storage)?,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let finite = prepare(&host, &office, "office-1").await.unwrap();
+        assert!(
+            finite["conversations"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["title"] == "启动期固定步骤"),
+            "有限持续任务仍按原计划验收"
+        );
+        provider.release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -2530,6 +4140,7 @@ mod tests {
             .await
             .unwrap();
         let office = OfficeConfig {
+            activity_window: false,
             base_url: "http://127.0.0.1:9".into(),
             api_key_env: "PAWOFFICE_TEST_KEY".into(),
             allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -2547,6 +4158,14 @@ mod tests {
             "一项真实读取完成、整理尚在途，不能只报0或随时间增长"
         );
         assert!(child["summary"].as_str().unwrap().contains("整理第一部分"));
+        assert!(
+            tasks[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("团队进展 · 李研："),
+            "主卡引用子动作必须标真实负责人，不能显示为王明本人执行：{}",
+            tasks[0]["summary"]
+        );
         provider.release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
             .await
@@ -2590,8 +4209,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_parent_acceptance_converges_internal_child_plan_but_cannot_fake_file_or_missing_acceptance(
-    ) {
+    async fn d139_parent_verified_plan_and_child_execution_have_separate_denominators() {
+        use openpaw_llm::{MockMode, MockProvider};
+        for confirm in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("brief.md"), "真实待核对资料").unwrap();
+            let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+            let call = |name: &str, input| MockMode::ToolUse {
+                tool_name: name.into(),
+                input,
+                text: String::new(),
+            };
+            let mut script = vec![
+                call(
+                    "report_progress",
+                    json!({"type":"create","steps":[{"id":"accept","title":"核对两位同事结果及实际资料"}]}),
+                ),
+                call(
+                    "delegate_task",
+                    json!({"role_id":"organize","title":"核对第一部分","instructions":"读取brief.md","acceptance":"真实有限核对"}),
+                ),
+                call("read_file", json!({"path":"brief.md"})),
+                MockMode::Fixed("第一部分已实际读取并完成核对".into()),
+                call(
+                    "delegate_task",
+                    json!({"role_id":"research","title":"核对第二部分","instructions":"读取brief.md","acceptance":"真实有限核对"}),
+                ),
+                call("read_file", json!({"path":"brief.md"})),
+                MockMode::Fixed("第二部分已实际读取并完成核对".into()),
+                call("read_file", json!({"path":"brief.md"})),
+            ];
+            if confirm {
+                // 父计划以自身最终读回证据验收，不必将每个中间委派ID再重复登记。
+                script.push(call("report_progress",json!({"type":"update","stepId":"accept","state":"completed","evidenceCallIds":["call_7"]})));
+            }
+            script.push(MockMode::Fixed("两项结果已收齐，实际资料核对完毕".into()));
+            let host =
+                Host::with_provider(config, std::sync::Arc::new(MockProvider::scripted(script)))
+                    .await
+                    .unwrap();
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "d139".into(),
+            };
+            let session = host.open_session(scope.clone()).await.unwrap();
+            let run = host
+                .submit_run(&scope, &session.session_id, "核对两份独立结果".into())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+                .await
+                .unwrap();
+            assert_eq!(
+                host.get_run(&scope, &run.run_id).await.unwrap().state,
+                RunState::Completed
+            );
+            let mut office = OfficeConfig {
+                activity_window: false,
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "UNUSED".into(),
+                allowed_origins: vec![],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+            let conv = &snapshot["conversations"][0];
+            assert_eq!(
+                conv["tasks"][0]["status"],
+                if confirm { "completed" } else { "blocked" },
+                "子执行完成和父业务验收分别计数，confirm={confirm}"
+            );
+            assert_eq!(conv["tasks"][0]["progress"] == 100, confirm);
+            for child in conv["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t["assigneeId"] != "office-lead")
+            {
+                assert_eq!(child["status"], "completed");
+                assert_eq!(child["progress"], 100);
+            }
+            assert_eq!(
+                conv["whiteboard"]["status"],
+                if confirm { "completed" } else { "blocked" }
+            );
+            // 生产活动窗口只隐藏已结束人物卡，不能改变白板的业务验收事实。
+            office.activity_window = true;
+            host.inner
+                .store
+                .call(|db| {
+                    db.office_projection_source.clear();
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let current = prepare(&host, &office, "office-1").await.unwrap();
+            assert_eq!(
+                current["conversations"][0]["whiteboard"]["status"],
+                conv["whiteboard"]["status"]
+            );
+            assert!(current["conversations"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            host.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_parent_acceptance_is_separate_from_finite_text_execution_and_file_gates() {
         use openpaw_llm::{MockMode, MockProvider};
         for (title, confirm, accepted) in [
             ("核对给定正文", true, true),
@@ -2651,6 +4380,7 @@ mod tests {
                 .await
                 .unwrap();
             let office = OfficeConfig {
+                activity_window: false,
                 base_url: "http://127.0.0.1:9".into(),
                 api_key_env: "PAWOFFICE_TEST_KEY".into(),
                 allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -2672,10 +4402,10 @@ mod tests {
                 .find(|t| t["assigneeId"] == "file-agent")
                 .unwrap();
             assert_eq!(
-                child["status"],
-                if accepted { "completed" } else { "blocked" }
+                child["status"], "completed",
+                "有限文本执行已经结束，父验收门禁由上面的父卡单独保持"
             );
-            assert_eq!(child["progress"] == 100, accepted);
+            assert_eq!(child["progress"], 100);
             assert!(!root.join("notes.md").exists());
             host.shutdown().await.unwrap();
         }
@@ -2736,6 +4466,7 @@ mod tests {
                 .await
                 .unwrap();
             let office = OfficeConfig {
+                activity_window: false,
                 base_url: "http://127.0.0.1:9".into(),
                 api_key_env: "PAWOFFICE_TEST_KEY".into(),
                 allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -2834,6 +4565,7 @@ mod tests {
             .await
             .unwrap();
         let office = OfficeConfig {
+            activity_window: false,
             base_url: "http://127.0.0.1:9".into(),
             api_key_env: "PAWOFFICE_TEST_KEY".into(),
             allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -2973,6 +4705,7 @@ mod tests {
             };
             let binding = host.open_session(scope.clone()).await.unwrap();
             let office = OfficeConfig {
+                activity_window: false,
                 base_url: "http://127.0.0.1:9".into(),
                 api_key_env: "PAWOFFICE_TEST_KEY".into(),
                 allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -3002,7 +4735,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), provider.entered.notified())
                 .await
                 .unwrap();
-            // 交接动画按顺序公开；等待第二个任务在前一事件的动画窗口后出现。
+            // 等待真实执行事实同步；不按动画时长推迟任务卡。
             let awaiting_review = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     let candidate = prepare(&host, &office, "office-1").await.unwrap();
@@ -3028,8 +4761,8 @@ mod tests {
                     .unwrap();
                 assert!(own["id"].as_str().unwrap().starts_with("delegation:"));
                 assert_eq!(
-                    own["status"], "blocked",
-                    "子执行结束后等待主角色核验，不能继续显示运行中或伪造已验收"
+                    own["status"], "completed",
+                    "子执行已完成，父业务步骤仍由下方未完成断言单独约束"
                 );
                 assert_eq!(own["progress"], 100);
             }
@@ -3077,12 +4810,8 @@ mod tests {
                     assert_eq!(own.len(), 1, "每位同事保留自己的真实任务");
                     assert!(own[0]["id"].as_str().unwrap().starts_with("delegation:"));
                     assert_eq!(
-                        own[0]["status"],
-                        if second_evidence == "call_2_0" && employee == "file-agent" {
-                            "blocked"
-                        } else {
-                            "completed"
-                        }
+                        own[0]["status"], "completed",
+                        "人物有限执行完成；父步骤仍由独立证据决定"
                     );
                     for event in conv["events"]
                         .as_array()
@@ -3349,6 +5078,7 @@ mod tests {
                 .await
                 .unwrap();
             let office = OfficeConfig {
+                activity_window: false,
                 base_url: "http://127.0.0.1:9".into(),
                 api_key_env: "PAWOFFICE_TEST_KEY".into(),
                 allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -3444,8 +5174,8 @@ mod tests {
                         "无准确替代证据时保留两次真实任务，不抹去失败尝试"
                     );
                     assert!(
-                        attempts.iter().any(|t| t["status"] == "blocked"),
-                        "后次真实执行结束仍待业务核验"
+                        attempts.iter().any(|t| t["status"] == "completed"),
+                        "后次真实执行完成，父业务仍须核验"
                     );
                     assert!(
                         attempts.iter().any(|t| t["status"] == "failed"),
@@ -3463,7 +5193,7 @@ mod tests {
                     .unwrap()
                     .iter()
                     .position(|task| {
-                        task["assigneeId"] == "code-agent" && task["status"] == "blocked"
+                        task["assigneeId"] == "code-agent" && task["status"] == "completed"
                     })
                     .unwrap();
                 assert_eq!(
@@ -3488,14 +5218,24 @@ mod tests {
                 .collect();
             assert_eq!(
                 completions.len(),
-                usize::from(confirm),
-                "执行结束不能伪造核验完成事件；仅确认的证据产生完成动态"
+                1,
+                "成功有限执行产生执行完成动态，摘要必须区分父验收"
             );
             if let Some(event) = completions.first() {
                 assert_eq!(event["employeeId"], "code-agent");
-                let child_index = if confirm { 1 } else { 3 };
-                assert_eq!(event["taskId"], conv["tasks"][child_index]["id"]);
-                assert!(event["summary"].as_str().unwrap().contains("已核验"));
+                let completed_task = conv["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|task| task["id"] == event["taskId"])
+                    .expect("完成动态必须引用真实任务");
+                assert_eq!(completed_task["status"], "completed");
+                assert_eq!(completed_task["assigneeId"], "code-agent");
+                assert!(event["summary"].as_str().unwrap().contains(if confirm {
+                    "已核验"
+                } else {
+                    "父目标待验收"
+                }));
             }
             if retry {
                 let session_id = session.session_id.clone();
@@ -3591,6 +5331,7 @@ mod tests {
             .await
             .unwrap();
         let office = OfficeConfig {
+            activity_window: false,
             base_url: "http://127.0.0.1:9".into(),
             api_key_env: "UNUSED".into(),
             allowed_origins: vec![],
@@ -3645,6 +5386,12 @@ mod tests {
         assert_eq!(snapshot["conversations"].as_array().unwrap().len(), 4);
         for c in snapshot["conversations"].as_array().unwrap() {
             assert_eq!(c["employees"].as_array().unwrap().len(), 6);
+            assert!(
+                c["whiteboard"]["detail"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("# ") && text.contains("## 任务进度")),
+                "正式四会话模式必须保留可点击Markdown详情，不能仅验小目录"
+            );
             assert_eq!(
                 c["tasks"].as_array().unwrap().len(),
                 39,
@@ -3696,6 +5443,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn d130_business_title_and_live_detail_stay_separate_for_real_members() {
+        use openpaw_llm::{MockMode, MockProvider};
+        use std::sync::{atomic::AtomicUsize, atomic::Ordering, Arc};
+        struct Paused {
+            inner: MockProvider,
+            calls: AtomicUsize,
+            ready: tokio::sync::Notify,
+            release: tokio::sync::Semaphore,
+        }
+        #[async_trait::async_trait]
+        impl openpaw_core::LlmProvider for Paused {
+            async fn complete(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+                self.inner.complete(request).await
+            }
+            async fn stream(
+                &self,
+                request: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    openpaw_core::Result<openpaw_core::StreamEvent>,
+                >,
+            > {
+                if matches!(self.calls.fetch_add(1, Ordering::SeqCst), 2..=4) {
+                    self.ready.notify_one();
+                    self.release.acquire().await.unwrap().forget();
+                }
+                self.inner.stream(request).await
+            }
+            fn capabilities(&self) -> openpaw_core::Capabilities {
+                self.inner.capabilities()
+            }
+            fn default_model(&self) -> &str {
+                self.inner.default_model()
+            }
+            fn name(&self) -> &str {
+                "d130-paused"
+            }
+        }
+        for role in ["organize", "draft", "research", "review", "audit"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            for file in ["first.md", "second.md"] {
+                std::fs::write(root.join(file), "可核对的真实资料").unwrap();
+            }
+            let call = |name: &str, input| MockMode::ToolUse {
+                tool_name: name.into(),
+                input,
+                text: String::new(),
+            };
+            let provider = Arc::new(Paused {
+                inner: MockProvider::scripted(vec![
+                    call(
+                        "delegate_task",
+                        json!({"role_id":role,"title":"复核资料","instructions":"核对两份文件","acceptance":"有限核对结果"}),
+                    ),
+                    call("read_file", json!({"path":"first.md"})),
+                    call("read_file", json!({"path":"second.md"})),
+                    MockMode::Fixed("两份资料均已核对".into()),
+                    MockMode::Fixed("汇总核对结果".into()),
+                ]),
+                calls: AtomicUsize::new(0),
+                ready: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            });
+            let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":["read_file"],"agents":{"enabled":true}})).unwrap();
+            let host = Host::with_provider(config, provider.clone()).await.unwrap();
+            let scope = ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "d130".into(),
+            };
+            let session = host.open_session(scope.clone()).await.unwrap();
+            let parent = host
+                .submit_run(
+                    &scope,
+                    &session.session_id,
+                    "完成资料核对\n\n请在当前单一对话中持续工作，此段是操作约束而不是标题".into(),
+                )
+                .await
+                .unwrap();
+            let office = OfficeConfig {
+                activity_window: true,
+                base_url: "http://127.0.0.1:9".into(),
+                api_key_env: "UNUSED".into(),
+                allowed_origins: vec![],
+                names: Default::default(),
+                creation_slots: vec![],
+            };
+            let employee = crate::agents::role(role).unwrap().employee;
+            let mut previous: Option<Value> = None;
+            for file in ["first.md", "second.md"] {
+                tokio::time::timeout(Duration::from_secs(5), provider.ready.notified())
+                    .await
+                    .unwrap();
+                let snapshot = prepare(&host, &office, "office-1").await.unwrap();
+                let conv = &snapshot["conversations"][0];
+                let item = conv["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|t| t["assigneeId"] == employee)
+                    .unwrap();
+                assert_eq!(item["title"], "复核资料", "粗体业务标题不能变成工具动作");
+                assert_eq!(
+                    item["status"], "running",
+                    "等待下一次模型响应仍是独立执行在途"
+                );
+                assert!(
+                    item["summary"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(&format!("刚完成：读取 {file}")),
+                    "灰色说明须以真实最近工具开头"
+                );
+                assert_eq!(conv["tasks"][0]["title"], "完成资料核对");
+                let shown = super::super::turns::display(
+                    &host,
+                    &host.get_run(&scope, &parent.run_id).await.unwrap(),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    shown.contains(crate::agents::role(role).unwrap().name)
+                        && shown.contains("复核资料")
+                        && shown.contains("正在执行"),
+                    "正常团队节点必须进入聊天，不能等待主模型转述：{shown}"
+                );
+                if let Some(old) = &previous {
+                    assert_eq!(old["conversations"][0]["tasks"][1]["id"], item["id"]);
+                    let assignments = |v: &Value| {
+                        v["conversations"][0]["events"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|e| e["kind"] == "task.assigned")
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        assignments(old),
+                        assignments(&snapshot),
+                        "动作变化不新增或重播交接"
+                    );
+                }
+                previous = Some(snapshot);
+                provider.release.add_permits(1);
+            }
+            tokio::time::timeout(Duration::from_secs(5), provider.ready.notified())
+                .await
+                .unwrap();
+            let parent_id = parent.run_id.clone();
+            host.inner
+                .store
+                .call(move |db| {
+                    let state = crate::continuous::State {
+                        run_id: parent_id,
+                        started: true,
+                        active: true,
+                        version: 1,
+                        ..Default::default()
+                    };
+                    db.bump("continuous_task", &serde_json::to_string(&state).unwrap())?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let waiting = prepare(&host, &office, "office-1").await.unwrap();
+            let tasks = waiting["conversations"][0]["tasks"].as_array().unwrap();
+            assert_eq!(tasks.len(), 1, "真实已结束的子执行应退场，主执行仍须保留");
+            assert_eq!(tasks[0]["assigneeId"], "office-lead");
+            assert_eq!(tasks[0]["status"], "running");
+            assert!(
+                tasks[0]["progress"].as_u64().unwrap() < 100,
+                "持续目标仍在运行，不能把当前批次完成写成总目标100%"
+            );
+            provider.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+                .await
+                .unwrap();
+            let terminal = prepare(&host, &office, "office-1").await.unwrap();
+            assert!(terminal["conversations"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert!(!terminal["conversations"][0]["whiteboard"]["detail"]
+                .as_str()
+                .unwrap()
+                .is_empty());
+            host.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn legacy_snapshot_upgrades_with_new_seq_and_full_catalogue_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -3712,6 +5657,7 @@ mod tests {
             .await
             .unwrap();
         let office = OfficeConfig {
+            activity_window: false,
             base_url: "http://127.0.0.1:9".into(),
             api_key_env: "PAWOFFICE_TEST_KEY".into(),
             allowed_origins: vec!["http://127.0.0.1:8765".into()],

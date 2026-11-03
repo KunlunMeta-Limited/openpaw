@@ -97,6 +97,7 @@ pub(crate) struct HostApproval {
     /// 关联：需求/设计DES-OP-006。
     pub(crate) timeout: Duration,
     before: Mutex<HashMap<String, Option<Precondition>>>,
+    continuous: Option<Arc<crate::orchestration::Group>>,
 }
 impl HostApproval {
     /// 功能：装配每Run的原审批trait实现。
@@ -119,11 +120,63 @@ impl HostApproval {
             control,
             timeout,
             before: Mutex::new(HashMap::new()),
+            continuous: None,
         }
+    }
+    /// 功能：关联本Run的可信持续任务授权策略。
+    /// 参数：group为原父组或None。
+    /// 返回：原审批器，不另建批准系统。
+    /// 错误：无。
+    /// 状态：只注入关联，start前不自动放行。
+    /// 并发与取消：主子共享启停事实，停止后不新授权。
+    /// 权限：仅配置的产物子目录及媒体/文件工具。
+    /// 关联：CHG-2026-0007第9.12节。
+    pub(crate) fn with_continuous(
+        mut self,
+        group: Option<Arc<crate::orchestration::Group>>,
+    ) -> Self {
+        self.continuous = group;
+        self
+    }
+    fn automatic(&self, b: &ToolCallBinding) -> bool {
+        let Some(group) = &self.continuous else {
+            return false;
+        };
+        let Some(config) = group
+            .config
+            .continuous
+            .as_ref()
+            .filter(|c| c.enabled && c.auto_approve)
+        else {
+            return false;
+        };
+        if group.cancel.is_cancelled()
+            || !group
+                .continuous
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active
+            || !matches!(
+                b.tool_name.as_str(),
+                "write_file" | "edit_file" | "notebook_edit" | "generate_image" | "render_visual"
+            )
+        {
+            return false;
+        }
+        let Some(path) = b.input["path"].as_str() else {
+            return false;
+        };
+        let Ok(target) = openpaw_tools::safety::resolve(&self.root.path, path) else {
+            return false;
+        };
+        let Ok(output) = openpaw_tools::safety::resolve(&self.root.path, &config.output_dir) else {
+            return false;
+        };
+        target != output && target.starts_with(output)
     }
     async fn capture(&self, b: &ToolCallBinding) -> HostResult<Option<Precondition>> {
         let path = match b.tool_name.as_str() {
-            "write_file" | "edit_file" | "notebook_edit" => b
+            "write_file" | "edit_file" | "notebook_edit" | "generate_image" | "render_visual" => b
                 .input
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -134,6 +187,21 @@ impl HostApproval {
         let resolved = openpaw_tools::safety::resolve(&self.root.path, path)
             .map_err(|_| HostError::new("scope_denied", "工具路径越界"))?;
         let content = match tokio::fs::symlink_metadata(&resolved).await {
+            Ok(meta) if matches!(b.tool_name.as_str(), "generate_image" | "render_visual") => {
+                if !meta.is_file() || meta.len() > 8 * 1024 * 1024 {
+                    return Err(HostError::new(
+                        "invalid_input",
+                        "已有媒体不是受支持大小的普通文件",
+                    ));
+                }
+                let bytes = tokio::fs::read(&resolved)
+                    .await
+                    .map_err(HostError::storage)?;
+                Some(format!(
+                    "{:?}",
+                    ring::digest::digest(&ring::digest::SHA256, &bytes)
+                ))
+            }
             Ok(_) => Some(
                 openpaw_tools::fs::read::read_text_bounded(&self.root.path, path, 256 * 1024)
                     .await
@@ -230,6 +298,8 @@ impl HostApproval {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let query_id = id.clone();
         let timeout_ms = i64::try_from(self.timeout.as_millis()).unwrap_or(i64::MAX);
+        let automatic = self.automatic(&binding);
+        let auto_group = self.continuous.clone();
         self.store
             .call_priority(move |db| {
                 let run = db.get_run(&binding.run_id)?;
@@ -239,10 +309,14 @@ impl HostApproval {
                 }) {
                     return Err(HostError::new("approval_conflict", "重复工具调用ID"));
                 }
+                let automatic=automatic && auto_group.as_ref().is_some_and(|g|!g.cancel.is_cancelled()&&g.continuous.lock().unwrap_or_else(|e|e.into_inner()).active);
+                if automatic {
+                    db.bump("approval_policy",&serde_json::json!({"version":1,"run_id":binding.run_id,"call_id":binding.call_id,"decision":"approved","source":"continuous_output_policy"}).to_string())?;
+                }
                 db.save_approval(ApprovalView {
                     approval_id: id,
                     binding,
-                    status: "pending".into(),
+                    status: if automatic {"approved"} else {"pending"}.into(),
                     consumed: false,
                     revision: 0,
                     expires_at_ms: chrono::Utc::now()

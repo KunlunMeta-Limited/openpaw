@@ -20,6 +20,8 @@ pub(super) struct Client {
     url: String,
     authorization: reqwest::header::HeaderValue,
     capabilities: tokio::sync::Mutex<Option<Value>>,
+    // 仅确认此Client已登记的可信聊天地址，不缓存Office动态状态或聊天正文。
+    chat_registration: tokio::sync::Mutex<Option<std::net::SocketAddr>>,
     gates: tokio::sync::Mutex<
         std::collections::BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
     >,
@@ -62,6 +64,7 @@ impl Client {
             ),
             authorization,
             capabilities: tokio::sync::Mutex::new(None),
+            chat_registration: Default::default(),
             gates: Default::default(),
         })
     }
@@ -242,7 +245,8 @@ impl Client {
             }
             None if request.get("command").is_some() => {
                 if status != 200
-                    || data["forwarded"] != true
+                    || !(data["forwarded"] == true
+                        || data["forwarded"].as_u64().is_some_and(|n| n > 0))
                     || data.as_object().is_none_or(|o| o.len() != 1)
                 {
                     return Err(HostError::new("protocol_error", "场景回执非法"));
@@ -251,6 +255,22 @@ impl Client {
             _ => return Err(HostError::new("unsupported", "不支持此Office操作")),
         }
         Ok((status, data))
+    }
+    /// 功能：确认同Client的聊天地址只注册一次，避免周期同步反复回传完整目录。
+    /// 参数：address为Host可信监听地址，不能来自浏览器输入。
+    /// 返回：原官方初始化回执已确认或同地址已成功登记。
+    /// 错误：原post网络/认证/协议错误原样返回，不把失败写成成功。
+    /// 状态：只保留进程内配置注册确认，不缓存聊天、审批或Office动态状态。
+    /// 并发与取消：仅注册短门跨HTTP等待；失败或取消后未登记，下次可原样重试。
+    /// 权限：复用固定Office端点与服务端密钥，原Host监听权限不变。
+    /// 关联：需求REQ-OP-014/022；设计DES-OP-006/007；CHG-2026-0007第12.136节。
+    pub(super) async fn register_chat(&self, address: std::net::SocketAddr) -> HostResult<()> {
+        let mut registered = self.chat_registration.lock().await;
+        if *registered != Some(address) {
+            self.post(json!({"type":"offices.initialize","offices":[],"chat":{"url":format!("http://{address}/office/chat")}})).await?;
+            *registered = Some(address);
+        }
+        Ok(())
     }
     /// 功能：发现真实场景人物与白板协议。
     /// 参数：self为固定Office客户端。
@@ -290,5 +310,291 @@ impl Client {
             .entry(team.to_owned())
             .or_default()
             .clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn d150_sync_avoids_full_directory_and_recovers_office_loss_without_hiding_errors() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        use std::sync::Arc;
+        #[derive(Default)]
+        struct Fixture {
+            initialized: bool,
+            denied: bool,
+            stale: bool,
+            requests: Vec<Value>,
+        }
+        async fn handle(
+            State(state): State<Arc<tokio::sync::Mutex<Fixture>>>,
+            Json(req): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let mut state = state.lock().await;
+            state.requests.push(req.clone());
+            let (code, data) = if state.denied {
+                (401, json!({"reasonCode":"AUTH_FAILED"}))
+            } else {
+                match req["type"].as_str().unwrap() {
+                    "office.capabilities" => (
+                        200,
+                        json!({"scene":{"protocolVersion":"2.0","actors":[{"id":"office-lead"},{"id":"file-agent"},{"id":"data-agent"}]},"ui":{"whiteboardSchema":{}},"requests":{},"responses":{"success":{},"error":{}}}),
+                    ),
+                    "office.read" => (
+                        200,
+                        json!({"offices":if state.initialized {json!([{"id":"office-1"}])} else {json!([])},"sceneCommandProtocol":"2.0","actors":[],"supportedMessages":[],"ui":{}}),
+                    ),
+                    "offices.initialize" => {
+                        if req["offices"].as_array().is_some_and(|a| !a.is_empty()) {
+                            state.initialized = true;
+                        }
+                        (
+                            202,
+                            json!({"offices":if state.initialized {json!([{"id":"office-1"}])} else {json!([])},"sceneCommandProtocol":"2.0","actors":[],"supportedMessages":[],"ui":{}}),
+                        )
+                    }
+                    "office.snapshot" if !state.initialized => {
+                        (404, json!({"reasonCode":"OFFICE_NOT_INITIALIZED"}))
+                    }
+                    "office.snapshot" => (
+                        if state.stale { 200 } else { 202 },
+                        if state.stale {
+                            json!({"teamId":req["teamId"],"seq":req["snapshot"]["seq"],"status":"ignored","reasonCode":"STALE_SEQ"})
+                        } else {
+                            json!({"teamId":req["teamId"],"seq":req["snapshot"]["seq"],"status":"cached"})
+                        },
+                    ),
+                    _ => panic!("unexpected Office request"),
+                }
+            };
+            (
+                StatusCode::from_u16(code).unwrap(),
+                Json(json!({"code":code,"msg":"fixture","data":data})),
+            )
+        }
+        let state = Arc::new(tokio::sync::Mutex::new(Fixture::default()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/pawoffice/messages",
+            listener.local_addr().unwrap()
+        );
+        let app = Router::new()
+            .route("/api/pawoffice/messages", post(handle))
+            .with_state(state.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client {
+            http: reqwest::Client::new(),
+            url,
+            authorization: reqwest::header::HeaderValue::from_static("Bearer fixture"),
+            capabilities: Default::default(),
+            chat_registration: Default::default(),
+            gates: Default::default(),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let cfg:crate::HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = crate::Host::start(cfg).await.unwrap();
+        let office = OfficeConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "UNUSED".into(),
+            allowed_origins: vec![],
+            names: Default::default(),
+            creation_slots: vec![],
+            activity_window: true,
+        };
+        let address = "127.0.0.1:12345".parse().unwrap();
+        // 先发现能力，确保下一次401确实发生在chat注册，而非能力读取。
+        client.capabilities().await.unwrap();
+        // 无缓存、认证失败不伪造注册成功或初始化完成。
+        state.lock().await.denied = true;
+        assert_eq!(
+            super::super::projection::sync_once(
+                &host, &office, "office-1", &client, false, address
+            )
+            .await
+            .unwrap_err()
+            .kind,
+            "office_auth"
+        );
+        {
+            let mut state = state.lock().await;
+            assert_eq!(state.requests.last().unwrap()["type"], "offices.initialize");
+            state.denied = false;
+            state.requests.clear();
+        }
+        for _ in 0..8 {
+            assert_eq!(
+                super::super::projection::sync_once(
+                    &host, &office, "office-1", &client, false, address
+                )
+                .await
+                .unwrap(),
+                "cached"
+            );
+        }
+        {
+            let state = state.lock().await;
+            assert_eq!(
+                state
+                    .requests
+                    .iter()
+                    .filter(|r| r["type"] == "office.read")
+                    .count(),
+                0,
+                "重复同步不得查全办公室及静态Schema"
+            );
+            assert_eq!(
+                state
+                    .requests
+                    .iter()
+                    .filter(|r| r["type"] == "offices.initialize")
+                    .count(),
+                2,
+                "一次chat注册加一次确切未初始化恢复"
+            );
+            let snapshots: Vec<_> = state
+                .requests
+                .iter()
+                .filter(|r| r["type"] == "office.snapshot")
+                .collect();
+            assert_eq!(snapshots.len(), 9, "仍每轮发快照，并在初始化后准确重试一次");
+            assert!(
+                snapshots
+                    .iter()
+                    .all(|r| r["snapshot"] == snapshots[0]["snapshot"]),
+                "同seq完整内容不能因重试变化"
+            );
+        }
+        // 模拟Office进程缓存清空：本地已注册不能阻止精确404后的重新初始化。
+        state.lock().await.initialized = false;
+        assert_eq!(
+            super::super::projection::sync_once(
+                &host, &office, "office-1", &client, false, address
+            )
+            .await
+            .unwrap(),
+            "cached"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .requests
+                .iter()
+                .filter(|r| r["type"] == "offices.initialize")
+                .count(),
+            3
+        );
+        // 新地址仅再注册一次，不把旧Client地址当作永久注册。
+        let second = "127.0.0.1:12346".parse().unwrap();
+        assert_eq!(
+            super::super::projection::sync_once(&host, &office, "office-1", &client, false, second)
+                .await
+                .unwrap(),
+            "cached"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .requests
+                .iter()
+                .filter(|r| r["type"] == "offices.initialize")
+                .count(),
+            4
+        );
+        state.lock().await.stale = true;
+        assert_eq!(
+            super::super::projection::sync_once(&host, &office, "office-1", &client, false, second)
+                .await
+                .unwrap_err()
+                .kind,
+            "sequence_conflict"
+        );
+        let before = state.lock().await.requests.len();
+        assert_eq!(
+            super::super::projection::sync_once(&host, &office, "office-1", &client, true, second)
+                .await
+                .unwrap(),
+            "halted"
+        );
+        assert_eq!(
+            state.lock().await.requests.len(),
+            before,
+            "外部序号冲突停写不能被初始化绕过"
+        );
+        state.lock().await.denied = true;
+        assert_eq!(
+            super::super::projection::sync_once(&host, &office, "office-1", &client, false, second)
+                .await
+                .unwrap_err()
+                .kind,
+            "office_auth"
+        );
+        assert_eq!(
+            state.lock().await.requests.last().unwrap()["type"],
+            "office.snapshot",
+            "认证失败不尝试初始化掩盖错误"
+        );
+        host.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn scene_receipts_accept_official_counts_and_reject_invalid_acknowledgements() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        let reply = std::sync::Arc::new(tokio::sync::Mutex::new((200u16, json!({"forwarded":1}))));
+        async fn handle(
+            State(reply): State<std::sync::Arc<tokio::sync::Mutex<(u16, Value)>>>,
+        ) -> (StatusCode, Json<Value>) {
+            let (status, data) = reply.lock().await.clone();
+            (
+                StatusCode::from_u16(status).unwrap(),
+                Json(json!({"code":status,"msg":"fixture","data":data})),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/pawoffice/messages",
+            listener.local_addr().unwrap()
+        );
+        let app = Router::new()
+            .route("/api/pawoffice/messages", post(handle))
+            .with_state(reply.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = Client {
+            http: reqwest::Client::new(),
+            url,
+            authorization: reqwest::header::HeaderValue::from_static("Bearer local-fixture"),
+            capabilities: Default::default(),
+            chat_registration: Default::default(),
+            gates: Default::default(),
+        };
+        for (status, data, valid) in [
+            (200, json!({"forwarded":1}), true),
+            (200, json!({"forwarded":3}), true),
+            (200, json!({"forwarded":true}), true),
+            (200, json!({"forwarded":0}), false),
+            (200, json!({"forwarded":false}), false),
+            (200, json!({"forwarded":-1}), false),
+            (200, json!({"forwarded":1.5}), false),
+            (200, json!({"forwarded":"1"}), false),
+            (200, json!({"forwarded":1,"completed":true}), false),
+            (200, json!({}), false),
+            (202, json!({"forwarded":1}), false),
+        ] {
+            *reply.lock().await = (status, data.clone());
+            let result = client.post(json!({"command":{}})).await;
+            assert_eq!(result.is_ok(), valid, "status={status} data={data}");
+            if !valid {
+                assert_eq!(result.unwrap_err().kind, "protocol_error");
+            }
+        }
+        server.abort();
     }
 }

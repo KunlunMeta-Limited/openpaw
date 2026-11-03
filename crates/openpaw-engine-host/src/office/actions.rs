@@ -48,7 +48,7 @@ pub(super) async fn run(
                         let saved = h
                             .inner
                             .store
-                            .call(move |db| {
+                            .call_priority(move |db| {
                                 db.office_action(&id, &scope, &kind, "claimed", expiry, &json!({}))
                             })
                             .await;
@@ -169,7 +169,7 @@ async fn handle(
     };
     host.inner
         .store
-        .call(move |db| db.office_action_state(&id, &s, status))
+        .call_priority(move |db| db.office_action_state(&id, &s, status))
         .await?;
     if reply.is_err() {
         eprintln!("engine-host Office UI: 响应未确认送达，已提交业务不回滚");
@@ -223,7 +223,7 @@ async fn dispatch(
     }
     let memory_snapshot = if matches!(
         action["action"].as_str(),
-        Some("actor.inspect") | Some("employee.inspect")
+        Some("actor.inspect") | Some("employee.inspect") | Some("dialog.action")
     ) {
         host.inner
             .office_projection_cache
@@ -239,7 +239,7 @@ async fn dispatch(
     let (binding, cached_snapshot) = host
         .inner
         .store
-        .call(move |db| {
+        .call_priority(move |db| {
             db.check_live_scope(&s)?;
             let binding = db
                 .bindings()?
@@ -308,7 +308,7 @@ async fn dispatch(
             let nav = host
                 .inner
                 .store
-                .call(move |db| db.office_navigation(&id, &s))
+                .call_priority(move |db| db.office_navigation(&id, &s))
                 .await?;
             nav["options"]
                 .get(action["optionId"].as_str().unwrap_or(""))
@@ -335,6 +335,7 @@ async fn dispatch(
         }
         _ => return Err(HostError::new("unsupported", "不支持此操作")),
     };
+    let details_started_at = std::time::Instant::now();
     let rendered = details::render(
         host,
         &scope,
@@ -348,7 +349,7 @@ async fn dispatch(
         eprintln!(
             "engine-host diagnostics ui action={} details_ms={}",
             action["action"].as_str().unwrap_or("unknown"),
-            started_at.elapsed().as_millis()
+            details_started_at.elapsed().as_millis()
         );
     }
     rendered

@@ -6,6 +6,7 @@ import { officeRequestSchema, officeSnapshotSchema, officeErrorResultSchema, off
 import { chatRequestSchema, chatEventSchema, chatOperationSchema, chatHistoryPageSchema, chatCancelResultSchema } from './upstream-office/packages/protocol/src/chat.ts'
 import { assertProtocolValue, responseEnvelopeSchema } from './upstream-office/packages/protocol/src/schema.ts'
 import { relayMessageSchema } from './upstream-office/packages/protocol/src/relay.ts'
+import { whiteboardTaskBoardSchema, resultDeliverySchema } from './upstream-office/packages/protocol/src/office-ui.ts'
 
 const f = JSON.parse(await readFile(new URL('./fixtures/office.json', import.meta.url)))
 const manifest = JSON.parse(await readFile(new URL('../../docs/engine-host/contracts/sources.json', import.meta.url)))
@@ -57,6 +58,23 @@ test('new upstream whiteboard separates short summary and Markdown detail withou
     invalid.conversations[0].whiteboard[key] = '字'.repeat(length)
     assert.equal(officeSnapshotSchema.safeParse(invalid).success, false)
   }
+})
+
+test('latest result reader accepts execution evidence and enforces immutable version references', () => {
+  const board = whiteboardTaskBoardSchema.parse({ title: '任务过程', status: 'running',
+    steps: [{ id: 'read', title: '读取资料', progress: 100, state: 'done' }],
+    detailSections: [{ id: 'facts', title: '真实任务', blocks: [{ type: 'text', text: '读取成功' }] }],
+    result: { title: '任务过程', status: 'draft', tasks: [{ id: 'read', title: '读取资料', status: 'done', progress: 100 }],
+      sections: [{ kind: 'custom', id: 'evidence', title: '执行依据', purpose: 'evidence', blocks: [{ type: 'text', text: '读取成功' }] }] } })
+  assert.equal(board.steps[0].progress, 100)
+  assert.equal(board.result.status, 'draft')
+  assert.deepEqual(board.result.artifacts, [])
+  const artifact = { id: 'doc', title: '说明.md', versionId: 'v1', content: '# 原始版本' }
+  const history = { id: 'delivery1', turnId: 'turn1', sequence: 1, createdAt: '2026-10-30T00:00:00Z', result: { runId: 'delivery1', artifacts: [artifact] } }
+  resultDeliverySchema.parse(history)
+  assert.equal(resultDeliverySchema.safeParse({ ...history, snapshotUrl: 'https://example.org/history.json' }).success, false)
+  assert.equal(whiteboardTaskBoardSchema.safeParse({ result: { artifacts: [{ ...artifact, content: '# 被覆盖' }] }, deliveries: [history] }).success, false)
+  assert.equal(whiteboardTaskBoardSchema.safeParse({ result: { sections: [{ kind: 'custom', id: 'bad', title: '文件', purpose: 'artifact-preview', artifactId: 'missing', versionId: 'v1', blocks: [{ type: 'text', text: '不存在' }] }] } }).success, false)
 })
 
 test('upstream rejects invalid seq, mismatched team, dangling assignee and unknown fields', () => {

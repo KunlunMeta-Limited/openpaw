@@ -31,6 +31,7 @@ pub struct ToolRegistry {
     environment: Arc<dyn crate::exec::environment::Environment>,
     observer: Option<Arc<dyn openpaw_core::ToolExecutionObserver>>,
     specs: Vec<ToolSpec>,
+    image_config: Option<crate::media::ImageService>,
 }
 
 impl ToolRegistry {
@@ -65,6 +66,7 @@ impl ToolRegistry {
         specs.push(web_fetch::spec());
         specs.push(web_search::spec());
         specs.push(web_extract::spec());
+        specs.extend(crate::media::specs());
         // 原写工具已有分类/破坏标记；注册时落实批准要求，不能仅展示metadata。
         for spec in &mut specs {
             if spec.is_destructive == Some(true)
@@ -83,6 +85,7 @@ impl ToolRegistry {
             environment: Arc::new(crate::exec::environment::LocalEnvironment),
             observer: None,
             specs,
+            image_config: None,
         }
     }
 
@@ -100,6 +103,18 @@ impl ToolRegistry {
         environment: Arc<dyn crate::exec::environment::Environment>,
     ) -> Self {
         self.environment = environment;
+        self
+    }
+    /// 功能：注入可信的可选图片服务配置。
+    /// 参数：config为正式配置加载器装配的只读服务，密钥不进入JSON。
+    /// 返回：当前原注册表。
+    /// 错误：配置和服务错误在实际调用时报告。
+    /// 状态：不调用网络，不写文件。
+    /// 并发与取消：配置只读共享。
+    /// 权限：不改变媒体工具的准确输入批准要求。
+    /// 关联：CHG-2026-0007第9.12节。
+    pub fn with_image_service(mut self, config: Option<crate::media::ImageService>) -> Self {
+        self.image_config = config;
         self
     }
     /// 功能：注入真正执行前的可靠观察器
@@ -145,6 +160,16 @@ impl ToolExecutor for ToolRegistry {
             "web_fetch" => web_fetch::run(&ws, args).await,
             "web_search" => web_search::run(&ws, args).await,
             "web_extract" => web_extract::run(&ws, args).await,
+            "generate_image" | "render_visual" => {
+                crate::media::run(
+                    &ws,
+                    self.image_config.as_ref(),
+                    name,
+                    args,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await
+            }
             "think" => think::run(&ws, args).await,
             "todo_add" | "todo_update" | "todo_list" => todo::run(&ws, name, args).await,
             "clarify" => clarify::run(&ws, args).await,
@@ -191,6 +216,19 @@ impl ToolExecutor for ToolRegistry {
             context.execution_started(name, &args).await?;
         }
         match name {
+            "generate_image" | "render_visual" => match crate::media::run(
+                &self.workspace,
+                self.image_config.as_ref(),
+                name,
+                args,
+                context.cancel(),
+            )
+            .await
+            {
+                Err(Error::Cancelled) => Err(Error::Cancelled),
+                Err(error) => Ok(ToolCallOutcome::error(error.to_string())),
+                result => result,
+            },
             "web_fetch" => {
                 web_fetch::run_cancellable(&self.workspace, args, context.cancel()).await
             }
@@ -258,6 +296,7 @@ fn validate_schema(
             "object" => input.is_object(),
             "string" => input.is_string(),
             "integer" => input.as_i64().is_some() || input.as_u64().is_some(),
+            "number" => input.is_number(),
             "boolean" => input.is_boolean(),
             "array" => input.is_array(),
             _ => false,
@@ -317,9 +356,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolRegistry::new(dir.path());
 
-        assert_eq!(host.tool_names().len(), 21);
+        assert_eq!(host.tool_names().len(), 23);
         let listed = host.list_tools().await.unwrap();
-        assert_eq!(listed.len(), 21);
+        assert_eq!(listed.len(), 23);
 
         // Roundtrip through the host: write then read.
         host.call(

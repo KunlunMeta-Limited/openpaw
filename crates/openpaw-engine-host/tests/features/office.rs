@@ -419,6 +419,11 @@ async fn suite() {
     drop(other_stream);
     drop(same_office);
     server.shutdown().await.unwrap();
+    network_failure_is_visible_in_stream_resume_and_history(tmp.path()).await;
+    quota_failure_uses_actual_provider_and_survives_restart(tmp.path()).await;
+    model_idle_diagnostics_preserve_stage_and_partial_text(tmp.path()).await;
+    child_error_display_keeps_followup_history_exact_and_untrusted_edits_rejected(tmp.path()).await;
+    normal_team_nodes_survive_history_resume_and_followup(tmp.path()).await;
     boundary_cases(tmp.path()).await;
     persistent_turn_cases(tmp.path()).await;
     history_encoded_byte_budget_pages_without_losing_turns(tmp.path()).await;
@@ -1094,4 +1099,481 @@ async fn checkpoint_write_failure_cancels_real_stream_without_success_and_deleti
         "session_deleted"
     );
     host.shutdown().await.unwrap();
+}
+
+struct NetworkFailure;
+#[async_trait]
+impl LlmProvider for NetworkFailure {
+    async fn complete(&self, _: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
+        Err(openpaw_core::Error::Provider("http send: error sending request for url (https://private.invalid/v1?api_key=NEVER_SHOW_SECRET)".into()))
+    }
+    async fn stream(
+        &self,
+        _: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        Ok(futures::stream::iter([
+            Ok(StreamEvent::MessageStart),
+            Ok(StreamEvent::TextDelta { index:0, text:"已取得的部分真实回复".into() }),
+            Err(openpaw_core::Error::Provider("http send: error sending request for url (https://private.invalid/v1?api_key=NEVER_SHOW_SECRET)".into())),
+        ]).boxed())
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn name(&self) -> &str {
+        "network-failure-fixture"
+    }
+    fn default_model(&self) -> &str {
+        "network-failure-fixture"
+    }
+}
+async fn network_failure_is_visible_in_stream_resume_and_history(base: &std::path::Path) {
+    let cfg = config(&base.join("d112-network"));
+    let host = Host::with_provider(cfg.clone(), Arc::new(NetworkFailure))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let client = reqwest::Client::new();
+    let req = request("network", "部分回复后断网");
+    let stream = events(post(&client, &url, &req).send().await.unwrap()).await;
+    let mut text = String::new();
+    for e in &stream {
+        match e["type"].as_str() {
+            Some("snapshot") => text = e["text"].as_str().unwrap().into(),
+            Some("delta") => text.push_str(e["text"].as_str().unwrap()),
+            _ => {}
+        }
+    }
+    assert!(
+        text.contains("已取得的部分真实回复"),
+        "不得丢失已显示正文：{text}"
+    );
+    assert!(
+        text.contains("本轮未完成：连接模型服务失败"),
+        "正文必须显示可理解原因：{text}"
+    );
+    assert!(!serde_json::to_string(&stream)
+        .unwrap()
+        .contains("NEVER_SHOW_SECRET"));
+    assert!(!stream.iter().any(|e| e["type"] == "done"));
+    server.shutdown().await.unwrap();
+    // 重启后仍从原账本分类，不需要写入另一份聊天消息或重放模型请求。
+    let reopened = Host::with_provider(cfg, Arc::new(MockProvider::fixed("不允许重放")))
+        .await
+        .unwrap();
+    let server = HostServer::bind(reopened, 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let resume = json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"network","turnId":req["turnId"]});
+    let restored = events(post(&client, &url, &resume).send().await.unwrap()).await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0]["text"], text);
+    assert_eq!(restored[0]["state"], "error");
+    let history = post(&client,&url,&json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"network","cursor":"","limit":20})).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(history["data"]["turns"][0]["assistant"], text);
+    assert_eq!(history["data"]["turns"][0]["state"], "error");
+    assert!(!history.to_string().contains("NEVER_SHOW_SECRET"));
+    server.shutdown().await.unwrap();
+}
+
+async fn quota_failure_uses_actual_provider_and_survives_restart(base: &std::path::Path) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let upstream = axum::Router::new().fallback(move || {
+        let count = count.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            (
+                axum::http::StatusCode::PAYMENT_REQUIRED,
+                axum::Json(json!({"error":{"type":"insufficient_balance_error","message":"Insufficient Balance NEVER_SHOW_QUOTA_SECRET"}})),
+            )
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let upstream = tokio::spawn(async move {
+        axum::serve(listener, upstream)
+            .with_graceful_shutdown(async {
+                let _ = stopped.await;
+            })
+            .await
+            .unwrap();
+    });
+    let cfg = config(&base.join("d112-quota"));
+    let provider = openpaw_llm::OpenAiProvider::new("isolated-key", "isolated-model")
+        .with_base_url(format!("http://{address}"));
+    let host = Host::with_provider(cfg.clone(), Arc::new(provider))
+        .await
+        .unwrap();
+    let server = HostServer::bind(host, 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let client = reqwest::Client::new();
+    let request = request("quota", "验证账户余额错误提示");
+    let stream = events(post(&client, &url, &request).send().await.unwrap()).await;
+    let error = stream.iter().find(|e| e["type"] == "error").unwrap();
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("模型服务账户余额或额度不足"));
+    let text = stream
+        .iter()
+        .filter_map(|e| match e["type"].as_str() {
+            Some("delta") | Some("snapshot") => e["text"].as_str(),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(
+        text.contains("本轮未完成：模型服务账户余额或额度不足"),
+        "{text}"
+    );
+    assert!(!stream.iter().any(|e| e["type"] == "done"));
+    assert!(!serde_json::to_string(&stream)
+        .unwrap()
+        .contains("NEVER_SHOW_QUOTA_SECRET"));
+    assert_eq!(requests.load(Ordering::SeqCst), 1, "402不能自动重放请求");
+    server.shutdown().await.unwrap();
+    let reopened = Host::with_provider(cfg, Arc::new(MockProvider::fixed("不允许重放")))
+        .await
+        .unwrap();
+    let server = HostServer::bind(reopened, 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let resume = json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"quota","turnId":request["turnId"]});
+    let restored = events(post(&client, &url, &resume).send().await.unwrap()).await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0]["text"], text);
+    assert_eq!(restored[0]["state"], "error");
+    let history = post(&client, &url, &json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"quota","cursor":"","limit":20})).send().await.unwrap().json::<Value>().await.unwrap();
+    assert_eq!(history["data"]["turns"][0]["assistant"], text);
+    assert_eq!(history["data"]["turns"][0]["state"], "error");
+    assert!(!history.to_string().contains("NEVER_SHOW_QUOTA_SECRET"));
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.shutdown().await.unwrap();
+    stop.send(()).unwrap();
+    upstream.await.unwrap();
+}
+
+struct IdleResponse(&'static str);
+#[async_trait]
+impl LlmProvider for IdleResponse {
+    async fn complete(&self, _: CompletionRequest) -> openpaw_core::Result<CompletionResponse> {
+        futures::future::pending().await
+    }
+    async fn stream(
+        &self,
+        _: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        if self.0 == "connection" {
+            return futures::future::pending().await;
+        }
+        let events = if self.0 == "partial" {
+            vec![Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: "这部分已经返回，必须保留".into(),
+            })]
+        } else {
+            vec![]
+        };
+        Ok(futures::stream::iter(events)
+            .chain(futures::stream::pending())
+            .boxed())
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn name(&self) -> &str {
+        "idle-fixture"
+    }
+    fn default_model(&self) -> &str {
+        "idle-fixture"
+    }
+}
+async fn model_idle_diagnostics_preserve_stage_and_partial_text(base: &std::path::Path) {
+    for (mode, stage) in [
+        ("connection", "建立响应流"),
+        ("first", "首次有效响应"),
+        ("partial", "后续有效响应"),
+    ] {
+        let mut cfg = config(&base.join(format!("d128-{mode}")));
+        cfg.stream_idle_secs = 1;
+        cfg.run_timeout_secs = 0;
+        let host = Host::with_provider(cfg.clone(), Arc::new(IdleResponse(mode)))
+            .await
+            .unwrap();
+        let server = HostServer::bind(host, 0).await.unwrap();
+        let url = format!("http://{}", server.address());
+        let client = reqwest::Client::new();
+        let req = request(mode, "核查模型等待错误，不进行实际付费调用");
+        let stream = events(post(&client, &url, &req).send().await.unwrap()).await;
+        let text = stream.iter().fold(String::new(), |mut text, event| {
+            if event["type"] == "snapshot" {
+                text = event["text"].as_str().unwrap().into();
+            }
+            if event["type"] == "delta" {
+                text.push_str(event["text"].as_str().unwrap());
+            }
+            text
+        });
+        assert!(
+            text.contains(stage),
+            "实际阶段必须出现在聊天：{mode} {text}"
+        );
+        assert!(text.contains("1秒"), "应显示本次配置而非固定60秒：{text}");
+        if mode == "partial" {
+            assert!(text.starts_with("这部分已经返回，必须保留"));
+        }
+        assert!(!stream.iter().any(|e| e["type"] == "done"));
+        server.shutdown().await.unwrap();
+        let reopened = Host::with_provider(cfg, Arc::new(MockProvider::fixed("不得重放")))
+            .await
+            .unwrap();
+        let server = HostServer::bind(reopened, 0).await.unwrap();
+        let url = format!("http://{}", server.address());
+        let resume = json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":mode,"turnId":req["turnId"]});
+        let restored = events(post(&client, &url, &resume).send().await.unwrap()).await;
+        assert_eq!(restored[0]["text"], text);
+        let history = post(&client,&url,&json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":mode,"cursor":"","limit":20})).send().await.unwrap().json::<Value>().await.unwrap();
+        assert_eq!(history["data"]["turns"][0]["assistant"], text);
+        server.shutdown().await.unwrap();
+    }
+}
+
+#[derive(Default)]
+struct ChildFailureHistory {
+    lead: std::sync::atomic::AtomicUsize,
+    child: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl LlmProvider for ChildFailureHistory {
+    async fn complete(
+        &self,
+        request: CompletionRequest,
+    ) -> openpaw_core::Result<CompletionResponse> {
+        MockProvider::fixed("有限摘要").complete(request).await
+    }
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> openpaw_core::Result<futures::stream::BoxStream<'static, openpaw_core::Result<StreamEvent>>>
+    {
+        use std::sync::atomic::Ordering;
+        if request
+            .system
+            .as_deref()
+            .is_some_and(|s| s.contains("本轮可信角色：李研（research）"))
+        {
+            self.child.fetch_add(1, Ordering::SeqCst);
+            return Err(openpaw_core::Error::Provider(
+                "http 402: Insufficient Balance NEVER_SHOW_CHILD_SECRET".into(),
+            ));
+        }
+        if self.lead.fetch_add(1, Ordering::SeqCst) == 0 {
+            MockProvider::scripted(vec![MockMode::ToolUse {tool_name:"delegate_task".into(), input:json!({"role_id":"research","title":"核查资料来源","instructions":"只核查给定资料，不写文件","acceptance":"有限真实结果"}), text:"已发起资料核查。".into()}]).stream(request).await
+        } else {
+            MockProvider::fixed("部分资料未完成，已有结果保留。")
+                .stream(request)
+                .await
+        }
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::default()
+    }
+    fn name(&self) -> &str {
+        "child-history-fixture"
+    }
+    fn default_model(&self) -> &str {
+        "child-history-fixture"
+    }
+}
+async fn child_error_display_keeps_followup_history_exact_and_untrusted_edits_rejected(
+    base: &std::path::Path,
+) {
+    use std::sync::atomic::Ordering;
+    let mut cfg = config(&base.join("d129-history"));
+    cfg.agents = Some(AgentsConfig {
+        enabled: true,
+        ..Default::default()
+    });
+    let provider = Arc::new(ChildFailureHistory::default());
+    let host = Host::with_provider(cfg.clone(), provider.clone())
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let client = reqwest::Client::new();
+    let first = request("child-history", "请核查给定资料");
+    let stream = events(post(&client, &url, &first).send().await.unwrap()).await;
+    assert!(stream.iter().any(completed));
+    let history = post(&client,&url,&json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"child-history","cursor":"","limit":20})).send().await.unwrap().json::<Value>().await.unwrap();
+    let shown = history["data"]["turns"][0]["assistant"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        shown.contains("子任务异常记录")
+            && shown.contains("李研")
+            && shown.contains("核查资料来源")
+    );
+    assert!(shown.contains("账户余额或额度不足"));
+    assert!(!shown.contains("NEVER_SHOW_CHILD_SECRET"));
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "child-history".into(),
+    };
+    let snap = host.snapshot_and_subscribe(&scope).await.unwrap().0;
+    let run = host.get_run(&scope, &snap.runs[0].run_id).await.unwrap();
+    assert!(!run.text.contains("子任务异常记录"));
+    let mut next = request("child-history", "请说明未完成事项，不重复核查");
+    next["messages"] = json!([{"role":"user","content":"请核查给定资料"},{"role":"assistant","content":shown.replacen("核查资料来源","虚假任务",1)},{"role":"user","content":"请说明未完成事项，不重复核查"}]);
+    let rejected = events(post(&client, &url, &next).send().await.unwrap()).await;
+    assert_eq!(rejected[0]["type"], "error");
+    assert_eq!(provider.lead.load(Ordering::SeqCst), 2);
+    next["turnId"] = json!(uuid::Uuid::new_v4().simple().to_string());
+    next["messages"][1]["content"] = json!(shown);
+    let accepted = events(post(&client, &url, &next).send().await.unwrap()).await;
+    assert!(
+        accepted.iter().any(completed),
+        "可信完整展示必须可继续追问：{accepted:?}"
+    );
+    assert_eq!(provider.lead.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        provider.child.load(Ordering::SeqCst),
+        1,
+        "不能重放原失败子任务"
+    );
+    // 旧客户端原正文与新版显示可逐消息混合；不接受任意前缀剥除。
+    let mut compatible = request("child-history", "继续说明");
+    compatible["messages"] = json!([{"role":"user","content":"请核查给定资料"},{"role":"assistant","content":run.text},{"role":"user","content":"请说明未完成事项，不重复核查"},{"role":"assistant","content":"部分资料未完成，已有结果保留。"},{"role":"user","content":"继续说明"}]);
+    assert!(
+        events(post(&client, &url, &compatible).send().await.unwrap())
+            .await
+            .iter()
+            .any(completed)
+    );
+    assert_eq!(provider.lead.load(Ordering::SeqCst), 4);
+    assert_eq!(provider.child.load(Ordering::SeqCst), 1);
+    let ledger = std::fs::read_to_string(
+        cfg.home
+            .join("sessions")
+            .join(format!("{}.jsonl", run.session_id)),
+    )
+    .unwrap();
+    assert!(
+        !ledger.contains("子任务异常记录"),
+        "UI说明不能被导入模型会话"
+    );
+    server.shutdown().await.unwrap();
+}
+
+async fn normal_team_nodes_survive_history_resume_and_followup(base: &std::path::Path) {
+    let mut cfg = config(&base.join("d133-normal-nodes"));
+    cfg.agents = Some(AgentsConfig {
+        enabled: true,
+        ..Default::default()
+    });
+    let delegate = |role: &str, title: &str| MockMode::ToolUse {
+        tool_name: "delegate_task".into(),
+        input: json!({"role_id":role,"title":title,"instructions":"核对给定材料","context":"给定材料：有限文本交接与审查","acceptance":"明确的有限结论"}),
+        text: String::new(),
+    };
+    let host = Host::with_provider(
+        cfg.clone(),
+        Arc::new(MockProvider::scripted(vec![
+            delegate("organize", "整理资料提纲"),
+            MockMode::Fixed("提纲已整理".into()),
+            delegate("audit", "审查资料结论"),
+            MockMode::Fixed("资料结论已审查".into()),
+            MockMode::Fixed("本轮资料核对已结束。".into()),
+        ])),
+    )
+    .await
+    .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let client = reqwest::Client::new();
+    let first = request("normal-nodes", "安排资料整理及审查");
+    let stream = events(post(&client, &url, &first).send().await.unwrap()).await;
+    assert!(stream.iter().any(completed));
+    let shown = stream.iter().fold(String::new(), |mut text, e| {
+        match e["type"].as_str() {
+            Some("snapshot") => text = e["text"].as_str().unwrap().into(),
+            Some("delta") => text.push_str(e["text"].as_str().unwrap()),
+            _ => {}
+        }
+        text
+    });
+    for required in [
+        "周理",
+        "整理资料提纲",
+        "赵审",
+        "审查资料结论",
+        "本阶段执行结束",
+        "本轮资料核对已结束。",
+    ] {
+        assert!(shown.contains(required), "缺少真实节点 {required}：{shown}");
+    }
+    assert!(!shown.contains("子任务异常记录"));
+    let history_request = json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"normal-nodes","cursor":"","limit":20});
+    let history = post(&client, &url, &history_request)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(history["data"]["turns"][0]["assistant"], shown);
+    let scope = ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "normal-nodes".into(),
+    };
+    let original = host.snapshot_and_subscribe(&scope).await.unwrap().0;
+    let run = host
+        .get_run(&scope, &original.runs[0].run_id)
+        .await
+        .unwrap();
+    assert_eq!(run.text, "本轮资料核对已结束。");
+    server.shutdown().await.unwrap();
+    let reopened = Host::with_provider(
+        cfg.clone(),
+        Arc::new(MockProvider::fixed("只说明已有结果，不重新执行。")),
+    )
+    .await
+    .unwrap();
+    let server = HostServer::bind(reopened.clone(), 0).await.unwrap();
+    let url = format!("http://{}", server.address());
+    let resume = json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"normal-nodes","turnId":first["turnId"]});
+    let restored = events(post(&client, &url, &resume).send().await.unwrap()).await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0]["text"], shown);
+    let mut next = request("normal-nodes", "仅说明已有结果");
+    next["messages"] = json!([{"role":"user","content":"安排资料整理及审查"},{"role":"assistant","content":shown},{"role":"user","content":"仅说明已有结果"}]);
+    assert!(events(post(&client, &url, &next).send().await.unwrap())
+        .await
+        .iter()
+        .any(completed));
+    let history = post(&client, &url, &history_request)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(history["data"]["turns"].as_array().unwrap().len(), 2);
+    assert_eq!(history["data"]["turns"][0]["assistant"], shown);
+    let ledger = std::fs::read_to_string(
+        cfg.home
+            .join("sessions")
+            .join(format!("{}.jsonl", run.session_id)),
+    )
+    .unwrap();
+    assert!(
+        !ledger.contains("团队执行节点"),
+        "展示摘要不能导入模型会话或重放执行"
+    );
+    server.shutdown().await.unwrap();
 }

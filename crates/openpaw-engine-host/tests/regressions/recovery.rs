@@ -621,7 +621,11 @@ async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_app
             let history:serde_json::Value=client.post(&url).header("origin","http://127.0.0.1:8765").json(&json!({"type":"history","version":"1.0","teamId":"office-1","conversationId":"conversation"})).send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
             assert_eq!(
                 history["data"]["turns"][0]["assistant"],
-                "硬停前已落盘的部分文本"
+                "硬停前已落盘的部分文本\n\n> 本轮未完成：宿主重启，未完成运行不自动重放"
+            );
+            assert_eq!(
+                run.text, "硬停前已落盘的部分文本",
+                "错误说明只投影展示，不能写入原模型正文"
             );
             assert_eq!(history["data"]["turns"][0]["state"], "error");
             let body=client.post(&url).header("origin","http://127.0.0.1:8765").json(&json!({"type":"resume","version":"1.0","teamId":"office-1","conversationId":"conversation","turnId":history["data"]["turns"][0]["id"]})).send().await.unwrap().error_for_status().unwrap().text().await.unwrap();

@@ -45,12 +45,41 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   await waitFor(async()=>(await page.getByRole('log',{name:'对话内容'}).innerText()).includes('T6五个独立角色核查完成'),45000)
   await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:15000})
   const final=await waitFor(async()=>{const c=conv(await readOffice(),request.conversationId);return c?.tasks[0].status==='completed'&&c.tasks[0].progress===100?c:false})
-  assert.equal(final.tasks.length,6);assert.equal(final.events.filter(e=>e.kind==='task.assigned').length,5)
-  for(const [,employee] of roles){const personal=final.events.filter(e=>e.employeeId===employee);assert.equal(personal.filter(e=>e.kind==='task.started').length,1);assert.equal(personal.filter(e=>e.kind==='task.completed').length,1);assert.ok(personal.find(e=>e.kind==='task.completed').summary.includes('已核验'))}
+  // 快照是有界显示窗口，已公开终态事件可退到账本。验收全过程真实
+  // Office响应里的事件，不能要求最后一帧永久保留全部历史，也不伪造最终快照。
+  const observedEventsById=new Map()
+  for(const message of report.messages){
+    const actual=message.response?.data?.snapshot?.conversations?.find(c=>c.id===request.conversationId)
+    if(actual)for(const event of actual.events)if(!observedEventsById.has(event.id))observedEventsById.set(event.id,event)
+  }
+  const observedEvents=[...observedEventsById.values()]
+  assert.equal(final.tasks.length,6);assert.equal(observedEvents.filter(e=>e.kind==='task.assigned').length,5)
+  for(const [,employee] of roles){const personal=observedEvents.filter(e=>e.employeeId===employee);assert.equal(personal.filter(e=>e.kind==='task.started').length,1);assert.equal(personal.filter(e=>e.kind==='task.completed').length,1);assert.ok(personal.find(e=>e.kind==='task.completed').summary.includes('已核验'))}
   assert.ok(final.whiteboard.steps.length<=3);assert.ok(final.whiteboard.description.includes('5/5'))
   await page.getByRole('button',{name:'收起聊天',exact:true}).click()
-  const snapshot=await scene('complete')
-  assert.equal(snapshot.records.filter(r=>r.command.capability==='office.visit').length,5,'每个真实派发只播放一次交接')
+  let snapshot=await scene('complete')
+  // r31将前向派发与真实执行完成汇报分别计数，不能再把全部visit误判为重复派发。
+  snapshot=await waitFor(async()=>{
+    const s=await scene('complete-returns')
+    const returns=s.records.filter(r=>r.command.capability==='office.visit'&&r.command.participants[1]?.entityId==='office-lead')
+    return returns.length===5&&returns.every(r=>r.status==='completed')?s:false
+  },45000)
+  const visits=snapshot.records.filter(r=>r.command.capability==='office.visit')
+  const forward=visits.filter(r=>r.command.participants[0]?.entityId==='office-lead')
+  const returns=visits.filter(r=>r.command.participants[1]?.entityId==='office-lead')
+  assert.equal(visits.length,10,'五次真实派发和五次完成汇报各一次')
+  assert.equal(forward.length,5,'每个真实派发只播放一次交接')
+  assert.equal(returns.length,5,'每个已完成真实子Run只播放一次汇报')
+  assert.deepEqual(new Set(forward.map(r=>r.command.commandId)),new Set(handoffs.map(h=>h.command.commandId)))
+  for(const [, ,actor] of roles){
+    const personal=returns.filter(r=>r.command.participants[0]?.entityId===actor)
+    assert.equal(personal.length,1,actor+'只能完成汇报一次')
+    const record=personal[0]
+    assert.equal(record.status,'completed')
+    assert.equal(record.command.busyPolicy,'queue')
+    assert.equal(record.command.params.stops[0].hostId,'office-lead')
+    assert.ok(record.command.params.stops[0].message.includes('独立执行已结束'))
+  }
   // 成员布局必须实际显示投影事件，不能只在HTTP快照里通过断言。
   await page.getByRole('button',{name:'切换页面布局',exact:true}).click()
   await page.getByRole('button',{name:'成员布局',exact:true}).click()
@@ -78,10 +107,21 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   report.workspaceIsolation={...report.workspaceIsolation,firstTeamRoot:parentBinding.root_id,childRootsVerified:children.length,secondTeamRoot:'project-2',secondBindings:secondBindings.length};
   for(const child of children){const ledger=(await readFile(join(output,'host-data/sessions',child.child_session+'.jsonl'),'utf8')).trim().split('\n').map(JSON.parse);assert.ok(ledger.some(e=>e.type==='tool_call_complete'&&e.tool_name==='read_file'));assert.ok(ledger.some(e=>e.type==='run_finished'&&e.status==='completed'))}
   db.close()
+  // 布局切换后画布会重新排版；等待真实尺寸稳定，再取当前世界位置。
+  // 不按切换前画布坐标点空白处，也不改用侧栏替代六次真实Pixi命中。
+  let lastGeometry='',geometrySince=0
+  await waitFor(async()=>{
+    const box=await page.locator('canvas:visible').first().boundingBox()
+    if(!box || box.width<=0 || box.height<=0)return false
+    const current=JSON.stringify(Object.fromEntries(Object.entries(box).map(([k,v])=>[k,Math.round(v)])))
+    if(current!==lastGeometry){lastGeometry=current;geometrySince=Date.now();return false}
+    return Date.now()-geometrySince>=400
+  })
+  snapshot=await scene('complete-after-layout')
   // Actual Pixi clicks use exported world positions and the frozen renderer transform. HTTP actorId remains authoritative.
   const actors=[];const members=[]
   for(const person of snapshot.world.actors) {
-    const canvas=await page.locator('canvas').first().boundingBox();assert.ok(canvas)
+    const canvas=await page.locator('canvas:visible').first().boundingBox();assert.ok(canvas)
     const scale=Math.min(canvas.width/1100,canvas.height/850)
     const x=canvas.x+(canvas.width-1100*scale)/2+((person.position.x+.5)*50+(person.posture==='seated'?25:0))*scale
     const y=canvas.y+(canvas.height-850*scale)/2+((person.position.y+.5)*50-(person.posture==='seated'?10:0)-40)*scale
@@ -137,8 +177,8 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
   // 王明只看本人任务，完整团队卡片仍在Office任务中心，不混算各角色进度。
   assert.ok((await page.getByRole('dialog').innerText()).includes('已核验完成'))
   await page.getByRole('button',{name:'关闭详情',exact:true}).click()
-  report.t6={request,parent,children,handoffs,actors,members,timelines,final,scene:snapshot,model:'deterministic real HTTP Provider; animation pacing only in test fixture; real Host execution'}
-  report.assertions.push('D61 five real member timelines preserve observed start and verified completion, without additional assignment or visit', 'T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five observed office.visit completions; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards','r6: real five children share their parent team root while second-team existing sessions stay on a distinct physical root')
+  report.t6={request,parent,children,handoffs,actors,members,timelines,final,observedEvents,scene:snapshot,model:'deterministic real HTTP Provider; animation pacing only in test fixture; real Host execution'}
+  report.assertions.push('D61 five real member timelines preserve observed start and verified completion, without duplicate assignments or completion returns', 'T6 six actual Pixi actor clicks and six sidebar members show the correct scoped identity with return navigation','T6 real parent + five independent Session/Run/JSONL with real read_file and Provider HTTP calls','T6 five task.assigned events cause exactly five forward visits, plus one completed return per real worker; each worker presents its real current task','T6 whiteboard bounded business goal and true 5/5; no per-call task cards','r6: real five children share their parent team root while second-team existing sessions stay on a distinct physical root')
   report.assertions.push('r7: six members open their own real task/result details and return without losing identity','D65: ordinary follow-up retains completed team cards, original whiteboard and independent member results')
   report.assertions.push('Six actual actor dialogs show their own verified task/progress/result, and refresh keeps identity without creating another Run')
 }

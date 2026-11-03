@@ -10,6 +10,21 @@ use std::collections::BTreeSet;
 
 const NAME: &str = "report_progress";
 
+/// 功能：识别可提供真实文件产出证据的现有工具。
+/// 参数：name为原注册表记录的工具名。
+/// 返回：文件写入或媒体保存工具返回true。
+/// 错误：无。
+/// 状态：只分类，不产生或确认文件。
+/// 并发与取消：纯函数，无共享状态。
+/// 权限：不授予执行权限；调用方仍核验成功、作用域和准确路径。
+/// 关联：CHG-2026-0007第9.12节媒体证据与产物展示。
+pub(crate) fn is_file_writer(name: &str) -> bool {
+    matches!(
+        name,
+        "write_file" | "edit_file" | "render_visual" | "generate_image"
+    )
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Step {
@@ -137,7 +152,7 @@ fn is_coordination_step(title: &str, run: &RunView) -> bool {
 /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
 pub(crate) fn spec() -> ToolSpec {
     let definition = json!({"type":"object","additionalProperties":false,"required":["id","title"],"properties":{"id":{"type":"string","minLength":1,"maxLength":80},"title":{"type":"string","minLength":1,"maxLength":160}}});
-    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。多步骤任务先create固定计划，再update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；同一步后续核验可补报新的真实证据，Host保留旧证据并合并，不能回退已完成状态；文件步骤须引用write_file/edit_file；真实协作也可引用父delegate_task调用ID，Host再核验该成功子Run的实际写入和相同产物路径。不能把子调用ID当父Run证据。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
+    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。多步骤任务先create固定计划，再update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；同一步后续核验可补报新的真实证据，Host保留旧证据并合并，不能回退已完成状态；文件步骤须引用write_file/edit_file/render_visual/generate_image；真实协作也可引用父delegate_task调用ID，Host再核验该成功子Run的实际写入和相同产物路径。不能把子调用ID当父Run证据。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
 }
 
 /// 功能：校验报告的结构，实际证据在Store序列内再次校验。
@@ -169,9 +184,9 @@ pub(crate) fn with_execution_receipt(
         let receipt = json!({"callId":binding.call_id,"tool":binding.tool_name});
         // 委派的执行证据属于父调用，真实子写入仍由原Store校验；不能要求父复制子工具调用。
         let evidence = if binding.tool_name == "delegate_task" {
-            "这是父delegate_task的执行回执。若子Run成功且其结果满足步骤，可引用上述父delegate_task调用ID；保存步骤由Host核验该子Run真实成功的write_file/edit_file及相同路径，不需要也不能把子调用ID冒充父证据。子Run内部仍走同一Host审批与执行管线；父模型未看到UI点击，不等于写入未审批。子文本不是审批凭据，工具成功不代表内容验收或步骤自动完成。"
+            "这是父delegate_task的执行回执。若子Run成功且其结果满足步骤，可引用上述父delegate_task调用ID；保存步骤由Host核验该子Run真实成功的write_file/edit_file/render_visual/generate_image及相同路径，不需要也不能把子调用ID冒充父证据。子Run内部仍走同一Host审批与执行管线；父模型未看到UI点击，不等于写入未审批。子文本不是审批凭据，工具成功不代表内容验收或步骤自动完成。"
         } else {
-            "保存步骤仍须引用对应路径的实际write_file/edit_file回执。"
+            "保存步骤仍须引用对应路径的实际write_file/edit_file/render_visual/generate_image回执。"
         };
         outcome.content.push_str(&format!("\n\n[Host执行回执]\n{receipt}\n以上仅确认本次工具执行成功，不代表资料内容有效或业务步骤已完成。核对结果符合对应步骤要求后，在进入下一步骤或最终回复前调用report_progress：{{\"type\":\"update\",\"stepId\":\"当前计划中对应步骤的id\",\"state\":\"completed\",\"evidenceCallIds\":[{}]}}。必须替换stepId，逐字使用此callId；若内容无效先继续检索，不得报告完成。{evidence}\n[/Host执行回执]", json!(binding.call_id)));
     }
@@ -396,7 +411,7 @@ pub(crate) fn update_with_delegations(
                         &b.call_id == id && b.run_id == run.run_id && b.tool_name == tool.tool_name
                     })
                     .ok_or_else(|| invalid("证据缺少本轮实际执行事实"))?;
-                if matches!(tool.tool_name.as_str(), "write_file" | "edit_file")
+                if is_file_writer(&tool.tool_name)
                     && binding
                         .input
                         .get("path")
@@ -479,6 +494,36 @@ pub(crate) fn project(value: Option<Value>, run: &RunView) -> HostResult<(Vec<Va
     Ok((steps, percent as u64))
 }
 
+/// 功能：区分子角色有限执行完成与父目标业务验收，生成执行进度。
+/// 参数：value为原子计划，run为真实子Run与已保存正文。
+/// 返回：执行步骤及百分比，未核验文件步骤仍不算完成。
+/// 错误：原计划损坏返回存储错误。
+/// 状态：只读投影，不补写进度证据或修改父业务验收。
+/// 并发与取消：纯计算，取消/失败不能补成完成。
+/// 权限：仅已保存非空正文的正常终态可确认无副作用的文本工作。
+/// 关联：CHG-2026-0007第9.13节D108。
+pub(crate) fn execution_project(
+    value: Option<Value>,
+    run: &RunView,
+) -> HostResult<(Vec<Value>, u64)> {
+    let Some(mut value) = value else {
+        return project(None, run);
+    };
+    if run.state == RunState::Completed && !run.text.trim().is_empty() {
+        if let Some(steps) = value["steps"].as_array_mut() {
+            for step in steps {
+                if step["title"]
+                    .as_str()
+                    .is_some_and(|title| !needs_write(title))
+                {
+                    step["state"] = json!("completed");
+                }
+            }
+        }
+    }
+    project(Some(value), run)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +539,25 @@ mod tests {
             tools: vec![],
             text_truncated: false,
         }
+    }
+    #[test]
+    fn d108_finite_text_execution_completes_without_accepting_an_unwritten_artifact() {
+        let mut r = run();
+        r.state = RunState::Completed;
+        r.text = "实际已保存的有限文本".into();
+        let value = json!({"run_id":"r","steps":[{"id":"text","title":"检查给定材料","state":"in_progress","evidenceCallIds":[]}]});
+        assert!(
+            project(Some(value.clone()), &r).unwrap().1 < 100,
+            "父验收不被放宽"
+        );
+        assert_eq!(execution_project(Some(value), &r).unwrap().1, 100);
+        let value = json!({"run_id":"r","steps":[{"id":"file","title":"保存 article.md","state":"in_progress","evidenceCallIds":[]}]});
+        assert!(
+            execution_project(Some(value), &r).unwrap().1 < 100,
+            "文本不证明文件已写"
+        );
+        r.state = RunState::Failed;
+        assert_eq!(execution_project(None, &r).unwrap().1, 0, "失败不提升完成");
     }
     fn plan(run: &RunView) -> Value {
         update(None,&json!({"type":"create","steps":[{"id":"lookup","title":"查询当天资料"},{"id":"record","title":"保存 weather.md"},{"id":"answer","title":"整理答复"}]}),run,&[]).unwrap()
@@ -660,6 +724,44 @@ mod tests {
         );
         assert!(update(Some(full), &report(json!(["review_32"])), &r, &started).is_err());
         assert_eq!(first["steps"][0]["evidenceCallIds"], json!(["review_0"]));
+    }
+
+    #[test]
+    fn media_completion_requires_successful_same_run_exact_path_evidence() {
+        for name in ["render_visual", "generate_image"] {
+            let mut r = run();
+            let p = update(
+                None,
+                &json!({"type":"create","steps":[{"id":"media","title":"保存 outputs/chart.svg"}]}),
+                &r,
+                &[],
+            )
+            .unwrap();
+            let report = json!({"type":"update","stepId":"media","state":"completed","evidenceCallIds":["media"]});
+            r.tools.push(ToolView {
+                call_id: "media".into(),
+                tool_name: name.into(),
+                state: "failed".into(),
+            });
+            let mut binding = ToolCallBinding {
+                run_id: "r".into(),
+                call_id: "media".into(),
+                tool_name: name.into(),
+                input: json!({"path":"outputs/chart.svg"}),
+            };
+            assert!(update(Some(p.clone()), &report, &r, &[binding.clone()]).is_err());
+            r.tools[0].state = "completed".into();
+            binding.run_id = "another".into();
+            assert!(update(Some(p.clone()), &report, &r, &[binding.clone()]).is_err());
+            binding.run_id = "r".into();
+            binding.input["path"] = json!("outputs/other.svg");
+            assert!(update(Some(p.clone()), &report, &r, &[binding.clone()]).is_err());
+            binding.input["path"] = json!("outputs/chart.svg");
+            let confirmed = update(Some(p), &report, &r, &[binding]).unwrap();
+            let (steps, percent) = project(Some(confirmed), &r).unwrap();
+            assert_eq!(steps[0]["status"], "completed");
+            assert_eq!(percent, 50, "实际文件完成不替代主Run最终交付");
+        }
     }
 
     #[test]
@@ -871,12 +973,12 @@ mod tests {
             delegated_result.content.contains("子Run")
                 && delegated_result.content.contains("父delegate_task")
         );
-        assert!(!delegated_result
-            .content
-            .contains("保存步骤仍须引用对应路径的实际write_file/edit_file回执"));
-        assert!(result
-            .content
-            .contains("保存步骤仍须引用对应路径的实际write_file/edit_file回执"));
+        assert!(!delegated_result.content.contains(
+            "保存步骤仍须引用对应路径的实际write_file/edit_file/render_visual/generate_image回执"
+        ));
+        assert!(result.content.contains(
+            "保存步骤仍须引用对应路径的实际write_file/edit_file/render_visual/generate_image回执"
+        ));
         assert_eq!(
             with_execution_receipt(child.clone(), &delegated, false).content,
             child.content

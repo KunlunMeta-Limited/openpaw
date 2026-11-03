@@ -4,6 +4,11 @@
 //! 禁止职责：不创建第二套引擎、工具、账本或审批系统。
 mod actions;
 mod approvals;
+/// 职责：真实成功文件的不可变版本与Office只读交付适配。
+/// 输入输出：原工具结果、受限blob和单版本访问响应。
+/// 依赖：原Root许可、Store、路径校验与Office官方Schema。
+/// 禁止职责：不重放写入、不扫描工作区补造历史、不授予执行权限。
+pub(crate) mod artifacts;
 mod chat;
 mod client;
 mod details;
@@ -12,6 +17,9 @@ mod projection;
 mod scene;
 mod turns;
 mod workspaces;
+
+// 存储核对复用同一纯展示，不复制Office错误格式或信任浏览器自述。
+pub(crate) use turns::display_in as chat_display;
 
 use crate::{HostConfig, HostError, HostResult};
 use serde::{Deserialize, Serialize};
@@ -26,6 +34,14 @@ use std::collections::BTreeMap;
 /// 稳定性：T4新增可选配置，旧TOML缺省关闭。
 /// 关联：需求/设计REQ-OP-010/011/012；DES-OP-007。
 pub struct OfficeConfig {
+    /// 用途：仅向人物当前任务窗口投影真实在途任务，并用短标题显示实际动作。
+    /// 字段：bool，缺省false保持原快照任务计数与终态展示。
+    /// 来源去向：可信Host配置到Office业务快照。
+    /// 约束：完整历史仍由原账本查询；启用后页面计数仅代表当前窗口。
+    /// 稳定性：新增可选配置，不增加Office协议字段。
+    /// 关联：REQ-OP-012/014；CHG-2026-0007第12.113节。
+    #[serde(default)]
+    pub activity_window: bool,
     /// Office Fastify服务根；禁止用户信息、查询、片段和重定向。
     /// 用途：Office服务根地址。
     /// 字段：String，官方配置或协议字段。
@@ -145,16 +161,33 @@ impl OfficeConfig {
                     | "todo_add"
                     | "todo_update"
                     | "bash"
+                    | "generate_image"
+                    | "render_visual"
             )
         }) {
             return Err(HostError::new(
                 "unsupported",
-                "Office未开放此工具；写工具需逐次审批，命令须逐次审批并受托管进程清理约束",
+                "Office未开放此工具；写工具须原审批或显式持续产物策略，命令仍逐次审批并托管清理",
             ));
         }
         Ok(())
     }
 }
 
-pub(crate) use chat::router;
+/// 功能：组合原Office聊天与已授权只读版本路由。
+/// 参数：host/config/address为原共享服务及监听地址。
+/// 返回：同一个loopback监听器的Router。
+/// 错误：存储、作用域或数据损坏明确拒绝。
+/// 状态：只读或发布派生版本，不修改原工具及会话。
+/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
+/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
+/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+pub(crate) fn router(
+    host: crate::Host,
+    config: OfficeConfig,
+    address: std::net::SocketAddr,
+) -> axum::Router {
+    chat::router(host.clone(), config.clone(), address)
+        .merge(artifacts::router(host, config, address))
+}
 pub(crate) use projection::Coordinator;

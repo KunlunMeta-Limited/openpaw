@@ -590,3 +590,46 @@ async fn d44_mixed_tool_result_and_text_does_not_break_tool_adjacency() {
         json!({"role":"user","content":"actual user text"})
     );
 }
+
+#[tokio::test]
+async fn continuous_stage_context_follows_finished_assistant_without_forging_user_input() {
+    use openpaw_core::SystemPromptBlocks;
+    for streaming in [false, true] {
+        let response = if streaming {
+            http_sse(&[
+                r#"data: {"choices":[{"delta":{"content":"next"},"finish_reason":"stop"}]}"#,
+                "data: [DONE]",
+            ])
+        } else {
+            http_json(&json!({"choices":[{"message":{"content":"next"},"finish_reason":"stop"}]}))
+        };
+        let (address, captured) = spawn_capture(vec![response]);
+        let provider =
+            OpenAiProvider::new("fixture", "fixture").with_base_url(format!("http://{address}"));
+        let request = CompletionRequest {
+            system_blocks: Some(SystemPromptBlocks {
+                stable: "原工具权限".into(),
+                dynamic: "Host已经接续，现在执行下一步".into(),
+            }),
+            messages: vec![
+                Message::user_text("持续工作直到停止"),
+                Message::assistant_text("上一阶段结束，等待自动接续"),
+            ],
+            ..Default::default()
+        };
+        if streaming {
+            use futures::StreamExt;
+            let events: Vec<_> = provider.stream(request).await.unwrap().collect().await;
+            assert!(events.iter().all(Result::is_ok));
+        } else {
+            provider.complete(request).await.unwrap();
+        }
+        let body = captured
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([{"role":"system","content":"原工具权限"},{"role":"user","content":"持续工作直到停止"},{"role":"assistant","content":"上一阶段结束，等待自动接续"},{"role":"system","content":"Host已经接续，现在执行下一步"}])
+        );
+    }
+}

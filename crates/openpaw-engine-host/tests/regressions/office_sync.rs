@@ -149,12 +149,18 @@ async fn sync_scenario() {
                 }
             }
             "offices.initialize" => {
-                s.initialized = true;
+                // 官方空列表只登记chat，不会凭空创建办公室或快照。
                 if let Some(first) = request["offices"].as_array().and_then(|a| a.first()) {
+                    s.initialized = true;
                     s.snapshot = Some(first.clone());
                 }
                 code = 202;
                 directory(&s)
+            }
+            "office.snapshot" if !s.initialized => {
+                // 与原版Office一致，尚无该办公室时返回明确404；不能假成功。
+                code = 404;
+                json!({"reasonCode":"OFFICE_NOT_INITIALIZED"})
             }
             "office.snapshot" => {
                 s.snapshot_bytes.push(bytes.to_vec());
@@ -218,6 +224,7 @@ async fn sync_scenario() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = config(tmp.path());
     cfg.office = Some(OfficeConfig {
+        activity_window: false,
         base_url: format!("http://{address}"),
         api_key_env: "PAWOFFICE_TEST_KEY".into(),
         allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -446,6 +453,7 @@ async fn sync_scenario() {
     let another = tempfile::tempdir().unwrap();
     let mut stale_cfg = config(another.path());
     stale_cfg.office = Some(OfficeConfig {
+        activity_window: false,
         base_url: format!("http://{address}"),
         api_key_env: "PAWOFFICE_TEST_KEY".into(),
         allowed_origins: vec!["http://127.0.0.1:8765".into()],

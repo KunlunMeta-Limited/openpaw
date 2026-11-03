@@ -224,6 +224,33 @@ fn adjust_index_to_preserve_tool_pairs(messages: &[Message], start_index: usize)
     adjusted
 }
 
+// 头部保护不能停在assistant工具调用与其结果之间，否则摘要会删除真实结果，
+// 后续Provider收到孤立tool_calls。按整条消息向前扩到当前批次闭合，不合成结果；
+// 未闭合时保留全部上下文，由调用方按“无可压缩区”处理。
+fn closed_protected_head(messages: &[Message], minimum: usize) -> usize {
+    if minimum == 0 {
+        return 0;
+    }
+    let mut pending = std::collections::HashSet::new();
+    for (index, message) in messages.iter().enumerate() {
+        for block in &message.content {
+            match block {
+                ContentBlock::ToolUse { id, .. } => {
+                    pending.insert(id.as_str());
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    pending.remove(tool_use_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        if index + 1 >= minimum && pending.is_empty() {
+            return index + 1;
+        }
+    }
+    messages.len()
+}
+
 /// Boundary marker message recording the pre-compaction size.
 pub fn create_compact_boundary_message(
     compact_type: CompactType,
@@ -282,13 +309,14 @@ pub(crate) async fn compact_session_report(
         return Ok((0, openpaw_core::Usage::default()));
     }
 
-    let protected_head: Vec<Message> = session.messages[..protect_count].to_vec();
+    let protect_count = closed_protected_head(&session.messages, protect_count);
     let raw_remaining_end = session.messages.len().saturating_sub(keep_count);
     let remaining_end = adjust_index_to_preserve_tool_pairs(&session.messages, raw_remaining_end);
     if remaining_end <= protect_count {
         return Ok((0, openpaw_core::Usage::default()));
     }
 
+    let protected_head: Vec<Message> = session.messages[..protect_count].to_vec();
     let old_messages: Vec<Message> = session.messages[protect_count..remaining_end].to_vec();
     let mut recent: Vec<Message> = session.messages[remaining_end..].to_vec();
     let compacted_count = old_messages.len();

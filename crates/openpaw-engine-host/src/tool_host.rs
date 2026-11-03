@@ -125,7 +125,14 @@ impl ToolExecutionObserver for Started {
 fn writing(name: &str) -> bool {
     matches!(
         name,
-        "write_file" | "edit_file" | "notebook_edit" | "todo_add" | "todo_update" | "bash"
+        "write_file"
+            | "edit_file"
+            | "notebook_edit"
+            | "todo_add"
+            | "todo_update"
+            | "bash"
+            | "generate_image"
+            | "render_visual"
     )
 }
 #[async_trait]
@@ -140,6 +147,16 @@ impl ToolExecutor for HostTools {
             .collect();
         if self.execution.as_ref().is_some_and(|e| e.role == "lead") {
             specs.push(crate::orchestration::spec());
+            specs.push(crate::orchestration::status_spec());
+            if self.execution.as_ref().is_some_and(|e| {
+                e.group
+                    .config
+                    .continuous
+                    .as_ref()
+                    .is_some_and(|c| c.enabled)
+            }) {
+                specs.push(crate::continuous::spec());
+            }
         }
         if self.progress_enabled {
             specs.push(crate::task_progress::spec());
@@ -158,7 +175,10 @@ impl ToolExecutor for HostTools {
         let cancel = context.cancel();
         let call = self.invoke(name, args, context);
         tokio::pin!(call);
-        if let Some(timeout) = self.ordinary_timeout.filter(|_| name != "delegate_task") {
+        if let Some(timeout) = self
+            .ordinary_timeout
+            .filter(|_| !matches!(name, "delegate_task" | "delegation_status"))
+        {
             tokio::select! { biased;
                 result=&mut call=>result,
                 _=tokio::time::sleep(timeout)=> {
@@ -180,8 +200,24 @@ impl ToolHostValidator for HostTools {
         name: &str,
         input: &serde_json::Value,
     ) -> std::result::Result<(), String> {
+        if name == "continuous_task"
+            && self.execution.as_ref().is_some_and(|e| {
+                e.role == "lead"
+                    && e.group
+                        .config
+                        .continuous
+                        .as_ref()
+                        .is_some_and(|c| c.enabled)
+            })
+        {
+            return crate::continuous::validate(input).map_err(|e| e.message);
+        }
         if name == "delegate_task" && self.execution.as_ref().is_some_and(|e| e.role == "lead") {
             return crate::orchestration::validate(input).map_err(|e| e.message);
+        }
+        if name == "delegation_status" && self.execution.as_ref().is_some_and(|e| e.role == "lead")
+        {
+            return crate::orchestration::validate_status(input).map_err(|e| e.message);
         }
         if self.progress_enabled && name == "report_progress" {
             return crate::task_progress::validate(input).map_err(|e| e.message);
@@ -209,6 +245,27 @@ impl HostTools {
         {
             return Err(Error::ToolHost("工具绑定不匹配".into()));
         }
+        if name == "continuous_task" {
+            if context.cancel().is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let execution = self
+                .execution
+                .as_ref()
+                .ok_or_else(|| Error::ToolHost("缺少可信主角色".into()))?;
+            return match self
+                .host
+                .continuous_update(execution, context.binding().clone())
+                .await
+            {
+                Ok(result) => Ok(ToolCallOutcome::ok(result)),
+                Err(error) if error.kind == "storage_unavailable" => {
+                    self.control.fail(error);
+                    Err(Error::Store("持续任务检查点保存失败".into()))
+                }
+                Err(error) => Ok(ToolCallOutcome::error(error.to_string())),
+            };
+        }
         if self.progress_enabled && name == "report_progress" {
             if context.cancel().is_cancelled() {
                 return Err(Error::Cancelled);
@@ -235,6 +292,28 @@ impl HostTools {
                     }
                 });
         }
+        if name == "delegation_status" {
+            let execution = self
+                .execution
+                .as_ref()
+                .filter(|e| e.role == "lead")
+                .ok_or_else(|| Error::ToolHost("缺少主角色".into()))?;
+            return self
+                .host
+                .delegation_status(execution, args, context.cancel())
+                .await
+                .map(ToolCallOutcome::ok)
+                .map_err(|e| {
+                    if e.kind == "cancelled" {
+                        Error::Cancelled
+                    } else if e.kind == "storage_unavailable" {
+                        self.control.fail(e.clone());
+                        Error::Store(e.message)
+                    } else {
+                        Error::ToolHost(e.to_string())
+                    }
+                });
+        }
         if name == "delegate_task" {
             let execution = self
                 .execution
@@ -255,9 +334,11 @@ impl HostTools {
                         Error::ToolHost(e.to_string())
                     }
                 })?;
-            let completed = serde_json::from_str::<serde_json::Value>(&result)
-                .ok()
-                .is_some_and(|v| v["state"] == "completed");
+            let state = serde_json::from_str::<serde_json::Value>(&result).unwrap_or_default();
+            if state["state"] == "accepted" {
+                return Ok(ToolCallOutcome::ok(result));
+            }
+            let completed = state["state"] == "completed";
             let mut outcome = ToolCallOutcome::ok(result);
             outcome.is_error = !completed;
             return Ok(crate::task_progress::with_execution_receipt(
@@ -318,8 +399,25 @@ impl HostTools {
             control: self.control.clone(),
         }));
         // 必须等待原调用返回；context取消不能通过drop绕过进程树、管道及原子写入清理。
-        let result = self.registry.call_with_context(name, args, context).await;
+        let mut result = self.registry.call_with_context(name, args, context).await;
         let success = result.as_ref().is_ok_and(|r| !r.is_error);
+        // Root许可仍持有：捕获只读取刚成功工具的准确目标，不再次执行副作用。
+        if success && self.progress_enabled && self.host.inner.config.office.is_some() {
+            if let Err(error) = crate::office::artifacts::capture(
+                &self.host,
+                self.root.path.clone(),
+                binding.clone(),
+            )
+            .await
+            {
+                if let Ok(outcome) = &mut result {
+                    outcome.content.push_str(&format!("\n\n文件写入已成功，但不可变版本捕获失败：{}。工作区原文件保留；不能宣称该文件已可预览或下载。",error.message));
+                }
+                let warning_binding = binding.clone();
+                let warning = error.message.clone();
+                if let Err(error)=self.store.call_priority(move|db|{let revision=db.bump("artifact_capture_failed",&serde_json::json!({"run_id":warning_binding.run_id,"call_id":warning_binding.call_id,"message":warning}).to_string())?;let _=db.notices.send(crate::HostNotice::Changed{revision});Ok(())}).await {self.control.fail(error);return Err(Error::Store("产物捕获警告保存失败".into()));}
+            }
+        }
         let receipt_binding = binding.clone();
         if let Err(e)=self.store.call_priority(move|db|{let rev=db.bump("tool_result",&serde_json::json!({"run_id":binding.run_id,"call_id":binding.call_id,"success":success}).to_string())?;let _=db.notices.send(crate::HostNotice::Changed{revision:rev});Ok(())}).await {self.control.fail(e);return Err(Error::Store("工具结果保存失败".into()));}
         // 回执在原结果可靠保存后追加；不提前宣称执行成功，也不把回执当作步骤完成。

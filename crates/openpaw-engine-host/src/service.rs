@@ -72,6 +72,7 @@ pub(crate) struct Inner {
     pub(crate) store: Store,
     provider: Arc<dyn LlmProvider>,
     model: String,
+    images: Option<openpaw_tools::media::ImageService>,
     state: Mutex<Registry>,
     unavailable: AtomicBool,
     shutdown_result: tokio::sync::Mutex<Option<HostResult<()>>>,
@@ -109,17 +110,11 @@ pub(crate) struct Inner {
     /// 稳定性：T6进程内缓存，重启后可重建。
     /// 关联：需求/设计REQ-OP-011/012；DES-OP-007。
     pub(crate) office_terminal_runs: Arc<Mutex<HashMap<String, RunView>>>,
-    /// 用途：保存同一事实版本下按顺序待展示的交接快照。
-    /// 字段：按办公室作用域索引的有界快照队列。
-    /// 来源去向：首次投影从真实账本生成，UI读取时逐项推进。
-    /// 约束：不再次扫描整个办公室；重启后为空并由持久投影和账本重建，不能替代事实来源。
-    /// 稳定性：T6进程内动画协调状态，不持久化业务结果。
-    /// 关联：需求/设计REQ-OP-011/012；DES-OP-009。
-    pub(crate) office_handoff_queue: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
 }
 struct Active {
     execution: Option<crate::orchestration::Execution>,
     reserved_children: usize,
+    waiting: bool,
     session: String,
     scope: ClientScope,
     control: RunControl,
@@ -232,6 +227,48 @@ impl Host {
         config: HostConfig,
         provider: Arc<dyn LlmProvider>,
     ) -> HostResult<Self> {
+        let images = Self::image_service(&config, |name| std::env::var(name).ok())?;
+        Self::with_services(config, provider, images).await
+    }
+    /// 功能：复用原模型配置快照装配Host及独立图片服务。
+    /// 参数：config为可信Host配置，provider为原Provider，environment为官方只读.env快照。
+    /// 返回：完成恢复且图片凭据仅保留在运行对象中的Host。
+    /// 错误：图片服务配置/独立密钥缺失或原Host启动失败时脱敏报告。
+    /// 状态：不修改进程环境，不把凭据写入配置或事件。
+    /// 并发与取消：服务只读共享，实际请求采用每次工具取消信号。
+    /// 权限：图片凭据只按images.api_key_env读取，不回退聊天密钥。
+    /// 关联：CHG-2026-0007第9.12节。
+    pub async fn with_provider_and_environment(
+        config: HostConfig,
+        provider: Arc<dyn LlmProvider>,
+        environment: &openpaw_llm::model_config::ModelEnvironment,
+    ) -> HostResult<Self> {
+        let images =
+            Self::image_service(&config, |name| environment.value(name).map(str::to_owned))?;
+        Self::with_services(config, provider, images).await
+    }
+    fn image_service(
+        config: &HostConfig,
+        value: impl Fn(&str) -> Option<String>,
+    ) -> HostResult<Option<openpaw_tools::media::ImageService>> {
+        config
+            .agents
+            .as_ref()
+            .and_then(|agents| agents.images.clone())
+            .map(|images| {
+                let key = value(&images.api_key_env)
+                    .ok_or_else(|| HostError::new("invalid_input", "独立图片服务密钥未配置"))?;
+                openpaw_tools::media::ImageService::new(images, key).map_err(|_| {
+                    HostError::new("invalid_input", "独立图片服务配置不合法或缺少凭据")
+                })
+            })
+            .transpose()
+    }
+    async fn with_services(
+        config: HostConfig,
+        provider: Arc<dyn LlmProvider>,
+        images: Option<openpaw_tools::media::ImageService>,
+    ) -> HostResult<Self> {
         config.validate()?;
         let model = openpaw_llm::assembly::resolve_model(&*provider, config.model.as_deref())
             .map_err(|_| HostError::new("invalid_input", "模型不能为空"))?;
@@ -244,7 +281,6 @@ impl Host {
         let office_projection_cache = Arc::new(Mutex::new(HashMap::new()));
         let office_projection_locks = Arc::new(Mutex::new(HashMap::new()));
         let office_terminal_runs = Arc::new(Mutex::new(HashMap::new()));
-        let office_handoff_queue = Arc::new(Mutex::new(HashMap::new()));
         let store = Store::open(
             home,
             roots
@@ -269,6 +305,7 @@ impl Host {
                 roots,
                 store,
                 provider,
+                images,
                 model,
                 state: Mutex::new(Registry::default()),
                 unavailable: AtomicBool::new(false),
@@ -282,7 +319,6 @@ impl Host {
                 office_projection_locks,
                 office_ui_busy: Arc::new(AtomicUsize::new(0)),
                 office_terminal_runs,
-                office_handoff_queue,
             }),
         })
     }
@@ -544,13 +580,13 @@ impl Host {
                 let parent_id = child.as_ref().map(|(_, e)| e.group.parent.clone());
                 let reserved_children =
                     usize::from(execution.as_ref().is_some_and(|e| e.role == "lead"));
-                let used = state.active.len()
+                let used = state.active.values().filter(|a| !a.waiting).count()
                     + state
                         .active
                         .values()
                         .map(|a| a.reserved_children)
                         .sum::<usize>();
-                let consume = if let Some(parent) = &parent_id {
+                if let Some(parent) = &parent_id {
                     let p = state
                         .active
                         .get(parent)
@@ -563,23 +599,19 @@ impl Host {
                     {
                         return Err(HostError::new("cancelled", "主运行不再接受委派"));
                     }
-                    p.reserved_children > 0
-                } else {
-                    false
-                };
-                if used + 1 + reserved_children
-                    > self.inner.config.max_active_runs + usize::from(consume)
+                }
+                if child.is_none()
+                    && used + 1 + reserved_children > self.inner.config.max_active_runs
                 {
                     if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() {
                         eprintln!(
-                            "engine-host diagnostics capacity scope={} session={} active={} reserved={} requested_reserved={} max={} consume={} parent={:?}",
+                            "engine-host diagnostics capacity scope={} session={} active={} reserved={} requested_reserved={} max={} parent={:?}",
                             scope.namespace,
                             session_id,
                             state.active.len(),
                             used.saturating_sub(state.active.len()),
                             reserved_children,
                             self.inner.config.max_active_runs,
-                            consume,
                             parent_id,
                         );
                     }
@@ -588,18 +620,15 @@ impl Host {
                         "宿主运行容量已满，协作需预留主子容量",
                     ));
                 }
-                if consume {
-                    state
-                        .active
-                        .get_mut(parent_id.as_ref().unwrap())
-                        .unwrap()
-                        .reserved_children -= 1;
+                if let Some((_, e)) = &child {
+                    e.group.enqueue(&e.role, &id)?;
                 }
                 state.active.insert(
                     id.clone(),
                     Active {
                         execution: execution.clone(),
                         reserved_children,
+                        waiting: child.is_some(),
                         session: session_id.into(),
                         scope: scope.clone(),
                         control: control.clone(),
@@ -711,22 +740,37 @@ impl Host {
         control: RunControl,
         execution: Option<crate::orchestration::Execution>,
     ) {
+        let model_trace = Arc::new(Mutex::new(ModelTrace::default()));
         let checkpoint_stop = tokio_util::sync::CancellationToken::new();
         let checkpoint_id = view.run_id.clone();
         let checkpoint_session = view.session_id.clone();
+        // 两枚执行许可只在真正开工后持有，直到终态持久化和实际清理。
+        let mut child_permits = None;
         let operation = async {
+            if let Some(e) = execution.as_ref().filter(|e| e.role != "lead") {
+                child_permits = Some(
+                    e.group
+                        .acquire(&e.role, &view.run_id, &control.cancel)
+                        .await?,
+                );
+                self.activate_child(&view.run_id, e, &control.cancel)
+                    .await?;
+            }
             view.state = RunState::Running;
             let v = view.clone();
             self.inner
                 .store
                 .call_priority(move |db| db.save_run(v, 0))
                 .await?;
-            let approval = Arc::new(HostApproval::new(
-                self.inner.store.clone(),
-                root.clone(),
-                control.clone(),
-                Duration::from_secs(self.inner.config.approval_timeout_secs),
-            ));
+            let approval = Arc::new(
+                HostApproval::new(
+                    self.inner.store.clone(),
+                    root.clone(),
+                    control.clone(),
+                    Duration::from_secs(self.inner.config.approval_timeout_secs),
+                )
+                .with_continuous(execution.as_ref().map(|e| e.group.clone())),
+            );
             let session_id = view.session_id.clone();
             let progress_enabled = self
                 .inner
@@ -748,7 +792,8 @@ impl Host {
                     .filter(|e| e.role == "lead")
                     .map(|_| Duration::from_secs(self.inner.config.tool_timeout_secs)),
                 progress_enabled,
-                registry: openpaw_tools::ToolRegistry::new(&root.path),
+                registry: openpaw_tools::ToolRegistry::new(&root.path)
+                    .with_image_service(self.inner.images.clone()),
                 allowed: allowed.clone(),
                 root: root.clone(),
                 approval: approval.clone(),
@@ -791,7 +836,8 @@ impl Host {
                             tools.join(", ")
                         ));
                     }
-                    system.push_str("派发前检查工具能力：需要新建或修改文件的任务只能交给白名单含write_file或edit_file的角色；没有写工具的角色只能读取、核验和报告限制，不能因为任务标题或context而获得写权限。若唯一可写角色正在工作，等待该任务实际结束后再安排保存；主角色有写工具时也可汇总保存。全队均无写工具时立即说明配置限制，不派发必然失败的保存任务。每位成员同时只能有一个在途任务，已结束后可继续承担有明确边界的后续任务，次数仍受本轮总上限约束；不要重复执行已经完成的同一操作。\n");
+                    system.push_str("派发前检查工具能力：需要新建或修改文件的任务只能交给白名单含write_file或edit_file的角色；没有写工具的角色只能读取、核验和报告限制，不能因为任务标题或context而获得写权限。若唯一可写角色正在工作，等待该任务实际结束后再安排保存；主角色有写工具时也可汇总保存。全队均无写工具时立即说明配置限制，不派发必然失败的保存任务。每位成员同时只执行一个任务；其他有明确边界的不同任务可用异步委派进入该成员FIFO待办，不必同步等待前项结束才向其他空闲成员派工，次数和队列仍受本轮配置上限约束；不要重复执行已经完成的同一操作。\n");
+                    system.push_str("队列身份与成果核对：以工具回执的task_id、role_id、title、work_item建立任务表，不用上下文转述的姓名或最近动画推断实际执行者/当前任务。accepted只是接单，可能排队；completed只是本次执行正常结束。子结果说缺工具、未写入或未达到验收时，保留未完成结论，不能把它当交付成功。available_tools是该角色实际白名单：精确局部替换必须有edit_file；只有write_file时不得要求只能局部编辑且禁止整文件写入，应选择具备该能力的同事或报告限制，不反复发同样不可执行的要求。每次delegation_status返回后处理新终态成果，下一轮等待使用pending_task_ids，已经收取的终态不要反复混入wait_for=any导致立即返回和无效模型往返。子任务结束后到后续真实委派之间可能等待主角色核验/模型响应；不得把这段空档伪报成同事还在执行，也不为动画重复派工。\n");
                     system.push_str("协作要有界：先用一句话说明分工并尽快调用工具，不为普通规划无穷检索。每位同事只做目标需要的一部分，不额外调查用户未要求的实时价格、天气或全部营业时刻。先交付简洁可用的方案，事实不明时标出待核实；不要反复抓取同一无效来源。每份子成果优先控制在约2000个汉字内，长文按章节分派，保留前序成功内容，避免把完整长稿在每次工具调用和最终回复中重复生成而耗尽输出额度。保存要求使用实际已核验成果，最终答复提供摘要与真实文件位置即可。\n");
                     system.push_str("规划、分析与建议任务不需要默认扫描工作区；根目录已经由Host提供，只有确有既存资料依赖或保存前检查目标时才读取。按用户实际问题拆分独立信息块，不把全部调查堆给一人再让其他人做无关工作；可联网角色可分担不同信息块，依赖草稿的审查仍必须在草稿返回后进行。没有明确日期或实时购买需求时，不新增近期活动、天气、逐项报价等调查；先交付可用方案与待核实项。\n");
                     system.push_str("按该目录派发：周理必须使用organize，李研使用research；其他人物同理。任务标题不能给另一个role改名。用户要求五位同事时，检查五个不同role_id都已真实派发，重复派给同一role不代表另一人参与。\n");
@@ -813,10 +859,30 @@ impl Host {
                 system.push_str("创建固定计划前先确定每个产物的实际文件路径，保存步骤标题必须逐字含工具实际使用的path值，不得只写保存章节/写入文件。长文先设计小章节的准确文件名和短入口路径，再create；委派instructions明确要求子角色沿用同一path值，不自行切换绝对/相对写法。无扩展名文件用反引号标出目标。无路径计划被create拒绝时修正整份计划后重试，不要先写文件或反复报告不可能通过的completed；计划固定后不得擅改目标。\n");
                 system.push_str("每个步骤开始前用{\"type\":\"update\",\"stepId\":\"该步骤ID\",\"state\":\"in_progress\"}报告；真实操作成功且内容核验后立即报告completed并填evidenceCallIds，再进入下一步。每次update必须带type。证据只用本轮工具响应对应的真实调用ID，不能猜工具名:路径、序号或时间戳；如Host返回恢复提示，逐字复制与该步骤匹配的callId修正输入，原权限/审批不变。成功工具结果末尾的[Host执行回执]提供本次准确callId，report_progress成功响应列出当前步骤。依照本轮清单推进，不沿用历史中漏报或报错后的做法；有真实依据就修正报告，不能用“以实际结果为准”代替进度更新。最终回复前检查全部步骤，不能只创建计划而忘记更新。\n");
             }
+            let staged = execution.as_ref().is_some_and(|e| {
+                e.role == "lead"
+                    && e.group
+                        .config
+                        .continuous
+                        .as_ref()
+                        .is_some_and(|c| c.enabled)
+            });
+            if let Some(config) = execution
+                .as_ref()
+                .and_then(|e| e.group.config.continuous.as_ref())
+                .filter(|c| c.enabled)
+            {
+                system.push_str(&format!("\n持续能力已由本机配置启用。只有用户明确要求持续工作直到停止时，主角色才调用continuous_task start，普通问题不要启动。启动后每个阶段保存checkpoint（成果摘要和准确下一步）；一次EndTurn不是整任务结束，Host会自动接续。只有start登记的用户明确有限完成条件满足时才finish；直到用户停止的任务不得自行finish。持续主任务不要建立无限延长的固定步骤计划，阶段/子任务可各自建立有界计划并准确完成；用checkpoint报告总体当前进展。完整正文保存文件，聊天只显示checkpoint摘要。允许自动审批的产物子目录为{}；仍需调用真实工具且不能越权。独立角色的任务可在同批delegate_task并行，依赖前序结果的审查必须等待。生图仅用generate_image，图表仅用render_visual；未配置或工具报错则明确缺项，不伪造图片。\n",config.output_dir));
+            }
+            if execution.as_ref().is_some_and(|e| e.role == "lead") {
+                system.push_str("\n通用交错调度：有前序成果时delegate_task.source_task_id填真实返回的task_id，Host据此让实际负责人交接，不能所有交接都冒称主角色。退修来源填实际审查者task_id。持续任务先continuous_task open_item开放稳定事项，最多配置允许数量；同一事项所有委派填写work_item。用wait_for_completion=false先派发空闲同事，再推进另一个独立事项；用delegation_status wait_for=any取得已完成的真实结果并立即衔接后续，把仍在途的任务保留并在下一轮等待列表里移除已终态项，不能一批全等完才调度。角色忙时只能排入不同且有明确边界的后续待办，不能重复当前任务；有前序依赖时先收取真实结果再交接。空闲时等待状态而非循环空checkpoint。source_task_id前序须真实成功，同事项不能串线。全部任务结束并验收产物后close_item，关闭一项才开放新项。阶段最终回复不代表同事完成，普通非持续任务结束前也必须收齐所有委派；父结束会取消未收齐同事。图文合稿属于用户要求时，配图负责人必须读取实际原稿、调用真实图表/生图工具，把相对图片链接用原编辑/写入工具嵌入同一Markdown；仅保存旁边图片不算合稿。审查读取合稿和真实图文件，图像能力未配置不虚构。\n");
+                system.push_str("交接参数纠错：source_task_id使用delegate_task或delegation_status返回的task_id（形如delegation:…），不是child_run_id或delegate_call_id。被拒绝时核对同一work_item的真实前序结果并纠正准确标识，不能删掉source_task_id把依赖交接伪装成主角色新派发。持续到用户停止的主目标没有固定总分母，不把启动阶段固定计划当成整个持续目标；用checkpoint及时报告已收取成果、实际下一步及等待原因，有限子任务仍逐项核验自己的计划。每次收取结果后先报告当前进展再派下一阶段，不让聊天长时间只停在旧检查点。用户给出的近似要求不能自行升级成精确硬阈值，有限检查不扩成反复计数、重写整份检查报告或无止境微调；报告结论、证据及必须修复项即可，不能因新增自定标准阻塞其他独立事项。\n");
+            }
             let provider = Arc::new(RunProvider {
                 inner: self.inner.provider.clone(),
                 context: system.clone(),
                 group: execution.as_ref().map(|e| e.group.clone()),
+                trace: model_trace.clone(),
             });
             // 多Agent运行的每个子Run都复用同一AgentLoop实现，但真实联网任务
             // 通常超过默认25轮（搜索、抓取、核对和整理各占一轮）。仅扩大
@@ -828,11 +894,17 @@ impl Host {
             });
             // 协作复用Provider已声明的单次上限，避免推理输出耗尽固定
             // 4096后没有正文。只分配既有组预算；reserve/settle及总硬上限不变。
-            let response_limit = if execution.is_some() {
-                match self.inner.provider.capabilities().max_output_tokens {
-                    0 => 4096,
-                    declared => declared.min(8192),
-                }
+            let response_limit = if let Some(execution) = &execution {
+                execution
+                    .group
+                    .config
+                    .max_response_tokens
+                    .unwrap_or_else(
+                        || match self.inner.provider.capabilities().max_output_tokens {
+                            0 => 4096,
+                            declared => declared.min(8192),
+                        },
+                    )
             } else {
                 4096
             };
@@ -845,21 +917,23 @@ impl Host {
                     agent_budget
                         .unwrap_or_else(|| openpaw_core::IterationBudget::new_elastic(8, 25, 1)),
                 )
-                .with_parallel_tools(false)
+                .with_parallel_tools(
+                    execution
+                        .as_ref()
+                        .is_some_and(|e| e.group.config.max_active_children > 2),
+                )
                 .with_stream_timeout(Duration::from_secs(self.inner.config.stream_idle_secs));
             let context = RunContext {
                 run_id: view.run_id.clone(),
                 cancel: control.cancel.clone(),
-                total_timeout: Some(
-                    execution
-                        .as_ref()
-                        .map(|e| {
-                            e.group
-                                .deadline
-                                .saturating_duration_since(tokio::time::Instant::now())
-                        })
-                        .unwrap_or_else(|| Duration::from_secs(self.inner.config.run_timeout_secs)),
-                ),
+                total_timeout: execution
+                    .as_ref()
+                    .and_then(|e| e.group.deadline)
+                    .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .or_else(|| {
+                        (execution.is_none() && self.inner.config.run_timeout_secs != 0)
+                            .then(|| Duration::from_secs(self.inner.config.run_timeout_secs))
+                    }),
                 tool_timeout: if execution.as_ref().is_some_and(|e| e.role == "lead") {
                     None
                 } else {
@@ -875,24 +949,113 @@ impl Host {
             };
             let id = view.run_id.clone();
             let inner = self.inner.clone();
-            let outcome = engine
-                .run_with_context(
-                    &mut session,
-                    Some(system),
-                    &specs,
-                    &context,
-                    &mut observer,
-                    &mut move |event| {
-                        if let AgentEvent::TextDelta { text } = event {
-                            let mut live = inner.live.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(buffer) = live.get_mut(&id) {
-                                buffer.append(&text);
-                            }
-                            let _ = inner.notices.send(HostNotice::Text);
+            if staged {
+                observer
+                    .record(SessionEvent::RunStarted {
+                        run_id: view.run_id.clone(),
+                    })
+                    .await
+                    .map_err(HostError::storage)?;
+            }
+            let engine = if staged {
+                engine.with_compact_options(openpaw_engine::compaction::CompactOptions::default())
+            } else {
+                engine
+            };
+            let mut next_system = system.clone();
+            let outcome = loop {
+                let mut stage_context = context.clone();
+                if let Some(group) = execution.as_ref().map(|e| &e.group) {
+                    stage_context.total_timeout = group.deadline.map(|deadline| {
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                    });
+                }
+                let mut sink = |event| {
+                    if let AgentEvent::TextDelta { text } = event {
+                        if execution.as_ref().is_some_and(|e| {
+                            e.role == "lead"
+                                && e.group
+                                    .continuous
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .started
+                        }) {
+                            return;
                         }
-                    },
-                )
-                .await;
+                        let mut live = inner.live.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(buffer) = live.get_mut(&id) {
+                            buffer.append(&text);
+                        }
+                        let _ = inner.notices.send(HostNotice::Text);
+                    }
+                };
+                let mut result = if staged {
+                    engine
+                        .run_with_context(
+                            &mut session,
+                            Some(next_system),
+                            &specs,
+                            &stage_context,
+                            &mut crate::continuous::StageObserver(&mut observer),
+                            &mut sink,
+                        )
+                        .await
+                } else {
+                    engine
+                        .run_with_context(
+                            &mut session,
+                            Some(next_system),
+                            &specs,
+                            &context,
+                            &mut observer,
+                            &mut sink,
+                        )
+                        .await
+                };
+                // 停止先于阶段成功终态；不能在EndTurn和停止竞争时报告成功。
+                if staged && control.cancel.is_cancelled() {
+                    result.status = RunStatus::Cancelled;
+                    result.error = Some(openpaw_core::Error::Cancelled);
+                }
+                let state = execution
+                    .as_ref()
+                    .map(|e| {
+                        e.group
+                            .continuous
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                    })
+                    .unwrap_or_default();
+                let resumable = result.status == RunStatus::Completed
+                    || matches!(result.error, Some(openpaw_core::Error::BudgetExhausted(_)));
+                if !staged || !state.active || !resumable || control.cancel.is_cancelled() {
+                    break result;
+                }
+                // 阶段只续推理，不重放任何工具；普通Run/失败均不进入这里。
+                next_system = format!("{}{}", system, state.instruction());
+                let pause = execution
+                    .as_ref()
+                    .and_then(|e| e.group.config.continuous.as_ref())
+                    .map_or(250, |c| c.stage_pause_ms);
+                tokio::select! {biased;_=control.cancel.cancelled()=>{},_=tokio::time::sleep(Duration::from_millis(pause))=>{}}
+            };
+            if staged {
+                let status = match outcome.status {
+                    RunStatus::Completed => "completed",
+                    RunStatus::Failed => "failed",
+                    RunStatus::Cancelled => "cancelled",
+                    RunStatus::TimedOut => "timed_out",
+                };
+                observer
+                    .record(SessionEvent::RunFinished {
+                        run_id: view.run_id.clone(),
+                        status: status.into(),
+                        error: outcome.error.as_ref().map(ToString::to_string),
+                    })
+                    .await
+                    .map_err(HostError::storage)?;
+            }
             view.state = match outcome.status {
                 RunStatus::Completed => RunState::Completed,
                 RunStatus::Failed => RunState::Failed,
@@ -900,7 +1063,12 @@ impl Host {
                 RunStatus::TimedOut => RunState::TimedOut,
             };
             if let Some(error) = outcome.error.as_ref() {
-                view.error = Some(safe_run_error(&error.to_string(), view.state));
+                let mut safe = safe_run_error(&error.to_string(), view.state);
+                model_trace
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .explain(&mut safe, self.inner.config.stream_idle_secs);
+                view.error = Some(safe);
             }
             Ok::<(), HostError>(())
         };
@@ -934,7 +1102,11 @@ impl Host {
             if error.kind == "storage_unavailable" {
                 self.inner.unavailable.store(true, Ordering::Release);
             }
-            view.state = RunState::Failed;
+            view.state = match error.kind.as_str() {
+                "cancelled" => RunState::Cancelled,
+                "run_timeout" => RunState::TimedOut,
+                _ => RunState::Failed,
+            };
             view.error = Some(error);
         }
         let id = view.run_id.clone();
@@ -997,13 +1169,65 @@ impl Host {
             }
         }
     }
+    async fn activate_child(
+        &self,
+        id: &str,
+        e: &crate::orchestration::Execution,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> HostResult<()> {
+        loop {
+            let changed = self.inner.idle.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if state.closing || cancel.is_cancelled() || e.group.cancel.is_cancelled() {
+                    return Err(HostError::new("cancelled", "待办已停止，未执行操作"));
+                }
+                let used = state
+                    .active
+                    .values()
+                    .map(|a| usize::from(!a.waiting) + a.reserved_children)
+                    .sum::<usize>();
+                let parent = state
+                    .active
+                    .get(&e.group.parent)
+                    .ok_or_else(|| HostError::new("cancelled", "主任务已结束"))?;
+                let consume = parent.reserved_children > 0;
+                if used < self.inner.config.max_active_runs || consume {
+                    if consume {
+                        state
+                            .active
+                            .get_mut(&e.group.parent)
+                            .unwrap()
+                            .reserved_children -= 1;
+                    }
+                    state
+                        .active
+                        .get_mut(id)
+                        .ok_or_else(|| HostError::new("cancelled", "待办已清理"))?
+                        .waiting = false;
+                    return Ok(());
+                }
+            }
+            tokio::select! { biased;
+                _=cancel.cancelled()=>return Err(HostError::new("cancelled", "待办已停止")),
+                _=e.group.cancel.cancelled()=>return Err(HostError::new("cancelled", "主任务已停止")),
+                _=e.group.wait_deadline()=>return Err(HostError::new("run_timeout", "协作期限已到")),
+                _=&mut changed=>{},
+            }
+        }
+    }
     fn release(&self, id: &str) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(done) = state.active.remove(id) {
             if let Some(e) = done.execution.filter(|e| e.role != "lead") {
-                if let Some(parent) = state.active.get_mut(&e.group.parent) {
-                    if parent.reserved_children == 0 {
-                        parent.reserved_children = 1;
+                e.group.dequeue(&e.role, id);
+                if !done.waiting {
+                    if let Some(parent) = state.active.get_mut(&e.group.parent) {
+                        if parent.reserved_children == 0 {
+                            parent.reserved_children = 1;
+                        }
                     }
                 }
             }
@@ -1343,6 +1567,7 @@ struct RunProvider {
     inner: Arc<dyn LlmProvider>,
     context: String,
     group: Option<Arc<crate::orchestration::Group>>,
+    trace: Arc<Mutex<ModelTrace>>,
 }
 impl RunProvider {
     fn with_context(
@@ -1350,10 +1575,22 @@ impl RunProvider {
         mut request: openpaw_core::CompletionRequest,
     ) -> openpaw_core::CompletionRequest {
         // 压缩请求有自己的system；不能把运行能力注入只负责历史摘要的请求。
-        if request.system.as_deref() == Some(self.context.as_str()) {
+        let runtime = request.system.as_deref().filter(|system| {
+            *system == self.context
+                || (system.starts_with(&self.context)
+                    && self.group.as_ref().is_some_and(|group| {
+                        group
+                            .continuous
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .started
+                    }))
+        });
+        if let Some(runtime) = runtime {
             request.system_blocks = Some(openpaw_core::SystemPromptBlocks {
                 stable: self.context.clone(),
-                dynamic: self.context.clone(),
+                // 接续后的真实阶段指令也要进入原动态系统块，不能被旧能力快照替代。
+                dynamic: runtime.to_owned(),
             });
         }
         request
@@ -1369,6 +1606,10 @@ impl LlmProvider for RunProvider {
         if let Some(g) = &self.group {
             g.reserve(reserved)?;
         }
+        self.trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin("等待非流式响应（含历史压缩）");
         let result = self.inner.complete(self.with_context(request)).await;
         if let (Some(g), Ok(response)) = (&self.group, &result) {
             g.settle(reserved, response.usage);
@@ -1386,11 +1627,25 @@ impl LlmProvider for RunProvider {
         if let Some(g) = &self.group {
             g.reserve(reserved)?;
         }
+        self.trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin("等待建立响应流");
         let stream = self.inner.stream(self.with_context(request)).await?;
+        self.trace
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting("等待首次有效响应");
+        let trace = self.trace.clone();
         let group = self.group.clone();
         let mut settled = false;
         Ok(stream
             .map(move |event| {
+                if event.is_ok() {
+                    let mut trace = trace.lock().unwrap_or_else(|e| e.into_inner());
+                    trace.events += 1;
+                    trace.waiting("等待后续有效响应");
+                }
                 if let Ok(openpaw_core::StreamEvent::Final(response)) = &event {
                     if !settled {
                         if let Some(g) = &group {
@@ -1414,6 +1669,51 @@ impl LlmProvider for RunProvider {
     }
 }
 
+// 仅记录可公开的结构与单调时间，不保留请求内容、URL或上游响应正文。
+#[derive(Default)]
+struct ModelTrace {
+    request: u64,
+    phase: &'static str,
+    waiting_since: Option<tokio::time::Instant>,
+    events: u64,
+}
+impl ModelTrace {
+    fn begin(&mut self, phase: &'static str) {
+        self.request += 1;
+        self.phase = phase;
+        self.waiting_since = Some(tokio::time::Instant::now());
+        self.events = 0;
+    }
+    fn waiting(&mut self, phase: &'static str) {
+        self.phase = phase;
+        self.waiting_since = Some(tokio::time::Instant::now());
+    }
+    fn explain(&self, error: &mut HostError, idle_secs: u64) {
+        if self.request == 0
+            || !matches!(
+                error.kind.as_str(),
+                "stream_idle"
+                    | "provider_stream"
+                    | "provider_network"
+                    | "provider_quota"
+                    | "provider_auth"
+                    | "provider_rate_limit"
+            )
+        {
+            return;
+        }
+        let elapsed = self.waiting_since.map_or(0, |at| at.elapsed().as_secs());
+        error.message.push_str(&format!(
+            "（第{}次模型请求；阶段：{}；本阶段已等待{}秒；已收到{}个有效事件；无事件超时阈值{}秒）",
+            self.request, self.phase, elapsed, self.events, idle_secs));
+        if error.kind == "stream_idle" {
+            error.message.push_str(
+                "。尚不能据此确定是模型处理慢还是连接停滞；已有成果保留，不会自动重做操作",
+            );
+        }
+    }
+}
+
 // 单次采样产生UTC和本地偏移，避免跨午夜的两次now给模型矛盾日期。
 fn run_system_prompt(
     root: &std::path::Path,
@@ -1427,10 +1727,8 @@ fn run_system_prompt(
         "Available network tools: web_search={search}, web_fetch={fetch}.\n"
     ));
     if tools.iter().any(|name| {
-        matches!(
-            name.as_str(),
-            "write_file" | "edit_file" | "todo_add" | "todo_update" | "bash"
-        )
+        crate::task_progress::is_file_writer(name)
+            || matches!(name.as_str(), "todo_add" | "todo_update" | "bash")
     }) {
         // 工具调用只是提出精确输入；真正执行前原审批服务会阻塞，模型不能用文字等待代替菜单。
         prompt.push_str("本轮受控写入/命令工具由Host负责人工审批。用户要求执行且等待审批时，请先发起对应的真实工具调用：该调用会被Host拦截并显示审批菜单，批准前不会执行副作用。不要仅输出拟写内容并结束回复来等待一个尚未创建的菜单。只有工具成功结果才能证明操作完成；拒绝、过期或取消后不得绕过审批或自行重复申请，除非用户明确再次提出请求。普通bash是本机当前用户权限执行，工作区锁不构成OS隔离。\n");
@@ -1520,6 +1818,34 @@ impl Host {
 pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
     let (kind, message) = if state == RunState::Cancelled {
         ("cancelled", "已停止，实际操作已清理")
+    } else if raw.starts_with("provider error:")
+        && (raw.contains("http 402:") || raw.contains("status 402"))
+    {
+        (
+            "provider_quota",
+            "模型服务账户余额或额度不足，本轮已停止；请在模型平台检查余额，已有回复和成果保留，不会自动重做操作",
+        )
+    } else if raw.contains("http send")
+        || raw.contains("error sending request")
+        || raw.contains("connection reset")
+        || raw.contains("Connection reset")
+        || raw.contains("connection closed")
+        || raw.contains("dns error")
+    {
+        ("provider_network", "连接模型服务失败，本轮已停止；已有回复和已完成操作保留，请检查网络后再重试，不会自动重做操作")
+    } else if raw.starts_with("authentication failed:")
+        || raw.contains("status 401")
+        || raw.contains("status 403")
+    {
+        (
+            "provider_auth",
+            "模型服务认证或权限校验失败，本轮已停止；请检查本机模型配置，已有操作不会自动重做",
+        )
+    } else if raw.starts_with("rate limited:") || raw.contains("status 429") {
+        (
+            "provider_rate_limit",
+            "模型服务请求过于频繁，本轮已停止；请稍后重试，已有操作不会自动重做",
+        )
     } else if raw.contains("invalid OpenAI streamed tool arguments") {
         (
             "provider_arguments",
@@ -1532,6 +1858,10 @@ pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
             "provider_empty",
             "模型未返回有效答复；可缩小任务后显式重试，已完成操作不会自动重做",
         )
+    } else if raw.starts_with("provider error: stream read:") {
+        // 流读取/解码失败不等于确定物理断网，也不能吞成无原因的通用失败。
+        // 仅识别Provider前缀，固定说明避免把上游响应正文或凭据穿透到页面。
+        ("provider_stream", "模型响应流读取失败，本轮已停止；已有回复和成果保留，请检查模型服务连接后再决定是否重试，不会自动重做操作")
     } else if raw.contains("finish_reason")
         || raw.contains("stream ended")
         || raw.contains("model response incomplete")
@@ -1665,11 +1995,39 @@ impl Host {
 mod runtime_context_tests {
     use super::*;
     #[test]
+    fn d128_diagnostics_only_add_local_structured_facts() {
+        let mut trace = ModelTrace::default();
+        trace.begin("等待建立响应流");
+        let mut error = safe_run_error(
+            "timeout: provider connection idle SECRET https://private.invalid",
+            RunState::TimedOut,
+        );
+        trace.explain(&mut error, 180);
+        assert!(error.message.contains("等待建立响应流"));
+        assert!(error.message.contains("180秒"));
+        assert!(error.message.contains("第1次模型请求"));
+        assert!(!error.message.contains("SECRET"));
+        assert!(!error.message.contains("private.invalid"));
+        for (raw, state) in [
+            (
+                "timeout: tool execution budget exceeded",
+                RunState::TimedOut,
+            ),
+            ("timeout: provider stream idle", RunState::Cancelled),
+        ] {
+            let mut other = safe_run_error(raw, state);
+            let before = other.clone();
+            trace.explain(&mut other, 180);
+            assert_eq!(other, before, "工具超时和用户停止不能误报模型错误");
+        }
+    }
+    #[test]
     fn d43_compaction_and_other_system_requests_keep_their_own_context() {
         let provider = RunProvider {
             inner: Arc::new(openpaw_llm::EchoProvider::new()),
             context: "trusted run context".into(),
             group: None,
+            trace: Arc::new(Mutex::new(ModelTrace::default())),
         };
         let request = openpaw_core::CompletionRequest {
             system: Some("summarize history only".into()),

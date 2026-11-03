@@ -2,9 +2,9 @@
 
 本目录与 tests/engine-host-contracts 同时审核。sources.json 固定 Office 提交、文档/Schema/示例/测试入口 SHA-256，以及 SDK 包版本/integrity。锁文件只用于测试，不把 Node 或 SDK 引入 Host 生产依赖。
 
-Office 原仓不能匿名下载。upstream-office 是九个原始协议 Schema 与 LICENSE 的只读测试快照，非 Host 实现或手写替代 Schema。默认准备流程验证快照哈希、无网络；传 --office-source 时从固定 git commit 校验全部 21 份来源并刷新测试快照，不读取工作区未提交改动。升级先审源码/契约，再同步 commit、哈希和 fixtures，不手改快照。
+Office 原仓不能匿名下载。upstream-office 是九个原始协议 Schema 与 LICENSE 的只读测试快照，非 Host 实现或手写替代 Schema。默认准备流程验证快照哈希、无网络；传 --office-source 时从固定 git commit 校验全部 28 份来源并刷新测试快照，不读取工作区未提交改动。升级先审源码/契约，再同步 commit、哈希和 fixtures，不手改快照。
 
-## Office：02dbac4 官方服务（version仍为1.0）
+## Office：5d21cf2 官方服务（version仍为1.0）
 
 Host → POST /api/pawoffice/messages，Bearer 仅服务端持有。外部消息包括 capabilities、initialize、snapshot、read、decision.request、ui.next/respond；场景走 teamId+command 现有 v2。Host 不向 Office 发送旧 actions gateway 格式。
 
@@ -28,7 +28,7 @@ Host → POST /api/pawoffice/messages，Bearer 仅服务端持有。外部消息
 
 四操作均有version/teamId/conversationId：send加turnId/messages，history加cursor/limit，resume/cancel加turnId。send/resume是NDJSON，history/cancel是code/msg/data。新增snapshot{text,state,message}，resume第一条必须snapshot或error；terminal snapshot可直接结束。重复turn相同内容同Run，异内容冲突；history从Run原输入边界投影，工具结果不是新轮次，页内旧→新，游标稳定。断开仅detach，显式cancel清理完成后stopped:true。
 
-请求≤512KiB；输入≤4000、回复≤50000，历史最多10轮且≤100000，行≤350000，delta≤16000；按JS UTF-16兼容限制，字节另计。history响应≤8MiB、每页1—50。单流连接180秒，非流15秒；Run预算独立。空输出/错误不发假done。完整契约与状态图见master第4节，T4实际能力及证据见0005，旧Office验证不能覆盖新版。
+请求≤512KiB；输入≤4000、回复≤50000，历史最多10轮且≤100000，行≤350000，delta≤16000；按JS UTF-16兼容限制，字节另计。history响应≤8MiB、每页1—50。当前原上游已取消固定180秒单流总期限，非流15秒；Run预算独立（原180秒为历史文档差异，真实长流回归继续保留）。空输出/错误不发假done。完整契约与状态图见master第4节，T4实际能力及证据见0005，旧Office验证不能覆盖新版。
 
 
 r6错误传输：仅send/resume接受阶段的history_conflict、request_conflict、session_busy、slot_busy、capacity_exceeded、not_found，以HTTP200/application/x-ndjson返回一条官方error{message}，没有done/成功snapshot/新Run；200只表示流可传输，客户端必须读事件判断业务结果。安全文案由适配器白名单决定，不回显原诊断，也不按Accept头切换语义。非法JSON/字段/来源/未授权办公室保留真实4xx，存储/未知故障保留HTTP失败。history/cancel仍是JSON；Office转发上游非2xx时按官方行为显示通用502，不保证其原细分状态透传。
@@ -117,3 +117,6 @@ T5场景仍用官方commandSchema：expiresAt取本次观察后10秒，timeoutMs
 ## 2026-10-27新版Office契约（ff9f6b7）
 
 按用户要求原样更新上游，来源锁26项中7项变化，测试Schema仅office-ui.ts变化。白板新增summary（300字符）和detail（16000字符），Host从同一任务事实生成有界Markdown详情，保留单步真实100与失败/待核验。完整消息仍64KiB；压缩先减少可选详情，不改任务事实。新版远端单条场景消息FIFO仅控制浏览器动作，dashboard快照直接工作状态不在该FIFO，HTTP仍无动画到达回执。人物/墙面仍按12秒/90秒曲线，R22未解决；后端核验进度与此显示曲线分开。聊天多页归档/草稿合并、重新展开修复来自上游，不等于Host崩溃或模型参数错误已修复。
+
+
+2026-10-30：准确上游5d21cf2、28来源固定，新增官方detailSections/steps.state/result/deliveries、版本hash和用途路由严格校验。r30原Host只读版本服务提供真实文件，不修改Office；runId在成果中指deliveryId，turnId显式关联原聊天，ready不等于verified。目录外部JSON保持确定记录，原件8MiB/总512MiB；主机端口固定、能力随版本存续及删除撤销见0007 §12.124。Office新增交接门控会隐藏queued/running拜访接收者任务卡，R27仍暂缓，不能把快照running当作一定正在显示工作卡。

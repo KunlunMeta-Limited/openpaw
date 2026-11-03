@@ -38,7 +38,7 @@ impl OpenAiProvider {
     }
 
     /// Map core messages onto the OpenAI chat shape:
-    /// - 旧system保持开头；显式blocks优先，dynamic在本轮真实用户文本前
+    /// - 旧system保持开头；显式blocks优先，dynamic在本轮用户前或已结束阶段后
     /// - tool_result不被视为新用户提问，系统上下文不拆断工具响应链
     /// - assistant tool_use → `tool_calls`
     /// - user tool_result → `role: tool` messages
@@ -58,6 +58,17 @@ impl OpenAiProvider {
                     .iter()
                     .any(|b| matches!(b, ContentBlock::Text { .. }))
         });
+        // 已有真实用户且上一阶段以纯文本assistant收尾时，新动态事实是
+        // 此次接续的触发上下文；放在旧用户之前会让模型继续复述等待。
+        // 只调整显式系统块，不伪造用户消息，也不拆断tool_use/result链。
+        let continuation = current_user.is_some()
+            && req.messages.last().is_some_and(|m| {
+                m.role == Role::Assistant
+                    && !m.content.is_empty()
+                    && m.content
+                        .iter()
+                        .all(|b| matches!(b, ContentBlock::Text { .. }))
+            });
         if current_user.is_none() {
             if let Some(context) = dynamic {
                 messages.push(json!({"role": "system", "content": context}));
@@ -88,7 +99,7 @@ impl OpenAiProvider {
                     }
                     if !text_parts.is_empty() {
                         // 混合工具结果和文本时，先输出全部tool结果，不能用system拆断调用链。
-                        if current_user == Some(index) {
+                        if current_user == Some(index) && !continuation {
                             if let Some(context) = dynamic {
                                 messages.push(json!({"role": "system", "content": context}));
                             }
@@ -124,6 +135,11 @@ impl OpenAiProvider {
                     }
                     messages.push(msg);
                 }
+            }
+        }
+        if continuation {
+            if let Some(context) = dynamic {
+                messages.push(json!({"role":"system","content":context}));
             }
         }
         messages

@@ -17,6 +17,11 @@ pub mod bashast;
 pub mod exec;
 pub mod fs;
 pub mod host;
+/// 职责：提供原工具注册表中的图片生成和结构化图表。
+/// 输入输出：已授权输入到真实媒体文件及执行回执。
+/// 依赖：原路径校验、HTTP客户端和调用取消上下文。
+/// 禁止职责：不授予权限、不规定文章流程、不伪造视觉审核。
+pub mod media;
 pub mod meta;
 pub mod safety;
 pub mod web;

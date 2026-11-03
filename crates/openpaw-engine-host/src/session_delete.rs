@@ -50,11 +50,6 @@ impl Host {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&scope.slot_id);
-            host.inner
-                .office_handoff_queue
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&scope.slot_id);
             // 删除后的Run标识不可复活；清掉终态视图，避免人物详情在墓碑之后
             // 命中旧内存数据。不同办公室的缓存仍保留。
             host.inner

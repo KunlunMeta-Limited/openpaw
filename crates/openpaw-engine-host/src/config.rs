@@ -241,7 +241,6 @@ impl HostConfig {
             || self.max_active_runs == 0
             || self.max_active_runs > 256
             || [
-                self.run_timeout_secs,
                 self.stream_idle_secs,
                 self.tool_timeout_secs,
                 self.approval_timeout_secs,
@@ -322,6 +321,8 @@ impl HostConfig {
             "bash",
             "web_search",
             "web_fetch",
+            "generate_image",
+            "render_visual",
         ];
         if self.tools.iter().any(|t| !allowed.contains(&t.as_str())) {
             return Err(HostError::new("unsupported", "工具白名单包含未支持项"));
@@ -376,6 +377,22 @@ pub(crate) fn valid_id(id: &str) -> HostResult<()> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentsConfig {
+    /// 用途：可信持续任务策略，默认关闭；由主模型显式启动。
+    /// 字段：可选ContinuousConfig。
+    /// 来源去向：本机配置到原Host运行。
+    /// 约束：不扩展Office协议，不自动恢复副作用。
+    /// 稳定性：新增可选字段，旧配置兼容。
+    /// 关联：CHG-2026-0007第9.12节。
+    #[serde(default)]
+    pub continuous: Option<crate::continuous::ContinuousConfig>,
+    /// 用途：可选实际图片服务配置。
+    /// 字段：服务地址、模型和密钥环境变量名。
+    /// 来源去向：本机配置到原工具注册表。
+    /// 约束：模型不能修改服务或凭据。
+    /// 稳定性：新增可选字段，默认无图片服务。
+    /// 关联：CHG-2026-0007第9.12节。
+    #[serde(default)]
+    pub images: Option<openpaw_tools::media::ImageConfig>,
     /// 用途：显式启用独立主子协作。
     /// 字段：bool，显式启用独立主子协作。
     /// 来源去向：可信Host装配、原Store与本次运行。
@@ -383,34 +400,41 @@ pub struct AgentsConfig {
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub enabled: bool,
-    /// 用途：每组最多1至2个活动子运行。
-    /// 字段：usize，每组最多1至2个活动子运行。
+    /// 用途：每组最多1至5个活动子运行。
+    /// 字段：usize，每组最多1至5个活动子运行。
     /// 来源去向：可信Host装配、原Store与本次运行。
     /// 约束：不得由浏览器或模型覆盖权限及所属关系。
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub max_active_children: usize,
-    /// 用途：每主Run最多1至12次委派。
-    /// 字段：usize，每主Run最多1至12次委派。
+    /// 用途：每主Run委派次数，零表示不封顶。
+    /// 字段：usize，每主Run委派次数，零表示不封顶。
     /// 来源去向：可信Host装配、原Store与本次运行。
     /// 约束：不得由浏览器或模型覆盖权限及所属关系。
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub max_delegations: usize,
     /// 用途：共享Provider调用次数预算，覆盖主Run及全部独立子Run。
-    /// 字段：u64，共享Provider调用次数预算。
+    /// 字段：u64，共享Provider调用次数预算，零表示不封顶。
     /// 来源去向：可信Host装配、原Store与本次运行。
     /// 约束：不得由浏览器或模型覆盖权限及所属关系。
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub max_model_requests: u64,
     /// 用途：共享输出token预留预算，覆盖主Run及全部独立子Run。
-    /// 字段：u64，共享输出token预留预算。
+    /// 字段：u64，共享输出token预留预算，零表示不封顶。
     /// 来源去向：可信Host装配、原Store与本次运行。
     /// 约束：不得由浏览器或模型覆盖权限及所属关系。
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub max_output_tokens: u64,
+    /// 用途：显式覆盖协作主子Run的单次响应token上限。
+    /// 字段：可选正整数，省略时沿用原Provider能力及8192封顶。
+    /// 来源去向：可信本机TOML到原AgentLoop请求装配。
+    /// 约束：1至1048576；仍受共享总预算及模型服务实际能力约束。
+    /// 稳定性：新增可选配置，不改变普通CLI或旧配置默认值。
+    /// 关联：REQ-OP-022；CHG-2026-0007第12.113节。
+    pub max_response_tokens: Option<u32>,
     /// 用途：按固定角色缩小的工具白名单。
     /// 字段：BTreeMap<String, Vec<String>>，按固定角色缩小的工具白名单。
     /// 来源去向：可信Host装配、原Store与本次运行。
@@ -422,6 +446,8 @@ pub struct AgentsConfig {
 impl Default for AgentsConfig {
     fn default() -> Self {
         Self {
+            continuous: None,
+            images: None,
             enabled: false,
             max_active_children: 2,
             max_delegations: 12,
@@ -430,6 +456,7 @@ impl Default for AgentsConfig {
             // 仍由配置硬上限约束，不改变单Run的AgentLoop预算或工具权限。
             max_model_requests: 384,
             max_output_tokens: 524288,
+            max_response_tokens: None,
             tools: BTreeMap::new(),
         }
     }
@@ -444,16 +471,25 @@ impl AgentsConfig {
     /// 权限：所有角色工具必须是Host白名单子集。
     /// 关联：需求/设计REQ-OP-022；DES-OP-012。
     fn validate(&self, host: &HostConfig) -> HostResult<()> {
-        if !(1..=2).contains(&self.max_active_children)
-            || !(1..=12).contains(&self.max_delegations)
-            || self.max_model_requests == 0
-            || self.max_output_tokens == 0
+        if !(1..=5).contains(&self.max_active_children)
             || (self.enabled && host.max_active_runs < 2)
+            || self
+                .max_response_tokens
+                .is_some_and(|n| !(1..=1_048_576).contains(&n))
         {
             return Err(HostError::new(
                 "invalid_input",
                 "协作需要至少2个全局运行槽及合法正数限额",
             ));
+        }
+        if let Some(config) = &self.continuous {
+            config.validate()?;
+            if config.enabled && self.enabled && host.max_active_runs <= self.max_active_children {
+                return Err(HostError::new(
+                    "invalid_input",
+                    "持续协作全局槽须容纳主Run和配置的全部并发子Run",
+                ));
+            }
         }
         for (id, tools) in &self.tools {
             if crate::agents::role(id).is_none()
@@ -485,6 +521,11 @@ impl AgentsConfig {
             host.iter()
                 .filter(|t| {
                     role == "lead"
+                        || (self.continuous.as_ref().is_some_and(|c| c.enabled)
+                            && matches!(
+                                t.as_str(),
+                                "write_file" | "edit_file" | "generate_image" | "render_visual"
+                            ))
                         || matches!(
                             t.as_str(),
                             "read_file"

@@ -416,7 +416,7 @@ async fn interaction_scenario() {
         .unwrap()
         .iter()
         .any(|field| field["label"] == "当前状态"
-            && field["value"] == "本轮运行已完成，业务进度以任务与白板为准"));
+            && field["value"] == "空闲；本轮运行已完成，业务进度以任务与白板为准"));
     let unknown = action(
         &shared,
         "unknown-actor",
