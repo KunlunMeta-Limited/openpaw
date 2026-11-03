@@ -93,6 +93,7 @@ test('rejects path/port collisions and config paths inside the Git repository', 
   assert.throws(() => setup.installState({ ...paths, env: path.join(paths.base, 'office-host-home', '.env') }), /必须与聊天数据/);
   assert.throws(() => setup.installState({ ...paths, base: path.parse(paths.base).root }), /独立数据目录/);
   assert.throws(() => setup.installState({ ...paths, base: path.resolve(__dirname, '..', '..', '.test-local') }), /仓库内/);
+  assert.throws(() => setup.installState({ ...paths, base: path.join(paths.office, '.test-local') }), /Office仓库内/);
   for (const value of ['0', '65536', 'not-a-port']) assert.throws(() => setup.port(value));
 });
 

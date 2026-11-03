@@ -124,7 +124,10 @@ function installState(paths) {
   for (const file of [paths.env, paths.config, paths.key]) {
     if (['office-host-home', 'workspaces'].some(name => inside(path.join(paths.base, name), file))) fail('配置与密钥必须与聊天数据及工作文件分开');
   }
-  for (const file of [paths.base, paths.env, paths.config, paths.key]) assertLocation(file);
+  for (const file of [paths.base, paths.env, paths.config, paths.key]) {
+    assertLocation(file);
+    if (inside(paths.office, file)) fail('本机私有配置/数据不能放在Office仓库内；请使用仓库外的OPENPAW_SETUP_HOME');
+  }
   const present = [paths.env, paths.config, paths.key].map(file => fs.existsSync(file));
   if (present.every(Boolean)) {
     if (![paths.env, paths.config, paths.key].every(file => fs.statSync(file).isFile() && fs.statSync(file).size)) fail('已有配置为空或不是普通文件；不覆盖，请先检查');
