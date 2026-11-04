@@ -1191,6 +1191,11 @@ mod tests {
         })
         .await
         .unwrap();
+        // 终态先落盘，外层任务随后释放注册表；下一轮须等真实清理，不能将
+        // get_run 的终态可见性误认为提交许可，也不能提前释放产品资源。
+        tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
         let second = host
             .submit_run(&scope, &binding.session_id, "另一项审核".into())
             .await
