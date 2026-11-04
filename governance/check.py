@@ -651,7 +651,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("validate").add_argument("--stage", choices=STAGES, default="proposal")
+    validation = sub.add_parser("validate")
+    validation.add_argument("--stage", choices=STAGES, default="proposal")
+    validation.add_argument("--base")
+    validation_source = validation.add_mutually_exclusive_group()
+    validation_source.add_argument("--head")
+    validation_source.add_argument("--worktree", action="store_true")
     for name in ("index", "trace"):
         sub.add_parser(name).add_argument("--check", action="store_true")
     pr = sub.add_parser("pr-check")
@@ -661,8 +666,13 @@ def main() -> int:
     choice.add_argument("--head")
     choice.add_argument("--worktree", action="store_true")
     args = parser.parse_args()
+    scoped = args.command == "validate" and (args.base is not None or args.head is not None or args.worktree)
+    if scoped and (args.stage != "delivery" or not args.base or not (args.head or args.worktree)):
+        parser.error("交付比较必须同时指定 --stage delivery、--base 和 --head/--worktree")
     try:
-        if args.command == "pr-check":
+        if args.command == "pr-check" or scoped:
+            # 全历史结构仍由原入口核对；本轮交付仅按明确的真实diff选择主CHG及关联修订。
+            # 不从批准状态猜测哪个是历史，也不为旧Windows暂缓补造验收事实。
             print(json.dumps(pr_check(args.root, args.base, args.head, args.stage), ensure_ascii=False, indent=2))
         else:
             reader = Reader(args.root)

@@ -46,14 +46,23 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("TEST-OFFICE-PRODUCT", {command["id"] for command in commands})
         for command in commands:
             actual=verify.command_argv(command,{'{python}':sys.executable,'{head}':'fixed-sha','{base}':'base'},'worktree','delivery')
-            if command['id'] in {'TEST-COMMENTS','TEST-GOV-DIFF'}:
+            if command['id'] in {'TEST-COMMENTS','TEST-GOV-DIFF','TEST-GOV-VALIDATE'}:
                 self.assertIn('--worktree',actual)
                 self.assertNotIn('--head',actual)
             if command['id'] in {'TEST-GOV-DIFF','TEST-GOV-VALIDATE'}:
                 self.assertEqual(actual[-2:],['--stage','delivery'])
+                self.assertEqual(actual[actual.index('--base')+1],'base')
+                delivery=verify.command_argv(command,{'{python}':sys.executable,'{head}':'fixed-sha','{base}':'base'},'head','delivery')
+                self.assertEqual(delivery[delivery.index('--head')+1],'fixed-sha')
+                self.assertEqual(delivery[delivery.index('--base')+1],'base')
             clean=verify.command_argv(command,{'{head}':'fixed-sha'},'head','implementation')
             if '--head' in clean:
                 self.assertEqual(clean[clean.index('--head')+1],'fixed-sha')
+            if command['id']=='TEST-GOV-VALIDATE':
+                self.assertNotIn('--base',clean)
+                for substitutions in [{},{'{base}':'base'},{'{head}':'fixed-sha'}]:
+                    with self.assertRaisesRegex(ValueError,'交付比较'):
+                        verify.command_argv(command,substitutions,'head','delivery')
 
     def test_registry_cannot_overwrite_or_escape_evidence(self):
         command={'id':'TEST-ONE','argv':['python','-V'],'suite':'governance','platforms':['linux','windows']}

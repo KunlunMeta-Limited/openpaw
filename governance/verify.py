@@ -66,6 +66,13 @@ def validate_registry(commands):
 def command_argv(command, substitutions, source="head", stage="implementation"):
     """保留注册命令职责，统一工作区/head和治理阶段，实际参数进入证据。"""
     argv = [substitutions.get(arg, arg) for arg in command['argv']]
+    if 'governance/check.py' in argv and 'validate' in argv and stage == 'delivery':
+        base = substitutions.get('{base}')
+        head = substitutions.get('{head}')
+        if not base or base == '{base}' or (source != 'worktree' and (not head or head == '{head}')):
+            raise ValueError('交付比较缺少准确base/head；不能回退为无范围历史审计')
+        argv += ['--base', base]
+        argv += ['--worktree'] if source == 'worktree' else ['--head', head]
     if source == 'worktree' and '--head' in argv:
         index = argv.index('--head')
         argv[index:index+2] = ['--worktree']
