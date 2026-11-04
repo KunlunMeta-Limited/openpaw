@@ -2834,18 +2834,22 @@ impl LlmProvider for AsyncPipeline {
                 }
                 10 => {
                     assert!(results["close-early"].1);
-                    self.waiting.notify_one();
                     tool(
                         "third",
                         "delegate_task",
                         json!({"role_id":"audit","title":"组容量排队","instructions":"有限资料核对","acceptance":"真实文本","work_item":"a","wait_for_completion":false}),
                     )
                 }
-                11 => tool(
-                    "wait",
-                    "delegation_status",
-                    json!({"task_ids":[task_id("a"),task_id("b"),task_id("third")],"wait_for":"all"}),
-                ),
+                11 => {
+                    // 到下一轮才证明第三项真实回执已持久接受，而非仅准备发出工具请求。
+                    assert!(!results["third"].1);
+                    self.waiting.notify_one();
+                    tool(
+                        "wait",
+                        "delegation_status",
+                        json!({"task_ids":[task_id("a"),task_id("b"),task_id("third")],"wait_for":"all"}),
+                    )
+                }
                 12 => {
                     assert!(!self.cancel_test);
                     let v: serde_json::Value = serde_json::from_str(results["wait"].0).unwrap();
@@ -2946,7 +2950,13 @@ async fn async_delegation_retains_real_slots_rejects_premature_evidence_and_canc
         tokio::time::timeout(Duration::from_secs(10), provider.waiting.notified())
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while provider.active.load(SeqCst) != 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(
             provider.active.load(SeqCst),
             2,
