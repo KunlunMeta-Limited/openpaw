@@ -305,6 +305,8 @@ async fn compacted_parallel_tool_calls_pass_actual_openai_http_validation() {
                 Err(error) => panic!("HTTP accept: {error}"),
             }
         };
+        // Windows接受的连接可继承listener的非阻塞模式；原读取期限需阻塞socket。
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
