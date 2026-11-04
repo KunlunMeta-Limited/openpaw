@@ -30,6 +30,7 @@ pub(crate) struct Store {
     tx: mpsc::Sender<Job>,
     priority_tx: mpsc::Sender<Job>,
     ui_tx: mpsc::Sender<Job>,
+    worker: std::thread::Thread,
 }
 /// 用途：原JSONL写入器及Host元数据的唯一串行所有者。
 /// 字段：下列成员或状态由宿主统一管理。
@@ -123,7 +124,7 @@ impl Store {
         let (tx, mut rx) = mpsc::channel::<Job>(256);
         let (priority_tx, mut priority_rx) = mpsc::channel::<Job>(256);
         let (ui_tx, mut ui_rx) = mpsc::channel::<Job>(128);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("openpaw-host-store".into())
             .spawn(move || {
                 let mut db = db;
@@ -173,7 +174,9 @@ impl Store {
                         if rx.is_closed() && priority_rx.is_closed() && ui_rx.is_closed() {
                             return;
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        // 入队后的unpark保留一个唤醒令牌，覆盖检查为空到park之间的竞争。
+                        // 超时仅兜底最后发送端丢弃等没有新命令的关闭路径。
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
                         continue;
                     };
                     match job {
@@ -187,6 +190,7 @@ impl Store {
             tx,
             priority_tx,
             ui_tx,
+            worker: worker.thread().clone(),
         })
     }
     /// 功能：将同步存储操作送入单写线程并等待完成。
@@ -257,6 +261,7 @@ impl Store {
             })))
             .await
             .map_err(HostError::storage)?;
+        self.worker.unpark();
         rx.await.map_err(HostError::storage)?
     }
 }
@@ -275,6 +280,7 @@ impl Store {
             .send(Job::Close(tx))
             .await
             .map_err(HostError::storage)?;
+        self.worker.unpark();
         rx.await.map_err(HostError::storage)?
     }
 }
@@ -3083,7 +3089,7 @@ impl Db {
                 continue;
             }
             let old = std::path::Path::new(event["old_path"].as_str().unwrap());
-            let Ok(relative) = std::path::Path::new(path).strip_prefix(old) else {
+            let Some(relative) = migrated_relative_path(std::path::Path::new(path), old) else {
                 continue;
             };
             if relative
@@ -3379,12 +3385,89 @@ impl Db {
     }
 }
 
+/// 功能：匹配历史绝对路径与可信迁移旧根，Windows别名额外核验目录身份。
+/// 参数：path为查询路径，old为已鉴权迁移审计中的规范旧根。
+/// 返回：规范根下的原相对路径，或无法证明归属时的None。
+/// 错误：目录身份不可读取时不认可别名，由原查询拒绝越界访问。
+/// 状态：只查询目录元数据，不读取旧文件，不改迁移记录。
+/// 并发与取消：仅在原Store单写线程内同步核验目录身份。
+/// 权限：相对路径仍须调用方校验普通组件、迁移清单和新根文件摘要。
+/// 关联：REQ-OP-025；DES-OP-013；CHG-2026-0007第12.147节。
+fn migrated_relative_path<'a>(
+    path: &'a std::path::Path,
+    old: &std::path::Path,
+) -> Option<&'a std::path::Path> {
+    if let Ok(relative) = path.strip_prefix(old) {
+        return Some(relative);
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return None;
+        };
+        if !matches!(
+            prefix.kind(),
+            Prefix::Disk(_)
+                | Prefix::VerbatimDisk(_)
+                | Prefix::UNC(_, _)
+                | Prefix::VerbatimUNC(_, _)
+        ) {
+            return None;
+        }
+        let mut components = path.components();
+        let mut candidate = PathBuf::new();
+        for _ in old.components() {
+            let part = components.next()?;
+            if matches!(part, Component::ParentDir | Component::CurDir) {
+                return None;
+            }
+            candidate.push(part.as_os_str());
+        }
+        if same_file::is_same_file(&candidate, old).unwrap_or(false) {
+            return Some(components.as_path());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod office_regressions {
     use super::*;
     use crate::{ClientScope, Host, HostConfig};
     use openpaw_core::{Message, Role};
     use serde_json::json;
+
+    #[cfg(windows)]
+    #[test]
+    fn migrated_windows_paths_require_the_audited_directory_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("团队 原目录");
+        let other = temp.path().join("团队 原目录-sibling");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let canonical = openpaw_tools::safety::dunce_canonicalize(&old).unwrap();
+        let verbatim = std::fs::canonicalize(&old).unwrap();
+        let relative = std::path::Path::new("nested/report.txt");
+        for root in [&old, &canonical, &verbatim] {
+            assert_eq!(
+                migrated_relative_path(&root.join(relative), &canonical),
+                Some(relative),
+                "历史正文不存在时也只核验目录身份"
+            );
+        }
+        assert!(migrated_relative_path(&other.join(relative), &canonical).is_none());
+        let device = PathBuf::from(format!(r"\\.\{}", canonical.display()));
+        assert!(migrated_relative_path(&device.join(relative), &canonical).is_none());
+        std::fs::remove_dir(&old).unwrap();
+        assert_eq!(
+            migrated_relative_path(&canonical.join(relative), &canonical),
+            Some(relative),
+            "精确可信路径不需要访问旧根"
+        );
+        assert!(migrated_relative_path(&verbatim.join(relative), &canonical).is_none());
+    }
+
     #[tokio::test]
     async fn d149_chat_and_full_run_share_text_errors_checkpoints_and_cancellation() {
         let temp = tempfile::tempdir().unwrap();

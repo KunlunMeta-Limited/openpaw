@@ -1015,11 +1015,57 @@ async fn workspace_migration_preserves_real_parent_child_ledger_and_isolates_art
         .await
         .unwrap_or_else(|error| {
             panic!(
-                "D157: original={absolute:?}, canonical={canonical_absolute:?}, audited_root={:?}, destination={destination:?}: {error:?}",
+                "迁移历史查询失败：original={absolute:?}, canonical={canonical_absolute:?}, audited_root={:?}, destination={destination:?}: {error:?}",
                 plan["payload"]["moves"][0]["old_path"]
             )
         });
     assert_eq!(page.items[0]["text"], "shared report");
+    let mut historical_paths = vec![absolute.clone(), canonical_absolute.clone()];
+    #[cfg(windows)]
+    historical_paths.push(
+        std::fs::canonicalize(source.join("report.txt"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    );
+    historical_paths.sort();
+    historical_paths.dedup();
+    let inventory_bindings: Vec<SessionBinding> =
+        serde_json::from_value(plan["payload"]["inventory"]["bindings"].clone()).unwrap();
+    let child_binding = inventory_bindings
+        .iter()
+        .find(|binding| {
+            binding.scope.slot_id == bindings[1].scope.slot_id
+                && binding.session_id != bindings[1].session_id
+        })
+        .unwrap();
+    for path in &historical_paths {
+        let child_page = host
+            .query(
+                &child_binding.scope,
+                QueryRequest {
+                    session_id: child_binding.session_id.clone(),
+                    kind: QueryKind::File { path: path.clone() },
+                    offset: 0,
+                    limit: 5,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(child_page.items[0]["text"], "shared report");
+    }
+    let sibling = source.with_file_name("workspace-sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    std::fs::write(sibling.join("report.txt"), "not a migrated file").unwrap();
+    for path in [sibling.join("report.txt"), source.join("sub/../report.txt")] {
+        assert!(host
+            .query(
+                &bindings[1].scope,
+                query(1, path.to_string_lossy().into_owned()),
+            )
+            .await
+            .is_err());
+    }
     std::fs::write(source.join("report.txt"), "team one only").unwrap();
     assert_eq!(
         host.query(&bindings[0].scope, query(0, "report.txt".into()))
@@ -1035,6 +1081,18 @@ async fn workspace_migration_preserves_real_parent_child_ledger_and_isolates_art
             .items[0]["text"],
         "shared report"
     );
+    std::fs::remove_file(source.join("report.txt")).unwrap();
+    for path in &historical_paths {
+        assert_eq!(
+            host.query(&bindings[1].scope, query(1, path.clone()))
+                .await
+                .unwrap()
+                .items[0]["text"],
+            "shared report",
+            "历史查询只读新团队副本，不依赖旧文件存在"
+        );
+    }
+    std::fs::write(source.join("report.txt"), "team one only").unwrap();
     assert!(host
         .query(
             &bindings[0].scope,

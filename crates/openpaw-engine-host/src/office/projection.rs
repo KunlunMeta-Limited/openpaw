@@ -4449,9 +4449,8 @@ mod tests {
                 ),
                 MockMode::Fixed("已核验实际交付".into()),
             ]);
-            let host = Host::with_provider(config, std::sync::Arc::new(provider))
-                .await
-                .unwrap();
+            let provider = std::sync::Arc::new(provider);
+            let host = Host::with_provider(config, provider.clone()).await.unwrap();
             let scope = ClientScope {
                 namespace: "office".into(),
                 slot_id: "office-1".into(),
@@ -4462,9 +4461,18 @@ mod tests {
                 .submit_run(&scope, &binding.session_id, "先审初稿，再验收修订".into())
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
+            if tokio::time::timeout(Duration::from_secs(5), host.wait_idle())
                 .await
-                .unwrap();
+                .is_err()
+            {
+                let view =
+                    tokio::time::timeout(Duration::from_secs(1), host.get_run(&scope, &run.run_id))
+                        .await;
+                panic!(
+                    "等待真实清理超时：accept_both={accept_both}, provider_calls={}, run={view:?}",
+                    provider.call_count()
+                );
+            }
             let office = OfficeConfig {
                 activity_window: false,
                 base_url: "http://127.0.0.1:9".into(),
