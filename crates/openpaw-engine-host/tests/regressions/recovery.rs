@@ -1001,10 +1001,24 @@ async fn workspace_migration_preserves_real_parent_child_ledger_and_isolates_art
         offset: 0,
         limit: 5,
     };
+    let canonical_absolute = openpaw_tools::safety::dunce_canonicalize(&source.join("report.txt"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let canonical_page = host
+        .query(&bindings[1].scope, query(1, canonical_absolute.clone()))
+        .await
+        .unwrap();
+    assert_eq!(canonical_page.items[0]["text"], "shared report");
     let page = host
         .query(&bindings[1].scope, query(1, absolute.clone()))
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "D157: original={absolute:?}, canonical={canonical_absolute:?}, audited_root={:?}, destination={destination:?}: {error:?}",
+                plan["payload"]["moves"][0]["old_path"]
+            )
+        });
     assert_eq!(page.items[0]["text"], "shared report");
     std::fs::write(source.join("report.txt"), "team one only").unwrap();
     assert_eq!(
