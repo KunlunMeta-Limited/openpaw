@@ -242,7 +242,7 @@ async fn d11_windows_file_without_delete_share_keeps_old_data_on_replace_failure
         .unwrap();
     let path = dir.path().join(".openpaw/todos.jsonl");
     let before = std::fs::read(&path).unwrap();
-    let _occupied = std::fs::OpenOptions::new()
+    let occupied = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(3)
         .open(&path)
@@ -258,6 +258,68 @@ async fn d11_windows_file_without_delete_share_keeps_old_data_on_replace_failure
             .file_name()
             .to_string_lossy()
             .starts_with(".tmp")));
+    drop(occupied);
+
+    // 同一线程runtime中，旧的同步persist会在释放任务得到调度前立即失败。
+    // 有限异步重试必须让真正的占用句柄释放，而非删除旧文件绕过共享限制。
+    let occupied = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&path)
+        .unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(occupied);
+    });
+    let recovered = todo::run(dir.path(), "todo_add", json!({"title":"after-release"})).await;
+    release.await.unwrap();
+    assert!(
+        matches!(&recovered, Ok(outcome) if !outcome.is_error),
+        "短暂占用释放后应提交：{recovered:?}"
+    );
+    let todos = todo::read(dir.path()).unwrap();
+    assert_eq!(todos.len(), 2);
+    assert_eq!(todos[0].title, "old");
+    assert_eq!(todos[1].title, "after-release");
+
+    let before_cancel = std::fs::read(&path).unwrap();
+    let occupied = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .open(&path)
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let signal = cancel.clone();
+    let cancellation = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        signal.cancel();
+    });
+    let args = json!({"title":"cancelled-replacement"});
+    let context = ToolCallContext::new("replace", "cancel", "todo_add", &args, cancel).approve();
+    let cancelled = ToolRegistry::new(dir.path())
+        .call_with_context("todo_add", args, context)
+        .await;
+    cancellation.await.unwrap();
+    assert!(
+        matches!(cancelled, Err(Error::Cancelled)),
+        "占用期间取消必须透传：{cancelled:?}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before_cancel);
+    assert!(std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".tmp")));
+    drop(occupied);
+    assert!(
+        !todo::run(dir.path(), "todo_add", json!({"title":"after-cancel"}))
+            .await
+            .unwrap()
+            .is_error
+    );
+    assert_eq!(todo::read(dir.path()).unwrap().len(), 3);
 }
 
 #[cfg(windows)]

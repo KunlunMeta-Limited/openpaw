@@ -157,7 +157,10 @@ pub fn read(workspace: &Path) -> Result<Vec<Todo>> {
     Ok(todos)
 }
 
-fn persist(workspace: &Path, todos: &[Todo]) -> Result<()> {
+async fn persist(workspace: &Path, todos: &[Todo], cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::Cancelled);
+    }
     let path = todos_path(workspace)?;
     let parent = path
         .parent()
@@ -186,10 +189,45 @@ fn persist(workspace: &Path, todos: &[Todo]) -> Result<()> {
         .as_file()
         .sync_all()
         .map_err(|e| Error::ToolHost(format!("todo sync: {e}")))?;
-    // 同目录原子替换，失败保留原文件；临时文件由既有tempfile RAII删除。
+    // Windows上的短暂不共享删除句柄会阻止原子替换。保持同一锁和临时文件，
+    // 只有限重试原操作，绝不先删旧文件；永久占用仍返回真实系统错误。
+    #[cfg(windows)]
+    {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut delay = std::time::Duration::from_millis(10);
+        loop {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            match temporary.persist(&path) {
+                Ok(_) => break,
+                Err(failure) => {
+                    if matches!(failure.error.raw_os_error(), Some(5 | 32 | 33))
+                        && tokio::time::Instant::now() < deadline
+                    {
+                        temporary = failure.file;
+                        let wait = delay
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Err(Error::Cancelled),
+                            _ = tokio::time::sleep(wait) => {}
+                        }
+                        delay = (delay * 2).min(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    return Err(Error::ToolHost(format!(
+                        "todo atomic replace: {}",
+                        failure.error
+                    )));
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
     temporary
         .persist(&path)
-        .map_err(|e| Error::ToolHost(format!("todo atomic replace: {}", e.error)))?;
+        .map_err(|failure| Error::ToolHost(format!("todo atomic replace: {}", failure.error)))?;
     #[cfg(unix)]
     std::fs::File::open(parent)
         .and_then(|f| f.sync_all())
@@ -214,7 +252,7 @@ pub async fn run(workspace: &Path, name: &str, args: serde_json::Value) -> Resul
 /// 返回：完整提交后的结果
 /// 错误：锁、权限、损坏或提交失败；取消明确返回
 /// 状态：写操作mkdir/锁文件/原子替换，只读不创建文件
-/// 并发与取消：可取消等待锁；提交过程无await，完成后才释放锁
+/// 并发与取消：等待锁及Windows短占用重试可取消；原子替换提交后才释放锁
 /// 权限：复用工作区路径安全；建议锁仅约束协作方
 /// 关联：需求/设计 DES-OP-004；REQ-OP-007。
 /// Stability: unstable.
@@ -261,8 +299,8 @@ pub(crate) async fn run_cancellable(
         context.execution_started(name, &args).await?;
     }
     match name {
-        "todo_add" => add(workspace, args).await,
-        "todo_update" => update(workspace, args).await,
+        "todo_add" => add(workspace, args, &cancel).await,
+        "todo_update" => update(workspace, args, &cancel).await,
         _ => unreachable!(),
     }
 }
@@ -272,7 +310,11 @@ struct AddArgs {
     title: String,
 }
 
-async fn add(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
+async fn add(
+    workspace: &Path,
+    args: serde_json::Value,
+    cancel: &CancellationToken,
+) -> Result<ToolCallOutcome> {
     let a: AddArgs = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => return Ok(ToolCallOutcome::error(format!("todo_add: bad args: {e}"))),
@@ -294,7 +336,7 @@ async fn add(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcom
         let excess = todos.len() - MAX_TODOS;
         todos.drain(0..excess);
     }
-    persist(workspace, &todos)?;
+    persist(workspace, &todos, cancel).await?;
     Ok(ToolCallOutcome::ok(format!(
         "added todo #{id}: {}",
         a.title
@@ -307,7 +349,11 @@ struct UpdateArgs {
     status: String,
 }
 
-async fn update(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOutcome> {
+async fn update(
+    workspace: &Path,
+    args: serde_json::Value,
+    cancel: &CancellationToken,
+) -> Result<ToolCallOutcome> {
     let a: UpdateArgs = match serde_json::from_value(args) {
         Ok(a) => a,
         Err(e) => {
@@ -330,7 +376,7 @@ async fn update(workspace: &Path, args: serde_json::Value) -> Result<ToolCallOut
         )));
     };
     todo.status = a.status.clone();
-    persist(workspace, &todos)?;
+    persist(workspace, &todos, cancel).await?;
     Ok(ToolCallOutcome::ok(format!(
         "todo #{} → {}",
         a.id, a.status
