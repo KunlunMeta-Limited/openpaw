@@ -76,7 +76,7 @@ pub(super) async fn render(
     let (s, sid) = (scope.clone(), session.to_owned());
     host.inner
         .store
-        .call(move |db| {
+        .call_priority(move |db| {
             db.check_live_scope(&s)?;
             crate::service::check_scope(&db.binding(&sid)?, &s)
         })
@@ -91,7 +91,7 @@ pub(super) async fn render(
         );
         host.inner
             .store
-            .call(move |db| {
+            .call_ui(move |db| {
                 let binding = db
                     .bindings()?
                     .into_iter()
@@ -99,13 +99,9 @@ pub(super) async fn render(
                     .ok_or_else(|| HostError::new("scope_denied", "成员会话不存在"))?;
                 // 同一会话的新普通问答不会删除同事上次的真实委派；按接受顺序
                 // 找角色结果，不用运行结束revision把旧任务错误排到新任务前面。
-                let mut parents = Vec::new();
-                for run in db.runs_for_session(&binding.session_id)? {
-                    parents.push((db.run_input(&run)?.0, run));
-                }
-                parents.sort_by_key(|(offset, _)| *offset);
+                let parents = db.runs_for_session(&binding.session_id)?;
                 let mut choices = Vec::new();
-                for (_, parent) in parents {
+                for parent in parents {
                     choices.extend(db.delegations(&parent.run_id)?);
                 }
                 let choice = if let Some(wanted) = wanted {
@@ -121,7 +117,26 @@ pub(super) async fn render(
                             })?,
                     )
                 } else {
-                    choices.into_iter().rev().find(|d| d.role_id == role_id)
+                    let mut candidates = Vec::new();
+                    for d in choices.into_iter().filter(|d| d.role_id == role_id) {
+                        match db.run_metadata(&d.child_run) {
+                            Ok(run) => candidates.push((d, run)),
+                            Err(e) if e.kind == "not_found" => {}
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    // 同人已接受的新待办不能遮住正在执行的旧项；同状态按真实接受顺序。
+                    let index = candidates
+                        .iter()
+                        .position(|(_, r)| {
+                            matches!(
+                                r.state,
+                                crate::RunState::Running | crate::RunState::Cancelling
+                            )
+                        })
+                        .or_else(|| candidates.iter().position(|(_, r)| !r.state.is_terminal()))
+                        .or_else(|| candidates.len().checked_sub(1));
+                    index.map(|i| candidates.remove(i).0)
                 };
                 match choice {
                     None => Ok(None),
@@ -154,17 +169,41 @@ pub(super) async fn render(
                 "{}。查看分工、进度与结果；运行中可刷新状态，查看详情不会重新执行任务。",
                 role.duty
             );
-            let (snapshot, _) = host.snapshot_and_subscribe(scope).await?;
-            let current = snapshot.runs.iter().max_by_key(|run| run.revision);
+            // 首页只用主角色当前Run；同事详情不需要解析全部父Run及其余同事正文。
+            let current_run = if role.id == "lead" || !agents_enabled {
+                let (s, sid, cache) = (
+                    scope.clone(),
+                    session.to_owned(),
+                    host.inner.office_terminal_runs.clone(),
+                );
+                host.inner
+                    .store
+                    .call_ui(move |db| {
+                        db.check_live_scope(&s)?;
+                        crate::service::check_scope(&db.binding(&sid)?, &s)?;
+                        db.runs_for_session(&sid)?
+                            .into_iter()
+                            .max_by_key(|r| r.revision)
+                            .map(|r| read_cached_run(db, &cache, &r.run_id))
+                            .transpose()
+                    })
+                    .await?
+            } else {
+                None
+            };
+            let current = current_run.as_ref();
             let active = current.filter(|run| !run.state.is_terminal());
             let state = if let Some((_, run)) = &member_child {
                 match run.state {
-                    crate::RunState::Completed => "子任务已完成",
+                    crate::RunState::Completed => "空闲；最近子任务已完成",
+                    crate::RunState::Accepted | crate::RunState::Accepting => {
+                        "已接受任务，排队等待执行"
+                    }
                     crate::RunState::Cancelling => "正在清理子任务",
                     crate::RunState::Failed
                     | crate::RunState::TimedOut
                     | crate::RunState::Interrupted
-                    | crate::RunState::Cancelled => "子任务未完成，实际结果可查询",
+                    | crate::RunState::Cancelled => "空闲；最近子任务未完成，实际结果可查询",
                     _ if run.tools.iter().any(|t| t.state == "awaiting_approval") => {
                         "子任务等待人工批准"
                     }
@@ -174,25 +213,29 @@ pub(super) async fn render(
                 // 主角色拥有会话Run；不能把已完成的主Run误报成“没有独立任务”。
                 match current.map(|run| run.state) {
                     None => "空闲，尚无会话任务",
-                    Some(crate::RunState::Completed) => "本轮运行已完成，业务进度以任务与白板为准",
-                    Some(crate::RunState::Cancelled) => "本轮任务已停止",
+                    Some(crate::RunState::Completed) => {
+                        "空闲；本轮运行已完成，业务进度以任务与白板为准"
+                    }
+                    Some(crate::RunState::Cancelled) => "空闲；本轮任务已停止",
                     Some(crate::RunState::Cancelling) => "正在停止本轮任务，等待实际清理",
                     Some(
                         crate::RunState::Failed
                         | crate::RunState::TimedOut
                         | crate::RunState::Interrupted,
-                    ) => "本轮任务未完成，实际结果可查询",
+                    ) => "空闲；本轮任务未完成，实际结果可查询",
                     _ => "正在处理会话任务",
                 }
-            } else if active.is_some_and(|r| {
-                r.tools.iter().any(|t| {
-                    super::projection::actor(&t.tool_name).0 == role.employee
-                        && matches!(
-                            t.state.as_str(),
-                            "running" | "awaiting_approval" | "awaiting_resource"
-                        )
+            } else if !agents_enabled
+                && active.is_some_and(|r| {
+                    r.tools.iter().any(|t| {
+                        super::projection::actor(&t.tool_name).0 == role.employee
+                            && matches!(
+                                t.state.as_str(),
+                                "running" | "awaiting_approval" | "awaiting_resource"
+                            )
+                    })
                 })
-            }) {
+            {
                 "正在处理已关联的会话操作"
             } else if agents_enabled {
                 "尚无此成员的独立任务"
@@ -206,7 +249,15 @@ pub(super) async fn render(
                 json!({"label":"职责","value":role.duty}),
                 json!({"label":"当前状态","value":state}),
             ]);
-            let tasks = task_views(host, scope, session, Some(role.employee)).await?;
+            let focus = member_child
+                .as_ref()
+                .map(|(d, _)| (d.run_id.clone(), Some(d.task_id.clone())))
+                .or_else(|| current.map(|r| (r.run_id.clone(), None)));
+            let tasks = if let Some(focus) = focus {
+                task_views_focused(host, scope, session, Some(role.employee), Some(focus)).await?
+            } else {
+                Vec::new()
+            };
             let business = tasks.iter().find(|(task, run, child)| {
                 if let Some((d, _)) = &member_child {
                     run.run_id == d.child_run && child.as_deref() == Some(d.task_id.as_str())
@@ -218,15 +269,15 @@ pub(super) async fn render(
             });
             if let Some((task, _, _)) = business {
                 fields.extend([
-                    json!({"label":"当前任务","value":task["title"]}),
+                    json!({"label":if member_child.as_ref().is_some_and(|(_,r)|r.state.is_terminal()) || role.id=="lead" && current.is_some_and(|r|r.state.is_terminal()) {"最近任务"}else{"当前任务"},"value":task["title"]}),
                     json!({"label":"业务状态","value":task_status(task["status"].as_str().unwrap_or("queued"))}),
                     json!({"label":"已确认进度","value":format!("{}%",task["progress"].as_u64().unwrap_or(0))}),
                     json!({"label":"进度说明","value":dto::bounded(task["summary"].as_str().unwrap_or("暂无说明"),1000)}),
                 ]);
             } else {
                 fields.extend([
-                    json!({"label":"当前任务","value":if member_child.is_some(){"已登记任务，等待前序交接动画完成"}else{"暂无已分配任务"}}),
-                    json!({"label":"已确认进度","value":if member_child.is_some(){"等待交接后同步任务进度"}else{"暂无任务，不估算进度"}}),
+                    json!({"label":"当前任务","value":member_child.as_ref().map(|(d,_)|d.title.as_str()).unwrap_or("暂无已分配任务")}),
+                    json!({"label":"已确认进度","value":if member_child.is_some(){"当前显示窗口未包含该任务，不估算进度"}else{"暂无任务，不估算进度"}}),
                 ]);
             }
             if let Some((d, run)) = &member_child {
@@ -235,11 +286,16 @@ pub(super) async fn render(
                     json!({"label":"最近结果","value":dto::bounded(if run.text.is_empty(){"尚无可靠回复正文"}else{&run.text},1800)}),
                 ]);
             }
-            if let Some(run) = current.filter(|_| member_child.is_none()) {
+            if let Some(run) =
+                current.filter(|_| member_child.is_none() && (!agents_enabled || role.id == "lead"))
+            {
                 let tools: Vec<_> = run
                     .tools
                     .iter()
-                    .filter(|tool| super::projection::actor(&tool.tool_name).0 == role.employee)
+                    .filter(|tool| {
+                        agents_enabled
+                            || super::projection::actor(&tool.tool_name).0 == role.employee
+                    })
                     .collect();
                 fields.push(json!({"label":"已关联操作","value":format!("最近一次会话运行中有 {} 次工具操作；这是执行记录，不代表独立Agent。",tools.len())}));
                 if role.id == "lead" {
@@ -281,7 +337,25 @@ pub(super) async fn render(
             );
         }
     } else if kind == "tasks" || kind == "task" {
-        let tasks = task_views(host, scope, session, member.map(|role| role.employee)).await?;
+        let focus = (kind == "task")
+            .then(|| {
+                member_child
+                    .as_ref()
+                    .map(|(d, _)| (d.run_id.clone(), Some(d.task_id.clone())))
+            })
+            .flatten();
+        let tasks = if let Some(focus) = focus {
+            task_views_focused(
+                host,
+                scope,
+                session,
+                member.map(|role| role.employee),
+                Some(focus),
+            )
+            .await?
+        } else {
+            task_views(host, scope, session, member.map(|role| role.employee)).await?
+        };
         if kind == "task" {
             let (task, run, _) = tasks
                 .iter()
@@ -298,7 +372,7 @@ pub(super) async fn render(
                     )
                 })?;
             title = dto::bounded(task["title"].as_str().unwrap_or("任务详情"), 160);
-            description = "业务进度来自最近已同步快照；执行状态和结果来自真实运行。结束回复不代表全部业务已核验。".into();
+            description = "当前任务使用同步快照；历史任务按原委派和计划查询。执行状态与结果来自真实运行，结束回复不代表全部业务已核验。".into();
             let owner = crate::agents::ROLES
                 .iter()
                 .find(|r| task["assigneeId"] == r.employee)
@@ -340,7 +414,7 @@ pub(super) async fn render(
             let offset = context["offset"].as_u64().unwrap_or(0) as usize;
             title = "任务进度与结果".into();
             description = format!(
-                "当前展示范围共{}项，显示{}—{}；已完成项保留，完整执行历史仍可从历史入口查询。",
+                "当前及历史任务共{}项，显示{}—{}；移出场景窗口的终态委派仍可查看真实结果。",
                 tasks.len(),
                 offset.min(tasks.len()),
                 (offset + 5).min(tasks.len())
@@ -583,7 +657,7 @@ pub(super) async fn render(
     let (id, scope) = (id.to_owned(), scope.clone());
     host.inner
         .store
-        .call(move |db| {
+        .call_priority(move |db| {
             db.check_live_scope(&scope)?;
             db.office_action(
                 &id,
@@ -609,11 +683,11 @@ fn task_status(status: &str) -> &str {
         _ => "待处理",
     }
 }
-/// 功能：复用已保存投影枚举可见任务，并用原父子运行重新核验所属及执行结果。
+/// 功能：复用当前投影与原委派枚举任务，补充显示窗口外的已公开终态历史。
 /// 参数：host为共享服务，scope/session为当前可信父会话，employee为可选角色过滤。
 /// 返回：任务、真实Run与可选独立子任务引用，不另建任务库。
 /// 错误：存储损坏或引用失效时明确报错。
-/// 状态：只读事实与最近同步投影；不推进进度、不执行工具。
+/// 状态：只读事实与最近同步投影；历史进度复用原计划核验，不推进进度、不执行工具。
 /// 并发与取消：原Store单线程读取，删除后不能复活导航。
 /// 权限：仅同办公室和同父会话，子运行必须有原委派事实。
 /// 关联：CHG-2026-0007第12.21节；REQ-OP-014/021。
@@ -623,69 +697,209 @@ async fn task_views(
     session: &str,
     employee: Option<&str>,
 ) -> HostResult<Vec<(Value, crate::RunView, Option<String>)>> {
+    task_views_focused(host, scope, session, employee, None).await
+}
+
+async fn task_views_focused(
+    host: &Host,
+    scope: &ClientScope,
+    session: &str,
+    employee: Option<&str>,
+    focus: Option<(String, Option<String>)>,
+) -> HostResult<Vec<(Value, crate::RunView, Option<String>)>> {
     let (scope, session, employee) = (
         scope.clone(),
         session.to_owned(),
         employee.map(str::to_owned),
     );
     let terminal_runs = host.inner.office_terminal_runs.clone();
-    host.inner
-        .store
-        .call(move |db| {
-            db.check_live_scope(&scope)?;
-            crate::service::check_scope(&db.binding(&session)?, &scope)?;
-            let Some((projection, _)) = db.office_projection(&scope.slot_id)? else {
-                return Ok(vec![]);
-            };
-            let Some(conv) = projection["conversations"]
-                .as_array()
-                .and_then(|a| a.iter().find(|c| c["id"] == scope.conversation_id))
-            else {
-                return Ok(vec![]);
-            };
-            let parents: Vec<_> = db.runs_for_session(&session)?;
-            let mut result = Vec::new();
-            for task in conv["tasks"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|t| employee.as_ref().is_none_or(|e| t["assigneeId"] == *e))
-            {
-                let mut selected = None;
-                for parent in &parents {
-                    let delegations = db.delegations(&parent.run_id)?;
-                    let delegated = delegations.iter().rev().find(|d| {
-                        task["id"] == d.task_id
-                            || conv["events"].as_array().into_iter().flatten().any(|e| {
-                                e["id"] == format!("assign:{}", d.task_id)
-                                    && e["taskId"] == task["id"]
-                                    && e["employeeId"] == task["assigneeId"]
-                            })
-                    });
-                    if let Some(d) = delegated {
-                        selected = Some((
-                            read_cached_run(db, &terminal_runs, &d.child_run)?,
-                            Some(d.task_id.clone()),
-                        ));
-                        break;
+    let activity_window = host
+        .inner
+        .config
+        .office
+        .as_ref()
+        .is_some_and(|o| o.activity_window);
+    let read = move |db: &mut Db| {
+        db.check_live_scope(&scope)?;
+        crate::service::check_scope(&db.binding(&session)?, &scope)?;
+        let Some((projection, _)) = db.office_projection(&scope.slot_id)? else {
+            return Ok(vec![]);
+        };
+        let Some(conv) = projection["conversations"]
+            .as_array()
+            .and_then(|a| a.iter().find(|c| c["id"] == scope.conversation_id))
+        else {
+            return Ok(vec![]);
+        };
+        let parents = db
+            .runs_for_session(&session)?
+            .into_iter()
+            .filter(|p| focus.as_ref().is_none_or(|(parent, _)| &p.run_id == parent))
+            .map(|p| {
+                let delegations = db.delegations(&p.run_id)?;
+                Ok((p, delegations))
+            })
+            .collect::<HostResult<Vec<_>>>()?;
+        let mut result = Vec::new();
+        for task in conv["tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| employee.as_ref().is_none_or(|e| t["assigneeId"] == *e))
+        {
+            let mut selected = None;
+            for (parent, delegations) in &parents {
+                let delegated = delegations.iter().rev().find(|d| {
+                    task["id"] == d.task_id
+                        || conv["events"].as_array().into_iter().flatten().any(|e| {
+                            e["id"] == format!("assign:{}", d.task_id)
+                                && e["taskId"] == task["id"]
+                                && e["employeeId"] == task["assigneeId"]
+                        })
+                });
+                if let Some(d) = delegated {
+                    if focus
+                        .as_ref()
+                        .is_some_and(|(_, child)| child.as_ref() != Some(&d.task_id))
+                    {
+                        continue;
                     }
-                    let step_owned = task["id"]
-                        .as_str()
-                        .is_some_and(|id| id.starts_with(&format!("step:{}:", parent.run_id)));
-                    if task["id"] == format!("run:{}", parent.run_id) || step_owned {
-                        selected =
-                            Some((read_cached_run(db, &terminal_runs, &parent.run_id)?, None));
-                        break;
+                    selected = Some((
+                        read_cached_run(db, &terminal_runs, &d.child_run)?,
+                        Some(d.task_id.clone()),
+                    ));
+                    break;
+                }
+                let step_owned = task["id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with(&format!("step:{}:", parent.run_id)));
+                if task["id"] == format!("run:{}", parent.run_id) || step_owned {
+                    if focus.as_ref().is_some_and(|(_, child)| child.is_some()) {
+                        continue;
+                    }
+                    selected = Some((read_cached_run(db, &terminal_runs, &parent.run_id)?, None));
+                    break;
+                }
+            }
+            let (run, child) = match selected {
+                Some(selected) => selected,
+                None if focus.is_some() => continue,
+                None => {
+                    return Err(HostError::new(
+                        "snapshot_changed",
+                        "任务执行引用已失效，请重新同步",
+                    ))
+                }
+            };
+            result.push((task.clone(), run, child));
+        }
+        // 快照只是显示窗口，不是历史任务库。只补已经公开且执行结束的
+        // 委派；当前卡仍优先，不把在途执行当终态，也不按回复猜完成。
+        let mut covered: std::collections::BTreeSet<_> = result
+            .iter()
+            .filter_map(|(_, _, child)| child.clone())
+            .collect();
+        for (parent, delegations) in &parents {
+            let continuous = db.continuous_state(&parent.run_id)?;
+            let plan = if continuous.is_some_and(|c| c.started && c.completion_condition.is_none())
+            {
+                None
+            } else {
+                db.progress(&parent.run_id)?
+            };
+            if activity_window && employee.as_ref().is_none_or(|e| e == "office-lead") {
+                let run = read_cached_run(db, &terminal_runs, &parent.run_id)?;
+                let (steps, percent) = crate::task_progress::project(plan.clone(), &run)?;
+                let root_id = format!("run:{}", run.run_id);
+                // 多Agent总进度还依赖委派验收；父模型结束不能补造100%。
+                // 这类成果按下方真实子任务恢复，目标仍由原白板/历史呈现。
+                if delegations.is_empty()
+                    && run.state.is_terminal()
+                    && !result.iter().any(|(t, _, _)| t["id"] == root_id)
+                {
+                    let (_, input) = db.run_input(parent)?;
+                    let state = if run.state == crate::RunState::Completed {
+                        if percent == 100 {
+                            "completed"
+                        } else {
+                            "blocked"
+                        }
+                    } else {
+                        "failed"
+                    };
+                    result.push((json!({"id":root_id,"title":dto::bounded(&input,80),"assigneeId":"office-lead","status":state,"progress":percent,"summary":"历史运行；业务计划与实际结果可查询"}),run.clone(),None));
+                }
+                for step in steps {
+                    if !result.iter().any(|(t, _, _)| t["id"] == step["id"])
+                        && matches!(step["status"].as_str(), Some("completed" | "failed"))
+                    {
+                        let mut item = step;
+                        item["assigneeId"] = json!("office-lead");
+                        result.push((item, run.clone(), None));
                     }
                 }
-                let (run, child) = selected.ok_or_else(|| {
-                    HostError::new("snapshot_changed", "任务执行引用已失效，请重新同步")
-                })?;
-                result.push((task.clone(), run, child));
             }
-            Ok(result)
-        })
-        .await
+            for d in delegations {
+                if focus
+                    .as_ref()
+                    .is_some_and(|(_, child)| child.as_ref() != Some(&d.task_id))
+                {
+                    continue;
+                }
+                let role = crate::agents::role(&d.role_id)
+                    .ok_or_else(|| HostError::new("storage_unavailable", "历史委派引用未知角色"))?;
+                if covered.contains(&d.task_id)
+                    || employee.as_ref().is_some_and(|e| e != role.employee)
+                {
+                    continue;
+                }
+                let child = match read_cached_run(db, &terminal_runs, &d.child_run) {
+                    Ok(run) if run.state.is_terminal() => run,
+                    Ok(_) => continue,
+                    Err(e) if e.kind == "not_found" => continue,
+                    Err(e) => return Err(e),
+                };
+                // 导航仅接受原委派中的可信子绑定，不能用浏览器提供的任务ID跨会话读取。
+                crate::service::check_scope(&db.binding(&d.child_session)?, &d.child_scope)?;
+                let (_, percent) =
+                    crate::task_progress::execution_project(db.progress(&child.run_id)?, &child)?;
+                let verified = child.state == crate::RunState::Completed
+                    && plan
+                        .as_ref()
+                        .map(|p| {
+                            p["steps"].as_array().into_iter().flatten().any(|step| {
+                                step["state"] == "completed"
+                                    && step["evidenceCallIds"]
+                                        .as_array()
+                                        .is_some_and(|ids| ids.iter().any(|id| id == &d.call_id))
+                            })
+                        })
+                        .unwrap_or(percent == 100);
+                let complete =
+                    child.state == crate::RunState::Completed && (verified || percent == 100);
+                let state = if complete {
+                    "completed"
+                } else if child.state == crate::RunState::Completed {
+                    "blocked"
+                } else {
+                    "failed"
+                };
+                let summary = if complete {
+                    "历史终态任务；实际回复与成果可查询".to_owned()
+                } else if state == "blocked" {
+                    "独立执行已结束，业务步骤仍待核验".to_owned()
+                } else {
+                    super::turns::message(&child)
+                };
+                let task = json!({"id":d.task_id,"title":d.title,"assigneeId":role.employee,"status":state,
+                        "progress":if complete {100}else{percent},"summary":summary,"updatedAt":d.created_at});
+                covered.insert(d.task_id.clone());
+                result.push((task, child, Some(d.task_id.clone())));
+            }
+        }
+        Ok(result)
+    };
+    host.inner.store.call_ui(read).await
 }
 fn button(
     buttons: &mut Vec<Value>,
@@ -728,7 +942,7 @@ async fn artifacts(host: &Host, scope: &ClientScope, session: &str) -> HostResul
                     for b in m.content {
                         match b {
                             openpaw_core::ContentBlock::ToolUse { id, name, input }
-                                if matches!(name.as_str(), "write_file" | "edit_file") =>
+                                if crate::task_progress::is_file_writer(&name) =>
                             {
                                 if let Some(path) = input["path"].as_str() {
                                     pending.insert(id, path.to_owned());
@@ -762,6 +976,327 @@ mod tests {
         assert_eq!(parts.concat(), text);
         assert!(parts.iter().all(|s| dto::units(s) <= 1800));
     }
+    #[tokio::test]
+    async fn d121_archived_delegation_remains_readable_without_a_snapshot_card() {
+        use openpaw_llm::{MockMode, MockProvider};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":[],"agents":{"enabled":true},"office":{"activity_window":true,"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_UNUSED","allowed_origins":["http://127.0.0.1:9"]}})).unwrap();
+        let provider = MockProvider::scripted(vec![
+            MockMode::ToolUse {
+                tool_name: "delegate_task".into(),
+                input: json!({"role_id":"organize","title":"整理已给定资料","instructions":"只整理已给定文本","acceptance":"有限文字成果"}),
+                text: String::new(),
+            },
+            MockMode::Fixed("真实子成果已完成".into()),
+            MockMode::Fixed("本轮已汇总".into()),
+        ]);
+        let host = Host::with_provider(config, std::sync::Arc::new(provider))
+            .await
+            .unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "d121-archive".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let accepted = host
+            .submit_run(&scope, &binding.session_id, "整理有限资料".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if host
+                    .get_run(&scope, &accepted.run_id)
+                    .await
+                    .unwrap()
+                    .state
+                    .is_terminal()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let office = super::super::OfficeConfig {
+            activity_window: true,
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "UNUSED".into(),
+            allowed_origins: vec![],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        let projected = super::super::projection::prepare(&host, &office, "office-1")
+            .await
+            .unwrap();
+        assert!(
+            projected["conversations"][0]["tasks"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "终态不常驻人物当前窗口"
+        );
+        assert!(
+            !projected["conversations"][0]["whiteboard"]["detail"]
+                .as_str()
+                .unwrap()
+                .is_empty(),
+            "人物空闲不能清空业务白板"
+        );
+        let member = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "idle-member",
+            json!({"kind":"member","employeeId":"file-agent","actorId":"file-agent"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(member["content"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["label"] == "当前状态"
+                && f["value"].as_str().unwrap_or("").starts_with("空闲")));
+        let before = task_views(&host, &scope, &binding.session_id, Some("file-agent"))
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        let child = before[0].2.clone().unwrap();
+        host.inner
+            .store
+            .call(|db| {
+                let (mut snapshot, state) = db.office_projection("office-1")?.unwrap();
+                snapshot["conversations"][0]["tasks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .retain(|t| t["assigneeId"] != "file-agent");
+                db.save_office_projection("office-1", &snapshot, &state)
+            })
+            .await
+            .unwrap();
+        let count = host
+            .snapshot_and_subscribe(&scope)
+            .await
+            .unwrap()
+            .0
+            .runs
+            .len();
+        let archived = task_views(&host, &scope, &binding.session_id, Some("file-agent"))
+            .await
+            .unwrap();
+        assert_eq!(archived.len(), 1, "移出快照的真实终态任务仍须可以查看");
+        assert_eq!(archived[0].2.as_deref(), Some(child.as_str()));
+        assert_eq!(archived[0].0["status"], before[0].0["status"]);
+        assert_eq!(archived[0].0["progress"], before[0].0["progress"]);
+        assert_eq!(archived[0].1.text, "真实子成果已完成");
+        let all = task_views(&host, &scope, &binding.session_id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.len(),
+            1,
+            "归档只恢复真实子任务，不用父模型结束补造多Agent总进度"
+        );
+        assert!(all.iter().all(|(_, _, child)| child.is_some()));
+        let detail = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "archived-detail",
+            json!({"kind":"task","taskId":child,"childTaskId":child}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(detail["content"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["label"] == "实际回复" && f["value"] == "真实子成果已完成"));
+        assert_eq!(
+            host.snapshot_and_subscribe(&scope)
+                .await
+                .unwrap()
+                .0
+                .runs
+                .len(),
+            count
+        );
+        let mut foreign = scope.clone();
+        foreign.conversation_id = "other".into();
+        assert!(task_views(&host, &foreign, &binding.session_id, None)
+            .await
+            .is_err());
+        host.delete_session(&scope).await.unwrap();
+        assert!(task_views(&host, &scope, &binding.session_id, None)
+            .await
+            .is_err());
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn d144_member_reads_selected_execution_without_unrelated_history() {
+        use openpaw_llm::{MockMode, MockProvider};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo","tools":[],"agents":{"enabled":true},"office":{"activity_window":true,"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_UNUSED","allowed_origins":["http://127.0.0.1:9"]}})).unwrap();
+        let provider = MockProvider::scripted(vec![
+            MockMode::ToolUse {
+                tool_name: "delegate_task".into(),
+                input: json!({"role_id":"organize","title":"整理已给定资料","instructions":"只整理已给定文本","acceptance":"有限文字成果"}),
+                text: String::new(),
+            },
+            MockMode::Fixed("真实子成果已完成".into()),
+            MockMode::Fixed("本轮已汇总".into()),
+            MockMode::ToolUse {
+                tool_name: "delegate_task".into(),
+                input: json!({"role_id":"audit","title":"另项独立审核","instructions":"独立审核另一份给定文字","acceptance":"报告依据"}),
+                text: String::new(),
+            },
+            MockMode::Fixed("另一位成员结果".into()),
+            MockMode::Fixed("第二轮结束".into()),
+        ]);
+        let host = Host::with_provider(config, std::sync::Arc::new(provider))
+            .await
+            .unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "d144-bounded".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let accepted = host
+            .submit_run(&scope, &binding.session_id, "整理有限资料".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if host
+                    .get_run(&scope, &accepted.run_id)
+                    .await
+                    .unwrap()
+                    .state
+                    .is_terminal()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // 终态先落盘，外层任务随后释放注册表；下一轮须等真实清理，不能将
+        // get_run 的终态可见性误认为提交许可，也不能提前释放产品资源。
+        tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let second = host
+            .submit_run(&scope, &binding.session_id, "另一项审核".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let office = super::super::OfficeConfig {
+            activity_window: true,
+            base_url: "http://127.0.0.1:9".into(),
+            api_key_env: "UNUSED".into(),
+            allowed_origins: vec![],
+            names: Default::default(),
+            creation_slots: vec![],
+        };
+        super::super::projection::prepare(&host, &office, "office-1")
+            .await
+            .unwrap();
+        let run_id = second.run_id.clone();
+        let other = host
+            .inner
+            .store
+            .call(move |db| Ok(db.delegations(&run_id)?.remove(0)))
+            .await
+            .unwrap();
+        let path = temp
+            .path()
+            .join("home/sessions")
+            .join(format!("{}.jsonl", other.child_session));
+        let original = std::fs::read(&path).unwrap();
+        // 当前人物不应为获取自己的状态而读取另一角色的损坏长历史；
+        // 真正查询那位角色时仍必须透传错误，不能将损坏吞成“暂无数据”。
+        std::fs::write(&path, b"{broken-json\n").unwrap();
+        host.inner.office_terminal_runs.lock().unwrap().clear();
+        let selected = render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "selected-member",
+            json!({"kind":"member","employeeId":"file-agent","actorId":"file-agent"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(selected["content"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["label"] == "最近结果" && f["value"] == "真实子成果已完成"));
+        assert!(
+            host.get_run(&scope, &second.run_id).await.is_err(),
+            "完整Run读取仍暴露真实账本损坏"
+        );
+        let audit = crate::agents::role("audit").unwrap();
+        assert!(render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "broken-member",
+            json!({"kind":"member","employeeId":audit.employee,"actorId":audit.actor}),
+            &CancellationToken::new()
+        )
+        .await
+        .is_err());
+        std::fs::write(&path, original).unwrap();
+        let all = task_views(&host, &scope, &binding.session_id, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "首页按需读取不裁掉历史列表");
+        assert!(all.iter().any(|(_, r, _)| r.text == "另一位成员结果"));
+        let metadata = host
+            .inner
+            .store
+            .call(move |db| db.run_metadata(&second.run_id))
+            .await
+            .unwrap();
+        assert!(metadata.state.is_terminal());
+        assert_eq!(
+            host.snapshot_and_subscribe(&scope)
+                .await
+                .unwrap()
+                .0
+                .runs
+                .len(),
+            2,
+            "只读详情不新增执行"
+        );
+        host.delete_session(&scope).await.unwrap();
+        assert!(render(
+            &host,
+            &scope,
+            &binding.session_id,
+            "deleted-member",
+            json!({"kind":"member","employeeId":"file-agent","actorId":"file-agent"}),
+            &CancellationToken::new()
+        )
+        .await
+        .is_err());
+        host.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn task_navigation_pages_real_facts_and_refuses_wrong_or_deleted_scope() {
         use openpaw_llm::{MockMode, MockProvider};

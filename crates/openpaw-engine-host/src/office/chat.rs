@@ -284,6 +284,7 @@ async fn send(tx: &mpsc::Sender<Bytes>, event: serde_json::Value) -> bool {
 async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sender<Bytes>) -> bool {
     let mut first = true;
     let mut sent = String::new();
+    let mut source_sent = String::new();
     let mut streaming = false;
     loop {
         let (_, mut notices) = match host.snapshot_and_subscribe(scope).await {
@@ -300,8 +301,19 @@ async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sende
                 return false;
             }
         };
+        let display = match turns::display(host, &run).await {
+            Ok(display) => display,
+            Err(_) => {
+                let _ = send(
+                    tx,
+                    json!({"type":"error","message":"无法读取可靠子任务状态，请重新同步会话"}),
+                )
+                .await;
+                return false;
+            }
+        };
         if first {
-            let event = json!({"type":"snapshot","text":dto::bounded(&run.text,50000),"state":turns::state(&run),"message":turns::message(&run)});
+            let event = json!({"type":"snapshot","text":display,"state":turns::state(&run),"message":turns::message(&run)});
             if !send(tx, event).await {
                 return false;
             }
@@ -311,13 +323,21 @@ async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sende
                 }
                 return true;
             }
-            sent = run.text.clone();
+            sent = display.clone();
+            source_sent = run.text.clone();
             first = false;
             if !send(tx, json!({"type":"status","phase":"thinking"})).await {
                 return false;
             }
         }
-        if !run.text.starts_with(&sent) || dto::units(&run.text) > 50000 || run.text_truncated {
+        if run.state.is_terminal() && !display.starts_with(&sent) {
+            // 终态说明需要预算时用官方snapshot替换展示，不截断流后伪报成功。
+            return send(tx, json!({"type":"snapshot","text":display,"state":turns::state(&run),"message":turns::message(&run)})).await;
+        }
+        if !run.text.starts_with(&source_sent)
+            || dto::units(&display) > 50000
+            || (!run.state.is_terminal() && run.text_truncated)
+        {
             let _ = host.cancel_run(scope, id).await;
             let _ = send(
                 tx,
@@ -326,7 +346,17 @@ async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sende
             .await;
             return false;
         }
-        let mut tail = &run.text[sent.len()..];
+        if !display.starts_with(&sent) {
+            // 子错误说明是只读展示前缀。异常集合改变时替换snapshot，
+            // 不能把尾注位置变化误当模型正文回退而取消仍工作的同事。
+            if !send(tx, json!({"type":"snapshot","text":display,"state":turns::state(&run),"message":turns::message(&run)})).await {
+                return false;
+            }
+            sent = display;
+            source_sent = run.text.clone();
+            continue;
+        }
+        let mut tail = &display[sent.len()..];
         if !tail.is_empty() && !streaming {
             if !send(tx, json!({"type":"status","phase":"streaming"})).await {
                 return false;
@@ -341,7 +371,8 @@ async fn stream_run(host: &Host, scope: &ClientScope, id: &str, tx: &mpsc::Sende
             }
             tail = &tail[chunk.len()..];
         }
-        sent = run.text.clone();
+        sent = display.clone();
+        source_sent = run.text.clone();
         if run.state.is_terminal() {
             return match turns::state(&run) {
                 "complete" => send(tx, json!({"type":"done"})).await,

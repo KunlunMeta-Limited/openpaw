@@ -48,7 +48,7 @@ pub(super) async fn run(
                         let saved = h
                             .inner
                             .store
-                            .call(move |db| {
+                            .call_priority(move |db| {
                                 db.office_action(&id, &scope, &kind, "claimed", expiry, &json!({}))
                             })
                             .await;
@@ -169,7 +169,7 @@ async fn handle(
     };
     host.inner
         .store
-        .call(move |db| db.office_action_state(&id, &s, status))
+        .call_priority(move |db| db.office_action_state(&id, &s, status))
         .await?;
     if reply.is_err() {
         eprintln!("engine-host Office UI: 响应未确认送达，已提交业务不回滚");
@@ -193,15 +193,25 @@ async fn dispatch(
     if action["action"] == "conversation.delete" {
         // 业务删除不随UI60秒期限回滚；成功响应必须在服务端最新快照移除后。
         host.delete_session(&scope).await?;
-        let sync = projection::sync_once(host, config, &scope.slot_id, client, false, address);
-        tokio::select! {_=cancel.cancelled()=>return Err(HostError::new("ui_expired","已删除，UI未确认")),r=sync=>{r?;}}
-        let (_, read) = client
-            .post(json!({"type":"office.read","teamId":scope.slot_id}))
+        let sync = projection::sync_for_ui(host, config, &scope.slot_id, client, address);
+        let accepted = tokio::select! {_=cancel.cancelled()=>return Err(HostError::new("ui_expired","已删除，UI未确认")),r=sync=>r?};
+        // snapshot的缓存/应用回执已经确认服务端接收该持久版本；额外office.read
+        // 要再等待浏览器场景回执，页面切换或断线可让真实删除无故超时。
+        // 只核对已接受版本中确实没有目标，不把cached宣称为页面已应用。
+        let team = scope.slot_id.clone();
+        let conversation = scope.conversation_id.clone();
+        let removed = host
+            .inner
+            .store
+            .call(move |db| {
+                Ok(db.office_projection(&team)?.is_some_and(|(snapshot, _)| {
+                    snapshot["conversations"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().all(|item| item["id"] != conversation))
+                }))
+            })
             .await?;
-        if read["snapshot"]["conversations"]
-            .as_array()
-            .is_none_or(|v| v.iter().any(|c| c["id"] == scope.conversation_id))
-        {
+        if !matches!(accepted.as_str(), "applied" | "cached" | "ignored") || !removed {
             return Err(HostError::new(
                 "snapshot_required",
                 "已删除，等待服务端完整快照移除",
@@ -213,7 +223,7 @@ async fn dispatch(
     }
     let memory_snapshot = if matches!(
         action["action"].as_str(),
-        Some("actor.inspect") | Some("employee.inspect")
+        Some("actor.inspect") | Some("employee.inspect") | Some("dialog.action")
     ) {
         host.inner
             .office_projection_cache
@@ -229,7 +239,7 @@ async fn dispatch(
     let (binding, cached_snapshot) = host
         .inner
         .store
-        .call(move |db| {
+        .call_priority(move |db| {
             db.check_live_scope(&s)?;
             let binding = db
                 .bindings()?
@@ -298,7 +308,7 @@ async fn dispatch(
             let nav = host
                 .inner
                 .store
-                .call(move |db| db.office_navigation(&id, &s))
+                .call_priority(move |db| db.office_navigation(&id, &s))
                 .await?;
             nav["options"]
                 .get(action["optionId"].as_str().unwrap_or(""))
@@ -325,6 +335,7 @@ async fn dispatch(
         }
         _ => return Err(HostError::new("unsupported", "不支持此操作")),
     };
+    let details_started_at = std::time::Instant::now();
     let rendered = details::render(
         host,
         &scope,
@@ -338,7 +349,7 @@ async fn dispatch(
         eprintln!(
             "engine-host diagnostics ui action={} details_ms={}",
             action["action"].as_str().unwrap_or("unknown"),
-            started_at.elapsed().as_millis()
+            details_started_at.elapsed().as_millis()
         );
     }
     rendered

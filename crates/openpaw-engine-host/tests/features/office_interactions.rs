@@ -102,6 +102,7 @@ struct Fixture {
     wrong_scope: bool,
     custom_text: bool,
     expire_delete_reply: bool,
+    unavailable_scene_read: bool,
 }
 async fn interaction_scenario() {
     use axum::{extract::State, routing::post, Json, Router};
@@ -127,6 +128,10 @@ async fn interaction_scenario() {
         let data = match r["type"].as_str().unwrap_or("") {
             "office.capabilities" => {
                 json!({"scene":{"protocolVersion":"2.0","actors":actors,"capabilities":[]},"ui":ui,"requests":{},"responses":{"success":{},"error":{}}})
+            }
+            "office.read" if r.get("teamId").is_some() && s.unavailable_scene_read => {
+                return Json(json!({"code":503,"msg":"页面不在线，无法读取场景","data":{}}))
+                    .into_response();
             }
             "office.read" if r.get("teamId").is_some() => {
                 json!({"snapshot":s.snapshot.clone().unwrap(),"scene":{},"pendingDecisions":[]})
@@ -411,7 +416,7 @@ async fn interaction_scenario() {
         .unwrap()
         .iter()
         .any(|field| field["label"] == "当前状态"
-            && field["value"] == "本轮运行已完成，业务进度以任务与白板为准"));
+            && field["value"] == "空闲；本轮运行已完成，业务进度以任务与白板为准"));
     let unknown = action(
         &shared,
         "unknown-actor",
@@ -596,6 +601,7 @@ async fn interaction_scenario() {
         }
     }
     shared.lock().await.expire_delete_reply = true;
+    shared.lock().await.unavailable_scene_read = true;
     let deleted = action(&shared, "delete-6", "conversation.delete", json!({})).await;
     assert_eq!(deleted["presentation"]["success"], true);
     assert!(

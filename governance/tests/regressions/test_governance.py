@@ -250,6 +250,58 @@ reason="需要保护"
         check.validate(check.Reader(self.root),'implementation')
         with self.assertRaisesRegex(check.Failure,'状态|批准'):self.pr_check(self.base,None,'implementation')
 
+    def test_scoped_delivery_keeps_historical_facts_and_current_acceptance_strict(self):
+        historical='docs/changes/CHG-2026-0002.md'
+        self.write(historical,chg().replace('CHG-2026-0001','CHG-2026-0002'))
+        self.approve(historical)
+        # 只提交历史记录；当前提案和业务文件仍是本轮变更。
+        self.command('add',historical)
+        self.command('commit','-qm','historical approved without Windows acceptance')
+        self.base=check.commit(self.root,'HEAD')
+        historical_bytes=(self.root/historical).read_bytes()
+        self.approve()
+        self.commit()
+        accepted=check.commit(self.root,'HEAD')
+        body=(self.root/self.path).read_text(encoding='utf-8')
+        facts=[('交付验收人','夹具审核人'),('交付验收时间','2026-11-04'),
+               ('交付验收证据','本轮准确验收'),('交付验收提交',accepted),('验证证据','真实夹具报告'),
+               ('Linux验证结果','passed'),('Windows验证结果','passed'),('Linux验证提交',accepted),
+               ('Windows验证提交',accepted),('Linux验证证据','Linux报告'),('Windows验证证据','Windows报告')]
+        body=body.replace('| 交付验收状态 | pending |','| 交付验收状态 | approved |')
+        body=body.replace('| 当前状态 |',''.join('| '+k+' | '+v+' |\n' for k,v in facts)+'| 当前状态 |')
+        self.write(self.path,body)
+        def cli(*args):
+            return subprocess.run([sys.executable,str(ROOT/'governance/check.py'),'--root',str(self.root),
+                                   'validate',*args],capture_output=True,text=True)
+        scoped=['--stage','delivery','--base',self.base,'--worktree']
+        result=cli(*scoped)
+        self.assertEqual(result.returncode,0,result.stderr)
+        # 显式的全历史审计继续失败，不把旧平台缺项伪造为通过。
+        self.assertNotEqual(cli('--stage','delivery').returncode,0)
+        for broken in [body.replace('| Windows验证结果 | passed |','| Windows验证结果 | pending |'),
+                       body.replace('| 交付验收状态 | approved |','| 交付验收状态 | pending |'),
+                       body.replace('| Windows验证提交 | '+accepted+' |','| Windows验证提交 | '+self.base+' |'),
+                       body.replace('| 交付验收提交 | '+accepted+' |','| 交付验收提交 | '+self.base+' |'),
+                       body.replace('最小真实Git与格式校验夹具。','未获批准的方案变化。')]:
+            self.write(self.path,broken)
+            self.assertNotEqual(cli(*scoped).returncode,0)
+        self.write(self.path,body)
+        self.write('中文 空格.txt','验收后代码变化')
+        self.assertNotEqual(cli(*scoped).returncode,0)
+        self.write('中文 空格.txt','data')
+        self.write(historical,(self.root/historical).read_text(encoding='utf-8')+'\n本轮未经范围登记修改历史\n')
+        self.assertNotEqual(cli(*scoped).returncode,0)
+        (self.root/historical).write_bytes(historical_bytes)
+        self.commit()
+        head=check.commit(self.root,'HEAD')
+        result=cli('--stage','delivery','--base',self.base,'--head',head)
+        self.assertEqual(result.returncode,0,result.stderr)
+        for incomplete in [['--stage','delivery','--base',self.base],
+                           ['--stage','delivery','--head',head],
+                           ['--stage','implementation','--base',self.base,'--head',head]]:
+            self.assertNotEqual(cli(*incomplete).returncode,0)
+        self.assertEqual((self.root/historical).read_bytes(),historical_bytes)
+
     def test_shared_pr_requires_explicit_versions_and_independent_approval(self):
         other='docs/changes/CHG-2026-0004.md'
         self.write('other.txt','第二部分')
@@ -264,6 +316,36 @@ reason="需要保护"
         self.assertEqual(self.pr_check(self.base,None,'implementation')['linked'],{'CHG-2026-0004':'fixture-r1'})
         self.write(other,(self.root/other).read_text(encoding='utf-8').replace('fixture-r1','fixture-r2',1))
         with self.assertRaisesRegex(check.Failure,'版本'):self.pr_check(self.base,None,'implementation')
+        self.write(other,(self.root/other).read_text(encoding='utf-8').replace('fixture-r2','fixture-r1',1))
+        self.commit()
+        accepted=check.commit(self.root,'HEAD')
+        facts=[('交付验收人','夹具审核人'),('交付验收时间','2026-11-04'),
+               ('交付验收证据','双方独立验收'),('交付验收提交',accepted),('验证证据','夹具报告'),
+               ('Linux验证结果','passed'),('Windows验证结果','passed'),('Linux验证提交',accepted),
+               ('Windows验证提交',accepted),('Linux验证证据','Linux报告'),('Windows验证证据','Windows报告')]
+        def delivery_body(path):
+            value=(self.root/path).read_text(encoding='utf-8')
+            value=value.replace('| 交付验收状态 | pending |','| 交付验收状态 | approved |')
+            return value.replace('| 当前状态 |',''.join('| '+k+' | '+v+' |\n' for k,v in facts)+'| 当前状态 |')
+        main,linked=delivery_body(self.path),delivery_body(other)
+        self.write(self.path,main)
+        # 先独立证明主CHG已通过，随后缺项必须来自关联修订。
+        metadata,_=check.load_chg(check.Reader(self.root),self.path,check.profile_for(check.Reader(self.root)))
+        check.check_stage(check.Reader(self.root),self.path,metadata,'delivery')
+        def scoped():
+            return subprocess.run([sys.executable,str(ROOT/'governance/check.py'),'--root',str(self.root),
+                                   'validate','--stage','delivery','--base',self.base,'--worktree'],
+                                  capture_output=True,text=True)
+        result=scoped()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('交付验收人',result.stderr)
+        self.write(other,linked.replace('| Windows验证结果 | passed |','| Windows验证结果 | pending |'))
+        result=scoped()
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('Windows',result.stderr)
+        self.write(other,linked)
+        result=scoped()
+        self.assertEqual(result.returncode,0,result.stderr)
 
     def test_overlap_needs_both_responsibilities_and_stricter_protection(self):
         other='docs/changes/CHG-2026-0004.md'

@@ -820,7 +820,10 @@ fn create_process_with_token(
         std::env::var_os("SystemRoot")
             .ok_or_else(|| SandboxError::ExecutionFailed("SystemRoot is unavailable".into()))?,
     )
-    .join("System32/cmd.exe");
+    // cmd自身会解析命令行中的斜杠选项；路径必须使用本机分隔符，
+    // 否则System32/cmd.exe中的/c可被误读为执行参数，损坏真实命令。
+    .join("System32")
+    .join("cmd.exe");
     use std::os::windows::ffi::OsStrExt;
     let application: Vec<u16> = shell.as_os_str().encode_wide().chain([0]).collect();
     let mut cmd_line = to_wide(&format!(

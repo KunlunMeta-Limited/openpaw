@@ -28,6 +28,9 @@ enum Job {
 /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
 pub(crate) struct Store {
     tx: mpsc::Sender<Job>,
+    priority_tx: mpsc::Sender<Job>,
+    ui_tx: mpsc::Sender<Job>,
+    worker: std::thread::Thread,
 }
 /// 用途：原JSONL写入器及Host元数据的唯一串行所有者。
 /// 字段：下列成员或状态由宿主统一管理。
@@ -62,13 +65,43 @@ pub(crate) struct Db {
     /// 稳定性：T6进程内调度状态。
     /// 关联：需求/设计REQ-OP-011；DES-OP-009。
     pub(crate) office_projection_source: HashMap<String, u64>,
-    /// 用途：记录交接动画顺序窗口的内存截止时间。
-    /// 字段：办公室作用域到下一次交接推进时间的映射。
-    /// 来源去向：projection设置和消费，过期后触发下一份已计算快照。
-    /// 约束：不写入Office快照，也不作为业务状态来源；重启后可丢弃。
-    /// 稳定性：T6进程内协调状态。
-    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
-    pub(crate) office_projection_handoff_until: HashMap<String, chrono::DateTime<chrono::Utc>>,
+}
+/// 用途：一次只读请求内复用原SessionReader结果，结束即释放。
+/// 字段：events为按Session分组的原账本，bytes为实际读取文件长度的诊断累计。
+/// 来源去向：原Store内读取到聊天分页，不跨请求保存或作为执行事实。
+/// 约束：调用方在同次Store序列内校验scope；禁止跨写入复用。
+/// 稳定性：Host私有读取细节，不改变持久格式或公共协议。
+/// 关联：需求REQ-OP-014/022；设计DES-OP-006/007；CHG-2026-0007第12.135节。
+#[derive(Default)]
+pub(crate) struct LedgerReadCache {
+    events: HashMap<String, Vec<SessionEvent>>,
+    bytes: u64,
+    read_time: std::time::Duration,
+    chat_runs: usize,
+}
+impl LedgerReadCache {
+    /// 功能：返回本次请求实际读取的账本份数。
+    /// 参数：无。
+    /// 返回：已成功解析的不同Session数。
+    /// 错误：无。
+    /// 状态：仅诊断，不读取新文件。
+    /// 并发与取消：由单次Store读取独占，结束后释放。
+    /// 权限：不返回正文、路径或会话身份。
+    /// 关联：需求REQ-OP-014；设计DES-OP-007；CHG-2026-0007第12.135节。
+    pub(crate) fn reads(&self) -> usize {
+        self.events.len()
+    }
+    /// 功能：返回本请求读取份数、账本字节、Reader耗时和正文Run数。
+    /// 参数：无。
+    /// 返回：仅计数与时长的元组，不含身份或正文。
+    /// 错误：无。
+    /// 状态：不额外查询数据库或文件。
+    /// 并发与取消：同一Store请求持有，释放后不能复用。
+    /// 权限：仅Host内部脱敏诊断与回归。
+    /// 关联：需求REQ-OP-014；设计DES-OP-007；CHG-2026-0007第12.135节。
+    pub(crate) fn stats(&self) -> (usize, u64, std::time::Duration, usize) {
+        (self.reads(), self.bytes, self.read_time, self.chat_runs)
+    }
 }
 impl Store {
     /// 功能：恢复原JSONL及宿主元数据并启动单写协调器。
@@ -89,24 +122,76 @@ impl Store {
             .await
             .map_err(HostError::storage)??;
         let (tx, mut rx) = mpsc::channel::<Job>(256);
-        std::thread::Builder::new()
+        let (priority_tx, mut priority_rx) = mpsc::channel::<Job>(256);
+        let (ui_tx, mut ui_rx) = mpsc::channel::<Job>(128);
+        let worker = std::thread::Builder::new()
             .name("openpaw-host-store".into())
             .spawn(move || {
                 let mut db = db;
-                while let Some(job) = rx.blocking_recv() {
-                    match job {
-                        Job::Call(job) => job(&mut db),
-                        Job::Close(reply) => {
+                // 运行事实优先，但持续流式写入不能无限饿死人物详情；UI与普通
+                // 读取交替获得一次机会，普通投影也不能被连续点击永久饿死。
+                // 所有命令仍在同一线程完成，取消等待不丢弃已经派发的写入。
+                let mut priority_streak = 0usize;
+                let mut prefer_ui = true;
+                let mut closing: Vec<oneshot::Sender<HostResult<()>>> = Vec::new();
+                loop {
+                    let priority_limit = if ui_rx.is_empty() { 4 } else { 1 };
+                    let mut take_read = || {
+                        let job = if prefer_ui {
+                            ui_rx.try_recv().ok().or_else(|| rx.try_recv().ok())
+                        } else {
+                            rx.try_recv().ok().or_else(|| ui_rx.try_recv().ok())
+                        };
+                        if job.is_some() {
+                            prefer_ui = !prefer_ui;
+                        }
+                        job
+                    };
+                    let read = if priority_streak >= priority_limit {
+                        take_read()
+                    } else {
+                        None
+                    };
+                    let job = if let Some(job) = read {
+                        priority_streak = 0;
+                        Some(job)
+                    } else if let Ok(job) = priority_rx.try_recv() {
+                        priority_streak = priority_streak.saturating_add(1);
+                        Some(job)
+                    } else {
+                        priority_streak = 0;
+                        take_read()
+                    };
+                    let Some(job) = job else {
+                        if !closing.is_empty() {
                             let result = db.close();
                             drop(db);
-                            let _ = reply.send(result);
+                            for reply in closing {
+                                let _ = reply.send(result.clone());
+                            }
                             return;
                         }
+                        if rx.is_closed() && priority_rx.is_closed() && ui_rx.is_closed() {
+                            return;
+                        }
+                        // 入队后的unpark保留一个唤醒令牌，覆盖检查为空到park之间的竞争。
+                        // 超时仅兜底最后发送端丢弃等没有新命令的关闭路径。
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                        continue;
+                    };
+                    match job {
+                        Job::Call(job) => job(&mut db),
+                        Job::Close(reply) => closing.push(reply),
                     }
                 }
             })
             .map_err(HostError::storage)?;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            priority_tx,
+            ui_tx,
+            worker: worker.thread().clone(),
+        })
     }
     /// 功能：将同步存储操作送入单写线程并等待完成。
     /// 参数：f为不跨异步等待的原存储操作。
@@ -120,9 +205,44 @@ impl Store {
         &self,
         f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
     ) -> HostResult<T> {
+        self.call_on(&self.tx, f).await
+    }
+    /// 功能：提交运行事实优先任务，先于排队中的Office投影执行。
+    /// 参数：f为不跨异步等待的原存储操作。
+    /// 返回：原操作已完成的结果。
+    /// 错误：与普通call相同；优先级不改变事务和权限语义。
+    /// 状态：只调整队列顺序，不跳过任何已排队事实。
+    /// 并发与取消：仍由唯一Store线程串行执行；调用方取消不丢弃已派发写入。
+    /// 权限：仅可信Host内部调用；请求入口仍负责作用域和授权根校验。
+    /// 关联：需求/设计REQ-OP-008/014；DES-OP-006/008。
+    pub(crate) async fn call_priority<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
+    ) -> HostResult<T> {
+        self.call_on(&self.priority_tx, f).await
+    }
+    /// 功能：将已聚焦的UI详情读取放入有界交互通道，避免被持续运行事实饿死。
+    /// 参数：f为已校验范围的成员或任务概况读取；聊天/工具/文件正文分页仍用普通通道。
+    /// 返回：原存储操作完成后的准确结果。
+    /// 错误：与call相同，关闭及存储错误不吞成空列表。
+    /// 状态：不增加事实缓存或数据库连接，不改变事务及权限。
+    /// 并发与取消：通常每四个优先任务让出一次读取；UI已排队时缩至一个，与普通队列轮换。
+    /// 权限：仅Host内部；调用方仍逐次校验会话、成员及委派。
+    /// 关联：需求/设计REQ-OP-014、REQ-OP-022；DES-OP-006、DES-OP-007。
+    pub(crate) async fn call_ui<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
+    ) -> HostResult<T> {
+        self.call_on(&self.ui_tx, f).await
+    }
+    async fn call_on<T: Send + 'static>(
+        &self,
+        sender: &mpsc::Sender<Job>,
+        f: impl FnOnce(&mut Db) -> HostResult<T> + Send + 'static,
+    ) -> HostResult<T> {
         let queued_at = Instant::now();
         let (tx, rx) = oneshot::channel();
-        self.tx
+        sender
             .send(Job::Call(Box::new(move |db| {
                 let started_at = Instant::now();
                 let result = if db.owner.is_some() {
@@ -141,6 +261,7 @@ impl Store {
             })))
             .await
             .map_err(HostError::storage)?;
+        self.worker.unpark();
         rx.await.map_err(HostError::storage)?
     }
 }
@@ -159,6 +280,7 @@ impl Store {
             .send(Job::Close(tx))
             .await
             .map_err(HostError::storage)?;
+        self.worker.unpark();
         rx.await.map_err(HostError::storage)?
     }
 }
@@ -196,24 +318,39 @@ impl Db {
     /// 错误：范围、取消、假完成、容量或存储失败明确拒绝。
     /// 状态：每Run最多256次有效报告，原host_events保留固定分母和证据。
     /// 并发与取消：状态检查和追加处于原Store单写命令，不等待审批或工作区锁。
-    /// 权限：仅Office绑定的同Run report_progress，不批准其他工具。
+    /// 权限：仅Office或其持久委派子Run的report_progress，不批准其他工具。
     /// 关联：需求/设计REQ-OP-012；CHG-2026-0006第9.9节。
     pub(crate) fn report_progress(
         &mut self,
         binding: &openpaw_core::ToolCallBinding,
         value: &serde_json::Value,
     ) -> HostResult<()> {
-        let run = self.get_run(&binding.run_id)?;
-        if self.binding(&run.session_id)?.scope.namespace != "office"
-            || binding.tool_name != "report_progress"
-            || binding.input != *value
-        {
+        let mut run = self.get_run(&binding.run_id)?;
+        let owner = self.binding(&run.session_id)?;
+        let office_run = owner.scope.namespace == "office"
+            || owner.scope.namespace == "host-agent"
+                && self.delegation_for_child(&run.run_id)?.is_some();
+        if !office_run || binding.tool_name != "report_progress" || binding.input != *value {
             return Err(HostError::new(
                 "scope_denied",
                 "步骤报告不属于当前Office运行",
             ));
         }
         let previous = self.progress(&run.run_id)?;
+        // 异步工具完成只证明子Run已接受。进度核验必须等待原子Run真实成功，
+        // 不能用接受回执提前完成“交接/写稿”等非文件步骤。
+        for d in self.delegations(&run.run_id)? {
+            let completed = match self.get_run(&d.child_run) {
+                Ok(child) => child.state == RunState::Completed,
+                Err(e) if e.kind == "not_found" => false,
+                Err(e) => return Err(e),
+            };
+            if !completed {
+                if let Some(tool) = run.tools.iter_mut().find(|t| t.call_id == d.call_id) {
+                    tool.state = "running".into();
+                }
+            }
+        }
         let mut stmt=self.conn.prepare("SELECT reference FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
         let rows = stmt
             .query_map([&run.run_id], |r| r.get::<_, String>(0))
@@ -304,6 +441,9 @@ impl Db {
         CREATE TABLE IF NOT EXISTS host_office_decisions(approval_id TEXT PRIMARY KEY,display_id TEXT NOT NULL UNIQUE,scope TEXT NOT NULL,expires_at INTEGER NOT NULL,state TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS host_office_actions(action_id TEXT PRIMARY KEY,scope TEXT NOT NULL,kind TEXT NOT NULL,status TEXT NOT NULL,expires_at INTEGER NOT NULL,context TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS host_office_scene(event_id TEXT PRIMARY KEY,command_id TEXT NOT NULL,expires_at INTEGER NOT NULL,status TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS host_artifact_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS host_artifact_versions(sequence INTEGER PRIMARY KEY AUTOINCREMENT,version TEXT NOT NULL UNIQUE,scope TEXT NOT NULL,artifact TEXT NOT NULL,run TEXT NOT NULL,call TEXT NOT NULL,hash TEXT NOT NULL,size INTEGER NOT NULL,data TEXT NOT NULL,UNIQUE(run,call));
+        CREATE INDEX IF NOT EXISTS host_artifact_scope ON host_artifact_versions(scope,artifact,sequence);
         PRAGMA user_version=4;
         COMMIT;").map_err(HostError::storage)?;
         for (id, path) in roots {
@@ -361,7 +501,6 @@ impl Db {
             notices,
             live,
             office_projection_source: HashMap::new(),
-            office_projection_handoff_until: HashMap::new(),
         };
         db.validate_workspace_rebinds()?;
         db.recover()?;
@@ -391,7 +530,7 @@ impl Db {
     }
     /// 功能：按Session读取宿主Run元数据，避免人物详情为查一名成员解析整个办公室历史。
     /// 参数：session为已校验的原JSONL会话ID。
-    /// 返回：该Session的Run元数据，工具与正文仍按需读取。
+    /// 返回：按输入位置及接受行顺序排列的Run元数据，工具与正文仍按需读取。
     /// 错误：SQL准备、查询或JSON反序列化失败时返回存储错误。
     /// 状态：只读，不改变运行生命周期；跨Session仍由调用方校验。
     /// 并发与取消：在Store单写线程内执行；外层Store调用可取消等待，不提前释放资源。
@@ -400,7 +539,9 @@ impl Db {
     pub(crate) fn runs_for_session(&self, session: &str) -> HostResult<Vec<RunView>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT data FROM host_runs WHERE session=?1")
+            .prepare(
+                "SELECT data FROM host_runs WHERE session=?1 ORDER BY input_event_offset, rowid",
+            )
             .map_err(HostError::storage)?;
         let rows = stmt
             .query_map([session], |row| row.get::<_, String>(0))
@@ -440,6 +581,107 @@ impl Db {
                 |r| r.get(0),
             )
             .map_err(HostError::storage)
+    }
+    /// 功能：判断上次投影以后是否有影响本办公室的真实事实。
+    /// 参数：team为办公室槽，after为已检查的全局事实版本。
+    /// 返回：需要重建返回true；仅其他办公室变化返回false。
+    /// 错误：读取失败原样上报，不以缓存掩盖存储异常。
+    /// 状态：只读原事实和绑定，不建立第二份状态或持久缓存。
+    /// 并发与取消：在原单写线程内查询，水位由投影成功后推进。
+    /// 权限：仅判定失效范围，快照读取仍按原办公室授权。
+    /// 关联：需求/设计REQ-OP-011、REQ-OP-014；DES-OP-009。
+    pub(crate) fn office_projection_changed(&self, team: &str, after: u64) -> HostResult<bool> {
+        if self.revision()? < after {
+            return Ok(true);
+        }
+        // 只扫描上次已检查水位之后的原事实。水位仍使用全局revision，
+        // 不改变历史终态判定，也不为每个办公室建立第二份运行状态。
+        let mut query = self
+            .conn
+            .prepare("SELECT kind,reference FROM host_events WHERE revision>?1 ORDER BY revision")
+            .map_err(HostError::storage)?;
+        let rows = query
+            .query_map([after], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(HostError::storage)?;
+        let mut run_slots: HashMap<String, Option<String>> = HashMap::new();
+        for row in rows {
+            let (kind, reference) = row.map_err(HostError::storage)?;
+            let run_id = match kind.as_str() {
+                "session" | "ledger" => {
+                    let session = if kind == "ledger" {
+                        reference.rsplit_once(':').map(|(id, _)| id)
+                    } else {
+                        Some(reference.as_str())
+                    };
+                    let Some(session) = session else {
+                        return Ok(true);
+                    };
+                    let slot: Option<String> = self
+                        .conn
+                        .query_row(
+                            "SELECT slot FROM host_bindings WHERE id=?1",
+                            [session],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(HostError::storage)?;
+                    if slot.as_deref().is_none_or(|slot| slot == team) {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                "run" | "run_input_committed" => reference,
+                "approval" => {
+                    let run: Option<String> = self
+                        .conn
+                        .query_row(
+                            "SELECT run FROM host_approvals WHERE id=?1",
+                            [&reference],
+                            |r| r.get(0),
+                        )
+                        .optional()
+                        .map_err(HostError::storage)?;
+                    let Some(run) = run else { return Ok(true) };
+                    run
+                }
+                "tool_waiting_resource"
+                | "tool_started"
+                | "tool_result"
+                | "run_progress"
+                | "continuous_task"
+                | "agent_group"
+                | "agent_budget"
+                | "agent_delegation"
+                | "artifact_published"
+                | "artifact_capture_failed"
+                | "approval_policy" => {
+                    let run = serde_json::from_str::<serde_json::Value>(&reference)
+                        .ok()
+                        .and_then(|value| value["run_id"].as_str().map(str::to_owned));
+                    let Some(run) = run else { return Ok(true) };
+                    run
+                }
+                // 删除后绑定/Run可能已经不在库中。迁移、创建及未来事实也
+                // 保守重建，不能因无法归属而无限复用旧的成功快照。
+                _ => return Ok(true),
+            };
+            let slot = if let Some(slot) = run_slots.get(&run_id) {
+                slot.clone()
+            } else {
+                let slot: Option<String> = self.conn.query_row(
+                    "SELECT b.slot FROM host_runs r JOIN host_bindings b ON b.id=r.session WHERE r.id=?1",
+                    [&run_id], |r| r.get(0),
+                ).optional().map_err(HostError::storage)?;
+                run_slots.insert(run_id, slot.clone());
+                slot
+            };
+            if slot.as_deref().is_none_or(|slot| slot == team) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     /// 功能：保存缺失的宿主生命周期事实并分配序号。
     /// 参数：kind与reference为生命周期及原账本引用。
@@ -481,13 +723,54 @@ impl Db {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub(crate) fn binding(&self, id: &str) -> HostResult<SessionBinding> {
-        let binding = self
-            .bindings()?
-            .into_iter()
-            .find(|b| b.session_id == id)
+        // 委派校验会逐一读取父子绑定；不能为每个ID重新解析整个历史目录。
+        // 主键查询仍校验JSON中的身份及原墓碑，不能以性能优化绕过作用域。
+        let raw: String = self
+            .conn
+            .query_row("SELECT data FROM host_bindings WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(HostError::storage)?
             .ok_or_else(|| HostError::new("not_found", "会话不存在"))?;
+        let binding: SessionBinding = serde_json::from_str(&raw).map_err(HostError::storage)?;
+        if binding.session_id != id {
+            return Err(HostError::new(
+                "storage_unavailable",
+                "会话绑定身份与主键不一致",
+            ));
+        }
         self.check_live_scope(&binding.scope)?;
         Ok(binding)
+    }
+    /// 功能：按完整scope精确查原绑定，避免聊天遍历全部办公室。
+    /// 参数：scope为入口已校验的命名空间、团队和会话。
+    /// 返回：原绑定或未创建时None。
+    /// 错误：删除墓碑、SQL或持久身份与scope不一致时拒绝。
+    /// 状态：只读，不创建会话或恢复执行。
+    /// 并发与取消：同一Store序列内查询，与删除提交有序。
+    /// 权限：SQL精确匹配全部scope字段，再复核主键与JSON绑定。
+    /// 关联：需求REQ-OP-014；设计DES-OP-006/007；CHG-2026-0007第12.135节。
+    pub(crate) fn binding_for_scope(
+        &self,
+        scope: &ClientScope,
+    ) -> HostResult<Option<SessionBinding>> {
+        self.check_live_scope(scope)?;
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM host_bindings WHERE namespace=?1 AND slot=?2 AND conversation=?3",
+                params![scope.namespace, scope.slot_id, scope.conversation_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        id.map(|id| {
+            let binding = self.binding(&id)?;
+            crate::service::check_scope(&binding, scope)?;
+            Ok(binding)
+        })
+        .transpose()
     }
     /// 功能：从原账本和宿主事实生成Run当前视图。
     /// 参数：id为Run稳定ID。
@@ -498,37 +781,54 @@ impl Db {
     /// 权限：仅本机可信调用方；作用域和允许根仍须在服务入口校验。
     /// 关联：需求/设计REQ-OP-008、REQ-OP-009；DES-OP-006。
     pub(crate) fn get_run(&self, id: &str) -> HostResult<RunView> {
-        // 人物详情及周期投影会逐个查询Run；不要反复解码其他历史Run和工具事实。
-        // 仍使用同一Store序列与原账本，精确筛选不引入缓存或改变状态覆盖顺序。
-        let data: String = self
-            .conn
-            .query_row("SELECT data FROM host_runs WHERE id=?1", [id], |r| r.get(0))
-            .optional()
-            .map_err(HostError::storage)?
-            .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
-        let mut run: RunView = serde_json::from_str(&data).map_err(HostError::storage)?;
-        let events = self.events(&run.session_id)?;
+        self.read_run(id, true, &mut LedgerReadCache::default())
+    }
+    /// 功能：从同一可靠文本恢复路径读取聊天，不递归构建工具详情。
+    /// 参数：id为已校验Run，cache只供同次Store请求复用账本。
+    /// 返回：准确正文、错误与生命周期；tools为空，不能用作工具执行证据。
+    /// 错误：沿原账本、检查点、SQL和安全错误分类，损坏不回退成空正文。
+    /// 状态：只读；持续展示、活动尾部、截断和停止规则沿用完整Run读取。
+    /// 并发与取消：原Store单写序列，不跨请求缓存或改变队列优先级。
+    /// 权限：调用者先核对绑定和scope；不读取无关子Session。
+    /// 关联：需求REQ-OP-014/022；设计DES-OP-006/007；CHG-2026-0007第12.135节。
+    pub(crate) fn get_chat_run(
+        &self,
+        id: &str,
+        cache: &mut LedgerReadCache,
+    ) -> HostResult<RunView> {
+        cache.chat_runs += 1;
+        self.read_run(id, false, cache)
+    }
+    fn read_run(
+        &self,
+        id: &str,
+        with_tools: bool,
+        cache: &mut LedgerReadCache,
+    ) -> HostResult<RunView> {
+        let mut run = self.run_metadata(id)?;
+        let continuous = self.continuous_state(id)?;
+        let events = self.events_cached(&run.session_id, cache)?;
         let mut active = false;
-        let text = committed_run_text(&events, id);
+        let text = committed_run_text(events, id);
         let mut tools = std::collections::BTreeMap::new();
         for e in events {
             match e {
                 SessionEvent::RunStarted { run_id } => active = run_id == id,
-                SessionEvent::ToolCallStart { call_id, tool_name } if active => {
+                SessionEvent::ToolCallStart { call_id, tool_name } if with_tools && active => {
                     tools.insert(
                         call_id.clone(),
                         ToolView {
-                            call_id,
-                            tool_name,
+                            call_id: call_id.clone(),
+                            tool_name: tool_name.clone(),
                             state: "proposed".into(),
                         },
                     );
                 }
                 SessionEvent::ToolCallComplete {
                     call_id, success, ..
-                } if active => {
-                    if let Some(t) = tools.get_mut(&call_id) {
-                        t.state = if success { "completed" } else { "failed" }.into();
+                } if with_tools && active => {
+                    if let Some(t) = tools.get_mut(call_id) {
+                        t.state = if *success { "completed" } else { "failed" }.into();
                     }
                 }
                 SessionEvent::RunFinished {
@@ -537,59 +837,84 @@ impl Db {
                     ..
                 // 历史通用错误可从账本细分；宿主已锁存的存储等确定分类不能被通用错误覆盖。
                 } if run_id == id && run.error.as_ref().is_none_or(|e| matches!(e.kind.as_str(), "interrupted" | "run_failed" | "timeout" | "cancelled")) => {
-                    run.error = Some(crate::service::safe_run_error(&error, run.state));
+                    run.error = Some(crate::service::safe_run_error(error, run.state));
                 }
                 _ => {}
             }
         }
-        let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_waiting_resource','tool_started','tool_result') AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
-        let rows = stmt
-            .query_map([id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(HostError::storage)?;
-        for row in rows {
-            let (kind, value) = row.map_err(HostError::storage)?;
-            let value: serde_json::Value =
-                serde_json::from_str(&value).map_err(HostError::storage)?;
-            if value["run_id"].as_str() == Some(id) {
-                if let Some(tool) = value["call_id"].as_str().and_then(|c| tools.get_mut(c)) {
-                    tool.state = if kind == "tool_waiting_resource" {
-                        "awaiting_resource"
-                    } else if kind == "tool_started" {
-                        "running"
-                    } else if value["success"] == true {
-                        "completed"
-                    } else {
-                        "failed"
-                    }
-                    .into();
-                }
-            }
-        }
-        let mut approvals = self
-            .conn
-            .prepare("SELECT data FROM host_approvals WHERE run=?1")
-            .map_err(HostError::storage)?;
-        let rows = approvals
-            .query_map([id], |row| row.get::<_, String>(0))
-            .map_err(HostError::storage)?;
-        for row in rows {
-            let a: ApprovalView = serde_json::from_str(&row.map_err(HostError::storage)?)
+        if with_tools {
+            let mut stmt=self.conn.prepare("SELECT kind,reference FROM host_events WHERE kind IN ('tool_waiting_resource','tool_started','tool_result') AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+            let rows = stmt
+                .query_map([id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
                 .map_err(HostError::storage)?;
-            if a.binding.run_id == id && a.status == "pending" {
-                if let Some(t) = tools.get_mut(&a.binding.call_id) {
-                    t.state = "awaiting_approval".into();
+            for row in rows {
+                let (kind, value) = row.map_err(HostError::storage)?;
+                let value: serde_json::Value =
+                    serde_json::from_str(&value).map_err(HostError::storage)?;
+                if value["run_id"].as_str() == Some(id) {
+                    if let Some(tool) = value["call_id"].as_str().and_then(|c| tools.get_mut(c)) {
+                        tool.state = if kind == "tool_waiting_resource" {
+                            "awaiting_resource"
+                        } else if kind == "tool_started" {
+                            "running"
+                        } else if value["success"] == true {
+                            "completed"
+                        } else {
+                            "failed"
+                        }
+                        .into();
+                    }
                 }
             }
+            let mut approvals = self
+                .conn
+                .prepare("SELECT data FROM host_approvals WHERE run=?1")
+                .map_err(HostError::storage)?;
+            let rows = approvals
+                .query_map([id], |row| row.get::<_, String>(0))
+                .map_err(HostError::storage)?;
+            for row in rows {
+                let a: ApprovalView = serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+                if a.binding.run_id == id && a.status == "pending" {
+                    if let Some(t) = tools.get_mut(&a.binding.call_id) {
+                        t.state = "awaiting_approval".into();
+                    }
+                }
+            }
+            run.tools = tools.into_values().collect();
+            // delegate_task的异步返回仅为接受。子Run才是完成事实，不能让
+            // ToolCallComplete(success=true)把尚在执行的同事变成成功证据。
+            if run.tools.iter().any(|t| t.tool_name == "delegate_task") {
+                for d in self.delegations(id)? {
+                    if let Some(tool) = run.tools.iter_mut().find(|t| t.call_id == d.call_id) {
+                        tool.state = match self.get_run(&d.child_run) {
+                            Ok(child) if child.state == RunState::Completed => "completed",
+                            Ok(child) if child.state.is_terminal() => "failed",
+                            Ok(_) => "running",
+                            Err(e) if e.kind == "not_found" => "proposed",
+                            Err(e) => return Err(e),
+                        }
+                        .into();
+                    }
+                }
+            }
+        } else {
+            run.tools.clear();
         }
-        run.tools = tools.into_values().collect();
         // 检查点只补足与可靠账本相符的展示尾部；不将它恢复为模型消息。
         if run.text.len() > 4 * 1024 * 1024 {
             return Err(HostError::new(
                 "storage_unavailable",
                 "展示检查点超过原有上限",
             ));
+        }
+        if let Some(state) = continuous {
+            run.text = state.display;
+            run.text_truncated = false;
+            return Ok(run);
         }
         let checkpoint = std::mem::take(&mut run.text);
         let checkpoint_truncated = run.text_truncated;
@@ -602,6 +927,102 @@ impl Db {
             }
         }
         Ok(run)
+    }
+    /// 功能：读取主Run最后持久化的持续任务控制记录。
+    /// 参数：id为已授权调用方提供的稳定RunID。
+    /// 返回：准确控制记录或尚未启动时None。
+    /// 错误：SQL/JSON损坏显式失败，不能回退成普通完成。
+    /// 状态：只读原host_events，不恢复执行。
+    /// 并发与取消：原Store单写序列内读取。
+    /// 权限：调用方先校验Run作用域，不接受外部控制正文。
+    /// 关联：CHG-2026-0007第9.12节。
+    pub(crate) fn continuous_state(
+        &self,
+        id: &str,
+    ) -> HostResult<Option<crate::continuous::State>> {
+        let raw:Option<String>=self.conn.query_row("SELECT reference FROM host_events WHERE kind='continuous_task' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC LIMIT 1",[id],|r|r.get(0)).optional().map_err(HostError::storage)?;
+        raw.map(|s| serde_json::from_str(&s).map_err(HostError::storage))
+            .transpose()
+    }
+    /// 功能：读取同Run当前工具或最近完成工具的真实开始事实。
+    /// 参数：run为已校验作用域的运行视图。
+    /// 返回：优先仍执行工具，否则最近成功工具；调用方须区分正在和刚完成。
+    /// 错误：SQLite或持久事实损坏时明确上报。
+    /// 状态：只读，不以模型计划、获批或排队替代真正开始。
+    /// 并发与取消：在原Store序列内读取；终态和清理态不返回活动。
+    /// 权限：调用方须已验证会话作用域；绑定输入仅供可信适配器脱敏。
+    /// 关联：CHG-2026-0007第12.82节D98；DES-OP-007/011。
+    pub(crate) fn office_tool_activity(
+        &self,
+        run: &RunView,
+    ) -> HostResult<Option<openpaw_core::ToolCallBinding>> {
+        if run.state.is_terminal()
+            || run.state == RunState::Cancelling
+            || run
+                .tools
+                .iter()
+                .any(|t| matches!(t.state.as_str(), "awaiting_approval" | "awaiting_resource"))
+            || !run.tools.iter().any(|t| {
+                matches!(t.state.as_str(), "running" | "completed")
+                    && !matches!(
+                        t.tool_name.as_str(),
+                        "report_progress" | "continuous_task" | "delegation_status"
+                    )
+            })
+        {
+            return Ok(None);
+        }
+        let mut statement = self.conn.prepare("SELECT reference FROM host_events WHERE kind='tool_started' AND json_valid(reference) AND json_extract(reference,'$.run_id')=?1 ORDER BY revision DESC").map_err(HostError::storage)?;
+        let rows = statement
+            .query_map([&run.run_id], |row| row.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let mut recent = None;
+        for row in rows {
+            let binding: openpaw_core::ToolCallBinding =
+                serde_json::from_str(&row.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+            if run.tools.iter().any(|t| {
+                t.call_id == binding.call_id
+                    && !matches!(
+                        t.tool_name.as_str(),
+                        "report_progress" | "continuous_task" | "delegation_status"
+                    )
+                    && t.state == "running"
+            }) {
+                return Ok(Some(binding));
+            }
+            if recent.is_none()
+                && run.tools.iter().any(|t| {
+                    t.call_id == binding.call_id
+                        && t.state == "completed"
+                        && !matches!(
+                            t.tool_name.as_str(),
+                            "report_progress" | "continuous_task" | "delegation_status"
+                        )
+                })
+            {
+                recent = Some(binding);
+            }
+        }
+        Ok(recent)
+    }
+
+    /// 功能：按主键读取原Run生命周期元数据，供详情选择当前运行而不提前解析正文。
+    /// 参数：id为可信Run标识。
+    /// 返回：原host_runs记录；工具、错误细分和完整正文须由get_run读取。
+    /// 错误：记录不存在、SQL失败或JSON损坏时明确返回错误。
+    /// 状态：只读原事实，不缓存、不推导执行终态。
+    /// 并发与取消：原Store单写序列；不持有外部资源锁。
+    /// 权限：仅Host内部使用，调用方须验证原会话及委派绑定。
+    /// 关联：需求/设计REQ-OP-014、REQ-OP-022；DES-OP-007。
+    pub(crate) fn run_metadata(&self, id: &str) -> HostResult<RunView> {
+        let data: String = self
+            .conn
+            .query_row("SELECT data FROM host_runs WHERE id=?1", [id], |r| r.get(0))
+            .optional()
+            .map_err(HostError::storage)?
+            .ok_or_else(|| HostError::new("not_found", "运行不存在"))?;
+        serde_json::from_str(&data).map_err(HostError::storage)
     }
     /// 功能：读取Office投影所需的轻量Run视图，不解析完整JSONL正文。
     /// 参数：id为已持久化Run标识。
@@ -627,6 +1048,10 @@ impl Db {
     /// 权限：同时核对Run、Session和存活作用域，不接收客户端正文。
     /// 关联：需求/设计REQ-OP-009、REQ-OP-016；DES-OP-006。
     pub(crate) fn checkpoint_run(&mut self, id: &str, session: &str) -> HostResult<()> {
+        if self.continuous_state(id)?.is_some() {
+            // 持续任务只展示已提交的checkpoint；不把原始长正文混回有界聊天摘要。
+            return Ok(());
+        }
         let data: Option<String> = self
             .conn
             .query_row(
@@ -824,6 +1249,23 @@ impl Db {
             .map_err(HostError::storage)?
             .events)
     }
+    fn events_cached<'a>(
+        &self,
+        session: &str,
+        cache: &'a mut LedgerReadCache,
+    ) -> HostResult<&'a [SessionEvent]> {
+        if !cache.events.contains_key(session) {
+            let started = Instant::now();
+            let events = self.events(session)?;
+            // 文件大小只作诊断；Reader成功后的stat失败不应改变历史读取语义。
+            cache.bytes += std::fs::metadata(self.path(session)?)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            cache.read_time += started.elapsed();
+            cache.events.insert(session.to_owned(), events);
+        }
+        Ok(&cache.events[session])
+    }
     /// 功能：通过原Reader恢复模型上下文。
     /// 参数：id为授权会话ID。
     /// 返回：原core Session。
@@ -939,6 +1381,8 @@ impl Db {
             return Ok(());
         }
         let mut complete_history = Vec::new();
+        let mut display_aliases = std::collections::BTreeMap::new();
+        let office_history = self.binding(id)?.scope.namespace == "office";
         if let Some((offset, count, _, true)) = imported {
             for e in events.iter().skip(offset).take(count) {
                 if let SessionEvent::Message(m) = e {
@@ -965,20 +1409,34 @@ impl Db {
                     let view = self.get_run(&r.run_id)?;
                     if !view.text.trim().is_empty() {
                         complete_history.push(m.clone());
+                        if office_history {
+                            let display = crate::office::chat_display(self, &view)?;
+                            if display != view.text {
+                                display_aliases.insert(
+                                    complete_history.len(),
+                                    Message::assistant_text(display),
+                                );
+                            }
+                        }
                         complete_history.push(Message::assistant_text(view.text));
                     }
                 }
             }
         }
+        let start = complete_history.len().saturating_sub(history.len());
         if history.len() > complete_history.len()
             || !history
                 .iter()
-                .zip(
-                    complete_history
-                        .iter()
-                        .skip(complete_history.len().saturating_sub(history.len())),
-                )
-                .all(|(a, b)| same(a, b))
+                .zip(complete_history.iter().skip(start))
+                .enumerate()
+                // 只允许同位置的可信完整展示别名；不能剥除客户端任意前缀。
+                // 原始正文仍兼容，且展示说明不导入模型消息或替换JSONL。
+                .all(|(index, (a, b))| {
+                    same(a, b)
+                        || display_aliases
+                            .get(&(start + index))
+                            .is_some_and(|shown| same(a, shown))
+                })
         {
             return Err(HostError::new(
                 "history_conflict",
@@ -1103,6 +1561,21 @@ impl Db {
     /// 权限：调用方校验会话归属。
     /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
     pub(crate) fn run_input(&self, run: &RunView) -> HostResult<(usize, String)> {
+        self.run_input_cached(run, &mut LedgerReadCache::default())
+    }
+    /// 功能：按原提交事实恢复用户输入，并复用同请求账本读取。
+    /// 参数：run为已授权Run，cache为不跨写入的请求局部读取结果。
+    /// 返回：原输入位置及用户文本；未提交接受失败仍返回空文本。
+    /// 错误：沿原位置、SQL和Reader校验，不接受工具结果伪装用户。
+    /// 状态：只读；优先复用原幂等输入索引，旧Run回退原账本。
+    /// 并发与取消：同次Store序列内，不跨请求缓存。
+    /// 权限：调用者核对Session和完整scope。
+    /// 关联：需求REQ-OP-014；设计DES-OP-003/007；CHG-2026-0007第12.135节。
+    pub(crate) fn run_input_cached(
+        &self,
+        run: &RunView,
+        cache: &mut LedgerReadCache,
+    ) -> HostResult<(usize, String)> {
         let offset: usize = self
             .conn
             .query_row(
@@ -1115,7 +1588,7 @@ impl Db {
         if !committed {
             // 升级前真正开始的Run有原RunStarted事实；从未接受的失败请求不得借用后来追加的User。
             let started = self
-                .events(&run.session_id)?
+                .events_cached(&run.session_id, cache)?
                 .iter()
                 .any(|e| matches!(e, SessionEvent::RunStarted { run_id } if run_id == &run.run_id));
             if !started {
@@ -1147,7 +1620,7 @@ impl Db {
                 return Ok((offset, input));
             }
         }
-        let events = self.events(&run.session_id)?;
+        let events = self.events_cached(&run.session_id, cache)?;
         let text = match events.get(offset) {
             Some(SessionEvent::Message(m)) if m.role == openpaw_core::Role::User => m.text(),
             _ if matches!(
@@ -1166,20 +1639,24 @@ impl Db {
         };
         Ok((offset, text))
     }
-    /// 功能：只读投影首次导入的完整文本轮次。
-    /// 参数：session为已授权原Session。
-    /// 返回：原事件位置、用户及助手文本；未完成导入不展示为成功。
-    /// 错误：导入位置/角色损坏或账本读取失败。
-    /// 状态：复用既有导入标记和JSONL，不保存第二份历史。
-    /// 并发与取消：Store单写序列读取。
-    /// 权限：外部导入仍是不可信文本，不产生工具或授权事实。
-    /// 关联：CHG-2026-0005第9.7节；DES-OP-003/007。 需求/设计REQ-OP-014。
-    pub(crate) fn imported_turns(&self, session: &str) -> HostResult<Vec<(usize, String, String)>> {
+    /// 功能：从原导入标记投影历史，并与本页Run恢复共享一次账本读取。
+    /// 参数：session为已授权Session，cache为请求局部Reader结果。
+    /// 返回：与原导入历史相同的位置、用户及助手文本。
+    /// 错误：导入边界/角色或账本损坏仍明确拒绝。
+    /// 状态：只读，不复制消息到数据库或重新执行工具。
+    /// 并发与取消：同次Store序列内使用，不能跨写入复用。
+    /// 权限：调用者先校验完整scope和墓碑。
+    /// 关联：需求REQ-OP-014；设计DES-OP-003/007；CHG-2026-0007第12.135节。
+    pub(crate) fn imported_turns_cached(
+        &self,
+        session: &str,
+        cache: &mut LedgerReadCache,
+    ) -> HostResult<Vec<(usize, String, String)>> {
         let marker:Option<(usize,usize)>=self.conn.query_row("SELECT event_offset,count FROM host_context_import WHERE session=?1 AND complete=1",[session],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(HostError::storage)?;
         let Some((offset, count)) = marker else {
             return Ok(Vec::new());
         };
-        let events = self.events(session)?;
+        let events = self.events_cached(session, cache)?;
         let Some(messages) = events.get(offset..offset + count) else {
             return Err(HostError::new("storage_unavailable", "导入历史位置损坏"));
         };
@@ -1520,6 +1997,8 @@ impl Db {
         ] {
             tx.execute(sql, [session]).map_err(HostError::storage)?;
         }
+        tx.execute("DELETE FROM host_artifact_versions WHERE scope=?1", [scope])
+            .map_err(HostError::storage)?;
         tx.execute("DELETE FROM host_office_actions WHERE scope=?1", [scope])
             .map_err(HostError::storage)?;
         // 清除缓存正文但保留seq；下一次prepare分配更高完整版本，不重置协调器。
@@ -1787,6 +2266,54 @@ impl Db {
         self.conn.query_row("SELECT EXISTS(SELECT 1 FROM host_events WHERE kind='tool_started' AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.call_id')=?2)",params![run,call],|r|r.get(0)).map_err(HostError::storage)
     }
 
+    /// 功能：核对真实完成子Run及原父作用域，并在原场景回执中认领一次完成汇报。
+    /// 参数：child为实际子Run，command为唯一场景命令，expiry为有限投递期限。
+    /// 返回：首次且范围有效的已完成委派；普通Run、重复或已停止父任务返回无。
+    /// 错误：SQL、委派解析或父子范围损坏明确返回错误。
+    /// 状态：仅复用原场景回执，不改变Run/业务进度，不恢复或重放执行。
+    /// 并发与取消：在单Store调用内查重、核对和登记，不持锁等待网络；父取消/删除后不认领。
+    /// 权限：复用delegation_for_child完整父子namespace/team/conversation/root校验，不接收人物ID。
+    /// 关联：需求/设计REQ-OP-014/022；DES-OP-007/012；CHG-2026-0007第12.132节。
+    pub(crate) fn claim_office_completion_return(
+        &self,
+        child: &str,
+        command: &str,
+        expiry: i64,
+    ) -> HostResult<Option<crate::orchestration::Delegation>> {
+        let event = format!("{child}:completion-return");
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM host_office_scene WHERE event_id=?1)",
+                [&event],
+                |r| r.get(0),
+            )
+            .map_err(HostError::storage)?;
+        if exists {
+            return Ok(None);
+        }
+        let run = match self.run_metadata(child) {
+            Ok(run) => run,
+            Err(e) if e.kind == "not_found" => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if run.state != RunState::Completed {
+            return Ok(None);
+        }
+        let Some(d) = self.delegation_for_child(child)? else {
+            return Ok(None);
+        };
+        let parent = self.run_metadata(&d.run_id)?;
+        if !matches!(
+            parent.state,
+            RunState::Accepted | RunState::Running | RunState::Completed
+        ) {
+            return Ok(None);
+        }
+        self.office_scene(&event, command, expiry, "queued")?;
+        Ok(Some(d))
+    }
+
     /// 功能：登记有限场景反馈并清除过期去重键。
     /// 参数：event/command为真实事实和唯一命令标识，expiry为原观察期限，state为投递状态。
     /// 返回：登记完成。
@@ -1901,6 +2428,19 @@ impl Db {
                     "storage_unavailable",
                     "持久委派版本或所属关系不合法",
                 ));
+            }
+            if let Some(source) = &d.source_task_id {
+                if !result
+                    .iter()
+                    .any(|prior: &crate::orchestration::Delegation| {
+                        &prior.task_id == source && prior.work_item == d.work_item
+                    })
+                {
+                    return Err(HostError::new(
+                        "storage_unavailable",
+                        "持久交接来源不是同父同事项的前序任务",
+                    ));
+                }
             }
             result.push(d);
         }
@@ -2047,6 +2587,9 @@ impl Db {
             .map_err(HostError::storage)?;
         let mut groups = std::collections::BTreeSet::new();
         let mut delegated = std::collections::BTreeSet::new();
+        // 启动校验尚不接受写入，同一父Run的完整账本/子Run与绑定只需核对一次。
+        // 仅复用本次校验的拥有者，逐条版本、顺序、重复组与子引用检查仍保留。
+        let mut owners = BTreeMap::<String, SessionBinding>::new();
         for row in rows {
             let (kind, raw) = row.map_err(HostError::storage)?;
             let value: serde_json::Value =
@@ -2060,8 +2603,13 @@ impl Db {
                     "不支持的协作元数据版本",
                 ));
             }
-            let run = self.get_run(parent)?;
-            let owner = self.binding(&run.session_id)?;
+            let owner = match owners.entry(parent.to_owned()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let run = self.get_run(parent)?;
+                    entry.insert(self.binding(&run.session_id)?)
+                }
+            };
             if owner.scope.namespace != "office" {
                 return Err(HostError::new(
                     "storage_unavailable",
@@ -2171,7 +2719,7 @@ impl Db {
                     serde_json::from_str(&row.map_err(HostError::storage)?)
                         .map_err(HostError::storage)?;
                 if b.run_id == d.child_run
-                    && matches!(b.tool_name.as_str(), "write_file" | "edit_file")
+                    && crate::task_progress::is_file_writer(&b.tool_name)
                     && child.tools.iter().any(|t| {
                         t.call_id == b.call_id
                             && t.tool_name == b.tool_name
@@ -2541,7 +3089,7 @@ impl Db {
                 continue;
             }
             let old = std::path::Path::new(event["old_path"].as_str().unwrap());
-            let Ok(relative) = std::path::Path::new(path).strip_prefix(old) else {
+            let Some(relative) = migrated_relative_path(std::path::Path::new(path), old) else {
                 continue;
             };
             if relative
@@ -2614,12 +3162,852 @@ impl Db {
     }
 }
 
+impl Db {
+    /// 功能：在原Host数据根准备只读版本资源地址。
+    /// 参数：origin为实际loopback监听根地址。
+    /// 返回：原操作结果。
+    /// 错误：存储、作用域或数据损坏明确拒绝。
+    /// 状态：首次记录地址；存在版本时禁止静默换端口使旧链接失效。
+    /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
+    /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
+    /// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+    pub(crate) fn artifact_origin(&mut self, origin: &str) -> HostResult<()> {
+        let old: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM host_artifact_settings WHERE key='origin'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM host_artifact_versions", [], |r| {
+                r.get(0)
+            })
+            .map_err(HostError::storage)?;
+        if count > 0 && old.as_deref() != Some(origin) {
+            return Err(HostError::new(
+                "invalid_input",
+                "已有文件版本需要保持原Host监听端口，避免历史文件链接失效",
+            ));
+        }
+        let dir = self.home.join("engine-host/artifacts");
+        if dir.exists() {
+            crate::office::artifacts::private_dir(&dir)?;
+        }
+        self.conn.execute("INSERT INTO host_artifact_settings(key,value) VALUES('origin',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[origin]).map_err(HostError::storage)?;
+        Ok(())
+    }
+    /// 功能：发布真实写工具的不可变文件版本。
+    /// 参数：binding为原工具绑定；path/mime/bytes为仍持Root锁时捕获的准确目标。
+    /// 返回：已发布版本，非Office调用返回无。
+    /// 错误：存储、作用域或数据损坏明确拒绝。
+    /// 状态：先原子blob再事务索引；同call幂等，失败不撤回原写入。
+    /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
+    /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
+    /// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+    pub(crate) fn capture_artifact(
+        &mut self,
+        binding: &openpaw_core::ToolCallBinding,
+        path: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> HostResult<Option<serde_json::Value>> {
+        use crate::office::artifacts as a;
+        let run = self.get_run(&binding.run_id)?;
+        let own = self.binding(&run.session_id)?;
+        let (scope, parent) = if let Some(d) = self.delegation_for_child(&run.run_id)? {
+            (d.parent_scope, d.run_id)
+        } else {
+            (own.scope, run.run_id.clone())
+        };
+        if scope.namespace != "office" {
+            return Ok(None);
+        }
+        self.check_live_scope(&scope)?;
+        let key = serde_json::to_string(&scope).map_err(HostError::storage)?;
+        let prior: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM host_artifact_versions WHERE run=?1 AND call=?2",
+                params![binding.run_id, binding.call_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        if let Some(prior) = prior {
+            return serde_json::from_str(&prior)
+                .map(Some)
+                .map_err(HostError::storage);
+        }
+        let origin: String = self
+            .conn
+            .query_row(
+                "SELECT value FROM host_artifact_settings WHERE key='origin'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(HostError::storage)?;
+        let dir = self.home.join("engine-host/artifacts");
+        a::private_dir(&dir)?;
+        let hash = a::sha256(bytes);
+        let artifact = format!(
+            "file-{}",
+            &a::sha256(format!("{key}\0{path}").as_bytes())[..32]
+        );
+        let version = format!("version-{}", uuid::Uuid::new_v4().simple());
+        let delivery = format!("delivery-{}", uuid::Uuid::new_v4().simple());
+        let secret = a::secret(&dir)?;
+        let access = a::capability(&secret, &version, &key, &artifact);
+        // Count every physical blob, including unpublished orphans; quota cannot be bypassed by a crash.
+        a::publish_blob(&dir, &hash, bytes)?;
+        let turn = self.request_key(&parent)?;
+        let tx = self.conn.transaction().map_err(HostError::storage)?;
+        let sequence:i64=tx.query_row("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name='host_artifact_versions'),0)+1",[],|r|r.get(0)).map_err(HostError::storage)?;
+        let number: i64 = tx
+            .query_row(
+                "SELECT COUNT(*)+1 FROM host_artifact_versions WHERE scope=?1 AND artifact=?2",
+                params![key, artifact],
+                |r| r.get(0),
+            )
+            .map_err(HostError::storage)?;
+        let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let title: String = path.chars().take(40).collect();
+        let data = serde_json::json!({"version":version,"artifact":artifact,"delivery":delivery,"sequence":sequence,"turn":turn,"path":path,"mime":mime,"hash":hash,"bytes":bytes.len(),"scope":scope,"parent_run":parent,"run_id":binding.run_id,"call_id":binding.call_id,"at":at,"number":number,"origin":origin,"access_hash":a::sha256(access.as_bytes()),"title":title});
+        tx.execute("INSERT INTO host_artifact_versions(version,scope,artifact,run,call,hash,size,data) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![version,key,artifact,binding.run_id,binding.call_id,hash,bytes.len() as i64,data.to_string()]).map_err(HostError::storage)?;
+        tx.commit().map_err(HostError::storage)?;
+        let revision=self.bump("artifact_published",&serde_json::json!({"run_id":binding.run_id,"call_id":binding.call_id,"version":version}).to_string())?;
+        let _ = self.notices.send(HostNotice::Changed { revision });
+        Ok(Some(data))
+    }
+    /// 功能：按准确会话读取版本目录和原blob位置。
+    /// 参数：scope为已绑定Office范围。
+    /// 返回：全部版本元数据及Host私有版本目录。
+    /// 错误：存储、作用域或数据损坏明确拒绝。
+    /// 状态：不改变原工具、Run或工作区文件。
+    /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
+    /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
+    /// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+    pub(crate) fn artifacts(
+        &self,
+        scope: &ClientScope,
+    ) -> HostResult<(Vec<serde_json::Value>, PathBuf)> {
+        self.check_live_scope(scope)?;
+        let key = serde_json::to_string(scope).map_err(HostError::storage)?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT data FROM host_artifact_versions WHERE scope=?1 ORDER BY sequence DESC",
+            )
+            .map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([key], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        let data = rows
+            .map(|r| {
+                serde_json::from_str(&r.map_err(HostError::storage)?).map_err(HostError::storage)
+            })
+            .collect::<HostResult<Vec<_>>>()?;
+        Ok((data, self.home.join("engine-host/artifacts")))
+    }
+    /// 功能：验证确定版本的单资源能力并返回原件字节。
+    /// 参数：version/access为URL版本和单版本能力；delivery选择原件或交付JSON。
+    /// 返回：经过墓碑、能力和SHA256核对的有界字节及MIME。
+    /// 错误：存储、作用域或数据损坏明确拒绝。
+    /// 状态：不改变原工具、Run或工作区文件。
+    /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
+    /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
+    /// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+    pub(crate) fn artifact_read(
+        &self,
+        version: &str,
+        access: &str,
+        delivery: bool,
+    ) -> HostResult<(Vec<u8>, String)> {
+        use crate::office::artifacts as a;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT data FROM host_artifact_versions WHERE version=?1",
+                [version],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(HostError::storage)?;
+        let denied = || HostError::new("scope_denied", "文件版本不存在、已删除或访问凭证无效");
+        let data: serde_json::Value =
+            serde_json::from_str(&raw.ok_or_else(denied)?).map_err(HostError::storage)?;
+        let scope: ClientScope =
+            serde_json::from_value(data["scope"].clone()).map_err(HostError::storage)?;
+        self.check_live_scope(&scope).map_err(|_| denied())?;
+        let exists:i64=self.conn.query_row("SELECT COUNT(*) FROM host_bindings WHERE namespace=?1 AND slot=?2 AND conversation=?3",params![scope.namespace,scope.slot_id,scope.conversation_id],|r|r.get(0)).map_err(HostError::storage)?;
+        if exists != 1 || !a::valid_capability(access, data["access_hash"].as_str().unwrap_or("")) {
+            return Err(denied());
+        }
+        let dir = self.home.join("engine-host/artifacts");
+        if delivery {
+            let (rows, _) = self.artifacts(&scope)?;
+            let result = a::delivery(&data, &rows, &dir)?;
+            let bytes = serde_json::to_vec(&result).map_err(HostError::storage)?;
+            if bytes.len() > 64000 {
+                return Err(HostError::new("capacity_exceeded", "历史交付JSON超过64KB"));
+            }
+            return Ok((bytes, "application/json".into()));
+        }
+        let bytes = a::read_blob(&dir, &data)?;
+        Ok((
+            bytes,
+            data["mime"]
+                .as_str()
+                .unwrap_or("application/octet-stream")
+                .to_owned(),
+        ))
+    }
+}
+
+impl Db {
+    /// 功能：读取主Run及真实委派后代的版本捕获警告。
+    /// 参数：run为已授权主Run标识。
+    /// 返回：最近8条脱敏捕获失败原因，真实写入仍保留成功。
+    /// 错误：存储、作用域或数据损坏明确拒绝。
+    /// 状态：不改变原工具、Run或工作区文件。
+    /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
+    /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
+    /// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
+    pub(crate) fn artifact_warnings(&self, run: &str) -> HostResult<Vec<String>> {
+        let mut stmt=self.conn.prepare("SELECT json_extract(reference,'$.message') FROM host_events WHERE kind='artifact_capture_failed' AND (json_extract(reference,'$.run_id')=?1 OR json_extract(reference,'$.run_id') IN (SELECT json_extract(reference,'$.child_run') FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1)) ORDER BY revision DESC LIMIT 8").map_err(HostError::storage)?;
+        let rows = stmt
+            .query_map([run], |r| r.get::<_, String>(0))
+            .map_err(HostError::storage)?;
+        rows.map(|r| r.map_err(HostError::storage)).collect()
+    }
+}
+
+/// 功能：匹配历史绝对路径与可信迁移旧根，Windows别名额外核验目录身份。
+/// 参数：path为查询路径，old为已鉴权迁移审计中的规范旧根。
+/// 返回：规范根下的原相对路径，或无法证明归属时的None。
+/// 错误：目录身份不可读取时不认可别名，由原查询拒绝越界访问。
+/// 状态：只查询目录元数据，不读取旧文件，不改迁移记录。
+/// 并发与取消：仅在原Store单写线程内同步核验目录身份。
+/// 权限：相对路径仍须调用方校验普通组件、迁移清单和新根文件摘要。
+/// 关联：REQ-OP-025；DES-OP-013；CHG-2026-0007第12.147节。
+fn migrated_relative_path<'a>(
+    path: &'a std::path::Path,
+    old: &std::path::Path,
+) -> Option<&'a std::path::Path> {
+    if let Ok(relative) = path.strip_prefix(old) {
+        return Some(relative);
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return None;
+        };
+        if !matches!(
+            prefix.kind(),
+            Prefix::Disk(_)
+                | Prefix::VerbatimDisk(_)
+                | Prefix::UNC(_, _)
+                | Prefix::VerbatimUNC(_, _)
+        ) {
+            return None;
+        }
+        let mut components = path.components();
+        let mut candidate = PathBuf::new();
+        for _ in old.components() {
+            let part = components.next()?;
+            if matches!(part, Component::ParentDir | Component::CurDir) {
+                return None;
+            }
+            candidate.push(part.as_os_str());
+        }
+        if same_file::is_same_file(&candidate, old).unwrap_or(false) {
+            return Some(components.as_path());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod office_regressions {
     use super::*;
     use crate::{ClientScope, Host, HostConfig};
     use openpaw_core::{Message, Role};
     use serde_json::json;
+
+    #[cfg(windows)]
+    #[test]
+    fn migrated_windows_paths_require_the_audited_directory_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = temp.path().join("团队 原目录");
+        let other = temp.path().join("团队 原目录-sibling");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let canonical = openpaw_tools::safety::dunce_canonicalize(&old).unwrap();
+        let verbatim = std::fs::canonicalize(&old).unwrap();
+        let relative = std::path::Path::new("nested/report.txt");
+        for root in [&old, &canonical, &verbatim] {
+            assert_eq!(
+                migrated_relative_path(&root.join(relative), &canonical),
+                Some(relative),
+                "历史正文不存在时也只核验目录身份"
+            );
+        }
+        assert!(migrated_relative_path(&other.join(relative), &canonical).is_none());
+        let device = PathBuf::from(format!(r"\\.\{}", canonical.display()));
+        assert!(migrated_relative_path(&device.join(relative), &canonical).is_none());
+        std::fs::remove_dir(&old).unwrap();
+        assert_eq!(
+            migrated_relative_path(&canonical.join(relative), &canonical),
+            Some(relative),
+            "精确可信路径不需要访问旧根"
+        );
+        assert!(migrated_relative_path(&verbatim.join(relative), &canonical).is_none());
+    }
+
+    #[tokio::test]
+    async fn d149_chat_and_full_run_share_text_errors_checkpoints_and_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        for (i, state) in [
+            RunState::Completed,
+            RunState::Failed,
+            RunState::Cancelled,
+            RunState::TimedOut,
+            RunState::Interrupted,
+            RunState::Running,
+            RunState::Cancelling,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let binding = host
+                .open_session(ClientScope {
+                    namespace: "office".into(),
+                    slot_id: "office-1".into(),
+                    conversation_id: format!("case-{i}"),
+                })
+                .await
+                .unwrap();
+            host.inner
+                .store
+                .call(move |db| {
+                    let id = format!("run-{i}");
+                    let session = &binding.session_id;
+                    let offset = db.events(session)?.len();
+                    db.append(
+                        session,
+                        SessionEvent::Message(Message::user_text("核对正文")),
+                    )?;
+                    db.append(session, SessionEvent::RunStarted { run_id: id.clone() })?;
+                    db.append(
+                        session,
+                        SessionEvent::ToolCallStart {
+                            call_id: "call".into(),
+                            tool_name: "think".into(),
+                        },
+                    )?;
+                    db.append(
+                        session,
+                        SessionEvent::ToolCallComplete {
+                            call_id: "call".into(),
+                            success: true,
+                            tool_name: "think".into(),
+                            duration_ms: Some(0),
+                        },
+                    )?;
+                    db.append(
+                        session,
+                        SessionEvent::Message(Message::assistant_text("可靠正文。")),
+                    )?;
+                    if state.is_terminal() {
+                        db.append(
+                            session,
+                            SessionEvent::RunFinished {
+                                run_id: id.clone(),
+                                status: if state == RunState::Completed {
+                                    "completed"
+                                } else {
+                                    "failed"
+                                }
+                                .into(),
+                                error: (state != RunState::Completed)
+                                    .then(|| "http send: SECRET_MUST_NOT_LEAK".into()),
+                            },
+                        )?;
+                    }
+                    let ledger = committed_run_text(&db.events(session)?, &id)
+                        .text()
+                        .to_owned();
+                    let checkpoint = if state.is_terminal() {
+                        String::new()
+                    } else {
+                        format!("{ledger}尚未提交的尾部")
+                    };
+                    db.save_run(
+                        RunView {
+                            run_id: id.clone(),
+                            session_id: session.clone(),
+                            state,
+                            revision: 0,
+                            text: checkpoint.clone(),
+                            error: None,
+                            tools: vec![],
+                            text_truncated: false,
+                        },
+                        offset,
+                    )?;
+                    if !state.is_terminal() {
+                        let mut text = RunText::default();
+                        text.append(&format!("{checkpoint}及最新片段"));
+                        db.live.lock().unwrap().insert(id.clone(), text);
+                    }
+                    let full = db.get_run(&id)?;
+                    let mut cache = LedgerReadCache::default();
+                    assert_eq!(db.run_input_cached(&full, &mut cache)?.1, "核对正文");
+                    let chat = db.get_chat_run(&id, &mut cache)?;
+                    assert_eq!(chat.text, full.text);
+                    assert_eq!(chat.error, full.error);
+                    assert_eq!(chat.state, full.state);
+                    assert_eq!(chat.text_truncated, full.text_truncated);
+                    assert!(chat.tools.is_empty(), "聊天不附带完整工具投影");
+                    assert_eq!(full.tools.len(), 1, "完整Run仍保留工具事实");
+                    assert_eq!(cache.reads(), 1, "旧输入和正文恢复共享一次Reader");
+                    assert!(!chat
+                        .error
+                        .as_ref()
+                        .is_some_and(|e| e.message.contains("SECRET_MUST_NOT_LEAK")));
+                    if !state.is_terminal() {
+                        assert!(chat.text.ends_with("及最新片段"));
+                    }
+                    let continuous = crate::continuous::State {
+                        version: 1,
+                        run_id: id.clone(),
+                        started: true,
+                        display: "真实持续检查点".into(),
+                        ..Default::default()
+                    };
+                    db.bump(
+                        "continuous_task",
+                        &serde_json::to_string(&continuous).map_err(HostError::storage)?,
+                    )?;
+                    let continued = db.get_chat_run(&id, &mut LedgerReadCache::default())?;
+                    assert_eq!(continued.text, "真实持续检查点");
+                    assert_eq!(continued.text, db.get_run(&id)?.text);
+                    assert_eq!(continued.error, full.error);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn d149_chat_does_not_construct_delegated_tool_views_at_any_team_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        for count in [0usize, 5, 85, 200] {
+            let parent = host
+                .open_session(ClientScope {
+                    namespace: "office".into(),
+                    slot_id: "office-1".into(),
+                    conversation_id: format!("parent-{count}"),
+                })
+                .await
+                .unwrap();
+            let mut children = Vec::new();
+            for i in 0..count {
+                children.push(
+                    host.open_session(ClientScope {
+                        namespace: "host-agent".into(),
+                        slot_id: "office-1".into(),
+                        conversation_id: format!("child-{count}-{i}"),
+                    })
+                    .await
+                    .unwrap(),
+                );
+            }
+            host.inner
+                .store
+                .call(move |db| {
+                    let id = format!("parent-run-{count}");
+                    let session = &parent.session_id;
+                    let offset = db.events(session)?.len();
+                    db.append(
+                        session,
+                        SessionEvent::Message(Message::user_text("有限协作")),
+                    )?;
+                    db.append(session, SessionEvent::RunStarted { run_id: id.clone() })?;
+                    db.save_run(
+                        RunView {
+                            run_id: id.clone(),
+                            session_id: session.clone(),
+                            state: RunState::Completed,
+                            revision: 0,
+                            text: String::new(),
+                            error: None,
+                            tools: vec![],
+                            text_truncated: false,
+                        },
+                        offset,
+                    )?;
+                    for (i, child) in children.iter().enumerate() {
+                        let child_id = format!("child-run-{count}-{i}");
+                        let call = format!("call-{i}");
+                        db.append(
+                            session,
+                            SessionEvent::ToolCallStart {
+                                call_id: call.clone(),
+                                tool_name: "delegate_task".into(),
+                            },
+                        )?;
+                        db.append(
+                            session,
+                            SessionEvent::ToolCallComplete {
+                                call_id: call.clone(),
+                                success: true,
+                                tool_name: "delegate_task".into(),
+                                duration_ms: Some(0),
+                            },
+                        )?;
+                        db.append(
+                            &child.session_id,
+                            SessionEvent::RunStarted {
+                                run_id: child_id.clone(),
+                            },
+                        )?;
+                        db.append(
+                            &child.session_id,
+                            SessionEvent::Message(Message::assistant_text("独立结果")),
+                        )?;
+                        db.save_run(
+                            RunView {
+                                run_id: child_id.clone(),
+                                session_id: child.session_id.clone(),
+                                state: RunState::Completed,
+                                revision: 0,
+                                text: String::new(),
+                                error: None,
+                                tools: vec![],
+                                text_truncated: false,
+                            },
+                            0,
+                        )?;
+                        db.save_delegation(&crate::orchestration::Delegation {
+                            version: 1,
+                            run_id: id.clone(),
+                            parent_session: session.clone(),
+                            parent_scope: parent.scope.clone(),
+                            call_id: call,
+                            role_id: ["organize", "research", "draft", "review", "audit"][i % 5]
+                                .into(),
+                            title: format!("独立工作{i}"),
+                            input_summary: "有限验证".into(),
+                            task_id: format!("task-{count}-{i}"),
+                            child_scope: child.scope.clone(),
+                            child_session: child.session_id.clone(),
+                            child_run: child_id,
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            source_task_id: None,
+                            work_item: None,
+                        })?;
+                    }
+                    db.append(
+                        session,
+                        SessionEvent::Message(Message::assistant_text("协作结果已汇总")),
+                    )?;
+                    let before = db.revision()?;
+                    let mut cache = LedgerReadCache::default();
+                    let chat = db.get_chat_run(&id, &mut cache)?;
+                    assert_eq!(cache.reads(), 1, "0/5/85/200次委派均只读父账本");
+                    assert!(cache.events.contains_key(session));
+                    assert!(chat.tools.is_empty());
+                    let full = db.get_run(&id)?;
+                    assert_eq!(full.tools.len(), count);
+                    assert_eq!(chat.text, full.text);
+                    assert_eq!(chat.error, full.error);
+                    assert!(full.tools.iter().all(|t| t.state == "completed"));
+                    assert!(chat.text.contains("协作结果已汇总"));
+                    assert_eq!(db.delegations(&id)?.len(), count);
+                    assert_eq!(before, db.revision()?, "读取不追加执行/动画事实");
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn office_projection_invalidates_own_parent_child_and_unknown_facts_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r","office-2":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let mut bindings = Vec::new();
+        for (namespace, slot, conversation) in [
+            ("office", "office-1", "a"),
+            ("office", "office-2", "b"),
+            ("host-agent", "office-2", "c"),
+        ] {
+            bindings.push(
+                host.open_session(ClientScope {
+                    namespace: namespace.into(),
+                    slot_id: slot.into(),
+                    conversation_id: conversation.into(),
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        host.inner.store.call(move |db| {
+            for (id, binding) in [("parent", &bindings[1]), ("child", &bindings[2])] {
+                db.save_run(RunView {run_id:id.into(),session_id:binding.session_id.clone(),state:RunState::Running,revision:0,text:String::new(),tools:vec![],error:None,text_truncated:false},0)?;
+            }
+            for id in ["parent", "child"] {
+                for kind in ["agent_group", "agent_delegation", "agent_budget", "run_progress", "tool_waiting_resource", "tool_started", "tool_result", "continuous_task", "approval_policy", "artifact_published", "artifact_capture_failed"] {
+                    let before = db.revision()?;
+                    db.bump(kind, &json!({"run_id":id,"call_id":format!("{id}-{kind}"),"tool_name":"read_file","input":{}}).to_string())?;
+                    assert!(!db.office_projection_changed("office-1", before)?, "unrelated {id}/{kind} must not force historical replay");
+                    assert!(db.office_projection_changed("office-2", before)?, "own {id}/{kind} must refresh immediately");
+                }
+                let before = db.revision()?;
+                db.bump("run", id)?;
+                assert!(!db.office_projection_changed("office-1", before)?);
+                assert!(db.office_projection_changed("office-2", before)?);
+            }
+            for kind in ["session", "ledger"] {
+                let before = db.revision()?;
+                let session = &bindings[2].session_id;
+                let reference = if kind == "ledger" {format!("{session}:42")} else {session.clone()};
+                db.bump(kind, &reference)?;
+                assert!(!db.office_projection_changed("office-1", before)?);
+                assert!(db.office_projection_changed("office-2", before)?);
+            }
+            db.conn.execute("INSERT INTO host_approvals VALUES('test-approval','child','test-call','{}')", []).map_err(HostError::storage)?;
+            let before = db.revision()?;
+            db.bump("approval", "test-approval")?;
+            assert!(!db.office_projection_changed("office-1", before)?);
+            assert!(db.office_projection_changed("office-2", before)?);
+            for (kind, reference) in [("deleted", "missing"), ("workspace_rebind", "{}"), ("office_created", "{}"), ("future_event", "{}"), ("run_progress", "not-json"), ("run_progress", "{}"), ("run_progress", r#"{"run_id":"missing"}"#), ("run", "missing"), ("ledger", "bad"), ("session", "missing"), ("approval", "missing")] {
+                let before = db.revision()?;
+                db.bump(kind, reference)?;
+                assert!(db.office_projection_changed("office-1", before)?, "unresolved {kind} cannot reuse stale data");
+            }
+            let current = db.revision()?;
+            assert!(!db.office_projection_changed("office-1", current)?);
+            assert_eq!(db.revision()?, current, "invalidation checks never write facts");
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn d144_store_bounds_priority_bursts_and_drains_all_lanes_before_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let store = host.inner.store.clone();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        store
+            .tx
+            .send(Job::Call(Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })))
+            .await
+            .unwrap();
+        entered_rx.await.unwrap();
+        // 同时放满三类待执行队列；Close排在普通队列前端也必须先排空已接受命令。
+        let (closed_tx, closed_rx) = oneshot::channel();
+        store.tx.send(Job::Close(closed_tx)).await.unwrap();
+        for i in 0..20 {
+            let order = order.clone();
+            store
+                .priority_tx
+                .send(Job::Call(Box::new(move |_| {
+                    order.lock().unwrap().push(("run", i))
+                })))
+                .await
+                .unwrap();
+        }
+        for i in 0..3 {
+            for (lane, tx) in [("ui", &store.ui_tx), ("background", &store.tx)] {
+                let order = order.clone();
+                tx.send(Job::Call(Box::new(move |_| {
+                    order.lock().unwrap().push((lane, i))
+                })))
+                .await
+                .unwrap();
+            }
+        }
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), closed_rx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        {
+            let actual = order.lock().unwrap();
+            assert_eq!(actual.len(), 26, "关闭不能丢弃任何通道中的已接受操作");
+            assert!(
+                actual.iter().position(|(lane, _)| *lane == "ui").unwrap() <= 4,
+                "持续Run事实不能饿死UI"
+            );
+            assert!(
+                actual
+                    .iter()
+                    .position(|(lane, _)| *lane == "background")
+                    .unwrap()
+                    <= 18,
+                "首个普通槽已用于Close；下个普通任务仍须在四轮优先突发内执行"
+            );
+            for lane in ["run", "ui", "background"] {
+                let ids: Vec<_> = actual
+                    .iter()
+                    .filter(|(l, _)| *l == lane)
+                    .map(|(_, i)| *i)
+                    .collect();
+                let mut sorted = ids.clone();
+                sorted.sort();
+                assert_eq!(ids, sorted, "每个通道保持FIFO");
+            }
+        }
+        assert!(
+            store.call_ui(|_| Ok(())).await.is_err(),
+            "关闭后不能接受读取"
+        );
+    }
+
+    #[tokio::test]
+    async fn d98_activity_reads_only_current_started_call_and_never_other_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        host.inner.store.call(|db| {
+            for (run, call) in [("r", "older"), ("r", "current"), ("other", "foreign")] {
+                db.bump("tool_started", &json!({"run_id":run,"call_id":call,"tool_name":"web_fetch","input":{"url":"https://example.org"}}).to_string())?;
+            }
+            let mut run = RunView { run_id:"r".into(), session_id:"s".into(), state:RunState::Running, revision:1, text:String::new(), error:None, text_truncated:false,
+                tools:vec![ToolView {call_id:"older".into(),tool_name:"web_fetch".into(),state:"completed".into()},ToolView {call_id:"current".into(),tool_name:"web_fetch".into(),state:"running".into()}] };
+            let revision = db.revision()?;
+            assert_eq!(db.office_tool_activity(&run)?.unwrap().call_id, "current");
+            run.tools[1].state = "awaiting_approval".into();
+            assert!(db.office_tool_activity(&run)?.is_none());
+            run.tools[1].state = "running".into(); run.state = RunState::Completed;
+            assert!(db.office_tool_activity(&run)?.is_none());
+            assert_eq!(db.revision()?, revision);
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn startup_repeated_parent_checks_still_reject_late_corruption_and_foreign_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "startup-check".into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(&scope, &binding.session_id, "核对原协作元数据".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        let foreign_scope = ClientScope {
+            namespace: "recovery".into(),
+            conversation_id: "foreign-owner".into(),
+            ..scope.clone()
+        };
+        let foreign = host.open_session(foreign_scope.clone()).await.unwrap();
+        let foreign_run = host
+            .submit_run(&foreign_scope, &foreign.session_id, "非Office运行".into())
+            .await
+            .unwrap();
+        host.wait_idle().await;
+        host.inner.store.call(move |db| {
+            let group = json!({"version":1,"run_id":run.run_id,"scope":scope,"config":{"enabled":true}});
+            db.bump("agent_group", &group.to_string())?;
+            for _ in 0..256 {
+                db.bump("agent_budget", &json!({"version":1,"run_id":run.run_id}).to_string())?;
+            }
+            let revision = db.revision()?;
+            db.validate_agent_metadata()?;
+            assert_eq!(db.revision()?, revision, "启动校验必须只读");
+            for (kind, value, message) in [
+                ("agent_budget", json!({"version":99,"run_id":run.run_id}), "不支持的协作元数据版本"),
+                ("agent_group", group.clone(), "协作主组绑定损坏或重复"),
+                ("agent_group", json!({"version":1,"run_id":run.run_id,"scope":foreign_scope,"config":{"enabled":true}}), "协作主组绑定损坏或重复"),
+                ("agent_group", json!({"version":1,"run_id":foreign_run.run_id,"scope":foreign_scope,"config":{"enabled":true}}), "协作主Run不属于Office绑定"),
+            ] {
+                let invalid = db.bump(kind, &value.to_string())?;
+                let error = db.validate_agent_metadata().unwrap_err();
+                assert_eq!(error.kind, "storage_unavailable");
+                assert_eq!(error.message, message, "复用拥有者不能跳过后置记录或其他父Run校验");
+                assert_eq!(db.revision()?, invalid, "失败校验也不得写入");
+                db.conn.execute("DELETE FROM host_events WHERE revision=?1", [invalid]).map_err(HostError::storage)?;
+            }
+            db.validate_agent_metadata()?;
+            assert_eq!(db.revision()?, revision);
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn binding_lookup_targets_one_row_and_preserves_corruption_and_deletion_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let config: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(config).await.unwrap();
+        let binding = host
+            .open_session(ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "target".into(),
+            })
+            .await
+            .unwrap();
+        host.inner.store.call(move |db| {
+            let revision = db.revision()?;
+            db.conn.execute("INSERT INTO host_bindings VALUES('unrelated','office','other','other','malformed')", []).map_err(HostError::storage)?;
+            assert_eq!(db.binding(&binding.session_id)?.session_id, binding.session_id,
+                "按主键读取不能解析其他会话；全量恢复另行检查整个库");
+            assert_eq!(db.binding("missing").unwrap_err().kind, "not_found");
+            assert_eq!(db.revision()?, revision, "绑定查询必须只读");
+            db.conn.execute("DELETE FROM host_bindings WHERE id='unrelated'", []).map_err(HostError::storage)?;
+            db.conn.execute("UPDATE host_bindings SET data='malformed' WHERE id=?1", [&binding.session_id]).map_err(HostError::storage)?;
+            assert_eq!(db.binding(&binding.session_id).unwrap_err().kind, "storage_unavailable");
+            db.conn.execute("UPDATE host_bindings SET data=?1 WHERE id=?2", rusqlite::params![serde_json::to_string(&binding).unwrap(), binding.session_id]).map_err(HostError::storage)?;
+            db.conn.execute("INSERT INTO host_session_deletions VALUES(?1,?2,'marked',0)", rusqlite::params![serde_json::to_string(&binding.scope).unwrap(), binding.session_id]).map_err(HostError::storage)?;
+            assert_eq!(db.binding(&binding.session_id).unwrap_err().kind, "session_deleted");
+            db.conn.execute("DELETE FROM host_session_deletions", []).map_err(HostError::storage)?;
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
+    }
     #[tokio::test]
     async fn targeted_run_read_preserves_tool_order_approval_scope_and_readonly_revision() {
         let temp = tempfile::tempdir().unwrap();

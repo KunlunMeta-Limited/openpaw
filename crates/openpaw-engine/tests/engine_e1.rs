@@ -43,6 +43,105 @@ fn echo_tool_host() -> Arc<dyn ToolHost> {
     })
 }
 
+#[tokio::test]
+async fn d90_only_deliverable_final_responses_are_completed() {
+    use openpaw_core::{Capabilities, CompletionResponse, SessionEvent, Usage};
+    use openpaw_engine::{RunContext, RunObserver, RunStatus};
+    struct FinalProvider(CompletionResponse, AtomicUsize);
+    #[async_trait::async_trait]
+    impl LlmProvider for FinalProvider {
+        async fn complete(&self, _: CompletionRequest) -> Result<CompletionResponse> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(self.0.clone())
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn default_model(&self) -> &str {
+            "final-fixture"
+        }
+        fn name(&self) -> &str {
+            "final-fixture"
+        }
+    }
+    struct Recorder(Vec<SessionEvent>);
+    #[async_trait::async_trait]
+    impl RunObserver for Recorder {
+        async fn record(&mut self, event: SessionEvent) -> Result<()> {
+            self.0.push(event);
+            Ok(())
+        }
+    }
+    let text = |s: &str| vec![ContentBlock::Text { text: s.into() }];
+    for (reason, content, success) in [
+        (StopReason::MaxTokens, vec![], false),
+        (StopReason::MaxTokens, text("已经输出的部分"), false),
+        (StopReason::Incomplete, text("不完整正文"), false),
+        (StopReason::EndTurn, vec![], false),
+        (StopReason::EndTurn, text(" \n"), false),
+        (
+            StopReason::EndTurn,
+            vec![ContentBlock::Thinking {
+                thinking: "只有思考".into(),
+                signature: None,
+            }],
+            false,
+        ),
+        (StopReason::EndTurn, text("真实交付"), true),
+    ] {
+        let provider = Arc::new(FinalProvider(
+            CompletionResponse {
+                content: content.clone(),
+                stop_reason: reason,
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 4096,
+                    ..Default::default()
+                },
+            },
+            AtomicUsize::new(0),
+        ));
+        let engine = AgentLoop::new(provider.clone());
+        let mut session = Session::new("final-fixture", "fixture");
+        session.messages.push(Message::user_text("核验资料"));
+        let mut recorder = Recorder(vec![]);
+        let outcome = engine
+            .run_with_context(
+                &mut session,
+                None,
+                &[],
+                &RunContext {
+                    run_id: "final-run".into(),
+                    cancel: CancellationToken::new(),
+                    total_timeout: None,
+                    tool_timeout: None,
+                },
+                &mut recorder,
+                &mut |_| {},
+            )
+            .await;
+        assert_eq!(
+            outcome.status,
+            if success {
+                RunStatus::Completed
+            } else {
+                RunStatus::Failed
+            },
+            "{reason:?}"
+        );
+        assert_eq!(outcome.usage.output_tokens, 4096);
+        assert_eq!(provider.1.load(Ordering::SeqCst), 1, "终态不得自动重放");
+        assert_eq!(
+            serde_json::to_value(&session.messages.last().unwrap().content).unwrap(),
+            serde_json::to_value(&content).unwrap(),
+            "原始输出必须保留"
+        );
+        assert!(
+            matches!(recorder.0.last(), Some(SessionEvent::RunFinished { status, .. }) if status == if success { "completed" } else { "failed" })
+        );
+    }
+}
+
 /// Search host with async sleep so the phased path's spawned tasks truly
 /// overlap (concurrency observation for the parallel assertion).
 struct SearchHost {
@@ -379,6 +478,116 @@ async fn stream_retry_recovers_from_overloaded() {
     let (stop, _) = run_simple(&l, &mut session, &[]).await;
     assert_eq!(stop.unwrap(), StopReason::EndTurn);
     assert_eq!(session.messages.last().unwrap().text(), "recovered");
+}
+
+#[tokio::test]
+async fn d97_argument_recovery_is_bounded_and_never_replays_completed_tools() {
+    struct ArgumentsProvider {
+        calls: AtomicUsize,
+        partial: bool,
+        always_invalid: bool,
+    }
+    #[async_trait::async_trait]
+    impl LlmProvider for ArgumentsProvider {
+        async fn complete(&self, _: CompletionRequest) -> Result<openpaw_core::CompletionResponse> {
+            unreachable!()
+        }
+        async fn stream(
+            &self,
+            req: CompletionRequest,
+        ) -> Result<futures::stream::BoxStream<'static, Result<StreamEvent>>> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut events = Vec::new();
+            if attempt == 0 {
+                events.push(Ok(StreamEvent::Final(Box::new(
+                    openpaw_core::CompletionResponse {
+                        content: vec![ContentBlock::ToolUse {
+                            id: "once".into(),
+                            name: "echo_tool".into(),
+                            input: serde_json::json!({"text":"one effect"}),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: Default::default(),
+                    },
+                ))));
+            } else {
+                assert_eq!(
+                    req.messages
+                        .iter()
+                        .flat_map(|m| &m.content)
+                        .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                        .count(),
+                    1
+                );
+                if attempt == 1 || self.always_invalid {
+                    if self.partial {
+                        events.push(Ok(StreamEvent::TextDelta {
+                            index: 0,
+                            text: "visible prefix".into(),
+                        }));
+                    }
+                    events.push(Err(Error::Provider(
+                        "invalid OpenAI streamed tool arguments: tool_index=0 json=Eof".into(),
+                    )));
+                } else {
+                    events.push(Ok(StreamEvent::Final(Box::new(
+                        openpaw_core::CompletionResponse {
+                            content: vec![ContentBlock::Text {
+                                text: "recovered".into(),
+                            }],
+                            stop_reason: StopReason::EndTurn,
+                            usage: Default::default(),
+                        },
+                    ))));
+                }
+            }
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+        fn capabilities(&self) -> openpaw_core::Capabilities {
+            Default::default()
+        }
+        fn name(&self) -> &str {
+            "arguments"
+        }
+        fn default_model(&self) -> &str {
+            "arguments"
+        }
+    }
+    for (partial, always_invalid, succeeds, calls) in [
+        (false, false, true, 3),
+        (true, false, false, 2),
+        (false, true, false, 3),
+    ] {
+        let provider = Arc::new(ArgumentsProvider {
+            calls: AtomicUsize::new(0),
+            partial,
+            always_invalid,
+        });
+        let engine = AgentLoop::new(provider.clone())
+            .with_tool_host(echo_tool_host())
+            .with_retry_policy(RetryPolicy::new(5, 1, 5, 2.0));
+        let mut session = Session::new("arguments", "arguments");
+        session
+            .messages
+            .push(Message::user_text("one effect then answer"));
+        let (result, _) =
+            run_simple(&engine, &mut session, &[ToolSpec::new("echo_tool", "echo")]).await;
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter(|b| matches!(b, ContentBlock::ToolResult { .. }))
+                .count(),
+            1,
+            "already executed tool must never replay"
+        );
+        if partial {
+            assert_eq!(session.messages.last().unwrap().text(), "visible prefix");
+        }
+    }
 }
 
 /// Provider whose stream lingers long enough to be cancelled mid-flight.

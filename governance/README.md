@@ -16,11 +16,15 @@ python3 governance/check.py trace --check
 python3 -m unittest discover -s governance/tests -v
 python3 governance/check.py pr-check --stage implementation --base <集成提交> --worktree
 python3 governance/check.py pr-check --stage delivery --base <集成提交> --head <实际交付head>
+python3 governance/check.py validate --stage delivery --base <集成提交> --head <实际交付head>
+python3 governance/check.py validate --stage delivery --base <集成提交> --worktree
 python3 governance/verify.py --suite all --source worktree --stage implementation --base <集成提交> --output <仓库外全新目录>
 python3 governance/verify.py --suite all --source head --stage implementation --base <集成提交> --head <已检出的提交> --output <仓库外全新目录>
 ~~~
 
 `validate`默认proposal，只验十二节结构、准确文件、可审说明、追踪、固定框架哈希及注册命令；不要求未来批准/结果。implementation要求当前新格式CHG的有效方案批准和一致版本，`pr-check`同时校验真实diff/必改/条件/保护。delivery再要求人工交付验收、完整提交号、两平台原生passed证据；交付版本后只允许审批元数据/追加履历和生成索引维护，代码或方案变化需重验。validate索引/追踪均从同一归一化结果读取，--check拒绝漂移。没有approve或merge入口。
+
+`validate --stage delivery`不带比较上下文时仍是严格的全历史交付审计，旧CHG当年的Windows暂缓也会如实失败。检查本轮交付应同时指定`--base`及`--head`或`--worktree`，直接复用原`pr-check`：全部CHG结构、标识和固定来源仍检查，交付验收则按真实diff检查当前主CHG及显式关联修订。历史文件若在本轮修改，仍须满足原关联/受限维护规则；不能把“历史”当作跳过授权的理由。比较参数只用于delivery，缺参、互斥参数或其他阶段传范围都会拒绝。原全量runner在delivery阶段把同一准确base/head或worktree传到这两个入口，实际argv进入原报告；27项命令、平台矩阵和当前交付的准确SHA/双平台要求不变，不改写旧平台事实。
 
 新CHG使用`openpaw/chg-review-v2`及稳定基础列，扩充“具体修改方向与复用方式”“完成标准与证据”。当前状态与原交付状态分离，方案、交付、PR、合入各有独立字段。非空姓名/URL不是身份认证；未知格式不会按legacy自动放行。legacy仅profile已登记的准确路径和完整历史提交，用于追溯，不授权新的代码修改。
 

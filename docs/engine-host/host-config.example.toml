@@ -10,6 +10,8 @@ provider = "echo" # 保留原离线演示；希望使用.env时删除或注释�
 # base_url = "https://api.openai.com/v1"
 max_active_runs = 4
 run_timeout_secs = 1800
+# 等待建立响应流及每个有效模型事件的最大空闲时间；不是整个任务时限。
+# 慢模型可显式调整为180秒；上游心跳不一定产生有效事件，超时不等于确定断网。
 stream_idle_secs = 60
 tool_timeout_secs = 300
 approval_timeout_secs = 300
@@ -47,6 +49,7 @@ office-4 = "project-4"
 # allowed_origins = ["http://127.0.0.1:8765"]
 # 先在[roots]/[slots]声明真实根及稳定槽，再把等待页面创建的槽填入此项。
 # 默认空，全部原办公室仍自动初始化；每槽只分配一次，名称不变成路径。
+# activity_window = true # 可选：人物只显示在途/排队任务，标题显示真实工具动作；页面计数变为当前窗口口径。
 # creation_slots = [] # 例如 ["office-reserved"]；该槽须已在[slots]存在
 # [office.names]
 # office-1 = "研发办公室"
@@ -68,3 +71,30 @@ office-4 = "project-4"
 # openpaw engine-host-workspace apply --config old.toml --target-config target.toml --plan plan.json --confirm-sha256 <计划sha256> --backup <全新备份目录>
 # 成功后才用target.toml启动；回退时先停新Host，再恢复完整配套home和old.toml，
 # 新根中新产物另行保留，不以回退为由删除。共享根仅为明确配置的可选旧行为。
+
+# 单对话持续协作：以下是显式启用示例，不能直接追加为同名重复TOML表。
+# 将上方max_active_runs改为6、run_timeout_secs改为0；零只取消总时限，
+# 网络空闲、单工具和审批超时继续生效。tools按需增加write_file/edit_file/render_visual/generate_image。
+# [agents]
+# enabled = true
+# max_active_children = 5
+# max_delegations = 0
+# max_model_requests = 0
+# max_output_tokens = 0
+# max_response_tokens = 16384 # 可选：协作主子Run单次响应上限；不是整组累计预算，模型需实际支持。
+# [agents.continuous]
+# enabled = true
+# output_dir = "outputs"
+# auto_approve = true
+# stage_pause_ms = 250
+# 同时开放的业务事项上限，不是子Agent数量。
+max_open_items = 2
+# 独立生图服务可选；DeepSeek聊天密钥不会自动作为图片凭据。
+# 地址须支持POST /images/generations，返回data[0].b64_json实际PNG/JPEG/WebP。
+# [agents.images]
+# base_url = "https://your-image-service.example/v1"
+# model = "your-image-model"
+# api_key_env = "OPENPAW_IMAGE_API_KEY"
+# OPENPAW_IMAGE_API_KEY的值放在原 ~/.openpaw/.env（或--env-file指定文件）；不写入TOML/仓库。
+# 若服务要求显式response_format，可在[agents.images]配置 response_format = "b64_json"；
+# 默认省略该字段，避免向不支持此参数的服务发送它。只支持实际base64结果，不自动下载返回URL。

@@ -38,7 +38,7 @@ impl OpenAiProvider {
     }
 
     /// Map core messages onto the OpenAI chat shape:
-    /// - 旧system保持开头；显式blocks优先，dynamic在本轮真实用户文本前
+    /// - 旧system保持开头；显式blocks优先，dynamic在本轮用户前或已结束阶段后
     /// - tool_result不被视为新用户提问，系统上下文不拆断工具响应链
     /// - assistant tool_use → `tool_calls`
     /// - user tool_result → `role: tool` messages
@@ -58,6 +58,17 @@ impl OpenAiProvider {
                     .iter()
                     .any(|b| matches!(b, ContentBlock::Text { .. }))
         });
+        // 已有真实用户且上一阶段以纯文本assistant收尾时，新动态事实是
+        // 此次接续的触发上下文；放在旧用户之前会让模型继续复述等待。
+        // 只调整显式系统块，不伪造用户消息，也不拆断tool_use/result链。
+        let continuation = current_user.is_some()
+            && req.messages.last().is_some_and(|m| {
+                m.role == Role::Assistant
+                    && !m.content.is_empty()
+                    && m.content
+                        .iter()
+                        .all(|b| matches!(b, ContentBlock::Text { .. }))
+            });
         if current_user.is_none() {
             if let Some(context) = dynamic {
                 messages.push(json!({"role": "system", "content": context}));
@@ -88,7 +99,7 @@ impl OpenAiProvider {
                     }
                     if !text_parts.is_empty() {
                         // 混合工具结果和文本时，先输出全部tool结果，不能用system拆断调用链。
-                        if current_user == Some(index) {
+                        if current_user == Some(index) && !continuation {
                             if let Some(context) = dynamic {
                                 messages.push(json!({"role": "system", "content": context}));
                             }
@@ -124,6 +135,11 @@ impl OpenAiProvider {
                     }
                     messages.push(msg);
                 }
+            }
+        }
+        if continuation {
+            if let Some(context) = dynamic {
+                messages.push(json!({"role":"system","content":context}));
             }
         }
         messages
@@ -228,8 +244,14 @@ impl LlmProvider for OpenAiProvider {
                 content.push(ContentBlock::Text { text: text.into() });
             }
         }
-        if let Some(tool_calls) = message.get("tool_calls").and_then(|t| t.as_array()) {
-            for tc in tool_calls {
+        let stop_reason =
+            Self::map_finish_reason(choice.get("finish_reason").and_then(|f| f.as_str()));
+        if let Some(tool_calls) = message
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .filter(|_| stop_reason == StopReason::ToolUse)
+        {
+            for (index, tc) in tool_calls.iter().enumerate() {
                 let id = tc
                     .get("id")
                     .and_then(|i| i.as_str())
@@ -245,15 +267,13 @@ impl LlmProvider for OpenAiProvider {
                     .get("arguments")
                     .and_then(|a| a.as_str())
                     .unwrap_or("{}");
-                let input: serde_json::Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                let input = parse_tool_arguments(args_str, index, &name)?;
                 content.push(ContentBlock::ToolUse { id, name, input });
             }
         }
         Ok(CompletionResponse {
             content,
-            stop_reason: Self::map_finish_reason(
-                choice.get("finish_reason").and_then(|f| f.as_str()),
-            ),
+            stop_reason,
             usage: Self::parse_usage(v.get("usage")),
         })
     }
@@ -345,6 +365,17 @@ impl LlmProvider for OpenAiProvider {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+}
+
+// 参数正文可能包含文件、密钥或个人资料；诊断只保留安全结构信息。
+fn parse_tool_arguments(args: &str, index: usize, name: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(args).map_err(|error| {
+        let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(64).collect();
+        Error::Provider(format!(
+            "invalid OpenAI streamed tool arguments: tool_index={index} name={name} bytes={} json={:?} line={} column={}",
+            args.len(), error.classify(), error.line(), error.column()
+        ))
+    })
 }
 
 /// Accumulates OpenAI stream chunks: text deltas flow through; tool_calls
@@ -451,13 +482,16 @@ impl OpenAiStreamState {
                 text: self.text.clone(),
             });
         }
-        for (idx, id, name, args) in &calls {
-            let input: serde_json::Value = match serde_json::from_str(args) {
+        // length等停止原因不能把截断的JSON误报为参数错误，也不能执行它。
+        // 整批校验成功后才发布任何工具事件，避免半批事件阻止安全恢复。
+        for (idx, id, name, args) in calls
+            .iter()
+            .filter(|_| self.stop_reason == Some(StopReason::ToolUse))
+        {
+            let input = match parse_tool_arguments(args, *idx, name) {
                 Ok(input) => input,
-                Err(_) => {
-                    queue.push_back(Err(Error::Provider(
-                        "invalid OpenAI streamed tool arguments".into(),
-                    )));
+                Err(error) => {
+                    queue.push_back(Err(error));
                     return;
                 }
             };
@@ -466,6 +500,11 @@ impl OpenAiStreamState {
                 name: name.clone(),
                 input,
             });
+        }
+        for (idx, id, name, _) in calls
+            .iter()
+            .filter(|_| self.stop_reason == Some(StopReason::ToolUse))
+        {
             queue.push_back(Ok(StreamEvent::ToolUseStart {
                 index: *idx,
                 id: id.clone(),

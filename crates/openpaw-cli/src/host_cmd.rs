@@ -84,7 +84,7 @@ pub fn run_with_env(config: &Path, port: Option<u16>, env_file: Option<&Path>) -
             .map_err(|_| "Provider配置不合法或缺少凭据".to_owned())?;
         let rt = tokio::runtime::Runtime::new().map_err(|_| "无法启动异步运行时".to_string())?;
         rt.block_on(async move {
-            let host=openpaw_engine_host::Host::with_provider(config, provider).await.map_err(|e|e.to_string())?;
+            let host=openpaw_engine_host::Host::with_provider_and_environment(config, provider, &settings).await.map_err(|e|e.to_string())?;
             let server=match openpaw_engine_host::HostServer::bind(host.clone(),port.unwrap_or(0)).await {
                 Ok(server)=>server,
                 Err(e)=>{let _=host.shutdown().await;return Err(e.to_string());}

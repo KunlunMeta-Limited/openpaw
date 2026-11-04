@@ -1,0 +1,214 @@
+{
+  "out": "/tmp/openpaw-status-repeat-ZxT3ym",
+  "base": "http://127.0.0.1:39563",
+  "officePort": 34293,
+  "providerPort": 36555,
+  "commit": "6caec7ec8c5fce2e19561e451731603906502261",
+  "single": 100,
+  "multi": 100,
+  "runs": 1,
+  "failures": [],
+  "finalSnapshot": {
+    "conversations": [
+      {
+        "employees": [
+          {
+            "id": "office-lead",
+            "name": "王明",
+            "online": true,
+            "role": "任务统筹、分工与结果汇总",
+            "sceneActorId": "office-lead"
+          },
+          {
+            "id": "code-agent",
+            "name": "李研",
+            "online": true,
+            "role": "信息检索与技术背景核对",
+            "sceneActorId": "code-agent"
+          },
+          {
+            "id": "file-agent",
+            "name": "周理",
+            "online": true,
+            "role": "项目资料查看与整理",
+            "sceneActorId": "file-agent"
+          },
+          {
+            "id": "app-agent",
+            "name": "陈书",
+            "online": true,
+            "role": "报告草稿与交付物撰写",
+            "sceneActorId": "app-agent"
+          },
+          {
+            "id": "review-agent",
+            "name": "刘市",
+            "online": true,
+            "role": "需求和验收覆盖核对",
+            "sceneActorId": "review-agent"
+          },
+          {
+            "id": "data-agent",
+            "name": "赵审",
+            "online": true,
+            "role": "来源、结论与风险复核",
+            "sceneActorId": "data-agent"
+          }
+        ],
+        "events": [
+          {
+            "employeeId": "code-agent",
+            "id": "activity:delegation:791a4717abc34a4d8ee8689e60291b74:completed",
+            "kind": "task.completed",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
+            "summary": "已核验完成：research完成资料核查",
+            "taskId": "delegation:791a4717abc34a4d8ee8689e60291b74"
+          },
+          {
+            "employeeId": "code-agent",
+            "fromEmployeeId": "office-lead",
+            "id": "assign:delegation:791a4717abc34a4d8ee8689e60291b74",
+            "kind": "task.assigned",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
+            "summary": "交给李研：research完成资料核查",
+            "taskId": "delegation:791a4717abc34a4d8ee8689e60291b74"
+          },
+          {
+            "employeeId": "file-agent",
+            "fromEmployeeId": "office-lead",
+            "id": "assign:delegation:37742fd9e735454faf65e8c38b1cb5ab",
+            "kind": "task.assigned",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
+            "summary": "交给周理：organize完成资料核查",
+            "taskId": "delegation:37742fd9e735454faf65e8c38b1cb5ab"
+          },
+          {
+            "employeeId": "app-agent",
+            "fromEmployeeId": "office-lead",
+            "id": "assign:delegation:79a37ebd073c434e89abd658e1d0824d",
+            "kind": "task.assigned",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
+            "summary": "交给陈书：draft完成资料核查",
+            "taskId": "delegation:79a37ebd073c434e89abd658e1d0824d"
+          },
+          {
+            "employeeId": "review-agent",
+            "fromEmployeeId": "office-lead",
+            "id": "assign:delegation:2170f6be147a405da878007d27e416e1",
+            "kind": "task.assigned",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
+            "summary": "交给刘市：review完成资料核查",
+            "taskId": "delegation:2170f6be147a405da878007d27e416e1"
+          },
+          {
+            "employeeId": "data-agent",
+            "fromEmployeeId": "office-lead",
+            "id": "assign:delegation:a80d154c833b4920bc9bf8d0fbbc3a45",
+            "kind": "task.assigned",
+            "occurredAt": "2026-10-25T16:47:54.586Z",
+            "summary": "交给赵审：audit完成资料核查",
+            "taskId": "delegation:a80d154c833b4920bc9bf8d0fbbc3a45"
+          }
+        ],
+        "id": "multi-0",
+        "tasks": [
+          {
+            "assigneeId": "office-lead",
+            "id": "run:0d1cb8dede124d0b90ce1199b1103af6",
+            "progress": 100,
+            "status": "completed",
+            "summary": "本次目标已完成",
+            "title": "MULTI-0",
+            "updatedAt": "2026-10-25T16:47:54.586Z"
+          },
+          {
+            "assigneeId": "code-agent",
+            "id": "delegation:791a4717abc34a4d8ee8689e60291b74",
+            "progress": 100,
+            "status": "completed",
+            "summary": "research 独立任务已完成。",
+            "title": "research完成资料核查",
+            "updatedAt": "2026-10-25T16:47:54.586Z"
+          },
+          {
+            "assigneeId": "file-agent",
+            "id": "delegation:37742fd9e735454faf65e8c38b1cb5ab",
+            "progress": 100,
+            "status": "completed",
+            "summary": "organize 独立任务已完成。",
+            "title": "organize完成资料核查",
+            "updatedAt": "2026-10-25T16:47:54.586Z"
+          },
+          {
+            "assigneeId": "app-agent",
+            "id": "delegation:79a37ebd073c434e89abd658e1d0824d",
+            "progress": 100,
+            "status": "completed",
+            "summary": "draft 独立任务已完成。",
+            "title": "draft完成资料核查",
+            "updatedAt": "2026-10-25T16:47:54.586Z"
+          },
+          {
+            "assigneeId": "review-agent",
+            "id": "delegation:2170f6be147a405da878007d27e416e1",
+            "progress": 100,
+            "status": "completed",
+            "summary": "review 独立任务已完成。",
+            "title": "review完成资料核查",
+            "updatedAt": "2026-10-25T16:47:54.586Z"
+          },
+          {
+            "assigneeId": "data-agent",
+            "id": "delegation:a80d154c833b4920bc9bf8d0fbbc3a45",
+            "progress": 100,
+            "status": "completed",
+            "summary": "audit 独立任务已完成。",
+            "title": "audit完成资料核查",
+            "updatedAt": "2026-10-25T16:47:54.586Z"
+          }
+        ],
+        "title": "MULTI-0",
+        "whiteboard": {
+          "description": "已确认完成 5/5 步；本次目标已完成",
+          "link": {
+            "label": "",
+            "url": ""
+          },
+          "note": "",
+          "status": "completed",
+          "steps": [
+            {
+              "id": "delegation:79a37ebd073c434e89abd658e1d0824d",
+              "progress": 100,
+              "title": "draft完成资料核查 · 已完成"
+            },
+            {
+              "id": "delegation:2170f6be147a405da878007d27e416e1",
+              "progress": 100,
+              "title": "review完成资料核查 · 已完成"
+            },
+            {
+              "id": "delegation:a80d154c833b4920bc9bf8d0fbbc3a45",
+              "progress": 100,
+              "title": "audit完成资料核查 · 已完成"
+            }
+          ],
+          "tagline": "",
+          "template": "task-board-v1",
+          "title": "MULTI-0"
+        }
+      }
+    ],
+    "schemaVersion": "1.0",
+    "seq": 6,
+    "system": {
+      "cpuPercent": -1,
+      "memoryPercent": -1,
+      "networkKbps": -1
+    },
+    "workspace": {
+      "id": "office-2",
+      "name": "office-2"
+    }
+  }
+}

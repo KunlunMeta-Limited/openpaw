@@ -1,0 +1,11 @@
+{
+  "capturedAt": "2026-10-25T16:05:38.733423+00:00",
+  "dataDir": "/tmp/openpaw-diagnostics-home-followup",
+  "bindingsBySlot": {
+    "office-1": 232,
+    "office-reserved-2": 3,
+    "office-reserved-3": 3
+  },
+  "officeBindingLimit": 100,
+  "interpretation": "diagnostic data directory exceeded the configured Office binding limit; existing sessions remain readable, new session creation is correctly rejected until old conversations are deleted"
+}

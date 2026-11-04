@@ -27,7 +27,7 @@ if (!relative(root, output).startsWith('..')) throw new Error('Evidence must be 
 await mkdir(output, { recursive: false })
 const report = { startedAt: new Date().toISOString(), platform: process.platform, commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim(), officeCommit: manifest.office.commit,
   sourceDirty: Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: root }).toString().trim()),
-  provider: 'deterministic OpenAI protocol fixture; actual AgentLoop and tools', commands: [], browserRequests: [], browserErrors: [], modelRequests: [], messages: [], assertions: [], result: 'running' }
+  provider: 'deterministic OpenAI protocol fixture; actual AgentLoop and tools', commands: [], browserRequests: [], browserErrors: [], modelRequests: [], messages: [], assertions: [], reviewFindings: [], result: 'running' }
 const processes = []
 let browser, context, providerServer, page, webFixtureServer, webBase
 const webFixture = { requests: [], active: 0, cancelled: 0 }
@@ -92,6 +92,17 @@ function provider() {
       const lastUser = data.messages.findLastIndex(m => m.role === 'user')
       const prompt = data.messages[lastUser]?.content ?? ''
       const results = data.messages.slice(lastUser + 1).filter(m => m.role === 'tool')
+      if (prompt==='R30版本一图文与数据') {
+        const calls=[['render_visual',{path:'reports/images/R30-flow.svg',title:'真实流程图',kind:'diagram',nodes:[{id:'a',label:'输入'},{id:'b',label:'结果'}],edges:[{from:'a',to:'b'}]}],
+          ['write_file',{path:'reports/R30-notes.md',content:'# R30 phase-one\n\n这是第一版真实图文。\n\n![流程图](images/R30-flow.svg)\n'}],
+          ['write_file',{path:'reports/R30-data.csv',content:'id,name\n001,真实数据\n'}],['write_file',{path:'reports/R30-data.json',content:'{"count":2,"id":"001"}\n'}]];
+        if(results.length<calls.length){const [name,input]=calls[results.length];finish({tool_calls:[{index:0,id:'r30-create-'+results.length,type:'function',function:{name,arguments:JSON.stringify(input)}}]},'tool_calls');return}
+        assert.ok(results.every(r=>!r.content.includes('捕获失败')));finish({content:'R30第一版的图文、CSV和JSON均由实际工具保存，未进行内容验收。'});return
+      }
+      if (prompt==='R30修改第二版') {
+        if(!results.length){finish({tool_calls:[{index:0,id:'r30-edit-second',type:'function',function:{name:'edit_file',arguments:JSON.stringify({path:'reports/R30-notes.md',old_string:'phase-one',new_string:'phase-two'})}}]},'tool_calls');return}
+        assert.ok(!results[0].content.includes('捕获失败'));finish({content:'R30第二版已由真实edit_file保存，第一版保留。'});return
+      }
       const role=['lead','research','organize','draft','review','audit'].find(role=>data.messages.some(m=>m.role==='system'&&m.content.includes('（'+role+'）')))
       if(role&&role!=='lead') {
         if(!results.length) {
@@ -268,7 +279,7 @@ try {
   await writeFile(join(workspace,'managed-parent.cjs'),"require('fs').writeFileSync('managed-parent.pid',String(process.pid));require('child_process').spawn(process.execPath,['managed-child.cjs'],{stdio:'inherit'});setInterval(()=>console.log('parent-tick'),50)")
   await writeFile(join(workspace,'managed-child.cjs'),"const fs=require('fs');fs.writeFileSync('managed-child.pid',String(process.pid));setInterval(()=>console.error('child-tick'),50);setTimeout(()=>fs.writeFileSync('late-side-effect','bad'),8000)")
   const config = join(output, 'host.toml')
-  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash"]\n[roots]\nproject = ${JSON.stringify(workspace)}\nproject-2 = ${JSON.stringify(workspace2)}\nproject-reserved = ${JSON.stringify(reservedWorkspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project-2"\noffice-reserved = "project-reserved"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\ncreation_slots = ["office-reserved"]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
+  await writeFile(config, `home = ${JSON.stringify(join(output, 'host-data'))}\nprovider = "openai"\nmodel = "office-product-fixture"\nbase_url = ${JSON.stringify(modelBase)}\napi_key_env = "OPENAI_API_KEY"\ntools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch", "write_file", "edit_file", "todo_add", "todo_update", "bash", "render_visual"]\n[roots]\nproject = ${JSON.stringify(workspace)}\nproject-2 = ${JSON.stringify(workspace2)}\nproject-reserved = ${JSON.stringify(reservedWorkspace)}\n[slots]\noffice-1 = "project"\noffice-2 = "project-2"\noffice-reserved = "project-reserved"\n[office]\nbase_url = ${JSON.stringify(officeBase)}\napi_key_env = "PAWOFFICE_API_KEY"\nallowed_origins = [${JSON.stringify(officeBase)}]\ncreation_slots = ["office-reserved"]\n[office.names]\noffice-1 = "真实运行验收"\noffice-2 = "独立办公室"\n`)
   if (!process.env.OPENPAW_HOST_BINARY) await run('cargo', ['build', '--locked', '-p', 'openpaw-cli', '--features', 'engine-host,sidecar'], root, childEnv, 'host-build')
   const buildBinary = process.env.OPENPAW_HOST_BINARY ?? join(process.env.CARGO_TARGET_DIR ?? join(root, 'target'), 'debug', process.platform === 'win32' ? 'openpaw.exe' : 'openpaw')
   // 每轮固定自己的已构建可执行文件；后续其他feature构建不能改变重启所用程序。
@@ -700,7 +711,14 @@ try {
   await page.getByRole('button',{name:'删除会话：T5-允许报告',exact:true}).click();
   await page.getByRole('alertdialog',{name:'删除会话'}).getByRole('button',{name:'删除',exact:true}).click();
   await waitFor(async()=>!conv(await readOffice(),report.t5.approveRequest.conversationId));
-  await page.getByRole('tab',{name:'T5-允许报告',exact:true}).waitFor({state:'hidden',timeout:15000});
+  try {
+    await page.getByRole('tab',{name:'T5-允许报告',exact:true}).waitFor({state:'hidden',timeout:15000});
+  } catch (error) {
+    // R21不允许修改Office。保留真实失败并继续核查后续旅程，最终仍失败。
+    report.reviewFindings.push({ id: 'R21', conversationId: report.t5.approveRequest.conversationId,
+      requirement: '后端删除成功后当前会话标签必须消失', error: String(error) });
+    await page.screenshot({path:join(output,'27-r21-deleted-tab-still-visible.png'),fullPage:true});
+  }
   assert.equal(await readFile(join(workspace,'reports/T5报告.md'),'utf8'),artifact);
   report.t5.deletedHistory=await fetch(hostBase+'/office/chat',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({version:'1.0',teamId:'office-1',conversationId:report.t5.approveRequest.conversationId,type:'history'})}).then(r=>({status:r.status}));
   assert.notEqual(report.t5.deletedHistory.status,200);
@@ -733,6 +751,30 @@ try {
   assert.ok(progressComplete.tasks.every(t=>t.status==='completed'));
   assert.ok(progressComplete.whiteboard.description.includes('3/3'));
   assert.equal(progressComplete.whiteboard.note,'');assert.equal(progressComplete.whiteboard.tagline,'');
+  assert.equal(progressComplete.whiteboard.summary,progressComplete.whiteboard.description);
+  assert.ok(progressComplete.whiteboard.detail.includes('## 任务进度'));
+  for(const task of progressComplete.tasks) assert.ok(progressComplete.whiteboard.detail.includes(task.title));
+  // Read the actual Pixi board by mouse; the new upstream detail must show Host facts.
+  await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  const sceneDownload=page.waitForEvent('download');await page.getByRole('button',{name:'导出快照',exact:true}).click();
+  const sceneFile=await sceneDownload;await sceneFile.saveAs(join(output,'d99-scene.json'));
+  const sceneData=JSON.parse(await readFile(join(output,'d99-scene.json'),'utf8'));
+  const boardProp=sceneData.world.props.find(prop=>prop.templateId==='office.wall-whiteboard');
+  const canvasBox=await page.locator('canvas').first().boundingBox();
+  const boardScale=Math.min(canvasBox.width/1100,canvasBox.height/850);
+  await page.mouse.click(canvasBox.x+(canvasBox.width-1100*boardScale)/2+(boardProp.position.x*50+290)*boardScale,
+    canvasBox.y+(canvasBox.height-850*boardScale)/2+(boardProp.position.y*50-70)*boardScale);
+  const boardDialog=page.getByRole('dialog',{name:'成果阅读器',exact:true});await boardDialog.waitFor();
+  await boardDialog.getByRole('tab',{name:'过程记录',exact:true}).click();
+  const executionDetails=await boardDialog.locator('.whiteboard-detail').innerText();
+  assert.ok(executionDetails.includes('已完成 · 100%'));
+  for(const task of progressComplete.tasks) assert.ok(executionDetails.includes(task.title));
+  assert.equal(progressComplete.whiteboard.result.status,'ready','真实文件版本可用，但不能冒充verified');assert.equal(progressComplete.whiteboard.result.artifacts.length,1);assert.ok(progressComplete.whiteboard.result.artifacts[0].versionId);
+  assert.ok(progressComplete.whiteboard.detailSections.length>0);
+  assert.ok(progressComplete.whiteboard.steps.every(step=>step.state==='done'));
+  await page.screenshot({path:join(output,'d99-real-whiteboard-details.png'),fullPage:true});
+  await boardDialog.getByRole('button',{name:'关闭当前成果',exact:true}).click();await expand(page);
+  report.assertions.push('D99/D138: actual Pixi mouse click opens the latest result reader; process tab has structured Host facts, same task titles and completed 100%; execution completion does not fabricate versioned deliverables');
   const recorded=await readFile(join(workspace,'reports/天气.md'),'utf8');assert.ok(recorded.includes('WEB-HTTP-MARKER'));
   await page.screenshot({path:join(output,'31-business-plan-completed.png'),fullPage:true});
   report.t5.progress={request:progressRequest,pending:progressPending,completed:progressComplete,file:{path:'reports/天气.md',sha256:createHash('sha256').update(recorded).digest('hex')}};
@@ -786,6 +828,59 @@ try {
       await waitFor(async()=>{try{const r=await readOffice();return r.code===200&&conv(r,latestSend().request.conversationId)}catch{return false}},45000)
     }})
   await storageProduct({page,report,output,fresh,waitFor})
+  // 原多人/网络/存储旅程先完成，避免新增文件目录占用历史窗口，
+  // 原五人最终事件断言与全部原旅程保持不变；容量裁剪另由Host精确回归覆盖。
+  // r30: original chat + exact approvals, immutable versions, real reader and downloads.
+  report.r30={};await fresh(page);await send('R30版本一图文与数据');
+  report.r30.request=structuredClone(latestSend().request);
+  const createdPaths=['reports/images/R30-flow.svg','reports/R30-notes.md','reports/R30-data.csv','reports/R30-data.json'];
+  for(const path of createdPaths){
+    if(await page.getByRole('button',{name:'收起聊天',exact:true}).isVisible())await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+    await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();await page.getByRole('button',{name:'允许本次',exact:true}).click();
+    await waitFor(async()=>access(join(workspace,path)).then(()=>true,()=>false));
+  }
+  await expand(page);await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});
+  const initialFiles=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.r30.request.conversationId);return c?.whiteboard.result.artifacts.length===4?c:false});
+  const firstDoc=initialFiles.whiteboard.result.artifacts.find(a=>a.title==='reports/R30-notes.md');assert.ok(firstDoc);report.r30.first=firstDoc;
+  const firstBytes=await readFile(join(workspace,'reports/R30-notes.md'));assert.equal(createHash('sha256').update(firstBytes).digest('hex'),firstDoc.sha256);
+  async function openR30File(title){
+    if(await page.getByRole('button',{name:'收起聊天',exact:true}).isVisible())await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+    await page.getByRole('button',{name:/^查看当前成果：/}).click();
+    const reader=page.getByRole('dialog',{name:'成果阅读器',exact:true});await reader.waitFor();await reader.getByRole('tab',{name:'交付物',exact:true}).click();
+    await reader.locator('.result-artifact').filter({has:page.getByRole('heading',{name:title,exact:true})}).getByRole('button',{name:'查看',exact:true}).click();
+    const preview=page.getByRole('dialog',{name:title,exact:true});await preview.waitFor();return preview;
+  }
+  let preview=await openR30File('reports/R30-notes.md');
+  await preview.getByText('原件 SHA-256 校验通过',{exact:false}).waitFor();
+  await waitFor(()=>preview.locator('.result-artifact-rich-preview img').evaluateAll(images=>images.length>0&&images.every(i=>i.complete&&i.naturalWidth>0)));
+  assert.ok((await preview.innerText()).includes('phase-one'));await page.screenshot({path:join(output,'r30-v1-image-preview.png'),fullPage:true});
+  await preview.getByRole('button',{name:'关闭文档预览',exact:true}).click();await page.getByRole('button',{name:'关闭当前成果',exact:true}).click();await expand(page);
+  await send('R30修改第二版');if(await page.getByRole('button',{name:'收起聊天',exact:true}).isVisible())await page.getByRole('button',{name:'收起聊天',exact:true}).click();
+  await page.getByRole('button',{name:'允许本次',exact:true}).waitFor();await page.getByRole('button',{name:'允许本次',exact:true}).click();
+  await expand(page);await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:45000});
+  const updatedFiles=await waitFor(async()=>{const r=await readOffice();const c=conv(r,report.r30.request.conversationId);const doc=c?.whiteboard.result.artifacts.find(a=>a.id===firstDoc.id);return doc&&doc.versionId!==firstDoc.versionId?c:false});
+  const secondDoc=updatedFiles.whiteboard.result.artifacts.find(a=>a.id===firstDoc.id);report.r30.second=secondDoc;
+  assert.equal(updatedFiles.whiteboard.result.artifacts.length,4,'未修改的文件须保留当前有效集合');
+  preview=await openR30File('reports/R30-notes.md');await preview.getByText('原件 SHA-256 校验通过',{exact:false}).waitFor();
+  await preview.getByRole('combobox',{name:'文档版本',exact:true}).selectOption(firstDoc.versionId);
+  await preview.getByText('原件 SHA-256 校验通过',{exact:false}).waitFor();assert.ok((await preview.innerText()).includes('phase-one'));
+  await preview.getByRole('button',{name:'与当前版本比较',exact:true}).click();
+  await waitFor(async()=>{const text=await preview.getByRole('article',{name:'版本差异',exact:true}).innerText();return text.includes('phase-one')&&text.includes('phase-two')});
+  await page.screenshot({path:join(output,'r30-v1-v2-real-comparison.png'),fullPage:true});
+  const downloading=page.waitForEvent('download');await preview.getByRole('button',{name:'下载该版本',exact:true}).click();const downloaded=await downloading;await downloaded.saveAs(join(output,'r30-downloaded-v1.md'));
+  assert.equal(createHash('sha256').update(await readFile(join(output,'r30-downloaded-v1.md'))).digest('hex'),firstDoc.sha256);
+  await preview.getByRole('button',{name:'关闭文档预览',exact:true}).click();await page.getByRole('button',{name:'关闭当前成果',exact:true}).click();
+  for(const [title,expected] of [['reports/R30-data.csv','001'],['reports/R30-data.json','001'],['reports/images/R30-flow.svg','']]){
+    preview=await openR30File(title);await preview.getByText('原件 SHA-256 校验通过',{exact:false}).waitFor();if(expected)assert.ok((await preview.innerText()).includes(expected));
+    if(title.endsWith('.svg'))await waitFor(()=>preview.locator('img.result-version-image').evaluateAll(images=>images.length>0&&images.every(i=>i.complete&&i.naturalWidth>0)));
+    await page.screenshot({path:join(output,'r30-'+title.split('/').at(-1)+'.png'),fullPage:true});
+    await preview.getByRole('button',{name:'关闭文档预览',exact:true}).click();await page.getByRole('button',{name:'关闭当前成果',exact:true}).click();
+  }
+  await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,'R30版本一图文与数据');
+  preview=await openR30File('reports/R30-notes.md');await preview.getByText('原件 SHA-256 校验通过',{exact:false}).waitFor();
+  await preview.getByRole('combobox',{name:'文档版本',exact:true}).selectOption(firstDoc.versionId);await preview.getByText('原件 SHA-256 校验通过',{exact:false}).waitFor();assert.ok((await preview.innerText()).includes('phase-one'));
+  await preview.getByRole('button',{name:'关闭文档预览',exact:true}).click();await page.getByRole('button',{name:'关闭当前成果',exact:true}).click();await expand(page);
+  report.assertions.push('r30: four real approved write/render tools publish immutable files; original Office previews Markdown relative image, CSV, JSON and SVG; followup edit preserves untouched files and v1; UI v1/v2 comparison and downloaded SHA256 match; browser refresh preserves versions');
   const saved=structuredClone((await readOffice()).data.snapshot)
   const same=await officePost(officeBase,{type:'office.snapshot',teamId:'office-1',snapshot:saved});assert.ok([200,202].includes(same.code))
   const differing=structuredClone(saved);differing.workspace.name='同版本不同内容'
@@ -837,6 +932,7 @@ try {
     let activeRun='';const calls=new Set();for(const e of ledger){if(e.type==='run_started')activeRun=e.run_id;if(e.type==='tool_call_complete'){const key=activeRun+':'+e.call_id;assert.ok(!calls.has(key),'same Run/call executed twice');calls.add(key)}}
     report.assertions.push('Session ' + file + ': ' + ledger.filter(e => e.type === 'run_finished').map(e => e.status).join(','))
   }
+  assert.equal(report.reviewFindings.length,0,'未闭环的真实UI问题：'+JSON.stringify(report.reviewFindings))
   report.result = 'passed'
 } catch (e) { report.result = 'failed'; report.error = e.stack; if (page) await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => {}); process.exitCode = 1 }
 finally {

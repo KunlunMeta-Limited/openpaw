@@ -1,31 +1,31 @@
 {
   "office": {
     "repository": "https://github.com/KunlunMeta-Limited/ai-office-react",
-    "commit": "fa6ae1f78efd5e9d11ea878e29c83b3ec5f1c518",
+    "commit": "5d21cf2e359d7ab2100e8344d08d58a09a20fe25",
     "files": [
       {
         "path": "integration/README.md",
-        "sha256": "5666df6b53db373668bcbfc156532299a320e472a62a426a62f70d33b04edb49",
+        "sha256": "ffb0bc2becfa70561c752dbb397624906b19e2bf1b88f74e0a7496eb71b3a455",
         "testSnapshot": false
       },
       {
         "path": "integration/docs/office-integration.md",
-        "sha256": "64f684be14ffb79188a52ad7e7f9745d0bfbfdb48e08ebe75b0548c11ea5501f",
+        "sha256": "53e91465a136d39bb9db308dd35d59a78767574fbde600533db76e05529a959e",
         "testSnapshot": false
       },
       {
         "path": "integration/docs/dashboard-integration.md",
-        "sha256": "84d22916e615153167f86c9a0a96d7fa023fbf83ec5478341de16fa3ff801b34",
+        "sha256": "b2df9ff4a842ab44daeef7bd38a54f618a6079dd42969a33c963e6b123010437",
         "testSnapshot": false
       },
       {
         "path": "integration/docs/chat-integration.md",
-        "sha256": "6cc69b2530f9716ca632f1bc52fb21fdd6dda10ea5829f8a7604a0248b555bb1",
+        "sha256": "8596f98de40e7fa6c5a96e3892721b70a3c4ad683feec22e769d8ec73dcb40d4",
         "testSnapshot": false
       },
       {
         "path": "integration/docs/message-relay.md",
-        "sha256": "07c5e0391ae62e96bd7d2ab126fe71936311f1f6d573b28f449a6a5f849e3622",
+        "sha256": "ca8693072e22e1f6f6c79db22fa8f854aff867ba680bad95828097c42094fc99",
         "testSnapshot": false
       },
       {
@@ -50,12 +50,12 @@
       },
       {
         "path": "packages/protocol/src/office-ui.ts",
-        "sha256": "83b6ae5274aa347c76e2fcd78253a9e216400754b249771aa102c815469a3539",
+        "sha256": "2a9b45fbc4fc01feea8bb070ebaae8abbbe911d80dd2430cec8fdf98a3f5bada",
         "testSnapshot": true
       },
       {
         "path": "packages/protocol/src/office-integration.ts",
-        "sha256": "73c9256d39df31cd9a09e1f24da445c3d5574869079641fd6cb1b4d0c05f7653",
+        "sha256": "3622be2200a941d1b16e249d7977af9bc973a692db45087c3131e4f638e4b827",
         "testSnapshot": true
       },
       {
@@ -70,12 +70,12 @@
       },
       {
         "path": "docs/plugin-runtime.md",
-        "sha256": "426fc9b4de161062f253d4f80740b04cd2a934e467508f0ec53f1d66662b63d5",
+        "sha256": "44f27e75c07b17cdf6de9dcdd950a6fbdb626cd44056782dd4c3c8dcd4c53361",
         "testSnapshot": false
       },
       {
         "path": "tests/README.md",
-        "sha256": "64890b84cab4f16a087b0e358d9b3187ec3e094a971bae0f3096ad4d897fdea8",
+        "sha256": "7cf568ddc9eef32e0459be70f50979c90c5dbc421a8d2cee8eefd71a392415d2",
         "testSnapshot": false
       },
       {
@@ -85,7 +85,7 @@
       },
       {
         "path": "apps/web/src/chat/ChatSession.ts",
-        "sha256": "8868884ed848883fc3c009336e45cd40d4327ac8e412858510df0f7ef80a0611",
+        "sha256": "896875efb7ae3c3ae4f3f3d8fed7bddbda101cc3f1eb76294fa20f088c3781f2",
         "testSnapshot": false
       },
       {
@@ -130,7 +130,17 @@
       },
       {
         "path": "tests/officeIntegration.test.mjs",
-        "sha256": "5bf7457f7cbbafc351e2042e638d23bd920073514627844319683d66de530985",
+        "sha256": "ee16da09c436ec7d985d0005ec951c80722b347eb3a2324d076d47b947c42251",
+        "testSnapshot": false
+      },
+      {
+        "path": "docs/architecture/result-deliveries.md",
+        "sha256": "26d92920611d9030562496107a4697fedc53338b06ecb0c0e8101f8205de19d3",
+        "testSnapshot": false
+      },
+      {
+        "path": "integration/docs/result-section-routing.md",
+        "sha256": "304eb2f2e618725c5f680d651de681c126dfef7b973752a3381cc0c5ab4e7cf6",
         "testSnapshot": false
       }
     ]

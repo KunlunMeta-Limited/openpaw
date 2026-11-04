@@ -469,6 +469,28 @@ impl AgentLoop {
             session.messages.push(message);
 
             if resp.stop_reason != StopReason::ToolUse {
+                // 额度耗尽/不完整响应只是停止生成，不是交付完成；只思考
+                // 而无正文也不能报成功。先保留usage和已输出内容，再可靠写失败
+                // 终态，不自动重试，以免重复文字或重放已经发生的工具副作用。
+                if matches!(
+                    resp.stop_reason,
+                    StopReason::MaxTokens | StopReason::Incomplete
+                ) {
+                    return Err(Error::Provider(
+                        if resp.stop_reason == StopReason::MaxTokens {
+                            "model output limit reached before complete delivery".into()
+                        } else {
+                            "model response incomplete before delivery".into()
+                        },
+                    ));
+                }
+                if !resp.content.iter().any(|block| match block {
+                    ContentBlock::Text { text } => !text.trim().is_empty(),
+                    ContentBlock::Image { .. } | ContentBlock::Document { .. } => true,
+                    _ => false,
+                }) {
+                    return Err(Error::Provider("model completed without an answer".into()));
+                }
                 // Token-budget continuation: the model stopped, but if
                 // meaningful budget remains (and returns are not
                 // diminishing), nudge it to keep working.
@@ -575,7 +597,7 @@ impl AgentLoop {
         partial: &mut String,
     ) -> Result<openpaw_core::CompletionResponse> {
         let mut attempts = 0;
-        loop {
+        'attempt: loop {
             let stream = match control
                 .wait(tokio::time::timeout(
                     self.stream_timeout,
@@ -623,7 +645,26 @@ impl AgentLoop {
                     .await?
                     .map_err(|_| Error::Timeout("provider stream idle".into()))?;
                 let Some(ev) = ev else { break };
-                match ev? {
+                let ev = match ev {
+                    Ok(ev) => ev,
+                    Err(Error::Provider(ref reason))
+                        if reason.starts_with("invalid OpenAI streamed tool arguments")
+                            && !emitted
+                            && attempts < self.retry_policy.max_retries.min(1) =>
+                    {
+                        // 本次调用尚未发布文字/工具且未执行，重发相同上下文至多一次。
+                        // 已完成工具保留在请求历史里；取消、期限与真实请求预算仍生效。
+                        attempts += 1;
+                        control
+                            .wait(tokio::time::sleep(
+                                self.retry_policy.delay_for_attempt(attempts),
+                            ))
+                            .await?;
+                        continue 'attempt;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match ev {
                     openpaw_core::StreamEvent::MessageStart => event_sink(AgentEvent::MessageStart),
                     openpaw_core::StreamEvent::TextDelta { text, .. } => {
                         emitted |= !text.is_empty();

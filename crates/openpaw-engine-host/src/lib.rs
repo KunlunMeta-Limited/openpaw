@@ -9,6 +9,8 @@ mod approval;
 #[cfg(feature = "engine-host")]
 mod config;
 #[cfg(feature = "engine-host")]
+mod continuous;
+#[cfg(feature = "engine-host")]
 mod query;
 #[cfg(feature = "engine-host")]
 mod resource;
@@ -25,6 +27,7 @@ mod types;
 #[cfg(feature = "engine-host")]
 pub use {
     config::{AgentsConfig, HostConfig},
+    continuous::ContinuousConfig,
     server::HostServer,
     service::Host,
     types::*,

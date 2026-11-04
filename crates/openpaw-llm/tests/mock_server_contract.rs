@@ -228,6 +228,108 @@ async fn openai_streaming_text_contract() {
 }
 
 #[tokio::test]
+async fn d97_invalid_call_batch_never_publishes_a_partial_tool_start() {
+    use futures::StreamExt;
+    let addr = spawn_mock(vec![http_sse(&[
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"good","function":{"name":"read_file","arguments":"{\"path\":\"ok.md\"}"}},{"index":1,"id":"bad","function":{"name":"write_file","arguments":"{\"secret\":\"DO_NOT_LOG_THIS\""}}]},"finish_reason":"tool_calls"}]}"#,
+        "data: [DONE]",
+    ])]);
+    let p = OpenAiProvider::new("sk-test", "m").with_base_url(format!("http://{addr}"));
+    let events: Vec<_> = p.stream(req("m")).await.unwrap().collect().await;
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Ok(StreamEvent::ToolUseStart { .. }))));
+    let error = events
+        .iter()
+        .find_map(|e| e.as_ref().err())
+        .unwrap()
+        .to_string();
+    assert!(error.contains("tool_index=1"), "{error}");
+    assert!(error.contains("json=Eof"), "{error}");
+    assert!(!error.contains("DO_NOT_LOG_THIS"));
+}
+
+#[tokio::test]
+async fn d97_output_limit_preserves_usage_without_exposing_truncated_call() {
+    use futures::StreamExt;
+    let addr = spawn_mock(vec![http_sse(&[
+        r#"data: {"choices":[{"delta":{"content":"partial","tool_calls":[{"index":0,"id":"bad","function":{"name":"write_file","arguments":"{\"content\":\"unfinished"}}]},"finish_reason":"length"}],"usage":{"prompt_tokens":21,"completion_tokens":100}}"#,
+        "data: [DONE]",
+    ])]);
+    let p = OpenAiProvider::new("sk-test", "m").with_base_url(format!("http://{addr}"));
+    let events: Vec<_> = p.stream(req("m")).await.unwrap().collect().await;
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Ok(StreamEvent::ToolUseStart { .. }))));
+    let response = events
+        .iter()
+        .find_map(|e| match e {
+            Ok(StreamEvent::Final(response)) => Some(response),
+            _ => None,
+        })
+        .expect("length must retain its stop reason and usage");
+    assert_eq!(response.stop_reason, openpaw_core::StopReason::MaxTokens);
+    assert_eq!(response.usage.output_tokens, 100);
+    assert_eq!(response.text(), "partial");
+    assert!(!response
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. })));
+}
+
+#[tokio::test]
+async fn d97_non_streaming_invalid_arguments_are_not_replaced_with_empty_object() {
+    let addr = spawn_mock(vec![http_json(&json!({
+        "choices":[{"message":{"tool_calls":[{"id":"bad","function":{"name":"write_file","arguments":"{broken"}}]},"finish_reason":"tool_calls"}]
+    }))]);
+    let p = OpenAiProvider::new("sk-test", "m").with_base_url(format!("http://{addr}"));
+    assert!(p.complete(req("m")).await.is_err());
+}
+
+#[tokio::test]
+async fn d97_unicode_long_artifact_and_escaped_arguments_survive_small_fragments() {
+    use futures::StreamExt;
+    let input = json!({"path":"图册.md","content":format!("<svg title=\"路线\">\n{}\n</svg>", "北京→长沙\\旅程\n".repeat(1200))});
+    let args: Vec<char> = serde_json::to_string(&input).unwrap().chars().collect();
+    let mut frames = Vec::new();
+    for (i, chars) in args.chunks(17).enumerate() {
+        let mut call = json!({"index":0,"function":{"arguments":chars.iter().collect::<String>()}});
+        if i == 0 {
+            call["id"] = json!("long");
+            call["function"]["name"] = json!("write_file");
+        }
+        frames.push(format!(
+            "data: {}",
+            json!({"choices":[{"delta":{"tool_calls":[call]}}]})
+        ));
+    }
+    frames.push(r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.into());
+    frames.push("data: [DONE]".into());
+    let addr = spawn_mock(vec![http_sse(
+        &frames.iter().map(String::as_str).collect::<Vec<_>>(),
+    )]);
+    let provider = OpenAiProvider::new("sk-test", "m").with_base_url(format!("http://{addr}"));
+    let events: Vec<_> = provider.stream(req("m")).await.unwrap().collect().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Ok(StreamEvent::ToolUseStart { .. })))
+            .count(),
+        1
+    );
+    let response = events
+        .iter()
+        .find_map(|e| match e {
+            Ok(StreamEvent::Final(response)) => Some(response),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        matches!(&response.content[0], ContentBlock::ToolUse { input: actual, .. } if actual == &input)
+    );
+}
+
+#[tokio::test]
 async fn openai_rate_limit_classified() {
     let addr = spawn_mock(vec![http_error(
         "429 Too Many Requests",
@@ -487,4 +589,47 @@ async fn d44_mixed_tool_result_and_text_does_not_break_tool_adjacency() {
         messages[4],
         json!({"role":"user","content":"actual user text"})
     );
+}
+
+#[tokio::test]
+async fn continuous_stage_context_follows_finished_assistant_without_forging_user_input() {
+    use openpaw_core::SystemPromptBlocks;
+    for streaming in [false, true] {
+        let response = if streaming {
+            http_sse(&[
+                r#"data: {"choices":[{"delta":{"content":"next"},"finish_reason":"stop"}]}"#,
+                "data: [DONE]",
+            ])
+        } else {
+            http_json(&json!({"choices":[{"message":{"content":"next"},"finish_reason":"stop"}]}))
+        };
+        let (address, captured) = spawn_capture(vec![response]);
+        let provider =
+            OpenAiProvider::new("fixture", "fixture").with_base_url(format!("http://{address}"));
+        let request = CompletionRequest {
+            system_blocks: Some(SystemPromptBlocks {
+                stable: "原工具权限".into(),
+                dynamic: "Host已经接续，现在执行下一步".into(),
+            }),
+            messages: vec![
+                Message::user_text("持续工作直到停止"),
+                Message::assistant_text("上一阶段结束，等待自动接续"),
+            ],
+            ..Default::default()
+        };
+        if streaming {
+            use futures::StreamExt;
+            let events: Vec<_> = provider.stream(request).await.unwrap().collect().await;
+            assert!(events.iter().all(Result::is_ok));
+        } else {
+            provider.complete(request).await.unwrap();
+        }
+        let body = captured
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            body["messages"],
+            json!([{"role":"system","content":"原工具权限"},{"role":"user","content":"持续工作直到停止"},{"role":"assistant","content":"上一阶段结束，等待自动接续"},{"role":"system","content":"Host已经接续，现在执行下一步"}])
+        );
+    }
 }

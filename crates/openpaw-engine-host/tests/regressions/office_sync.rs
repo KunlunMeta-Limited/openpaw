@@ -102,6 +102,7 @@ struct Fixture {
     drop_next_snapshot_reply: bool,
     dropped_replies: usize,
     snapshot_bytes: Vec<Vec<u8>>,
+    next_action: Option<serde_json::Value>,
 }
 async fn sync_scenario() {
     use axum::response::IntoResponse;
@@ -117,9 +118,16 @@ async fn sync_scenario() {
         assert_eq!(headers["authorization"], "Bearer fixture-key");
         if request["type"] == "ui.next" {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let actions: Vec<_> = shared
+                .lock()
+                .unwrap()
+                .next_action
+                .take()
+                .into_iter()
+                .collect();
             return (
                 axum::http::StatusCode::OK,
-                Json(json!({"code":200,"msg":"fixture","data":{"actions":[]}})),
+                Json(json!({"code":200,"msg":"fixture","data":{"actions":actions}})),
             )
                 .into_response();
         }
@@ -133,14 +141,26 @@ async fn sync_scenario() {
             "office.capabilities" => {
                 json!({"scene":{"protocolVersion":"2.0","sceneId":"office-1","command":{},"batch":{},"actors":actors,"objects":[],"capabilities":[]},"ui":ui,"requests":{},"responses":{"success":{},"error":{}}})
             }
-            "office.read" => directory(&s),
+            "office.read" => {
+                if request.get("teamId").is_some() {
+                    json!({"snapshot":s.snapshot.clone().unwrap(),"scene":{"protocolVersion":"2.0","actors":actors},"pendingDecisions":[]})
+                } else {
+                    directory(&s)
+                }
+            }
             "offices.initialize" => {
-                s.initialized = true;
+                // 官方空列表只登记chat，不会凭空创建办公室或快照。
                 if let Some(first) = request["offices"].as_array().and_then(|a| a.first()) {
+                    s.initialized = true;
                     s.snapshot = Some(first.clone());
                 }
                 code = 202;
                 directory(&s)
+            }
+            "office.snapshot" if !s.initialized => {
+                // 与原版Office一致，尚无该办公室时返回明确404；不能假成功。
+                code = 404;
+                json!({"reasonCode":"OFFICE_NOT_INITIALIZED"})
             }
             "office.snapshot" => {
                 s.snapshot_bytes.push(bytes.to_vec());
@@ -167,6 +187,19 @@ async fn sync_scenario() {
                 }
             }
             "ui.next" => json!({"actions":[]}),
+            "ui.respond" => {
+                if request["presentation"]["success"] == true {
+                    assert!(
+                        !s.snapshot.as_ref().unwrap()["conversations"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|c| c["id"] == "delete-target"),
+                        "必须先移除快照，再确认删除"
+                    );
+                }
+                json!({"interactionId":request["interactionId"],"delivered":true})
+            }
             _ => panic!("unexpected operation"),
         };
         (
@@ -191,6 +224,7 @@ async fn sync_scenario() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = config(tmp.path());
     cfg.office = Some(OfficeConfig {
+        activity_window: false,
         base_url: format!("http://{address}"),
         api_key_env: "PAWOFFICE_TEST_KEY".into(),
         allowed_origins: vec!["http://127.0.0.1:8765".into()],
@@ -198,7 +232,7 @@ async fn sync_scenario() {
         creation_slots: vec![],
     });
     let host = Host::start(cfg.clone()).await.unwrap();
-    let server = HostServer::bind(host, 0).await.unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
     async fn wait(mut ready: impl FnMut() -> bool) {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !ready() {
@@ -258,6 +292,68 @@ async fn sync_scenario() {
     }
     fixture.lock().unwrap().mode = 1;
     wait(|| state() == "applied").await;
+    // 真实UI处理持有优先计数；必须仍可同步删除，不能被自身让行规则挡住。
+    for id in ["delete-target", "keep-other"] {
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: id.into(),
+        };
+        let binding = host.open_session(scope.clone()).await.unwrap();
+        host.submit_run(&scope, &binding.session_id, "保留真实会话事实".into())
+            .await
+            .unwrap();
+    }
+    host.wait_idle().await;
+    wait(|| {
+        fixture.lock().unwrap().snapshot.as_ref().unwrap()["conversations"]
+            .as_array()
+            .unwrap()
+            .len()
+            == 2
+    })
+    .await;
+    fixture.lock().unwrap().next_action = Some(
+        json!({"id":"delete-ui-d91","teamId":"office-1","conversationId":"delete-target","action":"conversation.delete"}),
+    );
+    wait(|| {
+        fixture
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .any(|r| r["type"] == "ui.respond" && r["interactionId"] == "delete-ui-d91")
+    })
+    .await;
+    {
+        let s = fixture.lock().unwrap();
+        let response = s
+            .requests
+            .iter()
+            .find(|r| r["type"] == "ui.respond" && r["interactionId"] == "delete-ui-d91")
+            .unwrap();
+        assert_eq!(response["presentation"]["success"], true, "{response}");
+        let remaining = s.snapshot.as_ref().unwrap()["conversations"]
+            .as_array()
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0]["id"], "keep-other");
+    }
+    host.delete_session(&ClientScope {
+        namespace: "office".into(),
+        slot_id: "office-1".into(),
+        conversation_id: "keep-other".into(),
+    })
+    .await
+    .unwrap();
+    wait(|| {
+        fixture.lock().unwrap().snapshot.as_ref().unwrap()["conversations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    let original = fixture.lock().unwrap().snapshot.clone().unwrap();
     server.shutdown().await.unwrap();
     fixture.lock().unwrap().initialized = false;
     let count = fixture
@@ -357,6 +453,7 @@ async fn sync_scenario() {
     let another = tempfile::tempdir().unwrap();
     let mut stale_cfg = config(another.path());
     stale_cfg.office = Some(OfficeConfig {
+        activity_window: false,
         base_url: format!("http://{address}"),
         api_key_env: "PAWOFFICE_TEST_KEY".into(),
         allowed_origins: vec!["http://127.0.0.1:8765".into()],
