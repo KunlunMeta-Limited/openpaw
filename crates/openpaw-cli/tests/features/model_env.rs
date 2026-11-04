@@ -29,7 +29,14 @@ fn command(home: &Path) -> Command {
 fn file(home: &Path, contents: &str) {
     std::fs::write(home.join(".env"), contents).unwrap();
 }
-fn run_chat(mut command: Command, home: &Path) -> std::process::Output {
+fn run_chat(command: Command, home: &Path) -> std::process::Output {
+    run_chat_ready(command, home, None)
+}
+fn run_chat_ready(
+    mut command: Command,
+    home: &Path,
+    ready: Option<std::sync::mpsc::SyncSender<()>>,
+) -> std::process::Output {
     command
         .arg("--home")
         .arg(home)
@@ -45,6 +52,9 @@ fn run_chat(mut command: Command, home: &Path) -> std::process::Output {
         .unwrap()
         .write_all(b"hello\nexit\n")
         .unwrap();
+    if let Some(ready) = ready {
+        ready.send(()).unwrap();
+    }
     child.wait_with_output().unwrap()
 }
 #[test]
@@ -157,7 +167,13 @@ fn actual_provider_http_uses_file_credentials_endpoint_and_selected_model() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
+        let (ready, input_ready) = std::sync::mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
+            // 监听先绑定以容纳已到达请求；原网络期限不包含目录/.env准备
+            // 或进程创建。发送端失败会断开通道，不能静默跳过真实HTTP断言。
+            input_ready
+                .recv()
+                .expect("CLI did not reach input readiness");
             let deadline = Instant::now() + Duration::from_secs(15);
             let mut socket = loop {
                 match listener.accept() {
@@ -210,10 +226,12 @@ fn actual_provider_http_uses_file_credentials_endpoint_and_selected_model() {
                 .env("OPENPAW_MODEL", "system-model")
                 .env("OPENAI_API_KEY", "system-fixture-secret");
         }
-        let out = run_chat(c, dir.path());
+        let started = Instant::now();
+        let out = run_chat_ready(c, dir.path(), Some(ready));
         assert!(
             out.status.success(),
-            "{}",
+            "override={use_override}, client_elapsed={:?}: {}",
+            started.elapsed(),
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(String::from_utf8_lossy(&out.stdout).contains("model-connected"));
