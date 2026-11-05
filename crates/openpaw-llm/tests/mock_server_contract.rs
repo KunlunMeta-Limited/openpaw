@@ -97,6 +97,33 @@ fn http_error(status: &str, body: &str) -> String {
     )
 }
 
+#[tokio::test]
+async fn openai_early_body_truncation_distinguishes_heartbeat_and_uncommitted_content() {
+    let prefix = [
+        ("", "early-transient"),
+        (": keepalive\r\n\r\n", "early-transient"),
+        ("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"PRIVATE", "content-or-unknown"),
+        ("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"PRIVATE\"}}]}}]}\n\n", "content-or-unknown"),
+    ];
+    for (body, boundary) in prefix {
+        let addr = spawn_mock(vec![format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len() + 100
+        )]);
+        let p =
+            OpenAiProvider::new("test-key", "test-model").with_base_url(format!("http://{addr}"));
+        let result = p.stream(req("test-model")).await.unwrap();
+        use futures::StreamExt;
+        let events = result.collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 1);
+        let error = events[0].as_ref().unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!("provider error: stream read: {boundary} unexpected-eof")
+        );
+    }
+}
+
 fn req(model: &str) -> CompletionRequest {
     CompletionRequest {
         model: model.to_string(),

@@ -598,7 +598,7 @@ impl AgentLoop {
     ) -> Result<openpaw_core::CompletionResponse> {
         let mut attempts = 0;
         'attempt: loop {
-            let stream = match control
+            let mut stream = match control
                 .wait(tokio::time::timeout(
                     self.stream_timeout,
                     self.provider.stream(req.clone()),
@@ -637,7 +637,6 @@ impl AgentLoop {
                     return Err(error);
                 }
             };
-            futures::pin_mut!(stream);
             let mut emitted = false;
             loop {
                 let ev = control
@@ -647,6 +646,25 @@ impl AgentLoop {
                 let Some(ev) = ev else { break };
                 let ev = match ev {
                     Ok(ev) => ev,
+                    Err(Error::Provider(ref reason))
+                        if matches!(
+                            reason.as_str(),
+                            "stream read: early-transient connection-interrupted"
+                                | "stream read: early-transient unexpected-eof"
+                        ) && !emitted
+                            && attempts < self.retry_policy.max_retries.min(1) =>
+                    {
+                        // 只重发当前模型请求，已完成工具仍在原请求历史中。
+                        // 先释放失败连接，再以原取消/期限控制等待。
+                        attempts += 1;
+                        drop(stream);
+                        let delay = self
+                            .retry_policy
+                            .delay_for_attempt_with_jitter(attempts, None)
+                            .max(Duration::from_millis(500));
+                        control.wait(tokio::time::sleep(delay)).await?;
+                        continue 'attempt;
+                    }
                     Err(Error::Provider(ref reason))
                         if reason.starts_with("invalid OpenAI streamed tool arguments")
                             && !emitted

@@ -32,6 +32,7 @@ const processes = []
 let browser, context, providerServer, page, webFixtureServer, webBase
 const webFixture = { requests: [], active: 0, cancelled: 0 }
 const teamGates = new Map()
+const interruptedModelRequests = new Map()
 let networkGate
 const delay = ms => new Promise(r => setTimeout(r, ms))
 async function waitFor(fn, timeout = 30000) {
@@ -92,6 +93,23 @@ function provider() {
       const lastUser = data.messages.findLastIndex(m => m.role === 'user')
       const prompt = data.messages[lastUser]?.content ?? ''
       const results = data.messages.slice(lastUser + 1).filter(m => m.role === 'tool')
+      if (['D168-断流恢复','D168-断流耗尽','D168-部分正文断流'].includes(prompt)) {
+        const attempts=interruptedModelRequests.get(prompt)??[]
+        attempts.push(data);interruptedModelRequests.set(prompt,attempts)
+        if (prompt==='D168-断流恢复') {
+          if (attempts.length===1) {
+            finish({tool_calls:[{index:0,id:'d168-read-once',type:'function',function:{name:'read_file',arguments:'{"path":"README.md"}'}}]},'tool_calls')
+            return
+          }
+          assert.equal(results.length,1);assert.match(results[0].content,/README-/)
+          if(attempts.length===3){finish({content:'D168-已恢复当前请求，读取结果仍有效。'});return}
+        }
+        const partial=prompt==='D168-部分正文断流'
+        const sse=partial?'data: '+JSON.stringify({choices:[{delta:{content:'D168-已保留部分正文。'}}]})+'\n\n':': heartbeat\n\n'
+        res.writeHead(200,{'content-type':'text/event-stream','content-length':Buffer.byteLength(sse)+100,'connection':'close'})
+        res.end(sse)
+        return
+      }
       if (prompt==='R30版本一图文与数据') {
         const calls=[['render_visual',{path:'reports/images/R30-flow.svg',title:'真实流程图',kind:'diagram',nodes:[{id:'a',label:'输入'},{id:'b',label:'结果'}],edges:[{from:'a',to:'b'}]}],
           ['write_file',{path:'reports/R30-notes.md',content:'# R30 phase-one\n\n这是第一版真实图文。\n\n![流程图](images/R30-flow.svg)\n'}],
@@ -533,6 +551,26 @@ try {
   await page.screenshot({path:join(output,'14-provider-auth-error.png'),fullPage:true})
   await page.getByRole('button',{name:'重新同步',exact:true}).click();await waitFor(async()=>!await page.getByText('正在同步聊天记录…',{exact:true}).isVisible())
   await uiSend(page,'UI-模型失败后恢复')
+  for(const [prompt,expected,count] of [
+    ['D168-断流恢复','D168-已恢复当前请求，读取结果仍有效。',3],
+    ['D168-断流耗尽','本请求已尝试断流重试',2],
+    ['D168-部分正文断流','D168-已保留部分正文。',1],
+  ]){
+    await fresh(page);await box(page).fill(prompt);await page.getByRole('button',{name:'发送消息',exact:true}).click()
+    await waitFor(async()=>{const t=await transcriptOf(page).innerText();return t.includes(expected)&&(count===3||t.includes('回复未完成'))})
+    await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:30000})
+    const before=await transcriptOf(page).innerText()
+    assert.equal(before.includes('回复未完成'),count!==3)
+    if(count!==3)assert.match(before,/本次未触发 OpenPaw 空闲超时/)
+    assert.equal(interruptedModelRequests.get(prompt).length,count)
+    if(count===3)assert.deepEqual(interruptedModelRequests.get(prompt)[1],interruptedModelRequests.get(prompt)[2])
+    if(count===2)assert.deepEqual(...interruptedModelRequests.get(prompt))
+    await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,prompt)
+    await waitFor(async()=>{const t=await transcriptOf(page).innerText();return t.includes(expected)&&(count===3||t.includes('回复未完成'))})
+    assert.equal(interruptedModelRequests.get(prompt).length,count)
+    await page.screenshot({path:join(output,'d168-'+count+'-requests.png'),fullPage:true})
+  }
+  report.assertions.push('D168: real HTTP early truncation retries identical request after prior tool; repeated failure and partial output survive real browser reload without replay')
   await fresh(page);await stopHost();const beforeOffline=report.modelRequests.length
   await box(page).fill('UI-首次发送连接失败');await page.getByRole('button',{name:'发送消息',exact:true}).click()
   await waitFor(async()=>(await transcriptOf(page).innerText()).includes('回复未完成'))

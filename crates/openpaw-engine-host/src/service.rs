@@ -740,7 +740,10 @@ impl Host {
         control: RunControl,
         execution: Option<crate::orchestration::Execution>,
     ) {
-        let model_trace = Arc::new(Mutex::new(ModelTrace::default()));
+        let model_trace = Arc::new(Mutex::new(ModelTrace {
+            run_id: view.run_id.clone(),
+            ..ModelTrace::default()
+        }));
         let checkpoint_stop = tokio_util::sync::CancellationToken::new();
         let checkpoint_id = view.run_id.clone();
         let checkpoint_session = view.session_id.clone();
@@ -1636,13 +1639,21 @@ impl LlmProvider for RunProvider {
     > {
         use futures::StreamExt;
         let reserved = request.max_tokens;
-        if let Some(g) = &self.group {
-            g.reserve(reserved)?;
+        {
+            if let Some(g) = &self.group {
+                if let Err(error) = g.reserve(reserved) {
+                    let trace = self.trace.lock().unwrap_or_else(|e| e.into_inner());
+                    if trace.early_stream_failure {
+                        trace.note("body-read-retry-not-admitted");
+                    }
+                    return Err(error);
+                }
+            }
+            self.trace
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .begin("等待建立响应流");
         }
-        self.trace
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .begin("等待建立响应流");
         let stream = self.inner.stream(self.with_context(request)).await?;
         self.trace
             .lock()
@@ -1653,10 +1664,28 @@ impl LlmProvider for RunProvider {
         let mut settled = false;
         Ok(stream
             .map(move |event| {
-                if event.is_ok() {
+                {
                     let mut trace = trace.lock().unwrap_or_else(|e| e.into_inner());
-                    trace.events += 1;
-                    trace.waiting("等待后续有效响应");
+                    if event.is_ok() {
+                        trace.events += 1;
+                        trace.waiting("等待后续有效响应");
+                    }
+                    match &event {
+                        Err(openpaw_core::Error::Provider(reason)) => {
+                            trace.early_stream_failure = matches!(
+                                reason.as_str(),
+                                "stream read: early-transient connection-interrupted"
+                                    | "stream read: early-transient unexpected-eof"
+                            );
+                            if reason.starts_with("stream read:") {
+                                trace.note("body-read-failed");
+                            }
+                        }
+                        Ok(openpaw_core::StreamEvent::Final(_)) if trace.stream_retry_attempt => {
+                            trace.note("retry-response-completed");
+                        }
+                        _ => {}
+                    }
                 }
                 if let Ok(openpaw_core::StreamEvent::Final(response)) = &event {
                     if !settled {
@@ -1684,21 +1713,42 @@ impl LlmProvider for RunProvider {
 // 仅记录可公开的结构与单调时间，不保留请求内容、URL或上游响应正文。
 #[derive(Default)]
 struct ModelTrace {
+    run_id: String,
     request: u64,
     phase: &'static str,
     waiting_since: Option<tokio::time::Instant>,
     events: u64,
+    early_stream_failure: bool,
+    stream_retry_attempt: bool,
 }
 impl ModelTrace {
     fn begin(&mut self, phase: &'static str) {
+        self.stream_retry_attempt = std::mem::take(&mut self.early_stream_failure);
         self.request += 1;
         self.phase = phase;
         self.waiting_since = Some(tokio::time::Instant::now());
         self.events = 0;
+        if self.stream_retry_attempt {
+            self.note("body-read-retry-started");
+        }
     }
     fn waiting(&mut self, phase: &'static str) {
         self.phase = phase;
         self.waiting_since = Some(tokio::time::Instant::now());
+    }
+    fn note(&self, event: &'static str) {
+        if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "engine-host diagnostics model run={} request={} event={} phase={} elapsed_ms={} effective_events={} after_body_retry={}",
+                self.run_id,
+                self.request,
+                event,
+                self.phase,
+                self.waiting_since.map_or(0, |at| at.elapsed().as_millis()),
+                self.events,
+                self.stream_retry_attempt,
+            );
+        }
     }
     fn explain(&self, error: &mut HostError, idle_secs: u64) {
         if self.request == 0
@@ -1716,8 +1766,18 @@ impl ModelTrace {
         }
         let elapsed = self.waiting_since.map_or(0, |at| at.elapsed().as_secs());
         error.message.push_str(&format!(
-            "（第{}次模型请求；阶段：{}；本阶段已等待{}秒；已收到{}个有效事件；无事件超时阈值{}秒）",
-            self.request, self.phase, elapsed, self.events, idle_secs));
+            "（第{}次模型请求；阶段：{}；本阶段已等待{}秒；已收到{}个有效事件",
+            self.request, self.phase, elapsed, self.events
+        ));
+        if error.kind == "stream_idle" {
+            error
+                .message
+                .push_str(&format!("；无事件超时阈值{idle_secs}秒"));
+        }
+        if self.stream_retry_attempt {
+            error.message.push_str("；本请求已尝试断流重试");
+        }
+        error.message.push('）');
         if error.kind == "stream_idle" {
             error.message.push_str(
                 "。尚不能据此确定是模型处理慢还是连接停滞；已有成果保留，不会自动重做操作",
@@ -1872,10 +1932,15 @@ pub(crate) fn safe_run_error(raw: &str, state: RunState) -> HostError {
             "provider_empty",
             "模型未返回有效答复；可缩小任务后显式重试，已完成操作不会自动重做",
         )
+    } else if raw == "provider error: 协作总模型调用或输出预算不足" {
+        (
+            "run_failed",
+            "协作模型调用或输出预算不足，本轮已停止；未发起超出预算的请求，已有回复和成果保留",
+        )
     } else if raw.starts_with("provider error: stream read:") {
         // 流读取/解码失败不等于确定物理断网，也不能吞成无原因的通用失败。
         // 仅识别Provider前缀，固定说明避免把上游响应正文或凭据穿透到页面。
-        ("provider_stream", "模型响应流读取失败，本轮已停止；已有回复和成果保留，请检查模型服务连接后再决定是否重试，不会自动重做操作")
+        ("provider_stream", "模型响应流读取失败，本轮已停止；本次未触发 OpenPaw 空闲超时。已有回复和成果保留，请检查模型服务连接后再决定是否重试，不会自动重做操作")
     } else if raw.contains("finish_reason")
         || raw.contains("stream ended")
         || raw.contains("model response incomplete")
@@ -2022,6 +2087,18 @@ mod runtime_context_tests {
         assert!(error.message.contains("第1次模型请求"));
         assert!(!error.message.contains("SECRET"));
         assert!(!error.message.contains("private.invalid"));
+        trace.early_stream_failure = true;
+        trace.begin("等待首次有效响应");
+        let mut error = safe_run_error(
+            "provider error: stream read: early-transient unexpected-eof",
+            RunState::Failed,
+        );
+        trace.explain(&mut error, 180);
+        assert_eq!(error.kind, "provider_stream");
+        assert!(error.message.contains("第2次模型请求"));
+        assert!(error.message.contains("已尝试断流重试"));
+        assert!(error.message.contains("本次未触发 OpenPaw 空闲超时"));
+        assert!(!error.message.contains("180秒"));
         for (raw, state) in [
             (
                 "timeout: tool execution budget exceeded",
@@ -2035,6 +2112,85 @@ mod runtime_context_tests {
             assert_eq!(other, before, "工具超时和用户停止不能误报模型错误");
         }
     }
+
+    #[tokio::test]
+    async fn d168_body_retry_respects_shared_request_and_output_budgets() {
+        struct Truncated(std::sync::atomic::AtomicUsize);
+
+        #[async_trait]
+        impl LlmProvider for Truncated {
+            async fn complete(
+                &self,
+                _: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<openpaw_core::CompletionResponse> {
+                unreachable!()
+            }
+            async fn stream(
+                &self,
+                _: openpaw_core::CompletionRequest,
+            ) -> openpaw_core::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    openpaw_core::Result<openpaw_core::StreamEvent>,
+                >,
+            > {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::iter([Err(
+                    openpaw_core::Error::Provider(
+                        "stream read: early-transient unexpected-eof".into(),
+                    ),
+                )])))
+            }
+            fn capabilities(&self) -> openpaw_core::Capabilities {
+                openpaw_core::Capabilities::default()
+            }
+            fn name(&self) -> &str {
+                "truncated"
+            }
+            fn default_model(&self) -> &str {
+                "truncated"
+            }
+        }
+
+        for (requests, tokens) in [(1, 0), (0, 128)] {
+            let control = RunControl {
+                run_id: "test-run".into(),
+                cancel: Default::default(),
+                fault: Default::default(),
+            };
+            let group = crate::orchestration::Group::new(
+                control.run_id.clone(),
+                crate::config::AgentsConfig {
+                    max_model_requests: requests,
+                    max_output_tokens: tokens,
+                    ..Default::default()
+                },
+                &control,
+                0,
+            );
+            let upstream = Arc::new(Truncated(0.into()));
+            let provider = Arc::new(RunProvider {
+                inner: upstream.clone(),
+                context: String::new(),
+                group: Some(group.clone()),
+                trace: Arc::new(Mutex::new(ModelTrace::default())),
+            });
+            let engine = AgentLoop::new(provider).with_max_tokens(128);
+            let mut session = Session::new("budget-fixture", "truncated");
+            session.messages.push(Message::user_text("start"));
+            let failure = engine
+                .run_turn(&mut session, None, &[], &mut |_| {})
+                .await
+                .unwrap_err();
+            let safe = safe_run_error(&failure.to_string(), RunState::Failed);
+            assert!(safe.message.contains("预算不足"));
+            assert_eq!(upstream.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(group.summary()["provider_calls"], 1);
+            assert_eq!(group.summary()["unknown_requests"], 1);
+            assert_eq!(group.summary()["output_used_or_reserved"], 128);
+        }
+    }
+
     #[test]
     fn d43_compaction_and_other_system_requests_keep_their_own_context() {
         let provider = RunProvider {
