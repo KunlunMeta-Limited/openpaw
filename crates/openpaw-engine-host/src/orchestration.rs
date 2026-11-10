@@ -149,6 +149,28 @@ impl Group {
         self.queue_changed.notify_waiters();
     }
 
+    /// 功能：只读返回本组真实角色FIFO位置及前驱。
+    /// 参数：role和id为原委派身份。
+    /// 返回：排位及前驱Run，尚未入队返回空，不推断开工。
+    /// 错误：无；互斥锁毒化时读取原数据。
+    /// 状态：不改变队列、许可或执行顺序。
+    /// 并发与取消：短锁快照，返回后可能变化，不持锁等待。
+    /// 权限：只在已鉴别主Run的delegation_status使用。
+    /// 关联：CHG-2026-0007第12.160节D172；REQ-OP-022。
+    pub(crate) fn queue_position(&self, role: &str, id: &str) -> (Option<usize>, Option<String>) {
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(items) = queue.get(role) else {
+            return (None, None);
+        };
+        let Some(index) = items.iter().position(|item| item == id) else {
+            return (None, None);
+        };
+        (
+            Some(index + 1),
+            index.checked_sub(1).and_then(|i| items.get(i)).cloned(),
+        )
+    }
+
     /// 功能：等待本人成为队首后取得真实角色及组执行额度。
     /// 参数：role和id来自原接受流程，cancel为子Run取消上下文。
     /// 返回：持有到真实执行和清理结束的两枚许可。
@@ -428,6 +450,10 @@ pub(crate) struct Delegation {
 #[serde(deny_unknown_fields)]
 struct Input {
     role_id: String,
+    #[serde(default)]
+    candidate_roles: Option<Vec<String>>,
+    #[serde(default)]
+    required_tools: Option<Vec<String>>,
     title: String,
     instructions: String,
     acceptance: String,
@@ -446,13 +472,50 @@ fn wait_default() -> bool {
 impl Input {
     fn parse(value: &Value) -> HostResult<Self> {
         let input: Self = serde_json::from_value(value.clone()).map_err(|_| {
-            HostError::new(
-                "invalid_input",
-                "委派需要role_id/title/instructions/acceptance，不允许覆盖根或模型",
-            )
+            let missing: Vec<_> = ["role_id", "title", "instructions", "acceptance"]
+                .into_iter()
+                .filter(|field| value.get(*field).is_none())
+                .collect();
+            let message = if missing.is_empty() {
+                "委派字段类型或未知字段不合法；需要role_id/title/instructions/acceptance，不允许覆盖根或模型".to_owned()
+            } else {
+                format!("委派缺少必填字段：{}。补齐同一项任务的准确输入后再提交；未创建任务。", missing.join(", "))
+            };
+            HostError::new("invalid_input", message)
         })?;
+        if input.role_id != "auto"
+            && (input.candidate_roles.is_some() || input.required_tools.is_some())
+        {
+            return Err(HostError::new(
+                "invalid_input",
+                "固定role_id不能附candidate_roles/required_tools。未指定人员的独立任务请保留候选和必需工具、将role_id改为auto；确需固定人员则删除这两个仅auto字段。不会自动改派或创建任务。",
+            ));
+        }
+        if input.role_id == "auto"
+            && (input.candidate_roles.as_ref().is_none_or(|roles| {
+                roles.is_empty()
+                    || roles.len() > 5
+                    || roles
+                        .iter()
+                        .any(|r| r == "lead" || crate::agents::role(r).is_none())
+                    || roles
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != roles.len()
+            }) || input.required_tools.as_ref().is_none_or(|tools| {
+                tools.len() > 64
+                    || tools.iter().any(|t| {
+                        t.is_empty()
+                            || t.len() > 80
+                            || !t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
+            }))
+        {
+            return Err(HostError::new("invalid_input", "auto模式必须同时提供candidate_roles（1—5个不同且合法的子角色）和required_tools（最多64项合法工具名）；纯文字任务也须显式required_tools=[]。不能以更换固定角色绕过缺失参数；未创建任务。"));
+        }
         if input.role_id == "lead"
-            || crate::agents::role(&input.role_id).is_none()
+            || (input.role_id != "auto" && crate::agents::role(&input.role_id).is_none())
             || input.title.trim().is_empty()
             || input.title.chars().count() > 80
             || input.instructions.trim().is_empty()
@@ -470,6 +533,45 @@ impl Input {
         }
         Ok(input)
     }
+
+    // 调用方持原accepting门；选择后在释放门前提交原意图和Run，
+    // 后一并发调用看到已入FIFO的前项，不另建预留或调度器。
+    fn resolve_role(
+        &mut self,
+        group: &Group,
+        host_tools: &[String],
+        prior: &[Delegation],
+    ) -> HostResult<()> {
+        if self.role_id != "auto" {
+            return Ok(());
+        }
+        let queue = group.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let candidates = self.candidate_roles.as_ref().expect("validated candidates");
+        let required = self.required_tools.as_ref().expect("validated tools");
+        self.role_id = candidates
+            .iter()
+            .filter(|role| {
+                let allowed = group.config.allowed(role, host_tools);
+                required.iter().all(|tool| allowed.contains(tool))
+            })
+            // 已完成任务已退出FIFO；同为空闲时仍参考原意图接受次数，
+            // 避免稍晚补派又挤回刚结束的人，其他合格成员从未参与。
+            // 历史均衡只用于队列等长，不能把真实空闲者让给繁忙者。
+            .min_by_key(|role| {
+                (
+                    queue.get(role.as_str()).map_or(0, |q| q.len()),
+                    prior.iter().filter(|d| &d.role_id == *role).count(),
+                )
+            })
+            .cloned()
+            .ok_or_else(|| {
+                HostError::new(
+                    "scope_denied",
+                    "候选成员均不具备所列必需工具；请调整任务或候选，不会自动授予权限",
+                )
+            })?;
+        Ok(())
+    }
 }
 /// 功能：提供主角色唯一的薄委派工具定义。
 /// 参数：无。
@@ -480,8 +582,8 @@ impl Input {
 /// 权限：仅可信协作主Run暴露；执行仍验证上下文。
 /// 关联：需求/设计REQ-OP-022；DES-OP-012。
 pub(crate) fn spec() -> ToolSpec {
-    let mut spec = ToolSpec::new("delegate_task", "交给research/organize/draft/review/audit真实独立同事。默认等待结果；wait_for_completion=false只返回已接受，须用delegation_status取得真实结果，不能报告完成。source_task_id引用同父已完成前序任务以表达实际负责人之间的交接，context携带真实产物/路径；退修引用审查者任务。持续异步任务须填已open_item的work_item。同角色仍串行，不能覆盖根/模型/权限。");
-    spec.input_schema = json!({"type":"object","properties":{"role_id":{"type":"string","enum":["research","organize","draft","review","audit"]},"title":{"type":"string","maxLength":80},"instructions":{"type":"string"},"acceptance":{"type":"string"},"context":{"type":"string"},"wait_for_completion":{"type":"boolean","default":true},"source_task_id":{"type":"string","maxLength":128},"work_item":{"type":"string","maxLength":128}},"required":["role_id","title","instructions","acceptance"],"additionalProperties":false});
+    let mut spec = ToolSpec::new("delegate_task", "交给真实独立同事。每次必填role_id/title/instructions/acceptance；auto另必填candidate_roles和required_tools，纯文字也写required_tools=[]。存在多个就绪且互不依赖的实质交付物时，在同一响应发出多个本工具调用并明确wait_for_completion=false，先派齐再等结果；只有单项或确需结果才能推进时才同步等待。未指定执行人且无成果归属的独立工作使用role_id=auto，而不是固定常见专家；同时列candidate_roles及required_tools（纯文字用空数组），Host按真实工具和本组FIFO负载选择，回执role_id才是实际执行人。用户指定人员/已有明确归属时仍填固定role_id，不静默改派。默认等待结果；wait_for_completion=false只返回接受，须用delegation_status取得真实结果。source_task_id引用同父已完成前序task_id表达交接；context带真实资料；持续异步须已open_item的work_item。同角色串行，不覆盖权限。auto模式必须role_id=auto并同时带candidate_roles/required_tools；固定role_id禁止带这两个字段。用户要求不同同事/并行时不要对独立任务反复固定同一角色；无固定归属时用auto。");
+    spec.input_schema = json!({"type":"object","properties":{"role_id":{"type":"string","enum":["auto","research","organize","draft","review","audit"]},"candidate_roles":{"type":"array","items":{"type":"string","enum":["research","organize","draft","review","audit"]},"minItems":1,"maxItems":5,"uniqueItems":true,"description":"仅auto：列出全部实际合格成员；先按FIFO长度，再按同父已接受任务数较少者，仍相同按此顺序。纯文字成果通常五位均可承担，不因角色简介只列一两人而让其他合格空闲者被排除。不能加入工具能力不足的成员，不在标题或指令写死姓名。"},"required_tools":{"type":"array","items":{"type":"string"},"maxItems":64,"description":"仅auto且必填：执行所必需的实际工具名；纯文字交付填[]。不会授予新权限。"},"title":{"type":"string","maxLength":80},"instructions":{"type":"string"},"acceptance":{"type":"string"},"context":{"type":"string"},"wait_for_completion":{"type":"boolean","default":true},"source_task_id":{"type":"string","maxLength":128},"work_item":{"type":"string","maxLength":128}},"required":["role_id","title","instructions","acceptance"],"additionalProperties":false});
     spec.concurrency = Some(openpaw_core::ToolConcurrency::ParallelSafe);
     spec
 }
@@ -592,7 +694,8 @@ impl Host {
             let ids = input.task_ids.clone();
             let tools = self.inner.config.tools.clone();
             let config = execution.group.config.clone();
-            let (results,pending,finished)=self.inner.store.call_priority(move |db| {
+            let group = execution.group.clone();
+            let (results,pending,finished,participants)=self.inner.store.call_priority(move |db| {
                 let owner=db.get_run(&parent)?;
                 let binding=db.binding(&owner.session_id)?;
                 db.check_live_scope(&binding.scope)?;
@@ -607,15 +710,26 @@ impl Host {
                     };
                     finished+=usize::from(run.state.is_terminal());
                     if !run.state.is_terminal() {pending.push(d.task_id.clone());}
-                    results.push(json!({"task_id":d.task_id,"delegate_call_id":d.call_id,"role_id":d.role_id,"title":d.title,"work_item":d.work_item,"source_task_id":d.source_task_id,"available_tools":config.allowed(&d.role_id,&tools),"state":run.state,"summary":run.text,"error":run.error,"child_run_id":d.child_run}));
+                    let (position, predecessor)=group.queue_position(&d.role_id,&d.child_run);
+                    let phase=if run.state.is_terminal() {"terminal"}
+                        else if run.state==crate::RunState::Cancelling {"cancelling"}
+                        else if run.tools.iter().any(|t|t.state=="awaiting_user") {"awaiting_user"}
+                        else if run.tools.iter().any(|t|t.state=="awaiting_approval") {"awaiting_approval"}
+                        else if run.tools.iter().any(|t|t.state=="awaiting_resource") {"awaiting_resource"}
+                        else if run.state==crate::RunState::Accepted && predecessor.is_some() {"role_fifo"}
+                        else if run.state==crate::RunState::Accepted {"awaiting_execution"}
+                        else if run.tools.iter().any(|t|t.state=="running") {"tool_running"}
+                        else {"running_next_action_unknown"};
+                    results.push(json!({"task_id":d.task_id,"delegate_call_id":d.call_id,"role_id":d.role_id,"title":d.title,"work_item":d.work_item,"source_task_id":d.source_task_id,"available_tools":config.allowed(&d.role_id,&tools),"state":run.state,"summary":run.text,"error":run.error,"child_run_id":d.child_run,"scheduling":{"phase":phase,"role_queue_position":position,"predecessor_run_id":predecessor,"note":"队位是读取瞬间的事实；awaiting_execution不能据此区分角色许可、组容量或全局容量。"}}));
                 }
-                Ok((results,pending,finished))
+                let participants=intents.iter().map(|d|d.role_id.clone()).collect::<std::collections::BTreeSet<_>>();
+                Ok((results,pending,finished,participants))
             }).await?;
             if input.wait_for == "none"
                 || input.wait_for == "any" && finished > 0
                 || finished == input.task_ids.len()
             {
-                return Ok(json!({"tasks":results,"pending_task_ids":pending}).to_string());
+                return Ok(json!({"tasks":results,"pending_task_ids":pending,"participating_role_ids":participants,"participation_note":"真实受派子角色去重；不含主负责人，不代表所有任务已验收。","next_wait_hint":"仅等待pending_task_ids；已结束结果按task_id收取一次，有真实依赖的后续立即推进。"}).to_string());
             }
             tokio::select! {biased;
                 _=cancel.cancelled()=>return Err(HostError::new("cancelled","委派结果等待已取消")),
@@ -642,7 +756,7 @@ impl Host {
         if execution.role != "lead" || binding.run_id != execution.group.parent {
             return Err(HostError::new("scope_denied", "只有协作主Run可委派"));
         }
-        let input = Input::parse(&binding.input)?;
+        let mut input = Input::parse(&binding.input)?;
         let parent_input = binding.input.clone();
         // 依赖无效时必须在等待执行名额之前拒绝，否则主角色会被一个
         // 尚未就绪的交接堵住，无法收取正在工作的同事结果。保存时仍复验。
@@ -685,6 +799,7 @@ impl Host {
         let limit = execution.group.config.max_delegations;
         let wait = input.wait_for_completion;
         let group = execution.group.clone();
+        let host_tools = self.inner.config.tools.clone();
         let intent = self.inner.store.call_priority(move |db| {
             let parent = db.get_run(&b.run_id)?;
             let owner = db.binding(&parent.session_id)?;
@@ -698,6 +813,8 @@ impl Host {
                 db.check_delegation_input(&b)?;
                 return Ok((d.clone(), false));
             }
+            // 必须在幂等读取之后选人：同call重取不能因负载变化换成员。
+            input.resolve_role(&group, &host_tools, &prior)?;
             if limit != 0 && prior.len() >= limit { return Err(HostError::new("capacity_exceeded", "本轮委派次数已满")); }
             if group.cancel.is_cancelled() {return Err(HostError::new("cancelled","主任务已停止"));}
             {
@@ -820,6 +937,102 @@ impl Host {
 mod tests {
     use super::*;
     #[test]
+    fn d176_auto_selection_uses_capabilities_and_original_fifo_without_changing_fixed_role() {
+        let g = group();
+        let host = vec!["read_file".into(), "web_search".into()];
+        let value = json!({"role_id":"auto","candidate_roles":["research","organize","review"],"required_tools":["web_search"],"title":"独立来源核对","instructions":"按原始输入核对","acceptance":"返回真实来源"});
+        let mut first = Input::parse(&value).unwrap();
+        first.resolve_role(&g, &host, &[]).unwrap();
+        assert_eq!(first.role_id, "research");
+        g.enqueue("research", "first").unwrap();
+        let mut second = Input::parse(&value).unwrap();
+        second.resolve_role(&g, &host, &[]).unwrap();
+        assert_eq!(second.role_id, "organize");
+        g.enqueue("organize", "second").unwrap();
+        let mut third = Input::parse(&value).unwrap();
+        third.resolve_role(&g, &host, &[]).unwrap();
+        assert_eq!(third.role_id, "review");
+        let mut no_tools = value.clone();
+        no_tools["required_tools"] = json!(["write_file"]);
+        assert_eq!(
+            Input::parse(&no_tools)
+                .unwrap()
+                .resolve_role(&g, &host, &[])
+                .unwrap_err()
+                .kind,
+            "scope_denied"
+        );
+        let accepted = |role: &str, index: usize| Delegation {
+            version: 1,
+            source_task_id: None,
+            work_item: None,
+            run_id: "p".into(),
+            parent_session: "parent".into(),
+            parent_scope: ClientScope {
+                namespace: "office".into(),
+                slot_id: "team".into(),
+                conversation_id: "conversation".into(),
+            },
+            call_id: format!("call-{role}-{index}"),
+            role_id: role.into(),
+            title: "原有真实委派".into(),
+            input_summary: "有限成果".into(),
+            task_id: format!("task-{role}-{index}"),
+            child_scope: ClientScope {
+                namespace: "host-agent".into(),
+                slot_id: "team".into(),
+                conversation_id: format!("child-{role}-{index}"),
+            },
+            child_session: format!("session-{role}-{index}"),
+            child_run: format!("run-{role}-{index}"),
+            created_at: "2026-11-05T00:00:00Z".into(),
+        };
+        let prior = [
+            accepted("research", 1),
+            accepted("research", 2),
+            accepted("organize", 3),
+        ];
+        g.dequeue("research", "first");
+        g.dequeue("organize", "second");
+        let mut later = Input::parse(&value).unwrap();
+        later.resolve_role(&g, &host, &prior).unwrap();
+        assert_eq!(
+            later.role_id, "review",
+            "已完成离队后，优先同为空闲但尚未参与的合格成员"
+        );
+        g.enqueue("review", "occupied").unwrap();
+        let mut idle_first = Input::parse(&value).unwrap();
+        idle_first.resolve_role(&g, &host, &prior).unwrap();
+        assert_eq!(
+            idle_first.role_id, "organize",
+            "真实FIFO优先于历史均衡，等空闲再比较接受次数"
+        );
+        g.enqueue("research", "first").unwrap();
+        for changes in [
+            json!({"role_id":"lead"}),
+            json!({"candidate_roles":["lead"]}),
+            json!({"candidate_roles":["research","research"]}),
+            json!({"required_tools":null}),
+            json!({"candidate_roles":[]}),
+        ] {
+            let mut bad = value.clone();
+            for (k, v) in changes.as_object().unwrap() {
+                bad[k] = v.clone();
+            }
+            assert!(Input::parse(&bad).is_err());
+        }
+        let mut fixed=Input::parse(&json!({"role_id":"research","title":"固定责任","instructions":"必须原执行人","acceptance":"实际结果"})).unwrap();
+        fixed.resolve_role(&g, &host, &[]).unwrap();
+        assert_eq!(fixed.role_id, "research");
+        let mut mixed = value.clone();
+        mixed["role_id"] = json!("research");
+        let error = Input::parse(&mixed).err().unwrap();
+        assert_eq!(error.kind, "invalid_input");
+        assert!(error.message.contains("固定role_id不能附"));
+        assert!(error.message.contains("将role_id改为auto"));
+        assert_eq!(g.queue_position("research", "first").0, Some(1));
+    }
+    #[test]
     fn d116_source_hint_distinguishes_task_from_run_without_cross_item_disclosure() {
         let scope = json!({"namespace":"office","slot_id":"office-1","conversation_id":"c"});
         let d: Delegation = serde_json::from_value(json!({"version":1,"run_id":"parent","parent_session":"ps","parent_scope":scope,"call_id":"call","role_id":"organize","title":"真实有限成果","input_summary":"实际资料","task_id":"delegation:trusted","child_scope":scope,"child_session":"cs","child_run":"child-run","created_at":"2026-10-28T00:00:00Z","work_item":"a"})).unwrap();
@@ -898,6 +1111,16 @@ mod tests {
         g.settle(90, Default::default());
         assert!(g.reserve(11).is_err());
         assert_eq!(g.summary()["unknown_requests"], 1);
+        let missing = json!({"role_id":"auto","title":"整理","instructions":"文字"});
+        let error = Input::parse(&missing).err().unwrap();
+        assert!(error.message.contains("acceptance") && error.message.contains("未创建任务"));
+        assert!(!error.message.contains("整理"));
+        let auto = json!({"role_id":"auto","candidate_roles":["draft"],"title":"整理","instructions":"文字","acceptance":"完成正文"});
+        let error = Input::parse(&auto).err().unwrap();
+        assert!(error.message.contains("required_tools=[]"));
+        let mut complete = auto.clone();
+        complete["required_tools"] = json!([]);
+        assert!(validate(&complete).is_ok());
         let valid = json!({"role_id":"research","title":"核对资料","instructions":"只读取","acceptance":"有来源"});
         assert!(validate(&valid).is_ok());
         for (field, value) in [

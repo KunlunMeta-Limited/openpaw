@@ -315,6 +315,7 @@ impl HostConfig {
             office.validate(self)?;
         }
         let allowed = [
+            "clarify",
             "read_file",
             "glob",
             "grep",
@@ -334,6 +335,9 @@ impl HostConfig {
         ];
         if self.tools.iter().any(|t| !allowed.contains(&t.as_str())) {
             return Err(HostError::new("unsupported", "工具白名单包含未支持项"));
+        }
+        if self.tools.iter().any(|t| t == "clarify") && self.office.is_none() {
+            return Err(HostError::new("unsupported", "clarify需要显式Office配置"));
         }
         let file_tools = [
             "write_file",
@@ -556,6 +560,7 @@ impl AgentsConfig {
                         || matches!(
                             t.as_str(),
                             "read_file"
+                                | "clarify"
                                 | "glob"
                                 | "grep"
                                 | "todo_list"

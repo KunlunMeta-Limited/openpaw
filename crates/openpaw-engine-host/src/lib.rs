@@ -13,6 +13,8 @@ mod continuous;
 #[cfg(feature = "engine-host")]
 mod query;
 #[cfg(feature = "engine-host")]
+mod question;
+#[cfg(feature = "engine-host")]
 mod resource;
 #[cfg(feature = "engine-host")]
 mod server;
@@ -51,3 +53,6 @@ mod orchestration;
 mod workspace_migration;
 #[cfg(feature = "engine-host")]
 pub use workspace_migration::{apply_workspaces, plan_workspaces};
+
+#[cfg(feature = "engine-host")]
+mod delivery;

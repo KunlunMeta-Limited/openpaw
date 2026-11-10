@@ -10,7 +10,11 @@ mod approvals;
 /// 禁止职责：不重放写入、不扫描工作区补造历史、不授予执行权限。
 pub(crate) mod artifacts;
 mod chat;
-mod client;
+/// 职责：复用Office原HTTP连接池并校验响应作用域与决策结果。
+/// 输入输出：可信Host请求与严格校验后的Office响应。
+/// 依赖：原OfficeConfig、reqwest和冻结决策契约。
+/// 禁止职责：不更改目的地址、不替代用户选择、不授予工具权限。
+pub(crate) mod client;
 mod details;
 mod dto;
 mod projection;
@@ -150,6 +154,7 @@ impl OfficeConfig {
             !matches!(
                 name.as_str(),
                 "read_file"
+                    | "clarify"
                     | "glob"
                     | "grep"
                     | "todo_list"
@@ -191,3 +196,42 @@ pub(crate) fn router(
         .merge(artifacts::router(host, config, address))
 }
 pub(crate) use projection::Coordinator;
+
+/// 功能：复用原投影同步屏障确保问题的父会话存在于Office。
+/// 参数：host/config/scope为可信绑定，transport为原协调器句柄。
+/// 返回：同步且服务端确认会话存在后成功。
+/// 错误：网络、协议、删除或对话尚未就绪，不能假称已提问。
+/// 状态：只同步原投影，不新建对话或执行授权。
+/// 并发与取消：由外层原问题期限及取消包裹，不持根锁。
+/// 权限：只使用显式Office与原父会话范围。
+/// 关联：REQ-OP-013；DES-OP-008；CHG-2026-0007第9.16节。
+pub(crate) async fn prepare_question(
+    host: &crate::Host,
+    config: &OfficeConfig,
+    scope: &crate::ClientScope,
+    transport: &crate::question::Transport,
+) -> HostResult<()> {
+    projection::sync_once(
+        host,
+        config,
+        &scope.slot_id,
+        &transport.client,
+        false,
+        transport.address,
+    )
+    .await?;
+    let (_, data) = transport
+        .client
+        .post(serde_json::json!({"type":"office.read","teamId":scope.slot_id}))
+        .await?;
+    if !data["snapshot"]["conversations"]
+        .as_array()
+        .is_some_and(|v| v.iter().any(|c| c["id"] == scope.conversation_id))
+    {
+        return Err(HostError::new(
+            "office_unavailable",
+            "问题所属对话尚未完成同步",
+        ));
+    }
+    Ok(())
+}

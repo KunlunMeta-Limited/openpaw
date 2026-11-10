@@ -232,7 +232,7 @@ async fn completion_returns(
                 "command":{"protocolVersion":"2.0","sceneId":team,"commandId":command,
                     "type":"activity.start","capability":"office.visit",
                     "participants":[{"entityId":role.actor,"role":"visitor"},{"entityId":lead.actor,"role":"host"}],
-                    "params":{"stops":[{"hostId":lead.actor,"message":format!("{}：独立执行已结束，向分配人汇报结果，请核验。",super::dto::bounded(&delegation.title,80))}]},
+                    "params":{"stops":[{"hostId":lead.actor,"message":format!("已处理：{}。",super::dto::bounded(&delegation.title,48))}]},
                     "busyPolicy":"queue","expiresAt":chrono::DateTime::from_timestamp_millis(expiry).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)}})).await?;
             // 只记录实际送达页面；完整播放仍需浏览器runtime记录证明。
             Ok::<_, crate::HostError>(
@@ -604,10 +604,10 @@ mod tests {
                 assert_eq!(command["participants"][0]["role"], "visitor");
                 assert_eq!(command["participants"][1]["role"], "host");
                 assert_eq!(command["busyPolicy"], "queue");
-                assert!(command["params"]["stops"][0]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("请核验"));
+                let message = command["params"]["stops"][0]["message"].as_str().unwrap();
+                assert!(message.starts_with("已处理：独立待办"), "{message}");
+                assert!(message.ends_with('。'));
+                assert!(!message.contains("分配人") && !message.contains("请核验"));
                 let expiry =
                     chrono::DateTime::parse_from_rfc3339(command["expiresAt"].as_str().unwrap())
                         .unwrap()

@@ -1,5 +1,7 @@
 # Office 修改申请集中台账
 
+2026-11-04 R27真实复现补证（仍暂缓，未修改Office）：原5d21cf2服务/构建与Chromium在隔离端口实测，A有一条running visit后真实点击切到B，任务/白板已为B，导出runtime仍保留A的running visit；这条旧动作不会因切换自动撤销。两条带正确conversationId的完成汇报同时提交到同一host，HTTP均接受，导出为一条running、一条queued，全部完成约13.2秒（短300ms讲话测试）；不能把顺序播放归因于Host等待前人回执。证据及逐文件候选在文末本日期补充，用户需查看R27后再决定，当前不实施。
+
 2026-10-28 最新运行升级入口：用户要求“全部都按照最新的版本运行”。Office来源已冻结b33e206c4decf5c111e78fc134506079e97dd765，26来源仅office-integration.md内容变化，无Schema/后端协议变化；按原CHG0007 §12.106切换8765并复用当前最新已验证Host。实际运行状态、PID、二进制/前端SHA、备份、回退及真实浏览器结论以 `/home/cheng/.openpaw/verification/office-latest-runtime-20261028/deployment.json` 和 `closure.json` 为准，不能仅凭目标版本认定部署成功。Office所有活跃Rx仍未实施，DeepSeek不新增付费验收；下方原时点版本记录保留历史语境。
 
 
@@ -528,3 +530,45 @@ Office服务端删除缓存并登记本实例的删除墓碑、阻止旧快照�
 **候选效果与范围。**已有正文保留可读，当前会话按明确失效/有限新鲜度后台核对，只有可见办公室自动同步；无缓存首屏、显式重新同步、在途恢复、跨标签更新和停止仍可靠。候选原apps/web/src/components/OfficeChat.tsx、apps/web/src/chat/ChatSession.ts、apps/web/src/chat/ChatWorkspace.ts，原ChatTranscript.tsx仅实证存在布局问题时条件调整；OfficeIntegrationSession等激活调用点须进一步锁定，原聊天/工作区/浏览器测试扩失效及切换边界。不简单删除所有同步，不让缓存跳过Host输入冲突或权限检查，不改模型执行/动画。
 
 **状态。**用户本轮批准的是OpenPaw第一阶段，第4节Office仅统计；本条保持候选待补材料、暂缓、未批准、未实施。尚未声称精确前端方案通过；后续需准确逐文件范围、回退和专项验收再人工决定。本轮不改变任何Office文件，不关闭其他Rx。
+
+## 2026-11-04 R27补证：切换会话后旧动作残留、同一接收人串行（D166，暂缓）
+
+**范围和真实证据。**Office仍为原版`5d21cf2`，两份原用户文档保留；本轮没有修改Office代码、构建或配置。独立原服务/Chromium证据在仓库外`artifacts/maintenance/20261104-capacity-handoff/office-attempt-b`，`office-reproduction.json`记录4项实测，含实际点击切换、导出runtime及截图/trace。第一轮验收脚本误认为默认布局有成员工具折叠栏而失败，原日志保留；修正的是验收定位，不是Office实现。
+
+**跨对话动作的确定链路。**`OfficeTeamSession`为同一团队保留一个runtime；`OfficeIntegrationSession.receive`只在收到relay时检查当前conversationId。A会话已接受的visit进入runtime后，用户选择B会话会切换dashboard，却没有清除A已接受的queued/running活动。实测`b-after-switch.json`中B白板/任务已选择，A拜访仍running，截图`b-after-switch-a-animation.png`对应这一帧。现有接收过滤不能解决先接收后切换，也不能仅检查direct relay：`dashboard/sceneBridge.ts`生成的assignment动画同样必须带业务归属。该证据证明一个Office运行时隔离缺口；不据此排除其他Host错误，更不倒推每个未捕获现场。
+
+**候选解决与准确职责（未实施、仍待审）。**沿原`apps/web/src/application/OfficeIntegrationSession.ts`、`OfficeTeamSession.ts`及`apps/web/src/dashboard/sceneBridge.ts`追踪所有业务动画的conversation归属，切换时经原取消/资源清理机制结束旧会话在途和排队动画，并从新会话dashboard恢复人物presentation；不停止后台Agent，不修改任务Run状态，不把浏览器当前选择写成全局团队选择，不补播离开期间错过的历史。不设“走到或播放完才开工”的执行门禁。先在原`tests/officeIntegration.test.mjs`、`tests/teamSession.test.mjs`补先接收后切换、排队后切换、双标签不同选择、返回原对话及两类动画来源，再跑原Chromium和整套检查；须核对移动/桌面/讲话资源释放和坐姿收敛。是否还需修改runtime本身，应在批准前通过其现有取消接口核实，不先扩大候选范围。回退仅撤回前端隔离改动，Host和原会话事实不变。
+
+**同时向同一个人汇报：本轮仅核查。**`OfficeIntegrationSession.receive`直接指令使用`ordered:true`；`SceneRuntime.pump`按有序队列执行。`packages/scene-office/src/core/pack.ts`的`office.visit`还独占visitor和host的body/speech及接收人工位，默认资源容量1，因此只去掉ordered也不能让同一接收人同时接待。原版实测两个同接收人请求均HTTP200，活动状态分别running/queued，最终都完成，总计13194毫秒（包含移动/归位，talk仅300毫秒，不是通用延迟保证），见`simultaneous-same-host.json`及`same-host-latest.json`。Host逐条转发仅等待HTTP回执，不等待动画完成。已有meeting可表达集体汇报，但语义不同；如确需多人同时桌边汇报，须另给Office集体接待/资源与对白设计并审查，不在本轮修改或通过放松资源约束冒充已支持。
+
+**任务卡先于拜访的边界。**原截图刘市是queued/0%，不是已开工；已接受任务可以先进入待执行卡。Host取得真实执行额度才投影running及assignment。原Office的`sceneBridge.ts`先设置working presentation再提交visit，两者独立且visit可能排队。本轮原版隔离测试分别捕获queued无visit、assignment后visit运行，不将卡出现或走路完成当后端开工证据。OpenPaw单侧将排队摘要明确成“待执行：正在排队，尚未开始工作”；真正的当前任务被旧动画遮卡和切换残留仍按本R27统计，未批准、不实施、不关闭。
+
+## R31：新总览跨办公室待决定通知被 iframe 遮挡（2026-11-09-r1，待审、未实施）
+
+**对应记录。** CHG-2026-0007 §12.165 D186；官方Office `8ecef9a67939f68329063e27332aa042ee82c699`，本次未作Office定制修改。
+
+**原因与真实场景。** 正式办公室的write_file任务等待用户精确审批；用户切到本地Demo办公室。新`ConferenceWorkspace.tsx`会在外层放置`TeamDecisionNotice`，通知内容和按钮正常生成，正式任务也仍处于等待状态；但默认`.team-decision-notice`本身没有z-index，原来依赖`.office-team-switcher`容器的层级，新外壳没有该容器。新`ConferenceWorkspace.css`给active iframe设`z-index:1`，iframe覆盖了通知。真实Chromium普通鼠标点击“允许本次”超时，明确报告本地Demo iframe拦截pointer events，截图肉眼也未显示通知。该问题属于Office浏览器合成层级，Host已经将正确待审批数据送达，不能通过伪造任务状态、重复发审批或修改Host数据解决。
+
+**证据。** `/home/cheng/WorkSpace/openpaw/artifacts/maintenance/office-upgrade-20261109/ui-e/report.json`、`failed.png`、`trace.zip`。此前`ui-d/report.json`从总览返回正式办公室后批准成功并保存真实文件，证明原Host审批传输可用。后续`ui-f`命中检测/键盘专项结果以实际报告为准，不将键盘可用等同于鼠标修复。
+
+**准确候选范围。** 仅`apps/web/src/conference/ConferenceWorkspace.css`、原`tests/conferenceOffice.test.mjs`以及现有浏览器验收入口（需批准前确认正式入口路径）。在conference根下给直接子通知建立明确fixed/absolute定位、视口边距和层级，置于active iframe上方，保留右上总览按钮和顶层modal的访问优先级；不得给所有Office弹层全局加极大z-index。通知关闭、拒绝、允许、跳转详情以及打开总览后的状态均使用原回调，不改审批ID、输入绑定、权限、DTO或后端路由。只在实际测试显示有必要时调整同文件窄屏布局；若需要其他文件先更新准确方案。
+
+**验收标准。** 未修改旧行为的对照先能复现；普通鼠标而非force/DOM.click完成允许和拒绝，原Run各自只继续/拒绝一次；切换本地Demo、另一正式办公室仍能处理后台通知；关闭/进入详情可点；总览打开时通知不覆盖modal；键盘Tab/Enter、窄屏、多个后台待办及错误/过期反馈均可用。运行原Office全套测试和真实Chromium，保留命中元素/截图/请求与审批终态，不能只测组件是否存在。
+
+**影响与回退。** 修改只影响新版外层通知的视觉命中，不改变真实Agent执行或工作区文件。回退撤回上述局部CSS及相关回归，原Host审批保留。临时操作方式是从右上办公室总览的待审批计数进入正式办公室，再处理原审批；不能通过Host清空审批绕过问题。
+
+**授权状态。** 待用户单项审核R31 r1；本轮仅登记，不修改Office。该申请不覆盖R24/R27/R30，也不表示其他旧问题已修复。
+
+
+## R6 r2：新版总览普通新建统一真实空间（2026-11-09，已获本轮实施授权）
+
+原R6于2026-10-23的协议缺失理由仍撤回；本r2针对8ecef9a新总览入口另行补充，不恢复旧理由。实际Firefox空间“0”保存在本地demo-offices目录，正式Host无创建事实；原版真实UI复现当前选中Demo时create直接调用directory.create，聊天由PreviewChatSource模拟，0后端创建/聊天HTTP。用户明确批准“后续创建空间都按照真实空间创建，按照你的计划进行”；原“Office不改”仅在本已批准范围内例外，其他Rx状态不变。
+
+效果与准确范围：见原CHG0007 §12.167 D191。仅Office ConferenceWorkspace.tsx普通创建路径、OfficeCreationForm.tsx可选模式说明、原conferenceOffice.test.mjs/integration-e2e/office.spec.ts回归和README.md说明。所有普通新建复用真实office.create，已选Demo不影响创建类型；无配置/断连/容量满/拒绝明确报错，不落本地。既有Demo及“0”数据保留，不自动迁移或重放。Host原接口/槽/权限/持久数据不变；不修改其他Office动画、颜色或通知问题。原用户两份架构编辑保留。
+
+状态：准确会话方案已获实施授权；尚待本轮实现/Office全套/原27项/真实Host与网页验证及安全部署。不得把批准直接写成已修复、已验收或PR通过。证据根artifacts/maintenance/real-office-creation-20261109。回退仅本轮代码和原Office构建，保留全部用户数据与其他修改。
+
+
+### R6 r2 后续决定：撤销本地定制并恢复官方上游（2026-11-10）
+
+用户在该轮实施后再次明确要求“不改动任何Office代码”，并指定还原GitHub最新Office。因此上述2026-11-09实施授权及原失败证据保留为历史，R6 r2本地定制已撤销，本轮不再实施、不提交Office变更。当前运行官方main `a4c2a9b59ee60b8ed00c26f1b3aa6c030ab19fed`，Office工作区干净；上游总览只提供切换，真实创建入口仍在官方`/office/?conference=0`团队空间菜单。新增五主题为官方本地mock，正式空间继续连接OpenPaw；28份冻结对接资料未变，无需添加Host业务分支。新上游运行及真实UI证据见`artifacts/maintenance/office-latest-20261110/运行与验证说明.md`、原本地定制撤销证据见`artifacts/maintenance/office-upstream-restore-20261110T004604Z/`。本决定不修改R24/R27/R30/R31等其他申请的待审状态，也不将其写成已修复。

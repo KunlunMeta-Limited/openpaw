@@ -89,13 +89,14 @@ function preflight() {
   note(`依赖检查通过：Node ${process.versions.node}；${version.trim()}`);
 }
 
-function configuration(paths, allowWrites) {
+function configuration(paths, allowWrites, allowQuestions = false) {
   const q = value => JSON.stringify(value.replaceAll('\\', '/'));
   const all = Array.from({ length: 32 }, (_, index) => `office-${index + 1}`);
   const tools = ['read_file', 'glob', 'grep', 'todo_list', 'think', 'web_search', 'web_fetch', 'write_file', 'edit_file', 'render_visual'];
+  if (allowQuestions) tools.push('clarify');
   return `# 由setup生成的本机配置；不提交到仓库。撤销预授权后重启生效。\n` +
     `home = ${q(path.join(paths.base, 'office-host-home'))}\n` +
-    `max_active_runs = 6\nrun_timeout_secs = 0\nstream_idle_secs = 180\ntool_timeout_secs = 300\napproval_timeout_secs = 300\n` +
+    `max_active_runs = 24\nrun_timeout_secs = 0\nstream_idle_secs = 180\ntool_timeout_secs = 300\napproval_timeout_secs = 300\n` +
     `tools = ${JSON.stringify(tools)}\nauto_approve_tools = ${JSON.stringify(allowWrites ? ['write_file', 'edit_file', 'render_visual'] : [])}\n` +
     `\n[roots]\n${all.map(id => `${id} = ${q(path.join(paths.base, 'workspaces', id))}`).join('\n')}\n` +
     `\n[slots]\n${all.map(id => `${id} = ${q(id)}`).join('\n')}\n` +
@@ -141,9 +142,9 @@ function installState(paths) {
   return 'fresh';
 }
 
-function createFresh(paths, envText, allowWrites) {
+function createFresh(paths, envText, allowWrites, allowQuestions = false) {
   if (installState(paths) !== 'fresh') fail('已有配置，不允许覆盖');
-  const text = configuration(paths, allowWrites);
+  const text = configuration(paths, allowWrites, allowQuestions);
   const serviceKey = crypto.randomBytes(32).toString('hex');
   // 自定义配置文件仍须位于私有安装根中，避免给既有Desktop等目录改ACL。
   for (const file of [paths.env, paths.config, paths.key]) {
@@ -200,7 +201,10 @@ async function main() {
       note('权限选择：1 每次写文件/修改/绘图都审批；2 持久允许这些工具。只作用于配置中的工作目录，逐次保留审计。不开放Shell执行。');
       const permission = await prompt.ask('选择1或2', '1');
       if (!['1', '2'].includes(permission)) fail('权限选项只能是1或2；未写入配置');
-      createFresh(paths, envText, permission === '2');
+      note('沟通工具：启用后智能体可在Office显示选择题/其他需求输入，最多等待300秒；回答不会批准文件或命令执行。');
+      const questions = (await prompt.ask('启用交互补充信息？y/n', 'y')).toLowerCase();
+      if (!['y', 'n'].includes(questions)) fail('沟通工具选项只能是y或n；未写入配置');
+      createFresh(paths, envText, permission === '2', questions === 'y');
       note(`已生成全新配置、独立Office密钥和32个空工作目录；工作文件在 ${path.join(paths.base, 'workspaces')}。`);
     } else {
       note('已有完整配置：全部保留，不覆盖模型、权限、工作区或聊天数据。');

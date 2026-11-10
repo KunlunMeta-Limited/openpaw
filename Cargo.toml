@@ -76,6 +76,7 @@ rmcp = { version = "1.6", default-features = false, features = ["server", "macro
 # Web tool stack (openpaw-tools web; url parsing, LRU fetch cache, query encoding, base64 data URIs)
 url = "2"
 urlencoding = "2"
+encoding_rs = "=0.8.35"
 lru = "0.18.5"
 base64 = "0.22"
 

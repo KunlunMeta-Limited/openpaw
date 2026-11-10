@@ -1276,8 +1276,10 @@ async fn d102_actual_request_matches_whole_file_and_patch_capabilities() {
                 assert!(context.contains("审核结论不能代替事实依据"));
             }
             if tools.contains(&"write_file") && !tools.contains(&"edit_file") {
-                assert!(context.contains("独立章节文件与入口索引"));
-                assert!(context.contains("不要重写整篇"));
+                assert!(context.contains("不支持append参数"));
+                assert!(context.contains("只有长稿超出当前写入能力才协商分章节或新附件"));
+                assert!(context.contains("不将分文件作为默认业务流程"));
+                assert!(context.contains("不要为追加反复重写不断增长的长稿"));
             }
         }
         host.shutdown().await.unwrap();
@@ -1316,6 +1318,9 @@ async fn r7_actual_model_request_has_trusted_time_and_only_configured_web_tools(
         assert_eq!(records.len(), 1);
         let system = records[0].system.as_ref().unwrap();
         let tools: Vec<_> = records[0].tools.iter().map(|t| t.name.clone()).collect();
+        if enabled {
+            assert!(system.contains("移动版不是独立有效来源") && system.contains("先交付可用部分"));
+        }
         let timestamp = |prefix: &str| {
             chrono::DateTime::parse_from_rfc3339(
                 system.lines().find_map(|l| l.strip_prefix(prefix)).unwrap(),
@@ -1404,7 +1409,12 @@ async fn d43_reopened_session_uses_current_capabilities_without_rewriting_histor
             .as_ref()
             .expect("本轮上下文不能只在历史开头");
         assert_eq!(&blocks.stable, system);
-        assert_eq!(&blocks.dynamic, system);
+        assert!(blocks.dynamic.contains("历史回复不代表本轮能力"));
+        assert!(blocks.dynamic.contains("Current UTC time:"));
+        assert!(blocks.dynamic.contains("实际工具目录"));
+        assert!(blocks.dynamic.len() < blocks.stable.len());
+        assert!(!blocks.dynamic.contains("修订已有成果时"));
+        assert_eq!(blocks.dynamic.contains("web_fetch"), enabled);
         let now = chrono::DateTime::parse_from_rfc3339(
             system
                 .lines()
@@ -2046,6 +2056,201 @@ fn delegated(home: &std::path::Path, parent: &str) -> Vec<serde_json::Value> {
 }
 
 #[tokio::test]
+async fn d176_real_auto_delegations_overlap_filter_permissions_and_replay_same_identity() {
+    use openpaw_core::{ContentBlock, StopReason, Usage};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    struct AutoFixture {
+        lead: AtomicUsize,
+        active: AtomicUsize,
+        peak: AtomicUsize,
+        barrier: tokio::sync::Barrier,
+        requests: std::sync::Mutex<Vec<CompletionRequest>>,
+    }
+    #[async_trait]
+    impl LlmProvider for AutoFixture {
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> openpaw_core::Result<CompletionResponse> {
+            self.requests.lock().unwrap().push(request.clone());
+            let lead = request
+                .system
+                .as_deref()
+                .is_some_and(|s| s.contains("（lead）"));
+            let input = |i: usize| json!({"role_id":"auto","candidate_roles":["draft","research","organize","review"],"required_tools":["web_search"],"title":format!("独立资料{i}"),"instructions":"只处理给定资料并返回简短结论，本夹具不实际联网","acceptance":"返回本项真实正文","wait_for_completion":false});
+            let content = if lead {
+                match self.lead.fetch_add(1, SeqCst) {
+                    0 => (0..3)
+                        .map(|i| ContentBlock::ToolUse {
+                            id: format!("auto-{i}"),
+                            name: "delegate_task".into(),
+                            input: input(i),
+                        })
+                        .collect(),
+                    // 同一call的原输入重取；此时负载不同也必须复用原成员和Run。
+                    1 => vec![ContentBlock::ToolUse {
+                        id: "auto-0".into(),
+                        name: "delegate_task".into(),
+                        input: input(0),
+                    }],
+                    2 => {
+                        let ids: std::collections::BTreeSet<_> = request
+                            .messages
+                            .iter()
+                            .flat_map(|m| &m.content)
+                            .filter_map(|c| match c {
+                                ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                    is_error: false,
+                                    ..
+                                } if tool_use_id.starts_with("auto-") => {
+                                    serde_json::from_str::<Value>(content)
+                                        .ok()?
+                                        .get("task_id")?
+                                        .as_str()
+                                        .map(str::to_owned)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(ids.len(), 3);
+                        vec![ContentBlock::ToolUse {
+                            id: "auto-status".into(),
+                            name: "delegation_status".into(),
+                            input: json!({"task_ids":ids,"wait_for":"all"}),
+                        }]
+                    }
+                    _ => vec![ContentBlock::Text {
+                        text: "三项独立结果已收齐".into(),
+                    }],
+                }
+            } else {
+                let active = self.active.fetch_add(1, SeqCst) + 1;
+                self.peak.fetch_max(active, SeqCst);
+                tokio::time::timeout(Duration::from_secs(3), self.barrier.wait())
+                    .await
+                    .expect("三个不同真实子Run必须同时开工，不能退化成同人排队");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.active.fetch_sub(1, SeqCst);
+                vec![ContentBlock::Text {
+                    text: "本项给定资料已核对，返回实际结果".into(),
+                }]
+            };
+            let stop_reason = if content
+                .iter()
+                .any(|c| matches!(c, ContentBlock::ToolUse { .. }))
+            {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            };
+            Ok(CompletionResponse {
+                content,
+                stop_reason,
+                usage: Usage::default(),
+            })
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn default_model(&self) -> &str {
+            "auto-fixture"
+        }
+        fn name(&self) -> &str {
+            "auto-fixture"
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cfg = team_config(tmp.path());
+    cfg.max_active_runs = 8;
+    cfg.tools.push("web_search".into());
+    cfg.agents.as_mut().unwrap().max_active_children = 5;
+    cfg.agents
+        .as_mut()
+        .unwrap()
+        .tools
+        .insert("draft".into(), vec!["read_file".into()]);
+    let provider = Arc::new(AutoFixture {
+        lead: 0.into(),
+        active: 0.into(),
+        peak: 0.into(),
+        barrier: tokio::sync::Barrier::new(3),
+        requests: std::sync::Mutex::new(vec![]),
+    });
+    let host = Host::with_provider(cfg.clone(), provider.clone())
+        .await
+        .unwrap();
+    let scope = team_scope("auto-allocation");
+    let session = host.open_session(scope.clone()).await.unwrap();
+    let parent = host
+        .submit_run(
+            &scope,
+            &session.session_id,
+            "三个独立工作，按能力同时委派".into(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+        .await
+        .unwrap();
+    let result = host.get_run(&scope, &parent.run_id).await.unwrap();
+    assert_eq!(result.state, RunState::Completed, "{:?}", result.error);
+    assert_eq!(provider.peak.load(SeqCst), 3);
+    let rows = delegated(&cfg.home, &parent.run_id);
+    assert_eq!(rows.len(), 3, "同call重取不得重派");
+    let roles: std::collections::BTreeSet<_> = rows
+        .iter()
+        .map(|r| r["role_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        roles,
+        ["research", "organize", "review"].into_iter().collect()
+    );
+    for row in &rows {
+        let child = host
+            .get_run(
+                &serde_json::from_value(row["child_scope"].clone()).unwrap(),
+                row["child_run"].as_str().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.state, RunState::Completed);
+    }
+    {
+        let requests = provider.requests.lock().unwrap();
+        let receipts: Vec<_> = requests
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .filter_map(|c| match c {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } if tool_use_id == "auto-0" => Some((content, *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(receipts.len(), 2);
+        assert!(!receipts[0].1 && !receipts[1].1);
+        let parsed: Vec<Value> = receipts
+            .iter()
+            .map(|(s, _)| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(parsed[0]["child_run_id"], parsed[1]["child_run_id"]);
+        assert_eq!(parsed[0]["role_id"], parsed[1]["role_id"]);
+        let system = requests[0].system.as_ref().unwrap();
+        assert!(system.contains("首次派工先覆盖用户所需交付项"));
+        assert!(system.contains("不会自动") || system.contains("role_id=auto"));
+    }
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn d90_empty_child_fails_and_explicit_retry_preserves_role_and_budget_rules() {
     use openpaw_core::{ContentBlock, StopReason, Usage};
     struct EmptyThenRetry {
@@ -2248,20 +2453,61 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
         .iter()
         .filter(|r| r.system.as_deref().is_some_and(|s| s.contains("（lead）")))
     {
+        let runtime = request.system_blocks.as_ref().unwrap();
+        let all = format!("{}{}", runtime.stable, runtime.dynamic);
+        assert!(all.contains("交付范围与研究深度") && all.contains("足够回答时停止检索"));
+        assert!(all.contains("不自动升级为全量调查或长文档") && all.contains("字符，不是行"));
+        assert!(
+            all.contains("避免元数据独占模型轮次") && all.contains("create成功前不能同批update")
+        );
         assert_eq!(
             request.max_tokens,
             provider.capabilities().max_output_tokens.min(8192)
         );
         let system = request.system.as_ref().unwrap();
+        assert!(!system.contains("continuous_task open_item"));
+        assert!(request.tools.iter().any(|t| t.name == "inspect_delivery"));
         assert!(
-            system.contains("子角色看不到父会话历史") && system.contains("context"),
+            system.contains("子角色看不到父/同事会话") && system.contains("context"),
             "真实Provider必须获知独立子角色的资料交接方式，不能让审查者凭空核验前序结果"
         );
         assert!(
-            system.contains("不要把草稿和依赖它的审查放在同一批工具调用里")
-                && system.contains("已有前序产物时，review和audit必须实际检查该产物")
-                && system.contains("引用实际返回的原句"),
+            system.contains("依赖原稿的审核不能和尚未产出的草稿同批派发")
+                && system.contains("依赖原稿的审核")
+                && system.contains("须引用实际读到的原句"),
             "主角色必须按真实结果的依赖顺序交接，前期验收清单不能代替对稿核验"
+        );
+        assert!(
+            system.contains("复杂工作主动找输入齐全、互不依赖的可交付部分")
+                && request
+                    .system_blocks
+                    .as_ref()
+                    .unwrap()
+                    .dynamic
+                    .contains("一个最终文件不代表只有一项工作")
+                && system.contains("第一批先派出全部就绪工作")
+                && system.contains("不把它们捆给同一人串行完成")
+                && system.contains("固定role_id时省略candidate_roles和required_tools")
+                && system.contains("candidate_roles列出全部实际合格成员")
+                && system.contains("使用role_id=auto而不是自行固定某位专家")
+                && system.contains("五位同事通常均能胜任")
+                && system.contains("不要把“避免无意义拆分”理解为尽量不派工")
+                && system.contains("在同批delegate_task用wait_for_completion=false派发")
+                && system.contains("擅长方向不限定本轮工种")
+                && system.contains("默认负责人自检")
+                && system.contains("不因review/audit名称固定安排审核")
+                && system.contains("共享文件指定一名写入者")
+                && system.contains("人数按真实回执不同role_id计，不按任务数")
+                && system.contains("N个不同role_id及实际成果"),
+            "实际请求必须同时提供主动并行、灵活职责和按需审核，不能以提速丢掉文件冲突边界"
+        );
+        assert!(
+            !system.contains("再携正文和审查结论派发复核")
+                && !system.contains("常见擅长方向（仅供参考，不限定本轮职责）")
+                && system.contains("不能省略source绕过依赖")
+                && system.contains("近似篇幅不得另建精确字数核验或反复压缩任务")
+                && !system.contains("使用delegate_task逐一向research/organize/draft/review/audit"),
+            "不得同时注入旧固定审核链或全员逐一派发规则"
         );
         for mapping in [
             "王明 -> lead",
@@ -2279,9 +2525,7 @@ async fn p04_five_real_children_have_distinct_runs_sessions_requests_and_origina
         assert!(
             system.contains("本轮各子角色实际工具白名单")
                 && system.contains("赵审（audit）：read_file")
-                && system.contains(
-                    "需要新建或修改文件的任务只能交给白名单含write_file或edit_file的角色"
-                ),
+                && system.contains("写入者必须有write_file/edit_file"),
             "主角色必须看到每个子角色的实际工具能力，避免把写入任务派给只读角色"
         );
     }
@@ -3124,6 +3368,12 @@ impl LlmProvider for FifoMembers {
                         Some("completed" | "cancelled" | "failed" | "timed_out" | "interrupted")
                     );
                     assert_eq!(pending.contains(&task["task_id"]), !terminal);
+                    assert!(task["scheduling"]["phase"].is_string());
+                    if task["state"] == "accepted" && i > 0 && i < 3 {
+                        assert_eq!(task["scheduling"]["phase"], "role_fifo");
+                        assert!(task["scheduling"]["role_queue_position"].as_u64().unwrap() >= 2);
+                        assert!(task["scheduling"]["predecessor_run_id"].is_string());
+                    }
                 }
                 if n == 5 {
                     assert!(pending.len() >= 3, "三个未清理research任务均须保留");

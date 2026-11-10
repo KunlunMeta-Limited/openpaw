@@ -20,6 +20,7 @@ use crate::web::preapproved;
 
 /// Cache entry for WebFetch results.
 struct CacheEntry {
+    // 多留一个字符，准确区分恰好达到上限与正文仍有后续。
     content: String,
     fetched_at: Instant,
 }
@@ -29,6 +30,7 @@ static FETCH_CACHE: Mutex<Option<LruCache<String, CacheEntry>>> = Mutex::new(Non
 
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_CAPACITY: usize = 50;
+const MAX_CACHED_CHARS: usize = 100_001;
 
 /// 进程级复用的 HTTP 客户端（复用连接池与 TLS 握手）。
 /// 配置保持不变：30s 总超时、10s 连接超时、禁用自动重定向
@@ -45,13 +47,16 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
-/// 构建缓存 key。
-///
-/// key 必须包含影响输出内容的全部参数：`max_chars` 决定截断长度。
-/// 旧实现只按 URL 缓存，先以小的 max_chars 抓取后，TTL 内的大
-/// max_chars 请求会命中截断缓存，返回错误精度的内容。
-fn build_cache_key(url: &url::Url, max_chars: usize) -> String {
-    format!("{}|{}", url.as_str(), max_chars)
+// 缓存已通过原安全与正文检查的文本，截取参数只影响展示，不影响来源身份。
+// 不缓存截断提示；同页从小范围扩读时仍能获得后续原文。
+fn render_excerpt(content: &str, max_chars: usize) -> String {
+    let mut chars = content.chars();
+    let excerpt: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{excerpt}\n... (truncated at {max_chars} chars)")
+    } else {
+        excerpt
+    }
 }
 
 #[derive(Deserialize)]
@@ -89,7 +94,7 @@ pub(crate) fn loopback_test_allowance() -> bool {
 pub fn spec() -> ToolSpec {
     ToolSpec {
         name: "web_fetch".into(),
-        description: "Fetch a web page and return its content as Markdown (preserving headings, code blocks, and links).".into(),
+        description: "Fetch a web page as Markdown. max_chars counts Unicode characters from the start; offset/pagination is not supported. Expand max_chars to read more of the same page; cached body is reused unless fresh=true. Stop when the needed facts are obtained. Preserves headings, code blocks, and links.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -138,9 +143,222 @@ pub(crate) async fn run_cancellable(
     args: serde_json::Value,
     cancel: CancellationToken,
 ) -> Result<ToolCallOutcome> {
+    fetch_with_deadline(args, cancel, Duration::from_secs(30)).await
+}
+
+async fn fetch_with_deadline(
+    args: serde_json::Value,
+    cancel: CancellationToken,
+    timeout: Duration,
+) -> Result<ToolCallOutcome> {
     tokio::select! { biased;
         _ = cancel.cancelled() => Err(openpaw_core::Error::Cancelled),
+        _ = tokio::time::sleep(timeout) => Ok(web_error("deadline", "dns/request/redirect/body", true,
+            "单次网页读取总时限已到；未取得完整正文。请换有效来源，勿将其当作模型响应超时。")),
         result = fetch(args, &cancel) => result,
+    }
+}
+
+fn web_error(kind: &str, stage: &str, retryable: bool, message: &str) -> ToolCallOutcome {
+    let mut outcome = ToolCallOutcome::error(format!("web_fetch [{kind}/{stage}]: {message}"));
+    outcome.structured = Some(serde_json::json!({"kind":kind,"stage":stage,"retryable":retryable}));
+    outcome
+}
+
+/// 功能：将HTTP错误原因链归类为固定脱敏诊断。
+/// 参数：error为原reqwest错误；stage为可信调用阶段。
+/// 返回：固定错误类别及阶段，不回显URL、凭据或响应正文。
+/// 错误：未知原因明确标为transport，不推断服务不可用。
+/// 状态：不重试、不缓存。
+/// 并发与取消：纯计算，不改变原取消链。
+/// 权限：仅公开诊断，不增加网络访问能力。
+/// 关联：CHG-2026-0007第12.161节D175。
+pub(crate) fn transport_diagnostic(error: &reqwest::Error, stage: &str) -> String {
+    use std::error::Error;
+    let mut chain = String::new();
+    let mut current: Option<&(dyn Error + 'static)> = Some(error);
+    for _ in 0..8 {
+        let Some(cause) = current else { break };
+        chain.push_str(&cause.to_string().to_ascii_lowercase());
+        current = cause.source();
+    }
+    let kind = if error.is_timeout() && error.is_connect() {
+        "connect_timeout"
+    } else if error.is_timeout() {
+        "timeout"
+    } else if chain.contains("dns")
+        || chain.contains("resolve")
+        || chain.contains("name or service")
+    {
+        "dns"
+    } else if chain.contains("certificate") || chain.contains("tls") {
+        "tls"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() || error.is_decode() {
+        "body_read"
+    } else {
+        "transport"
+    };
+    format!("{kind} at {stage}; no complete response; verify connection or use another source")
+}
+
+// 仅识别显式charset参数；不猜测编码、不将未知声明降级为成功。
+fn declared_charset(
+    value: &str,
+) -> std::result::Result<Option<&'static encoding_rs::Encoding>, ()> {
+    let mut found = None;
+    for parameter in value.split(';').skip(1) {
+        let parameter = parameter.trim();
+        let Some((name, label)) = parameter.split_once('=') else {
+            if parameter.eq_ignore_ascii_case("charset") {
+                return Err(());
+            }
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            continue;
+        }
+        let label = label.trim();
+        let label = if label.starts_with('"') || label.starts_with('\'') {
+            let quote = label.as_bytes()[0] as char;
+            label
+                .strip_prefix(quote)
+                .and_then(|s| s.strip_suffix(quote))
+                .ok_or(())?
+        } else {
+            label
+        };
+        agree_charset(
+            &mut found,
+            encoding_rs::Encoding::for_label(label.as_bytes()).ok_or(())?,
+        )?;
+    }
+    Ok(found)
+}
+
+fn agree_charset(
+    found: &mut Option<&'static encoding_rs::Encoding>,
+    next: &'static encoding_rs::Encoding,
+) -> std::result::Result<(), ()> {
+    if found.is_some_and(|previous| previous != next) {
+        return Err(());
+    }
+    *found = Some(next);
+    Ok(())
+}
+
+/// 功能：严格解码已有文字响应，兼容明确声明的传统网页编码。
+/// 参数：bytes为已受5MiB上限约束的完整正文，content_type为实际HTTP头。
+/// 返回：有效UTF-8原文或按明确编码严格解出的Unicode文本。
+/// 错误：未知/冲突/损坏编码、无声明的非UTF-8及二进制NUL返回拒绝。
+/// 状态：无缓存写入；只在完整成功后由原调用链缓存。
+/// 并发与取消：有界同步解码，不创建任务；原调用链在返回前检查取消。
+/// 权限：不执行页面，不增加网络权限；只扫描前1024字节的HTML声明。
+/// 关联：CHG-2026-0007第12.164节r38 r2，REQ-OP-010、DES-OP-007。
+fn decode_web_text<'a>(
+    bytes: &'a [u8],
+    content_type: &str,
+) -> std::result::Result<std::borrow::Cow<'a, str>, ()> {
+    let mut encoding = declared_charset(content_type)?;
+    let bom_length = if let Some((bom, length)) = encoding_rs::Encoding::for_bom(bytes) {
+        agree_charset(&mut encoding, bom)?;
+        length
+    } else {
+        0
+    };
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if media_type.is_empty()
+        || media_type.eq_ignore_ascii_case("text/html")
+        || media_type.eq_ignore_ascii_case("application/xhtml+xml")
+    {
+        // 只扫描ASCII标记；空格替代非ASCII仅用于定位声明，不是正文的有损解码。
+        let prefix_bytes = &bytes[..bytes.len().min(1024)];
+        let prefix: String =
+            if encoding.is_some_and(|e| e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE) {
+                // 明确UTF-16时按码元定位ASCII标记；扫描窗口仍按原字节计量。
+                prefix_bytes[bom_length..]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| {
+                        let unit = if encoding == Some(encoding_rs::UTF_16LE) {
+                            u16::from_le_bytes([pair[0], pair[1]])
+                        } else {
+                            u16::from_be_bytes([pair[0], pair[1]])
+                        };
+                        if unit <= 0x7f {
+                            char::from(unit as u8)
+                        } else {
+                            ' '
+                        }
+                    })
+                    .collect()
+            } else {
+                prefix_bytes
+                    .iter()
+                    .map(|&b| if b.is_ascii() { char::from(b) } else { ' ' })
+                    .collect()
+            };
+        static META: OnceLock<regex::Regex> = OnceLock::new();
+        static ATTR: OnceLock<regex::Regex> = OnceLock::new();
+        let tags = META.get_or_init(|| regex::Regex::new(r#"(?is)<!--.*?(?:-->|$)|<script\b[^>]*>.*?(?:</script\s*>|$)|<style\b[^>]*>.*?(?:</style\s*>|$)|<meta\b(?:[^"'<>]|"[^"]*"|'[^']*')*>"#).expect("constant HTML charset tag pattern"));
+        let attributes = ATTR.get_or_init(|| regex::Regex::new(r#"(?i)(?:^|\s)([a-z_:][-a-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"#).expect("constant HTML charset attribute pattern"));
+        for tag in tags.find_iter(&prefix) {
+            if !tag
+                .as_str()
+                .get(..5)
+                .is_some_and(|s| s.eq_ignore_ascii_case("<meta"))
+            {
+                continue;
+            }
+            let mut http_equiv = None;
+            let mut content = None;
+            for attribute in attributes.captures_iter(tag.as_str()) {
+                let name = &attribute[1];
+                let value = attribute
+                    .get(2)
+                    .or_else(|| attribute.get(3))
+                    .or_else(|| attribute.get(4))
+                    .ok_or(())?
+                    .as_str();
+                if name.eq_ignore_ascii_case("charset") {
+                    agree_charset(
+                        &mut encoding,
+                        encoding_rs::Encoding::for_label(value.as_bytes()).ok_or(())?,
+                    )?;
+                } else if name.eq_ignore_ascii_case("http-equiv") {
+                    http_equiv = Some(value);
+                } else if name.eq_ignore_ascii_case("content") {
+                    content = Some(value);
+                }
+            }
+            if http_equiv.is_some_and(|v| v.eq_ignore_ascii_case("content-type")) {
+                if let Some(declared) = content.map(declared_charset).transpose()?.flatten() {
+                    agree_charset(&mut encoding, declared)?;
+                }
+            }
+        }
+    }
+    let is_utf16 =
+        encoding.is_some_and(|e| e == encoding_rs::UTF_16LE || e == encoding_rs::UTF_16BE);
+    if bom_length == 0 && !is_utf16 {
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            return if text.contains('\0') {
+                Err(())
+            } else {
+                Ok(text.into())
+            };
+        }
+    }
+    let decoded = encoding
+        .ok_or(())?
+        .decode_without_bom_handling_and_without_replacement(&bytes[bom_length..])
+        .ok_or(())?;
+    if decoded.contains('\0') {
+        Err(())
+    } else {
+        Ok(decoded)
     }
 }
 
@@ -182,10 +400,10 @@ async fn fetch(args: serde_json::Value, cancel: &CancellationToken) -> Result<To
     };
 
     // Check cache — return cached result if within TTL.
-    // key 纳入 effective_max_chars，避免不同截断精度的请求互相污染缓存。
-    let cache_key = build_cache_key(&current_url, effective_max_chars);
+    // 保留原请求URL（含查询）隔离，正文扩读无需重新联网。
+    let cache_key = current_url.as_str().to_owned();
     if !a.fresh {
-        if let Some(cached) = get_cached(&cache_key) {
+        if let Some(cached) = get_cached(&cache_key, effective_max_chars) {
             return Ok(ToolCallOutcome::ok(cached));
         }
     }
@@ -209,7 +427,14 @@ async fn fetch(args: serde_json::Value, cancel: &CancellationToken) -> Result<To
         .await
     {
         Ok(r) => r,
-        Err(e) => return Ok(ToolCallOutcome::error(format!("web_fetch: {e}"))),
+        Err(e) => {
+            return Ok(web_error(
+                "transport",
+                "request",
+                true,
+                &transport_diagnostic(&e, "request"),
+            ))
+        }
     };
 
     for _ in 0..MAX_REDIRECTS {
@@ -247,15 +472,60 @@ async fn fetch(args: serde_json::Value, cancel: &CancellationToken) -> Result<To
         {
             Ok(r) => r,
             Err(e) => {
-                return Ok(ToolCallOutcome::error(format!(
-                    "web_fetch: redirect failed: {e}"
-                )))
+                return Ok(web_error(
+                    "transport",
+                    "redirect",
+                    true,
+                    &transport_diagnostic(&e, "redirect"),
+                ))
             }
         };
     }
 
     if !resp.status().is_success() {
-        return Ok(ToolCallOutcome::error(format!("HTTP {}", resp.status())));
+        let status = resp.status();
+        let advice = match status.as_u16() {
+            401 | 403 => "访问被拒绝；不要重复请求同一受限地址，换公开来源，不绕过访问控制",
+            404 | 410 => "页面不存在；从搜索结果发现真实链接，不继续猜测目录",
+            429 => "来源限流；稍后再试或换来源，不立即循环请求",
+            500..=599 => "来源服务异常；保留已有资料，换来源或稍后再试",
+            _ => "未取得成功响应；核对来源地址",
+        };
+        return Ok(web_error(
+            "http_status",
+            "response",
+            status.is_server_error() || status.as_u16() == 429,
+            &format!("HTTP {status}; {advice}"),
+        ));
+    }
+
+    let content_type_header = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let content_type = content_type_header
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !content_type.is_empty()
+        && !(content_type.starts_with("text/")
+            || matches!(
+                content_type.as_str(),
+                "application/json" | "application/xml" | "application/xhtml+xml"
+            )
+            || content_type.ends_with("+json")
+            || content_type.ends_with("+xml"))
+    {
+        return Ok(web_error(
+            "unsupported_content",
+            "headers",
+            false,
+            "来源返回非文本文件，web_fetch不进行图片/PDF/二进制解析；请使用可读正文来源。",
+        ));
     }
 
     // Check Content-Length before reading body to prevent OOM from
@@ -282,25 +552,55 @@ async fn fetch(args: serde_json::Value, cancel: &CancellationToken) -> Result<To
                 bytes.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(e) => return Ok(ToolCallOutcome::error(format!("web_fetch body: {e}"))),
+            Err(e) => {
+                return Ok(web_error(
+                    "transport",
+                    "body",
+                    true,
+                    &transport_diagnostic(&e, "body"),
+                ))
+            }
         }
     }
-    let body = String::from_utf8_lossy(&bytes);
-
-    let text = crate::web::html_to_md::html_to_markdown(&body);
-
-    let truncated = if text.chars().count() > effective_max_chars {
-        let t: String = text.chars().take(effective_max_chars).collect();
-        format!("{t}\n... (truncated at {} chars)", effective_max_chars)
-    } else {
-        text
+    let body = match decode_web_text(&bytes, &content_type_header) {
+        Ok(body) => body,
+        Err(()) => return Ok(web_error(
+            "unsupported_encoding",
+            "body",
+            false,
+            "响应编码未知、声明冲突、正文损坏或包含二进制字节；仅接受UTF-8或明确声明且可严格解码的文本，请换可读来源。",
+        )),
     };
 
+    let text = crate::web::html_to_md::html_to_markdown(&body);
+    if text.trim().is_empty() {
+        return Ok(web_error(
+            "empty_content",
+            "body",
+            false,
+            "响应没有可读正文；不能视为资料核实成功。",
+        ));
+    }
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("id=\"challenge-form\"")
+        || lower.contains("id=\"anomaly-form\"")
+        || lower.contains("cf-chl-")
+        || lower.contains("<title>just a moment")
+    {
+        return Ok(web_error(
+            "challenge",
+            "body",
+            false,
+            "来源返回验证挑战页，未取得正文；请换公开来源。",
+        ));
+    }
+
+    let truncated = render_excerpt(&text, effective_max_chars);
     if cancel.is_cancelled() {
         return Err(openpaw_core::Error::Cancelled);
     }
-    // 只缓存原正文，避免把旧抓取时间伪装成本次fresh的时间；旧调用输出不变。
-    put_cached(&cache_key, &truncated);
+    // 成功才更新正文缓存；fresh仍强制联网，原返回的抓取时间不进入缓存。
+    put_cached(&cache_key, &text);
     if a.fresh {
         let retrieved = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -436,13 +736,13 @@ pub(crate) async fn check_dns_rebinding(
 }
 
 /// Get a cached WebFetch result if within TTL.
-fn get_cached(key: &str) -> Option<String> {
+fn get_cached(key: &str, max_chars: usize) -> Option<String> {
     let mut guard = FETCH_CACHE.lock().ok()?;
     let cache = guard
         .get_or_insert_with(|| LruCache::new(std::num::NonZeroUsize::new(CACHE_CAPACITY).unwrap()));
     let entry = cache.get(key)?;
     if entry.fetched_at.elapsed() < CACHE_TTL {
-        Some(entry.content.clone())
+        Some(render_excerpt(&entry.content, max_chars))
     } else {
         cache.pop(key);
         None
@@ -458,7 +758,7 @@ fn put_cached(key: &str, content: &str) {
         cache.put(
             key.to_string(),
             CacheEntry {
-                content: content.to_string(),
+                content: content.chars().take(MAX_CACHED_CHARS).collect(),
                 fetched_at: Instant::now(),
             },
         );
@@ -468,6 +768,42 @@ fn put_cached(key: &str, content: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn d175_total_deadline_covers_redirect_and_body_and_cancel_closes_connection() {
+        if std::env::var("OPENPAW_D175_FETCH_CHILD").as_deref() != Ok("1") {
+            let status=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","web::web_fetch::tests::d175_total_deadline_covers_redirect_and_body_and_cancel_closes_connection","--nocapture"])
+                .env("OPENPAW_D175_FETCH_CHILD","1").env(TEST_ALLOW_LOOPBACK_ENV,"1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use tokio::io::{AsyncReadExt,AsyncWriteExt};
+            for cancelled in [false,true] {
+                let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url=format!("http://{}/start",listener.local_addr().unwrap());
+                let (ready,received)=tokio::sync::oneshot::channel();
+                let server=tokio::spawn(async move {
+                    let (mut first,_)=listener.accept().await.unwrap();let mut request=[0;8192];assert!(first.read(&mut request).await.unwrap()>0);
+                    first.write_all(b"HTTP/1.1 302 Found\r\nLocation: /end\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();drop(first);
+                    let (mut second,_)=listener.accept().await.unwrap();assert!(second.read(&mut request).await.unwrap()>0);
+                    second.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100\r\n\r\n").await.unwrap();
+                    let _=ready.send(());
+                    let closed=second.read(&mut request).await;
+                    assert!(matches!(closed,Ok(0))||closed.is_err(),"{closed:?}");
+                });
+                let cancel=CancellationToken::new();let token=cancel.clone();
+                let call=tokio::spawn(async move {fetch_with_deadline(serde_json::json!({"url":url}),token,Duration::from_millis(500)).await});
+                tokio::time::timeout(Duration::from_secs(2),received).await.unwrap().unwrap();
+                if cancelled {cancel.cancel();}
+                let result=tokio::time::timeout(Duration::from_secs(2),call).await.unwrap().unwrap();
+                if cancelled {assert!(matches!(result,Err(openpaw_core::Error::Cancelled)));}
+                else {let outcome=result.unwrap();assert!(outcome.is_error);assert_eq!(outcome.structured.unwrap()["kind"],"deadline");}
+                tokio::time::timeout(Duration::from_secs(2),server).await.unwrap().unwrap();
+            }
+        });
+    }
 
     #[test]
     fn is_private_ip_rejects_loopback() {
@@ -527,17 +863,45 @@ mod tests {
         assert!(validate_url_ssrf(&url, false).is_ok());
     }
 
-    /// 缓存 key 必须区分 max_chars，防止小 max_chars 的截断结果
-    /// 污染大 max_chars 的请求。
     #[test]
-    fn cache_key_distinguishes_max_chars() {
-        let url = url::Url::parse("https://example.com/").unwrap();
-        let small = build_cache_key(&url, 100);
-        let large = build_cache_key(&url, 20_000);
+    fn d188_cached_body_keeps_unicode_excerpt_boundary_and_expiry() {
+        let key = "https://example.invalid/d188-unicode";
+        let text = "正文😀尾部";
+        put_cached(key, text);
+        assert_eq!(
+            get_cached(key, 2).unwrap(),
+            "正文\n... (truncated at 2 chars)"
+        );
+        assert_eq!(get_cached(key, 5).unwrap(), text);
+        assert_eq!(get_cached(key, 100).unwrap(), text);
+        assert!(get_cached("https://example.invalid/d188-unicode?other=1", 5).is_none());
+        {
+            let mut guard = FETCH_CACHE.lock().unwrap();
+            guard.as_mut().unwrap().get_mut(key).unwrap().fetched_at = Instant::now() - CACHE_TTL;
+        }
+        assert!(get_cached(key, 5).is_none());
+    }
 
-        assert_ne!(small, large, "不同 max_chars 不得共享缓存条目");
-        // 相同参数产生相同 key（缓存命中依赖这一点）
-        assert_eq!(large, build_cache_key(&url, 20_000));
+    #[test]
+    fn d188_cached_body_is_bounded_without_losing_truncation_signal() {
+        let key = "https://example.invalid/d188-bounded";
+        put_cached(key, &"字".repeat(120_000));
+        let guard = FETCH_CACHE.lock().unwrap();
+        assert_eq!(
+            guard
+                .as_ref()
+                .unwrap()
+                .peek(key)
+                .unwrap()
+                .content
+                .chars()
+                .count(),
+            MAX_CACHED_CHARS
+        );
+        drop(guard);
+        let excerpt = get_cached(key, 100_000).unwrap();
+        assert!(excerpt.ends_with("... (truncated at 100000 chars)"));
+        assert_eq!(excerpt.lines().next().unwrap().chars().count(), 100_000);
     }
 
     /// 进程级复用 Client 应返回同一实例。

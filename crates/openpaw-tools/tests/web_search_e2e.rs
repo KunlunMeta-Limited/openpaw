@@ -199,6 +199,10 @@ fn spec_contract() {
     assert_eq!(s.name, "web_search");
     assert_eq!(s.category, Some(ToolCategory::Network));
     assert_eq!(s.is_destructive, Some(false));
+    assert_eq!(
+        s.input_schema["properties"]["fetch_content"]["default"],
+        false
+    );
     // engine 枚举收敛为双引擎
     let engine = &s.input_schema["properties"]["engine"];
     assert_eq!(engine["enum"][0], "bing");

@@ -326,7 +326,9 @@ async fn suite() {
                 .unwrap()
         )
         .await,
-        vec![json!({"type":"error","message":"当前运行容量已满，请稍后重试"})]
+        vec![
+            json!({"type":"error","message":"运行额度不足。Host 的 max_active_runs 是所有办公室共用的并发上限，协作还会预留子任务额度；请等待任务结束，或调整配置后重启 Host"})
+        ]
     );
     let capacity_scope = ClientScope {
         namespace: "office".into(),

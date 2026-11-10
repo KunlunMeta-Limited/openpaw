@@ -97,7 +97,7 @@ fn acceptance_error(e: HostError) -> Response {
         "request_conflict" => "本轮标识已用于其他内容，请重新同步会话后重试",
         "session_busy" => "当前会话仍有任务运行，请等待完成或先停止",
         "slot_busy" => "当前办公室仍有任务运行，请等待完成或先停止",
-        "capacity_exceeded" => "当前运行容量已满，请稍后重试",
+        "capacity_exceeded" => "运行额度不足。Host 的 max_active_runs 是所有办公室共用的并发上限，协作还会预留子任务额度；请等待任务结束，或调整配置后重启 Host",
         "not_found" => "未找到这轮对话，请重新同步会话",
         _ => return error(e),
     };

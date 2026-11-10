@@ -126,6 +126,7 @@ pub(crate) struct Coordinator {
     config: OfficeConfig,
     address: std::net::SocketAddr,
     ui_refresh: tokio::sync::broadcast::Sender<ClientScope>,
+    client: std::sync::Arc<Client>,
 }
 impl Coordinator {
     /// 功能：为每个授权办公室启动独立投影和同步循环。
@@ -312,14 +313,35 @@ impl Coordinator {
             address,
             stop.clone(),
         )));
-        tasks.push(tokio::spawn(super::scene::run(host, client, stop.clone())));
+        tasks.push(tokio::spawn(super::scene::run(
+            host,
+            client.clone(),
+            stop.clone(),
+        )));
         Ok(Self {
             stop,
             tasks,
             config,
             address,
             ui_refresh,
+            client,
         })
+    }
+    /// 功能：取得同一Office连接池和恢复通知的短期问答句柄。
+    /// 参数：self为已启动协调器。
+    /// 返回：连接池、监听地址、恢复广播及关闭token的克隆。
+    /// 错误：无。
+    /// 状态：不创建网络请求，不延长问题期限。
+    /// 并发与取消：短读，不持协调器锁等待用户；关闭token保持同源。
+    /// 权限：内部句柄不授予工具或文件权限。
+    /// 关联：REQ-OP-013；DES-OP-008；CHG-2026-0007第9.16节。
+    pub(crate) fn question_transport(&self) -> crate::question::Transport {
+        crate::question::Transport {
+            client: self.client.clone(),
+            address: self.address,
+            refresh: self.ui_refresh.clone(),
+            stop: self.stop.clone(),
+        }
     }
     /// 功能：通知成功恢复聊天的会话需要重新展示待审批菜单。
     /// 参数：scope为已经轮次服务校验的完整作用域。
@@ -1527,7 +1549,7 @@ async fn prepare_internal(
                 let role=crate::agents::role(&d.role_id).ok_or_else(||HostError::new("storage_unavailable","委派引用未知角色"))?;
                 let show_card=display_calls.contains(&d.call_id);
                 let child=match read_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
-                let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
+                let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"|"awaiting_user"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
                 let superseded=recovered.contains(&d.call_id);
                 let done=state=="completed";
                 // 正式业务卡以父计划的准确委派验收为准；子执行计划是未验收时的阶段展示。
@@ -1540,8 +1562,9 @@ async fn prepare_internal(
                     s["state"]=="completed" && s["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id))
                 )).unwrap_or(child_percent==100);
                 let summary=if let Some(c)=&child {
-                    if state=="queued" {"已接受任务，等待成员依次执行".into()}
+                    if state=="queued" {"待执行：正在排队，尚未开始工作".into()}
                     else if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {super::turns::message(c)}
+                    else if c.tools.iter().any(|t|t.state=="awaiting_user") {"等待用户补充信息，请在当前对话选择或填写其他需求".into()}
                     else if state=="blocked" {"等待确认、资源或清理".into()}
                     else if let Some(binding)=db.office_tool_activity(c)? {
                         format!("{}{}；已核验进度{child_percent}%",observed_tool_activity(&binding,c),child_steps_view.iter().find(|s|s["status"]=="running").and_then(|s|s["title"].as_str()).map(|title|format!("；正在{title}")).unwrap_or_default())
@@ -1676,6 +1699,7 @@ async fn prepare_internal(
                 RunState::Completed if percent<100=>"回复已结束；已完成部分保留，其余待核验或继续处理".to_owned(),
                 RunState::Completed=>"本次目标已完成".to_owned(),
                 _ if !unbounded && child_blocked && !child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="running")=>"子任务等待确认、核验或可用资源".to_owned(),
+                _ if r.tools.iter().any(|t|t.state=="awaiting_user")=>"等待用户补充信息，请选择或填写其他需求".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
                 _=>child_tasks.iter().chain(child_steps.values()).find(|t|t["status"]=="running")
@@ -1692,7 +1716,7 @@ async fn prepare_internal(
                         format!("正在{}；已核验进度{percent}%",s["title"].as_str().unwrap_or("处理任务"))))
                     .unwrap_or_else(||"正在分析并组织下一步；尚无新增核验进度".to_owned()),
             };
-            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (!unbounded && child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (!unbounded && child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"|"awaiting_user")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
             let business_title = input.lines().find(|line| !line.trim().is_empty()).unwrap_or(&input).trim();
             let mut tasks=vec![task(main_id,dto::bounded(business_title,80),main_state,summary.clone(),&old,&now,percent)];
             for (index,step) in steps.into_iter().enumerate() {

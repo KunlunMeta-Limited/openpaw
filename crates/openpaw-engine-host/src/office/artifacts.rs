@@ -432,6 +432,19 @@ fn preview(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Option<Value
         json!({"kind":"custom","id":format!("preview-{}",row["version"].as_str().unwrap_or("")),"title":"图文预览","purpose":"artifact-preview","artifactId":row["artifact"],"versionId":row["version"],"span":"full","blocks":blocks}),
     ))
 }
+// 当前与历史均按准确version取核验说明；每文件仍最多一个section，遵守原8项上限。
+fn version_section(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Option<Value>> {
+    let preview = preview(row, rows, dir)?;
+    let Some(detail) = row["check_detail"].as_str() else {
+        return Ok(preview);
+    };
+    let mut section = preview.unwrap_or_else(||json!({"kind":"custom","id":format!("check-{}",row["version"].as_str().unwrap_or("")),"title":"版本核验依据","purpose":"evidence","artifactId":row["artifact"],"versionId":row["version"],"span":"full","blocks":[]}));
+    section["blocks"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"text","text":dto::bounded(detail,1800)}));
+    Ok(Some(section))
+}
 /// 功能：从可信版本构造固定历史交付。
 /// 参数：row为准确版本；rows为同会话版本目录；dir为私有blob根。
 /// 返回：只含该次真实写入的官方不可变交付对象。
@@ -441,8 +454,8 @@ fn preview(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Option<Value
 /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
 /// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
 pub(crate) fn delivery(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Value> {
-    let mut result = json!({"runId":row["delivery"],"title":row["title"],"status":"ready","producedAt":row["at"],"artifacts":[artifact(row,dir)?],"note":"原工具成功写出的确定版本；未进行内容验收。"});
-    if let Some(section) = preview(row, rows, dir)? {
+    let mut result = json!({"runId":row["delivery"],"title":row["title"],"status":"ready","producedAt":row["at"],"artifacts":[artifact(row,dir)?],"note":format!("原工具成功写出的确定版本；{}。", row["check_summary"].as_str().unwrap_or("本版本未登记核验"))});
+    if let Some(section) = version_section(row, rows, dir)? {
         result["sections"] = json!([section]);
     }
     Ok(
@@ -493,7 +506,7 @@ pub(crate) fn project(
             break;
         }
         current.push(artifact(row, &dir)?);
-        if let Some(section) = preview(row, &rows, &dir)? {
+        if let Some(section) = version_section(row, &rows, &dir)? {
             sections.push(section);
         }
     }
@@ -510,9 +523,26 @@ pub(crate) fn project(
     board["result"]["producedAt"] = rows[0]["at"].clone();
     // 新的成功文件不能覆盖同会话先前的捕获失败说明。
     let prior_note = board["result"]["note"].as_str().unwrap_or_default();
-    let note = "文件来自真实成功工具，版本原件可校验和下载；ready表示已保存，不表示内容审核通过。";
+    let mut checked = std::collections::HashSet::new();
+    let notes: Vec<_> = rows
+        .iter()
+        .filter(|row| checked.insert(row["artifact"].to_string()))
+        .take(3)
+        .map(|row| {
+            format!(
+                "{} v{}：{}",
+                dto::bounded(row["path"].as_str().unwrap_or("文件"), 40),
+                row["number"],
+                row["check_summary"].as_str().unwrap_or("未登记核验")
+            )
+        })
+        .collect();
+    let note = dto::bounded(
+        &format!("ready表示已保存，不代表整体验收；{}", notes.join("；")),
+        300,
+    );
     board["result"]["note"] = json!(if prior_note.is_empty() {
-        note.to_owned()
+        note.clone()
     } else {
         dto::bounded(&format!("{prior_note}；{note}"), 300)
     });
@@ -871,6 +901,167 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dir.join(format!("{}.blob", sha256(b"x")))).unwrap();
         assert!(read_blob(&dir, &json!({"hash":sha256(b"x"),"bytes":1})).is_err());
     }
+    #[tokio::test]
+    async fn d170_real_inspection_receipt_is_accepted_by_original_progress_and_survives_restart() {
+        use crate::{ClientScope, HostConfig, RunState};
+        use openpaw_core::{
+            Capabilities, CompletionRequest, CompletionResponse, ContentBlock, LlmProvider,
+            StopReason,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Checks(AtomicUsize);
+        #[async_trait::async_trait]
+        impl LlmProvider for Checks {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> openpaw_core::Result<CompletionResponse> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let last =
+                    req.messages
+                        .iter()
+                        .flat_map(|m| &m.content)
+                        .rev()
+                        .find_map(|c| match c {
+                            ContentBlock::ToolResult {
+                                content, is_error, ..
+                            } => {
+                                assert!(!is_error, "{content}");
+                                Some(content)
+                            }
+                            _ => None,
+                        });
+                let parsed = || serde_json::from_str::<Value>(last.unwrap()).unwrap();
+                let (name, input) = match n {
+                    0 => (
+                        "report_progress",
+                        json!({"type":"create","steps":[{"id":"verify","title":"核对限定内容"}]}),
+                    ),
+                    1 => (
+                        "write_file",
+                        json!({"path":"checks.md","content":"# 核验\n金额100元"}),
+                    ),
+                    2 => ("inspect_delivery", json!({"action":"list"})),
+                    3 => (
+                        "inspect_delivery",
+                        json!({"action":"read","version":parsed()["versions"][0]["version"]}),
+                    ),
+                    4 => {
+                        let r = parsed();
+                        assert_eq!(r["full_text"], true);
+                        (
+                            "inspect_delivery",
+                            json!({"action":"check","version":r["version"],"inspected_call_id":r["read_call_id"],"contains":["100元"],"excludes":["200元"]}),
+                        )
+                    }
+                    5 => {
+                        assert_eq!(parsed()["deterministic_failed"], 0);
+                        (
+                            "report_progress",
+                            json!({"type":"update","stepId":"verify","state":"completed","evidenceCallIds":["inspection-4"]}),
+                        )
+                    }
+                    _ => {
+                        return Ok(CompletionResponse {
+                            content: vec![ContentBlock::Text {
+                                text: "已核对两项实际内容，其他要求未核验".into(),
+                            }],
+                            stop_reason: StopReason::EndTurn,
+                            usage: Default::default(),
+                        })
+                    }
+                };
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: format!("inspection-{n}"),
+                        name: name.into(),
+                        input,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Default::default(),
+                })
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::default()
+            }
+            fn name(&self) -> &str {
+                "delivery-fixture"
+            }
+            fn default_model(&self) -> &str {
+                "delivery-fixture"
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let cfg:HostConfig=serde_json::from_value(json!({"home":tmp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"mock","tools":["write_file"],"auto_approve_tools":["write_file"],"office":{"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_UNUSED","allowed_origins":["http://127.0.0.1:8765"]}})).unwrap();
+        let host = Host::with_provider(cfg.clone(), Arc::new(Checks(AtomicUsize::new(0))))
+            .await
+            .unwrap();
+        host.inner
+            .store
+            .call(|db| db.artifact_origin("http://127.0.0.1:12345"))
+            .await
+            .unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "checks".into(),
+        };
+        let session = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(&scope, &session.session_id, "保存并核验".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let final_run = host.get_run(&scope, &run.run_id).await.unwrap();
+        assert_eq!(
+            final_run.state,
+            RunState::Completed,
+            "{:?}",
+            final_run.error
+        );
+        assert_eq!(final_run.tools.len(), 6);
+        assert!(final_run.tools.iter().all(|t| t.state == "completed"));
+        let id = run.run_id.clone();
+        host.inner
+            .store
+            .call(move |db| {
+                assert_eq!(db.progress(&id)?.unwrap()["steps"][0]["state"], "completed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
+        let host = Host::with_provider(cfg, Arc::new(openpaw_llm::MockProvider::fixed("未调用")))
+            .await
+            .unwrap();
+        host.inner
+            .store
+            .call(move |db| {
+                let (rows, dir) = db.artifacts(&scope)?;
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0]["check_summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("0项未通过"));
+                let d = delivery(&rows[0], &rows, &dir)?;
+                assert!(d["result"]["sections"][0]["blocks"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("100元"));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn real_tools_http_versions_restart_scope_revocation_and_capture_warning() {
         use crate::{ClientScope, HostConfig, RunState};

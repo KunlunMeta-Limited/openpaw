@@ -25,6 +25,7 @@ test('fresh installation creates private configuration, 32 empty roots and no im
   assert.equal(dirs.length, 32);
   for (const dir of dirs) assert.deepEqual(fs.readdirSync(path.join(paths.base, 'workspaces', dir)), []);
   const config = fs.readFileSync(paths.config, 'utf8');
+  assert.match(config, /^max_active_runs = 24$/m, '全局容量应容纳多个办公室的完整协作组');
   assert.match(config, /auto_approve_tools = \[\]/);
   assert.match(config, /auto_approve = false/);
   assert.equal((config.match(/office-\d+ = /g) || []).length, 64);
@@ -139,7 +140,7 @@ test('actual configure-only setup and rerun preserve a newly generated installat
   fs.writeFileSync(path.join(office, 'package-lock.json'), '{}');
   const helper = path.resolve(__dirname, '..', 'office-setup.cjs');
   const env = { ...process.env, OPENPAW_SETUP_HOME: path.join(dir, '本机 data'), OPENPAW_OFFICE_SOURCE: office };
-  const fresh = cp.spawnSync(process.execPath, [helper], { env, input: 'openai\n\n\nfixture-secret\n2\n1\n', encoding: 'utf8', timeout: 8000 });
+  const fresh = cp.spawnSync(process.execPath, [helper], { env, input: 'openai\n\n\nfixture-secret\n2\ny\n1\n', encoding: 'utf8', timeout: 8000 });
   assert.equal(fresh.status, 0, fresh.stderr);
   assert.ok(!fresh.stdout.includes('fixture-secret'));
   const paths = setup.locations(env);
@@ -166,10 +167,26 @@ test('failed dependency installation reports failure and leaves fresh config ret
   fs.writeFileSync(path.join(office, 'package-lock.json'), 'invalid lock file');
   const env = { ...process.env, OPENPAW_SETUP_HOME: path.join(dir, 'data'), OPENPAW_OFFICE_SOURCE: office };
   const result = cp.spawnSync(process.execPath, [path.resolve(__dirname, '..', 'office-setup.cjs')], {
-    env, input: 'openai\n\n\nfixture-secret\n1\n2\n', encoding: 'utf8', timeout: 8000,
+    env, input: 'openai\n\n\nfixture-secret\n1\nn\n2\n', encoding: 'utf8', timeout: 8000,
   });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /命令执行失败/);
   assert.ok(!`${result.stdout}${result.stderr}`.includes('fixture-secret'));
   assert.equal(setup.installState(setup.locations(env)), 'existing');
+});
+
+
+test('interactive questions are explicitly opt-in, independent of write consent, and rerun cannot expand permission', t => {
+  for (const writes of [false, true]) {
+    for (const questions of [false, true]) {
+      const paths = pathsFor(temporary(t));
+      setup.createFresh(paths, envText(), writes, questions);
+      const config = fs.readFileSync(paths.config, 'utf8');
+      const tools = JSON.parse(config.match(/^tools = (.*)$/m)[1]);
+      assert.equal(tools.includes('clarify'), questions);
+      assert.match(config, writes ? /auto_approve = true/ : /auto_approve = false/);
+      assert.throws(() => setup.createFresh(paths, envText(), !writes, !questions), /已有配置/);
+      assert.equal(fs.readFileSync(paths.config, 'utf8'), config);
+    }
+  }
 });

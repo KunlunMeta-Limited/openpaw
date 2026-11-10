@@ -267,6 +267,11 @@ impl<'a> MarkdownParser<'a> {
                     self.pos += end + 2; // skip both \x00 markers
                     continue;
                 }
+                // 外部内容中的孤立NUL不是代码块占位符。必须消费它，否则
+                // 普通文本分支再次找到同一字节，阻塞执行与协作取消。
+                out.push('\u{fffd}');
+                self.pos += 1;
+                continue;
             }
 
             if self.html[self.pos..].starts_with('<') {
@@ -686,6 +691,21 @@ mod tests {
         assert!(md.contains("<tag>"));
         assert!(md.contains("&"));
         assert!(md.contains("\"quote\""));
+    }
+
+    #[test]
+    fn test_unmatched_nul_consumes_input_without_losing_normal_code_blocks() {
+        for (html, expected) in [
+            ("\0正文", "�正文"),
+            ("前文\0后文", "前文�后文"),
+            ("正文\0", "正文�"),
+            ("<p>前文\0后文</p>", "前文�后文"),
+        ] {
+            assert_eq!(html_to_markdown(html).trim(), expected);
+        }
+        let markdown = html_to_markdown("<pre><code>let x = 1;</code></pre><p>尾部\0</p>");
+        assert!(markdown.contains("```\nlet x = 1;\n```"));
+        assert!(markdown.contains("尾部�"));
     }
 
     #[test]

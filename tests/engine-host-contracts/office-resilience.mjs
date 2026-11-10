@@ -78,7 +78,10 @@ export async function teamProduct({page,report,output,readOffice,conv,latestSend
     assert.equal(record.status,'completed')
     assert.equal(record.command.busyPolicy,'queue')
     assert.equal(record.command.params.stops[0].hostId,'office-lead')
-    assert.ok(record.command.params.stops[0].message.includes('独立执行已结束'))
+    const message=record.command.params.stops[0].message
+    const assigned=handoffs.find(handoff=>handoff.actor===actor)
+    assert.equal(message,`已处理：${assigned.task.title}。`)
+    assert.ok(!message.includes('分配人')&&!message.includes('请核验'))
   }
   // 成员布局必须实际显示投影事件，不能只在HTTP快照里通过断言。
   await page.getByRole('button',{name:'切换页面布局',exact:true}).click()
@@ -329,4 +332,21 @@ async function memberLayoutProduct({page,report,output,readOffice,conv,request,p
   db.close()
   report.memberLayout={parent,request,profiles,selected,initial,runsBefore:before,runsAfter:before,modelsBefore,modelsAfter:report.modelRequests.length,invalidStatus:invalid.status()}
   report.assertions.push('T6 active Run survives classic/members switching, refresh and cross-page layout synchronization without duplicate Run/model request','T6 six members layout profile buttons reach six real Host details; full roster disables add; layout revision stays separate from snapshot seq')
+}
+
+// 问答验收同时适用于原经典布局和新版团队通知；只点公开控件，不注入Office内部状态。
+export async function answerQuestion({page, choice, customText, report}) {
+  const scope=page.locator('.office-decision-card, .team-decision-notice').filter({has:page.getByRole('group',{name:'处理方案',exact:true})}).filter({visible:true}).first()
+  await scope.waitFor({state:'visible',timeout:20000})
+  const submit=scope.locator('button[type="submit"], .office-decision-primary').first()
+  assert.equal(await submit.isEnabled(),false,'未选答案时不能默认批准或继续')
+  await scope.getByRole('radio',{name:customText===undefined?choice:/其他需求/}).check()
+  if(customText!==undefined) {
+    const input=scope.getByRole('textbox',{name:'其他需求',exact:true})
+    await input.fill(customText)
+    assert.equal(await input.inputValue(),customText)
+  }
+  assert.equal(await submit.isEnabled(),true)
+  await submit.click()
+  report.assertions.push(customText===undefined?'真实选择答案已提交，未默认选择':'真实自定义文本已提交，未由普通聊天冒充')
 }
