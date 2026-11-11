@@ -1,9 +1,14 @@
+//! 职责：提供需显式装配的MCP客户端能力。
+//! 输入输出：调用方显式参数到原工具/资源或反思结果。
+//! 依赖：原核心接口与锁定依赖。
+//! 禁止职责：不自动装配默认聊天，不替代Host权限。
 //! openpaw-mcp — MCP client host.
 //!
-//! Planned scope (M2): host (stdio + Streamable HTTP), circuit breaker,
+//! Library scope: client host (stdio + plain Streamable HTTP), circuit breaker,
 //! `${VAR}` interpolation, minimal resource list/read. See the engineering
 //! plan, crate card for this crate.
 //!
+//! This public library is not automatically assembled by CLI/Host chat.
 //! Landed modules (MC-1): [`error`], [`interpolator`], [`config`].
 //! Landed modules (MC-2): [`circuit_breaker`], [`server`].
 
@@ -23,7 +28,7 @@ pub use server::ServerSession;
 mod spike_probe {
     //! MC-0 verification spike (devlog session log has the conclusions).
     //!
-    //! Offline-safe probes that pin the rmcp 1.8 client surface the
+    //! Offline-safe probes that pin the rmcp 3.9 client surface the
     //! MC-2/MC-3 implementation will drive:
     //! 1. hand-rolled stdio transport on `AsyncRwTransport` + tokio
     //!    `kill_on_drop` (a deliberate choice over rmcp's

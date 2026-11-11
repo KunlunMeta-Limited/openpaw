@@ -2,6 +2,8 @@
 //! 输入输出：真实配置及隔离数据到授权/只读断言。
 //! 依赖：现有Host与原技能/目标/Todo查询。
 //! 禁止职责：不将共享服务测试冒充真实Office浏览器验证。
+#[path = "../../src/test_support.rs"]
+mod test_support;
 use openpaw_engine_host::*;
 use serde_json::json;
 fn config(base: &std::path::Path) -> HostConfig {
@@ -75,22 +77,25 @@ async fn readonly_categories_do_not_create_files_and_deleted_scope_cannot_query(
 
 #[test]
 fn office_approval_and_ui_use_real_http_with_shared_cas() {
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "interaction_fixture_child", "--nocapture"])
-        .env("OPENPAW_INTERACTION_CHILD", "1")
-        .env("PAWOFFICE_TEST_KEY", "isolated-office-key")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "interaction_fixture_child", "--nocapture"])
+            .env("OPENPAW_INTERACTION_CHILD", "1")
+            .env("PAWOFFICE_TEST_KEY", "isolated-office-key"),
+        "interaction_fixture_child",
+    );
 }
 #[test]
 fn interaction_fixture_child() {
     if std::env::var("OPENPAW_INTERACTION_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let proof = test_support::ChildProof::start("interaction_fixture_child");
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(interaction_scenario());
+
+    proof.complete();
 }
 #[derive(Default)]
 struct Fixture {
@@ -679,22 +684,25 @@ fn reserved_creation_slots_must_be_unique_and_pre_authorized() {
 
 #[test]
 fn creation_http_recovers_410_serializes_allocations_and_restores_names() {
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "creation_http_fixture_child", "--nocapture"])
-        .env("OPENPAW_CREATION_HTTP_CHILD", "1")
-        .env("PAWOFFICE_TEST_KEY", "isolated-key")
-        .status()
-        .unwrap();
-    assert!(result.success());
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "creation_http_fixture_child", "--nocapture"])
+            .env("OPENPAW_CREATION_HTTP_CHILD", "1")
+            .env("PAWOFFICE_TEST_KEY", "isolated-key"),
+        "creation_http_fixture_child",
+    );
 }
 #[test]
 fn creation_http_fixture_child() {
     if std::env::var("OPENPAW_CREATION_HTTP_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let proof = test_support::ChildProof::start("creation_http_fixture_child");
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(creation_http_scenario());
+
+    proof.complete();
 }
 async fn creation_http_scenario() {
     use axum::response::IntoResponse;
@@ -1003,22 +1011,25 @@ fn r37_clarify_requires_explicit_office_permission_and_never_grants_write_consen
 
 #[test]
 fn r37_real_question_http_lifecycle() {
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "r37_question_fixture_child", "--nocapture"])
-        .env("OPENPAW_QUESTION_CHILD", "1")
-        .env("PAWOFFICE_TEST_KEY", "isolated-question-key")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "r37_question_fixture_child", "--nocapture"])
+            .env("OPENPAW_QUESTION_CHILD", "1")
+            .env("PAWOFFICE_TEST_KEY", "isolated-question-key"),
+        "r37_question_fixture_child",
+    );
 }
 #[test]
 fn r37_question_fixture_child() {
     if std::env::var("OPENPAW_QUESTION_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let proof = test_support::ChildProof::start("r37_question_fixture_child");
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(r37_question_scenario());
+
+    proof.complete();
 }
 async fn r37_question_scenario() {
     use axum::response::IntoResponse;

@@ -22,7 +22,6 @@ regex.workspace = true
 glob.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
-tree-sitter-language.workspace = true
 url.workspace = true
 urlencoding.workspace = true
 encoding_rs.workspace = true

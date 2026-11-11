@@ -63,6 +63,12 @@ function assertLocation(target) {
   }
 }
 
+// 仅检查版本能力，不更改工具链或全局环境。
+function rustVersionSupported(version) {
+  const match = version.match(/rustc (\d+)\.(\d+)/);
+  return Boolean(match && (Number(match[1]) > 1 || Number(match[1]) === 1 && Number(match[2]) >= 89));
+}
+
 function preflight() {
   const [major, minor] = process.versions.node.split('.').map(Number);
   if (!(major === 22 && minor >= 13 || major >= 24)) fail('需要Node.js 24 LTS（或22.13+的22.x），请从 https://nodejs.org 安装后重试');
@@ -73,8 +79,7 @@ function preflight() {
   };
   check('git', ['--version'], '缺少Git：https://git-scm.com/downloads');
   const version = check('rustc', ['--version'], '缺少Rust：https://rustup.rs；Windows还需Visual Studio C++ Build Tools，Linux需C编译器');
-  const match = version.match(/rustc (\d+)\.(\d+)/);
-  if (!match || Number(match[1]) < 1 || Number(match[1]) === 1 && Number(match[2]) < 88) fail('需要Rust 1.88+；运行 rustup update stable');
+  if (!rustVersionSupported(version)) fail('需要Rust 1.89+；运行 rustup update stable');
   check('cargo', ['--version'], 'cargo不在PATH中；安装Rust后重新打开终端');
   check(windows ? 'npm.cmd' : 'npm', ['--version'], '缺少npm；请重新安装Node.js LTS');
   if (!windows) {
@@ -228,9 +233,9 @@ async function main() {
     }
     note(`setup完成。模型配置：${paths.env}；权限/工作区：${paths.config}；服务密钥：${paths.key}（不要提交）。`);
     note(`页面：http://127.0.0.1:${paths.officePort}/office/；模型密钥有效性需实际聊天验证，setup不发送付费模型请求。`);
-    note('若设置了OPENPAW_SETUP_HOME/其他覆盖变量，后续build/start/stop/status须使用相同设置；详见docs/engine-host/setup.md。');
+    note('若设置了OPENPAW_SETUP_HOME/其他覆盖变量，后续build/start/stop/status须使用相同设置；详见README.md的“配置和数据目录”。');
   } finally { prompt.close(); }
 }
 
-module.exports = { locations, port, configuration, modelEnvironment, installState, createFresh, inside };
+module.exports = { locations, port, configuration, modelEnvironment, installState, createFresh, inside, rustVersionSupported };
 if (require.main === module) main().catch(error => { console.error(`openpaw-office: ${error.message}`); process.exitCode = 2; });

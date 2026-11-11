@@ -1,10 +1,17 @@
+//! 职责：提供需显式装配的反思与未核验统计库。
+//! 输入输出：调用方显式参数到原工具/资源或反思结果。
+//! 依赖：原核心接口与锁定依赖。
+//! 禁止职责：不自动装配默认聊天，不替代Host权限。
 //! openpaw-reflect-lite — the three-step minimal reflection loop (S2 landed).
 //!
 //! Landed (M4): rule trigger (turn threshold N or error in turn), single-shot
 //! LLM reflection emitting the same `ReflectionOutput` schema, direct
 //! persistence with `unverified: true` forced on every artifact, unverified-
-//! ratio stats, config. The trigger → reflect → persist steps compose into
-//! the loop the CLI assembly drives.
+//! ratio stats, config. The trigger → reflect → persist steps are library
+//! capabilities demonstrated by examples/demo_reflect_loop.rs. Default CLI
+//! chat and Host do not automatically run this loop; evolve/sidecar inspect
+//! unverified statistics. Automatic model calls and knowledge writes require
+//! an explicit caller assembly and its permission policy.
 //!
 //! Generation-gap red lines (deliberate deviations from the upstream reflect
 //! crate, also annotated in the corresponding modules):

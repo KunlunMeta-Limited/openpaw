@@ -29,6 +29,49 @@ use crate::{HostConfig, HostError, HostResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// 用途：Office展示与动作协调的进程内状态。
+/// 字段：原团队投影、团队锁、UI计数与终态视图。
+/// 来源去向：原Host启动/删除/关闭到Office适配。
+/// 约束：不保存新的持久事实，不作为授权来源。
+/// 稳定性：Host私有结构。
+/// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-011；DES-OP-007。
+#[derive(Default)]
+pub(crate) struct RuntimeState {
+    /// 用途：Office只读详情的最近完整投影，降低人物点击的首屏延迟。
+    /// 字段：按办公室作用域索引的规范JSON快照。
+    /// 来源去向：Coordinator从Store更新，actions只读消费。
+    /// 约束：事实仍以Store中的JSONL/SQLite为准；删除或作用域变化必须失效。
+    /// 稳定性：T6内部缓存，不是第二份账本或授权来源。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
+    /// 启动时从持久投影预热，投影保存后更新；删除会话后必须失效对应团队。
+    pub(crate) projection_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>>,
+    /// 用途：合并同一办公室同时到达的只读投影请求。
+    /// 字段：按办公室作用域的异步互斥锁；不锁不同办公室。
+    /// 来源去向：Office read/UI 与后台同步到单次事实扫描。
+    /// 约束：等待者在首个扫描完成后复用持久投影，不能重复扫描整本账本。
+    /// 稳定性：T6内部协调状态，不是业务数据或第二份账本。
+    /// 关联：需求/设计REQ-OP-011/014；DES-OP-007/008。
+    pub(crate) projection_locks: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    >,
+    /// 用途：标记当前Office UI动作，避免后台投影扫描争用Store。
+    /// 字段：活动动作计数器。
+    /// 来源去向：actions入口增减，projection在扫描边界读取。
+    /// 约束：只影响后台扫描调度，不跳过UI事实校验或降低权限。
+    /// 稳定性：T6内部协调状态，不持久化。
+    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
+    pub(crate) ui_busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// 用途：缓存已结束Run的只读完整视图，避免重复解析大型JSONL。
+    /// 字段：按Run ID索引的终态crate::RunView。
+    /// 来源去向：projection从Store装载，详情查询只读消费。
+    /// 约束：仅缓存终态；活动Run始终回到Store读取最新事实，不能作为授权来源。
+    /// 稳定性：T6进程内缓存，重启后可重建。
+    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007。
+    pub(crate) terminal_runs:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, crate::RunView>>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// 用途：显式启用Office接入，密钥只保留环境变量名。
@@ -234,4 +277,72 @@ pub(crate) async fn prepare_question(
         ));
     }
     Ok(())
+}
+
+/// 用途：将可信业务角色映射到原Office展示身份。
+/// 字段：无；只提供固定员工与人物标识。
+/// 来源去向：原角色目录到Office投影/详情/场景。
+/// 约束：不改变业务角色、权限或运行作用域。
+/// 稳定性：Office私有适配契约。
+/// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-021；DES-OP-012。
+pub(super) trait RolePresentation {
+    /// 功能：取得角色对应的原Office成员标识。
+    /// 参数：self为可信固定业务角色。
+    /// 返回：原成员ID。
+    /// 错误：无；角色目录为服务端固定集合。
+    /// 状态：纯映射。
+    /// 并发与取消：无共享状态。
+    /// 权限：不接受浏览器覆盖，不授予执行能力。
+    /// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-021；DES-OP-012。
+    fn employee(&self) -> &'static str;
+    /// 功能：取得角色对应的原Office人物标识。
+    /// 参数：self为可信固定业务角色。
+    /// 返回：原人物ID。
+    /// 错误：无。
+    /// 状态：纯映射，与原人物名册保持一致。
+    /// 并发与取消：无共享状态。
+    /// 权限：不改变角色或授权范围。
+    /// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-021；DES-OP-012。
+    fn actor(&self) -> &'static str;
+}
+impl RolePresentation for crate::agents::Role {
+    fn employee(&self) -> &'static str {
+        match self.id {
+            "lead" => "office-lead",
+            "research" => "code-agent",
+            "organize" => "file-agent",
+            "draft" => "app-agent",
+            "review" => "review-agent",
+            "audit" => "data-agent",
+            _ => unreachable!("角色仅由固定可信目录构造"),
+        }
+    }
+    fn actor(&self) -> &'static str {
+        self.employee()
+    }
+}
+
+/// 功能：按原Office协议组装真实提问菜单。
+/// 参数：role为可信角色ID，title/description/options为已由原问题入口校验的内容。
+/// 返回：原choice菜单JSON，显示ID仍由原协调器赋值。
+/// 错误：无；长度/选项约束仍由原校验负责。
+/// 状态：不创建问题、不提交菜单、不写账本。
+/// 并发与取消：纯转换，等待与取消仍在question模块。
+/// 权限：答案不是工具执行授权，人物标识由服务端固定映射。
+/// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-013；DES-OP-008。
+pub(crate) fn question_menu(
+    role: &str,
+    title: &str,
+    description: String,
+    options: &[String],
+) -> serde_json::Value {
+    let actor = crate::agents::role(role)
+        .map(|r| r.actor())
+        .unwrap_or("office-lead");
+    let options: Vec<_> = options
+        .iter()
+        .enumerate()
+        .map(|(i, s)| serde_json::json!({"id":format!("option-{i}"),"label":s}))
+        .collect();
+    serde_json::json!({"id":"pending","actorId":actor,"kind":"choice","title":title,"description":description,"allowCustom":true,"options":options})
 }

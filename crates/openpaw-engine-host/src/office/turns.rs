@@ -333,17 +333,11 @@ fn display_counted(
     for d in db.delegations(&run.run_id)?.into_iter().rev() {
         // 原delegations已验证父子scope/根；只按主键读生命周期，不解析子正文或工具。
         child_reads += 1;
-        let mut child = match db.run_metadata(&d.child_run) {
+        let mut child = match crate::query::delegated_run_metadata(db, &d) {
             Ok(child) => child,
             Err(error) if error.kind == "not_found" => continue,
             Err(error) => return Err(error),
         };
-        if child.session_id != d.child_session {
-            return Err(HostError::new(
-                "storage_unavailable",
-                "子运行与持久委派所属不一致",
-            ));
-        }
         // 旧记录可能只持有通用终态错误；复用原文本恢复来细分账本原因，
         // 仍不构建工具或递归子任务。新明确分类沿元数据，不能被旧账本覆盖。
         if matches!(

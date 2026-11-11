@@ -120,23 +120,26 @@ mod tests {
     use super::*;
     #[test]
     fn creation_uses_real_scoped_session_and_survives_unconfirmed_ui() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "office::workspaces::tests::creation_fixture_child",
-                "--nocapture",
-            ])
-            .env("OPENPAW_CREATION_CHILD", "1")
-            .env("PAWOFFICE_CREATION_TEST_KEY", "isolated-key")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        crate::test_support::run_child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "office::workspaces::tests::creation_fixture_child",
+                    "--nocapture",
+                ])
+                .env("OPENPAW_CREATION_CHILD", "1")
+                .env("PAWOFFICE_CREATION_TEST_KEY", "isolated-key"),
+            "office::workspaces::tests::creation_fixture_child",
+        );
     }
     #[test]
     fn creation_fixture_child() {
         if std::env::var("OPENPAW_CREATION_CHILD").as_deref() != Ok("1") {
             return;
         }
+        let proof = crate::test_support::ChildProof::start(
+            "office::workspaces::tests::creation_fixture_child",
+        );
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().join("root");std::fs::create_dir(&root).unwrap();
@@ -182,5 +185,7 @@ mod tests {
             assert_eq!(host.inner.store.call(|db|db.office_creations()).await.unwrap().len(),1);
             host.shutdown().await.unwrap();
         });
+
+        proof.complete();
     }
 }

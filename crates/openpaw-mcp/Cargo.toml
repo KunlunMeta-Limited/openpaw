@@ -10,7 +10,7 @@ authors.workspace = true
 [dependencies]
 # Client transports only, with two floor-driven choices (MC-0 spike):
 # 1. No `transport-child-process`: originally forced by the 1.80/1.85 MSRV
-#    floor (process-wrap 9.x needs 1.87); under the final 1.88 floor it
+#    floor (process-wrap 9.x needs 1.87); under the current 1.89 floor it
 #    would be usable, but the hand-rolled stdio transport is kept
 #    deliberately — tokio `kill_on_drop` + `AsyncRwTransport` keeps
 #    process-wrap/nix out of the tree and Windows `.cmd/.bat` spawn

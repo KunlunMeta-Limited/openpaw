@@ -2,6 +2,7 @@
 //! 输入输出：原ApprovalView到官方decision.request和共享CAS。
 //! 依赖：共享Host、唯一Client和快照同步屏障。
 //! 禁止职责：不另建授权、不延长业务期限、不从未知结果批准。
+use super::RolePresentation;
 use super::{client::Client, dto, projection};
 use crate::{ApprovalView, ClientScope, Host, HostResult};
 use serde_json::json;
@@ -127,7 +128,7 @@ async fn display(
     let title = role
         .map(|r| format!("{}：确认本次 {}", r.name, a.binding.tool_name))
         .unwrap_or_else(|| format!("确认本次 {}", a.binding.tool_name));
-    let actor = role.map(|r| r.actor).unwrap_or("office-lead");
+    let actor = role.map(|r| r.actor()).unwrap_or("office-lead");
     let description = if let Some(d) = &owner {
         format!("子任务：{}\n{}", d.title, description(a))
     } else {

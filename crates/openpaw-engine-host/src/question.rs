@@ -251,15 +251,12 @@ pub(crate) async fn ask(
     for option in &mut options {
         *option = option.trim().into();
     }
-    let decision_options: Vec<_> = options
-        .iter()
-        .enumerate()
-        .map(|(i, s)| json!({"id":format!("option-{i}"),"label":s}))
-        .collect();
-    let role = crate::agents::role(&state.role_id);
-    let mut decision = json!({"id":"pending","actorId":role.map(|r|r.actor).unwrap_or("office-lead"),
-        "kind":"choice","title":input.question.trim(),"description":input.context.unwrap_or_default(),
-        "allowCustom":true,"options":decision_options});
+    let mut decision = crate::office::question_menu(
+        &state.role_id,
+        input.question.trim(),
+        input.context.unwrap_or_default(),
+        &options,
+    );
     let mut display = None;
     let mut retries = 0;
     let mut openings = 0;

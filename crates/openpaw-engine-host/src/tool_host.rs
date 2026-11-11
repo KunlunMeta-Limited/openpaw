@@ -156,12 +156,17 @@ impl ToolExecutor for HostTools {
                         || self.progress_enabled && self.host.inner.config.office.is_some())
             })
             .collect();
-        if let Some(spec) = specs.iter_mut().find(|s| s.name == "clarify") {
+        if self.allowed.iter().any(|s| s == "clarify")
+            && self.progress_enabled
+            && self.host.inner.config.office.is_some()
+        {
+            let mut spec = openpaw_tools::meta::clarify::spec();
             spec.description = "仅当关键缺失信息实质影响正确性或执行范围时提问；Office显示选项和其他需求输入，等待真实回答后继续同Run。问题最多120 UTF-16单元，上下文1800；选项省略或2—8个互异非空短文本。回答不授权文件或命令操作。".into();
             spec.input_schema["additionalProperties"] = serde_json::json!(false);
             spec.input_schema["properties"]["options"]["minItems"] = serde_json::json!(2);
             spec.input_schema["properties"]["options"]["maxItems"] = serde_json::json!(8);
             spec.input_schema["properties"]["options"]["uniqueItems"] = serde_json::json!(true);
+            specs.push(spec);
         }
         if self.execution.as_ref().is_some_and(|e| e.role == "lead") {
             specs.push(crate::orchestration::spec());
@@ -483,12 +488,8 @@ impl HostTools {
         let success = result.as_ref().is_ok_and(|r| !r.is_error);
         // Root许可仍持有：捕获只读取刚成功工具的准确目标，不再次执行副作用。
         if success && self.progress_enabled && self.host.inner.config.office.is_some() {
-            if let Err(error) = crate::office::artifacts::capture(
-                &self.host,
-                self.root.path.clone(),
-                binding.clone(),
-            )
-            .await
+            if let Err(error) =
+                crate::artifacts::capture(&self.host, self.root.path.clone(), binding.clone()).await
             {
                 if let Ok(outcome) = &mut result {
                     outcome.content.push_str(&format!("\n\n文件写入已成功，但不可变版本捕获失败：{}。工作区原文件保留；不能宣称该文件已可预览或下载。",error.message));

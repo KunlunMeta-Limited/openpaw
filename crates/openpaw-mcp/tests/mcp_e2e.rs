@@ -9,8 +9,9 @@ use std::time::Duration;
 use openpaw_mcp::server::ServerSession;
 use openpaw_mcp::{CircuitBreaker, CircuitState, McpError};
 use rmcp::model::{
-    Annotated, CallToolResult, Content, JsonObject, ListResourcesResult, ListToolsResult,
-    RawResource, ReadResourceResult, ServerCapabilities, ServerInfo, Tool,
+    CallToolResponse, CallToolResult, ContentBlock, JsonObject, ListResourcesResult,
+    ListToolsResult, ReadResourceResponse, ReadResourceResult, Resource, ServerCapabilities,
+    ServerConfig, Tool,
 };
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::async_rw::AsyncRwTransport;
@@ -27,8 +28,8 @@ struct MockServer {
 }
 
 impl ServerHandler for MockServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -51,30 +52,31 @@ impl ServerHandler for MockServer {
         &self,
         request: rmcp::model::CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         if let Some(delay) = self.call_delay {
             tokio::time::sleep(delay).await;
         }
         let args = request.arguments.unwrap_or_default();
-        match request.name.as_ref() {
+        let result = match request.name.as_ref() {
             "echo" => {
                 let text = args
                     .get("text")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                Ok(CallToolResult::success(vec![Content::text(format!(
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                     "echo: {text}"
                 ))]))
             }
-            "fail" => Ok(CallToolResult::error(vec![Content::text(
+            "fail" => Ok(CallToolResult::error(vec![ContentBlock::text(
                 "mock tool failure",
             )])),
-            _ => Ok(CallToolResult::error(vec![Content::text(format!(
+            _ => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "unknown tool {}",
                 request.name
             ))])),
-        }
+        };
+        result.map(Into::into)
     }
 
     async fn list_resources(
@@ -82,36 +84,30 @@ impl ServerHandler for MockServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let resource = Annotated::new(
-            RawResource::new("mock://doc/1", "Mock Document").with_mime_type("text/plain"),
-            None,
-        );
-        Ok(ListResourcesResult {
-            resources: vec![resource],
-            next_cursor: None,
-            meta: None,
-        })
+        let resource = Resource::new("mock://doc/1", "Mock Document").with_mime_type("text/plain");
+        Ok(ListResourcesResult::with_all_items(vec![resource]))
     }
 
     async fn read_resource(
         &self,
         request: rmcp::model::ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         if request.uri != "mock://doc/1" {
             return Err(ErrorData::invalid_params(
                 format!("no resource {}", request.uri),
                 None,
             ));
         }
-        Ok(ReadResourceResult::new(vec![
-            rmcp::model::ResourceContents::TextResourceContents {
+        Ok(
+            ReadResourceResult::new(vec![rmcp::model::ResourceContents::TextResourceContents {
                 uri: "mock://doc/1".into(),
                 mime_type: Some("text/plain".into()),
                 text: "mock body".into(),
                 meta: None,
-            },
-        ]))
+            }])
+            .into(),
+        )
     }
 }
 
@@ -237,4 +233,133 @@ async fn breaker_trips_on_transport_failure_then_reconnects() {
 
     session.shutdown().await.unwrap();
     handle.cancel().await.expect("server service stopped");
+}
+
+#[tokio::test]
+async fn http_json_and_error_bodies_are_bounded_with_or_without_length() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Instant;
+    for (status, limit, chunked) in [
+        (200, 16 * 1024 * 1024, false),
+        (400, 64 * 1024, false),
+        (200, 16 * 1024 * 1024, true),
+        (400, 64 * 1024, true),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((s, _)) => break s,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    other => panic!("bounded HTTP fixture was not reached: {other:?}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(T)).unwrap();
+            socket.set_write_timeout(Some(T)).unwrap();
+            let mut buf = [0; 8192];
+            assert!(socket.read(&mut buf).unwrap() > 0);
+            if chunked {
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                let chunk = vec![b' '; 64 * 1024];
+                for _ in 0..=limit / chunk.len() {
+                    if write!(socket, "{:x}\r\n", chunk.len())
+                        .and_then(|_| socket.write_all(&chunk))
+                        .and_then(|_| socket.write_all(b"\r\n"))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                let _ = socket.write_all(b"0\r\n\r\n");
+            } else {
+                write!(socket, "HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", limit + 1).unwrap();
+            }
+        });
+        let spec = openpaw_mcp::ServerSpec::Http {
+            url: url.parse().unwrap(),
+            headers: Default::default(),
+        };
+        let started = Instant::now();
+        let error = ServerSession::connect("bounded", &spec, T)
+            .await
+            .unwrap_err();
+        worker.join().unwrap();
+        assert!(
+            started.elapsed() < T,
+            "must reject actual size, not hang until request timeout"
+        );
+        assert!(
+            error.to_string().contains("maximum size"),
+            "status={status}, chunked={chunked}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_sse_is_streamed_without_a_total_body_limit() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Instant;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + T;
+        let mut requests = 0;
+        while requests < 2 {
+            let mut socket = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                other => panic!("SSE fixture did not receive initialize/notification: {other:?}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket.set_read_timeout(Some(T)).unwrap();
+            socket.set_write_timeout(Some(T)).unwrap();
+            let mut buf = [0; 8192];
+            let n = socket.read(&mut buf).unwrap();
+            assert!(n > 0);
+            if requests == 0 {
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+                // Each SSE comment is small; the full stream deliberately exceeds JSON's 16MiB cap.
+                let comment = format!(":{}\n\n", "x".repeat(16 * 1024));
+                for _ in 0..1025 {
+                    write!(socket, "{:x}\r\n{comment}\r\n", comment.len()).unwrap();
+                }
+                let event = format!(
+                    "data: {}\n\n",
+                    rmcp::serde_json::json!({"jsonrpc":"2.0","id":0,"result":{"protocolVersion":rmcp::model::ProtocolVersion::LATEST,"capabilities":{},"serverInfo":{"name":"bounded-sse","version":"1"}}})
+                );
+                write!(socket, "{:x}\r\n{event}\r\n0\r\n\r\n", event.len()).unwrap();
+            } else {
+                socket
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+            }
+            requests += 1;
+        }
+    });
+    let spec = openpaw_mcp::ServerSpec::Http {
+        url: url.parse().unwrap(),
+        headers: Default::default(),
+    };
+    let session = ServerSession::connect("streaming", &spec, T).await.unwrap();
+    session.shutdown().await.unwrap();
+    worker.join().unwrap();
 }

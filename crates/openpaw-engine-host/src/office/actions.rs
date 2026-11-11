@@ -110,7 +110,7 @@ async fn handle(
         ));
     }
     let _ui_busy = {
-        let counter = host.inner.office_ui_busy.clone();
+        let counter = host.inner.office_state.ui_busy.clone();
         counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         UiBusyGuard(counter)
     };
@@ -226,7 +226,8 @@ async fn dispatch(
         Some("actor.inspect") | Some("employee.inspect") | Some("dialog.action")
     ) {
         host.inner
-            .office_projection_cache
+            .office_state
+            .projection_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&scope.slot_id)

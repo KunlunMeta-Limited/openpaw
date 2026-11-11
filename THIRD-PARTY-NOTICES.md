@@ -5,7 +5,7 @@ This supplement covers the two version-scoped license exceptions proposed in
 notices for all dependencies; distribution review must use the final lockfile.
 
 Distribute this file and `third-party-licenses/` with every released binary or
-archive. The T8 packaging check must verify their presence. These upstream
+archive. The release packaging check must verify their presence. These upstream
 packages are used without source modifications in this change.
 
 | Package | Upstream source archive | License text | SHA-256 of license text |
@@ -22,6 +22,17 @@ Upgrading either package requires reviewing the actual new license and updating
 the version-scoped exception and these notices together. The licenses are not
 added to the global allow list and security advisory checks remain enabled.
 
-T2/D35 updates the current TLS root data to 1.0.10 after reviewing its actual
-license from the exact published crate. The 1.0.9 license file remains for
-historical reports; it is not an additional current dependency exception.
+The historical 1.0.9 license text is not part of the current distribution; the
+current lockfile uses 1.0.10. License texts and upstream attribution must be
+reviewed together with any dependency upgrade.
+
+## Office protocol test snapshot
+
+The files under `tests/engine-host-contracts/upstream-office/` are unmodified
+protocol source and license bytes from:
+https://github.com/KunlunMeta-Limited/ai-office-react
+
+The exact commit and SHA-256 values are recorded in
+`docs/engine-host/contracts/sources.json`. The snapshot is MIT-licensed;
+retain `tests/engine-host-contracts/upstream-office/LICENSE` with those sources.
+The OpenPaw root license does not replace that license or its copyright notice.

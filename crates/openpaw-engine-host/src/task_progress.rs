@@ -10,6 +10,33 @@ use std::collections::BTreeSet;
 
 const NAME: &str = "report_progress";
 
+/// 功能：统一判断父计划是否已用准确委派调用证据验收子成果。
+/// 参数：plan为父计划，call_id为真实委派调用，run为子运行，percent为原执行进度。
+/// 返回：正常子终态且被父计划准确验收时为true；无父计划沿原100%执行结果。
+/// 错误：无，缺证据不推定验收。
+/// 状态：只读；执行完成和业务完成保持分离。
+/// 并发与取消：同步纯函数。
+/// 权限：只能消费Store已经授权的事实。
+/// 关联：Office投影与历史详情共用验收规则。
+pub(crate) fn delegation_verified(
+    plan: Option<&Value>,
+    call_id: &str,
+    run: &RunView,
+    percent: u64,
+) -> bool {
+    run.state == RunState::Completed
+        && plan
+            .map(|p| {
+                p["steps"].as_array().into_iter().flatten().any(|step| {
+                    step["state"] == "completed"
+                        && step["evidenceCallIds"]
+                            .as_array()
+                            .is_some_and(|ids| ids.iter().any(|id| id == call_id))
+                })
+            })
+            .unwrap_or(percent == 100)
+}
+
 /// 功能：识别可提供真实文件产出证据的现有工具。
 /// 参数：name为原注册表记录的工具名。
 /// 返回：文件写入或媒体保存工具返回true。

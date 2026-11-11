@@ -29,7 +29,7 @@ use windows::Win32::System::Threading::*;
 
 use crate::audit::AuditLog;
 use crate::error::SandboxError;
-use crate::policy::{FileSystemPolicy, NetworkPolicy, SandboxPolicy};
+use crate::policy::{FileSystemPolicy, SandboxPolicy};
 use crate::SandboxResult;
 
 // ---------------------------------------------------------------------------
@@ -174,26 +174,6 @@ impl Drop for JobGuard {
         // Drop the handle, which closes it and kills child processes
         // (because KILL_ON_JOB_CLOSE is set)
         self.handle.take();
-    }
-}
-
-/// RAII guard for firewall rules. Removes the rules on drop.
-struct FirewallGuard {
-    rule_names: Vec<String>,
-}
-
-impl FirewallGuard {
-    #[allow(dead_code)] // associated function `new` is never used
-    fn new(rule_names: Vec<String>) -> Self {
-        Self { rule_names }
-    }
-}
-
-impl Drop for FirewallGuard {
-    fn drop(&mut self) {
-        for name in &self.rule_names {
-            remove_firewall_rule(name).ok();
-        }
     }
 }
 
@@ -587,89 +567,6 @@ fn assign_to_job_object(job: HANDLE, process_handle: HANDLE) -> Result<(), Sandb
     unsafe {
         AssignProcessToJobObject(job, process_handle)
             .map_err(|e| SandboxError::JobObject(format!("AssignProcessToJobObject failed: {e}")))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Firewall rules for network isolation
-// ---------------------------------------------------------------------------
-
-/// Add a firewall rule blocking outbound connections for a specific process.
-///
-/// Uses `netsh advfirewall firewall add rule` to create a blocking rule.
-/// This requires administrator privileges; if not available, logs a warning
-/// and returns an error gracefully.
-#[allow(dead_code)] // function `add_firewall_block_rule` is never used
-fn add_firewall_block_rule(rule_name: &str, program_path: &str) -> Result<(), SandboxError> {
-    let output = std::process::Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "add",
-            "rule",
-            &format!("name={rule_name}"),
-            "dir=out",
-            "action=block",
-            "enable=yes",
-            &format!("program={program_path}"),
-            "profile=any",
-        ])
-        .output()
-        .map_err(|e| SandboxError::FirewallRule(format!("netsh execution failed: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(SandboxError::FirewallRule(format!(
-            "netsh add rule failed: {stderr}"
-        )));
-    }
-
-    Ok(())
-}
-
-/// Remove a firewall rule by name.
-fn remove_firewall_rule(rule_name: &str) -> Result<(), SandboxError> {
-    let output = std::process::Command::new("netsh")
-        .args([
-            "advfirewall",
-            "firewall",
-            "delete",
-            "rule",
-            &format!("name={rule_name}"),
-        ])
-        .output()
-        .map_err(|e| SandboxError::FirewallRule(format!("netsh execution failed: {e}")))?;
-
-    if !output.status.success() {
-        // Best-effort cleanup: 删除失败时静默忽略（本 crate 无日志设施）。
-        let _ = &output;
-    }
-
-    Ok(())
-}
-
-/// Apply network isolation based on the policy.
-///
-/// For NoAccess policy, creates a firewall rule blocking all outbound.
-/// Returns a guard that removes the rule on drop.
-#[allow(dead_code)] // function `apply_network_isolation` is never used
-fn apply_network_isolation(
-    policy: &SandboxPolicy,
-    program_path: &str,
-) -> Result<Option<FirewallGuard>, SandboxError> {
-    match policy.net_policy() {
-        NetworkPolicy::FullAccess | NetworkPolicy::AllowDomains(_) => Ok(None),
-        NetworkPolicy::NoAccess => {
-            let rule_name = format!("OpenPaw_Sandbox_Block_{}", std::process::id());
-            match add_firewall_block_rule(&rule_name, program_path) {
-                Ok(()) => Ok(Some(FirewallGuard::new(vec![rule_name]))),
-                Err(_e) => {
-                    // 网络隔离为尽力而为：防火墙规则创建失败（通常因缺少管理员
-                    // 权限）不应阻断沙箱执行。
-                    Ok(None)
-                }
-            }
-        }
     }
 }
 

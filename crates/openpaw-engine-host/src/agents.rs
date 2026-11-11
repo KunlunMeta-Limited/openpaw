@@ -1,13 +1,13 @@
-//! 职责：集中定义可信角色和常驻人物对应关系，供运行与展示共同复用。
-//! 输入输出：可信角色标识到固定身份、职责和原成员标识。
+//! 职责：集中定义可信业务角色、姓名和职责。
+//! 输入输出：可信角色标识到业务身份与能力判断。
 //! 依赖：Host配置；不依赖浏览器输入或修改Office协议。
 //! 禁止职责：不创建模型、会话、工具权限或第二套执行循环。
 
 /// 用途：可信角色目录的一项，不代表已有活动Agent。
-/// 字段：角色、原成员、人物标识及可公开的姓名职责。
+/// 字段：角色及可公开的姓名职责。
 /// 来源去向：固定目录到Host运行装配与Office适配。
 /// 约束：仅匹配配置中已有角色，不接收任意客户端别名。
-/// 稳定性：Host内部角色定义；employee使用Office官方成员ID。
+/// 稳定性：Host内部业务角色定义；展示标识由Office边界映射。
 /// 关联：需求/设计REQ-OP-021/022；CHG-2026-0007第9.6节。
 pub(crate) struct Role {
     /// 用途：可信角色标识。
@@ -17,20 +17,6 @@ pub(crate) struct Role {
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub(crate) id: &'static str,
-    /// 用途：保留兼容的业务成员标识。
-    /// 字段：&'static str，保留兼容的业务成员标识。
-    /// 来源去向：可信Host装配、原Store与本次运行。
-    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
-    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
-    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
-    pub(crate) employee: &'static str,
-    /// 用途：Office官方人物标识。
-    /// 字段：&'static str，Office官方人物标识。
-    /// 来源去向：可信Host装配、原Store与本次运行。
-    /// 约束：不得由浏览器或模型覆盖权限及所属关系。
-    /// 稳定性：T6宿主字段，旧默认运行保持兼容。
-    /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
-    pub(crate) actor: &'static str,
     /// 用途：官方人物公开姓名。
     /// 字段：&'static str，官方人物公开姓名。
     /// 来源去向：可信Host装配、原Store与本次运行。
@@ -56,43 +42,31 @@ pub(crate) struct Role {
 pub(crate) const ROLES: [Role; 6] = [
     Role {
         id: "lead",
-        employee: "office-lead",
-        actor: "office-lead",
         name: "王明",
         duty: "任务统筹、分工与结果汇总",
     },
     Role {
         id: "research",
-        employee: "code-agent",
-        actor: "code-agent",
         name: "李研",
         duty: "信息检索与技术背景核对",
     },
     Role {
         id: "organize",
-        employee: "file-agent",
-        actor: "file-agent",
         name: "周理",
         duty: "项目资料查看与整理",
     },
     Role {
         id: "draft",
-        employee: "app-agent",
-        actor: "app-agent",
         name: "陈书",
         duty: "报告草稿与交付物撰写",
     },
     Role {
         id: "review",
-        employee: "review-agent",
-        actor: "review-agent",
         name: "刘市",
         duty: "需求和验收覆盖核对",
     },
     Role {
         id: "audit",
-        employee: "data-agent",
-        actor: "data-agent",
         name: "赵审",
         duty: "来源、结论与风险复核",
     },

@@ -190,3 +190,9 @@ test('interactive questions are explicitly opt-in, independent of write consent,
     }
   }
 });
+
+
+test('setup accepts current Rust floor and rejects older or unrecognized toolchains', () => {
+  for (const version of ['rustc 1.89.0 (fixture)', 'rustc 1.99.1', 'rustc 2.0.0']) assert.equal(setup.rustVersionSupported(version), true, version);
+  for (const version of ['rustc 1.88.9', 'rustc 1.80.0', 'rustc 0.99.0', 'unknown']) assert.equal(setup.rustVersionSupported(version), false, version);
+});

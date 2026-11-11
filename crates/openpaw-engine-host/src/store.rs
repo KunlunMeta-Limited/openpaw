@@ -1583,6 +1583,22 @@ impl Db {
         id: &str,
         history: &[openpaw_core::Message],
     ) -> HostResult<()> {
+        self.reconcile_history_with_display(id, history, None)
+    }
+    /// 功能：在同一原Store序列中比较历史及调用方可信展示别名。
+    /// 参数：id/history为原会话历史，display为服务端适配器纯转换函数。
+    /// 返回：原正文或同位置可信展示一致时成功。
+    /// 错误：转换、账本或历史冲突沿原错误返回。
+    /// 状态：只按原首次导入规则追加；别名不写入模型历史。
+    /// 并发与取消：转换与最终核对位于同一单写序列，不读取过期缓存。
+    /// 权限：函数由可信Host装配，浏览器不能提供或覆盖别名。
+    /// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-014；DES-OP-007。
+    pub(crate) fn reconcile_history_with_display(
+        &mut self,
+        id: &str,
+        history: &[openpaw_core::Message],
+        display: Option<fn(&Db, &RunView) -> HostResult<String>>,
+    ) -> HostResult<()> {
         use openpaw_core::{Message, Role};
         let same = |a: &Message, b: &Message| a.role == b.role && a.text() == b.text();
         let runs: Vec<_> = self
@@ -1644,7 +1660,6 @@ impl Db {
         }
         let mut complete_history = Vec::new();
         let mut display_aliases = std::collections::BTreeMap::new();
-        let office_history = self.binding(id)?.scope.namespace == "office";
         if let Some((offset, count, _, true)) = imported {
             for e in events.iter().skip(offset).take(count) {
                 if let SessionEvent::Message(m) = e {
@@ -1671,8 +1686,8 @@ impl Db {
                     let view = self.get_run(&r.run_id)?;
                     if !view.text.trim().is_empty() {
                         complete_history.push(m.clone());
-                        if office_history {
-                            let display = crate::office::chat_display(self, &view)?;
+                        if let Some(convert) = display {
+                            let display = convert(self, &view)?;
                             if display != view.text {
                                 display_aliases.insert(
                                     complete_history.len(),
@@ -3473,7 +3488,7 @@ impl Db {
         }
         let dir = self.home.join("engine-host/artifacts");
         if dir.exists() {
-            crate::office::artifacts::private_dir(&dir)?;
+            crate::artifacts::private_dir(&dir)?;
         }
         self.conn.execute("INSERT INTO host_artifact_settings(key,value) VALUES('origin',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[origin]).map_err(HostError::storage)?;
         Ok(())
@@ -3493,7 +3508,7 @@ impl Db {
         mime: &str,
         bytes: &[u8],
     ) -> HostResult<Option<serde_json::Value>> {
-        use crate::office::artifacts as a;
+        use crate::artifacts as a;
         let run = self.get_run(&binding.run_id)?;
         let own = self.binding(&run.session_id)?;
         let (scope, parent) = if let Some(d) = self.delegation_for_child(&run.run_id)? {
@@ -3664,8 +3679,7 @@ impl Db {
         if let Some(prior) = &prior {
             let prior: serde_json::Value =
                 serde_json::from_str(prior).map_err(HostError::storage)?;
-            if prior["input_hash"] != crate::office::artifacts::sha256(value.to_string().as_bytes())
-            {
+            if prior["input_hash"] != crate::artifacts::sha256(value.to_string().as_bytes()) {
                 return Err(HostError::new("request_conflict", "同一核验调用不能改输入"));
             }
             // read不在事件复制正文，原件按hash重新读取，返回完全相同的范围。
@@ -3673,7 +3687,7 @@ impl Db {
                 return Ok(prior);
             }
         }
-        let bytes = crate::office::artifacts::read_blob(&dir, row)?;
+        let bytes = crate::artifacts::read_blob(&dir, row)?;
         let text = std::str::from_utf8(&bytes).map_err(|_| {
             HostError::new(
                 "unsupported",
@@ -3696,9 +3710,7 @@ impl Db {
         result["call_id"] = json!(binding.call_id);
         result["inspected_call_id"] = value["inspected_call_id"].clone();
         result["at"] = json!(chrono::Utc::now().to_rfc3339());
-        result["input_hash"] = json!(crate::office::artifacts::sha256(
-            value.to_string().as_bytes()
-        ));
+        result["input_hash"] = json!(crate::artifacts::sha256(value.to_string().as_bytes()));
         if value["action"] == "read" {
             result["read_call_id"] = json!(binding.call_id);
         }
@@ -3723,9 +3735,9 @@ impl Db {
         }
         Ok(result)
     }
-    /// 功能：验证确定版本的单资源能力并返回原件字节。
-    /// 参数：version/access为URL版本和单版本能力；delivery选择原件或交付JSON。
-    /// 返回：经过墓碑、能力和SHA256核对的有界字节及MIME。
+    /// 功能：验证确定版本的单资源能力并返回授权后的原版本事实。
+    /// 参数：version/access为原URL版本与能力；delivery控制是否读取同作用域关联版本。
+    /// 返回：已核对墓碑与能力的版本元数据、关联版本及固定blob目录；调用方在同一Store序列中读取或转换。
     /// 错误：存储、作用域或数据损坏明确拒绝。
     /// 状态：不改变原工具、Run或工作区文件。
     /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
@@ -3736,8 +3748,8 @@ impl Db {
         version: &str,
         access: &str,
         delivery: bool,
-    ) -> HostResult<(Vec<u8>, String)> {
-        use crate::office::artifacts as a;
+    ) -> HostResult<(serde_json::Value, Vec<serde_json::Value>, PathBuf)> {
+        use crate::artifacts as a;
         let raw: Option<String> = self
             .conn
             .query_row(
@@ -3758,27 +3770,12 @@ impl Db {
             return Err(denied());
         }
         let dir = self.home.join("engine-host/artifacts");
-        if delivery {
-            let (rows, _) = self.artifacts(&scope)?;
-            let checked = rows
-                .iter()
-                .find(|row| row["version"] == data["version"])
-                .unwrap_or(&data);
-            let result = a::delivery(checked, &rows, &dir)?;
-            let bytes = serde_json::to_vec(&result).map_err(HostError::storage)?;
-            if bytes.len() > 64000 {
-                return Err(HostError::new("capacity_exceeded", "历史交付JSON超过64KB"));
-            }
-            return Ok((bytes, "application/json".into()));
-        }
-        let bytes = a::read_blob(&dir, &data)?;
-        Ok((
-            bytes,
-            data["mime"]
-                .as_str()
-                .unwrap_or("application/octet-stream")
-                .to_owned(),
-        ))
+        let rows = if delivery {
+            self.artifacts(&scope)?.0
+        } else {
+            Vec::new()
+        };
+        Ok((data, rows, dir))
     }
 }
 

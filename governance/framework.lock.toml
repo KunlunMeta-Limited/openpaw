@@ -1,7 +1,0 @@
-schema = "openpaw/framework-lock/v1"
-source = "user-provided Kunlun/framework/tools/governance.py"
-revision_kind = "sha256-snapshot"
-revision = "a2d9b08c502d32a1be6ca32b3c9c787d3b2c144c5420b564e795e1455e0d3a13"
-file = "governance/vendor/framework_governance.py"
-usage = "Only CHG data parsing/validation is reused; project CLI owns enforcement."
-license_note = "The provided framework has no license declaration; do not relabel this snapshot Apache-2.0 or redistribute it in runtime release packages. Confirm upstream terms before wider distribution."

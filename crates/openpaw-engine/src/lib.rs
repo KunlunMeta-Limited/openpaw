@@ -1,15 +1,10 @@
 //! openpaw-engine — the agent loop.
 //!
-//! E1 scope (this revision): `run_turn` skeleton (cancel check → budget
-//! consume → compaction hook (no-op until E2) → streaming call → tool
-//! execution → backfill), the three-path tool dispatcher, the phased
-//! three-stage semantics (Deny → error / Allow → parallel / Confirm →
-//! serial approval), and `stream_with_retry` (classified retry with
-//! Retry-After). Compaction, fallback provider, and token budgeting land
-//! with E2; checkpoint/nudge/stop-hook are stretch items (deferred in
-//! order).
-//!
-//! Skeleton outline and the E1/E2 split line: `docs/spikes/S1-agent-loop.md`.
+//! 职责：共享单轮推理、分阶段工具执行、审批、取消及可选压缩/预算。
+//! 输入输出：原Session与Provider到流式事件及真实运行结果。
+//! 依赖：core契约、llm与可选Hook装配。
+//! 禁止职责：不内置Office协议，不默认加载外部插件或自动反思。
+//! 压缩、fallback和预算已有实现，是否启用由CLI或Host装配决定。
 
 pub mod agent_loop;
 pub mod compaction;

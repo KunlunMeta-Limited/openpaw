@@ -54,14 +54,14 @@ const ALLOW_MARKER: &str = "openpaw-scrub-allow";
 /// 状态：只读源码及编号登记表。
 /// 并发与取消：同步扫描，无共享写入。
 /// 权限：不执行目标代码，不改变文件。
-/// 关联：移植清理规则与治理编号登记校验。
+/// 关联：移植清理规则与项目编号精确清单。
 pub fn run(root: &Path, check: bool) -> Result<()> {
     // Build the rule list once: compiling all four regexes per scanned
     // line made the gate take minutes on this repo size.
     let rule_list = rules();
-    let registered: Vec<String> = if root.join("governance/identifiers.json").exists() {
+    let registered: Vec<String> = if root.join("xtask/identifiers.json").exists() {
         let document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
-            root.join("governance/identifiers.json"),
+            root.join("xtask/identifiers.json"),
         )?)?;
         document["ids"]
             .as_array()

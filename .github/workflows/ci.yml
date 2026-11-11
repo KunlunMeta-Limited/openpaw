@@ -1,14 +1,7 @@
 name: ci
 on:
   push:
-    # Tx branches need native evidence before their PR is created.
-    branches:
-      - main
-      - merge/ai-ofice-react-overagent
-      - 'docs/engine-host-t*'
-      - 'fix/engine-host-t*'
-      - 'feat/engine-host-t*'
-      - 'test/engine-host-t*'
+    branches: ['**']
   pull_request:
 
 env:
@@ -51,7 +44,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --workspace
       - run: cargo test --locked --workspace --all-features
-      # T0 wires the opt-in dependency only; runtime/CLI behavior arrives in T3.
+      # Verify the optional Host and sidecar build independently of default CLI.
       - run: cargo build --locked -p openpaw-cli --features engine-host,sidecar
       - name: Default CLI does not pull in the Host HTTP framework
         shell: pwsh
@@ -61,17 +54,8 @@ jobs:
           if ($tree -match '^axum v') { throw 'default CLI unexpectedly depends on axum' }
 
   msrv:
-    # compatibility.md §2 declares an MSRV floor of 1.88. This job enforces
-    # it: if any workspace crate or locked dependency needs a newer rustc,
-    # the build fails here and the MSRV declaration must be revisited (raise
-    # the floor via the RFC process, or pin the offending dependency).
-    # History (MSRV-floor decision, devlog session 39): the floor was 1.80,
-    # but the locked tree already carried edition2024 dependencies
-    # (clap 4.6, rand 0.10, rmcp 1.8 — rmcp itself has no edition2021
-    # release line), so 1.80 could not even parse the manifests. An
-    # intermediate 1.85 floor failed on the next discovery: the rmcp
-    # macro stack hard-depends on darling 0.23, which declares rustc
-    # 1.88. The floor settled at 1.88 — also rmcp's own declared floor.
+    # README declares Rust 1.89 as the minimum supported compiler.
+    # Check the actual locked dependency graph on both native platforms.
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -79,7 +63,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked --workspace --all-targets
       - run: cargo check --locked --workspace --all-targets --all-features
@@ -142,8 +126,8 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo deny --workspace check
 
-  governance:
-    name: governance (${{ matrix.os }})
+  technical-review:
+    name: technical-review (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -161,30 +145,31 @@ jobs:
           python-version: '3.11'
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Validate the exact PR head and preserve evidence
+      - name: Verify the technical executor with real subprocesses
+        shell: pwsh
+        env:
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPORT_ROOT: ${{ runner.temp }}/openpaw-review-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          python scripts/verify.py --suite runner --source head --head $env:REVIEW_HEAD --output "$env:REPORT_ROOT/runner"
+          exit $LASTEXITCODE
+      - name: Check Rustdoc against the exact review base
         shell: pwsh
         env:
           REVIEW_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           REVIEW_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
-          REPORT_ROOT: ${{ runner.temp }}/openpaw-governance-${{ github.run_id }}-${{ github.run_attempt }}
+          REPORT_ROOT: ${{ runner.temp }}/openpaw-review-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           $base = $env:REVIEW_BASE
-          # Check the entire Tx against its integration base before a PR exists.
-          if ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF_NAME -match '^(docs|fix|feat|test)/engine-host-t') {
-            $base = git merge-base $env:REVIEW_HEAD origin/merge/ai-ofice-react-overagent
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
           if (-not $base -or $base -match '^0+$') {
             $base = git rev-parse "$($env:REVIEW_HEAD)^"
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
-          $stage = 'implementation'
-          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') { $stage = 'delivery' }
-          python governance/verify.py --suite governance --source head --stage $stage --base $base --head $env:REVIEW_HEAD --output $env:REPORT_ROOT
+          cargo run --locked -p xtask -- comments --base $base --head $env:REVIEW_HEAD 2>&1 | Tee-Object -FilePath "$env:REPORT_ROOT/comments.log"
           exit $LASTEXITCODE
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: governance-${{ matrix.os }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/openpaw-governance-${{ github.run_id }}-${{ github.run_attempt }}
+          name: technical-review-${{ matrix.os }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/openpaw-review-${{ github.run_id }}-${{ github.run_attempt }}
           if-no-files-found: error

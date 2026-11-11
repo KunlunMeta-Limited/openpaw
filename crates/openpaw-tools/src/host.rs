@@ -32,6 +32,7 @@ pub struct ToolRegistry {
     observer: Option<Arc<dyn openpaw_core::ToolExecutionObserver>>,
     specs: Vec<ToolSpec>,
     image_config: Option<crate::media::ImageService>,
+    session_index: PathBuf,
 }
 
 impl ToolRegistry {
@@ -86,7 +87,22 @@ impl ToolRegistry {
             observer: None,
             specs,
             image_config: None,
+            session_index: openpaw_core::openpaw_home().join("index.db"),
         }
+    }
+
+    /// 功能：为会话查询注入调用方已解析的数据根索引。
+    /// 参数：path为可信本机索引路径，不接收模型声明的路径。
+    /// 返回：使用指定索引的原注册表。
+    /// 错误：读取错误在实际查询时报告。
+    /// 状态：只保存路径，不创建索引或修改进程环境。
+    /// 并发与取消：每个注册表独立，不共享可变目录状态。
+    /// 权限：继承调用方所选择的数据根，不改变工作区权限。
+    /// 关联：数据根修复能力与错误边界修复；需求REQ-OP-005；设计DES-OP-004；CHG-2026-0007 §12.169。
+    /// Stability: unstable.
+    pub fn with_session_index(mut self, path: impl Into<PathBuf>) -> Self {
+        self.session_index = path.into();
+        self
     }
 
     /// 功能：注入原命令Environment，避免注册表固定本地执行
@@ -134,15 +150,32 @@ impl ToolRegistry {
         self
     }
     /// Specs of the registered tools.
+    /// 功能：列出当前注册表实际向模型提供的工具名称。
+    /// 参数：self为已装配注册表。
+    /// 返回：原声明顺序的工具名，不包含未装配的提问与计划模式。
+    /// 错误：无。
+    /// 状态：只读原声明，不执行工具。
+    /// 并发与取消：同步只读，无等待。
+    /// 权限：不改变直接调用的权限及错误语义。
+    /// 关联：需求REQ-OP-005；设计DES-OP-004；能力与错误边界修复。
     pub fn tool_names(&self) -> Vec<String> {
-        self.specs.iter().map(|s| s.name.clone()).collect()
+        self.available_tools().map(|s| s.name.clone()).collect()
+    }
+
+    fn available_tools(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.specs.iter().filter(|s| {
+            !matches!(
+                s.name.as_str(),
+                "clarify" | "enter_plan_mode" | "exit_plan_mode"
+            )
+        })
     }
 }
 
 #[async_trait]
 impl ToolExecutor for ToolRegistry {
     async fn list_tools(&self) -> Result<Vec<ToolSpec>> {
-        Ok(self.specs.clone())
+        Ok(self.available_tools().cloned().collect())
     }
 
     async fn call(&self, name: &str, args: serde_json::Value) -> Result<ToolCallOutcome> {
@@ -175,7 +208,7 @@ impl ToolExecutor for ToolRegistry {
             "clarify" => clarify::run(&ws, args).await,
             "enter_plan_mode" | "exit_plan_mode" => plan_mode::run(&ws, name).await,
             "structured_output" => structured_output::run(&ws, args).await,
-            "session_search" => session_search::run(&ws, args).await,
+            "session_search" => session_search::run_with_index(&self.session_index, args).await,
             other => Err(Error::ToolHost(format!("unknown tool: {other}"))),
         }
     }
@@ -356,9 +389,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let host = ToolRegistry::new(dir.path());
 
-        assert_eq!(host.tool_names().len(), 23);
+        assert_eq!(host.tool_names().len(), 20);
         let listed = host.list_tools().await.unwrap();
-        assert_eq!(listed.len(), 23);
+        assert_eq!(listed.len(), 20);
 
         // Roundtrip through the host: write then read.
         host.call(

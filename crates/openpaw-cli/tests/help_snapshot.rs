@@ -171,3 +171,46 @@ fn goal_help_lists_all_three_subcommands() {
         );
     }
 }
+
+#[test]
+fn unfinished_commands_fail_instead_of_reporting_success() {
+    use std::process::Command;
+    for args in [
+        vec!["model", "default", "echo"],
+        vec!["completions", "bash"],
+        vec!["completions", "not-a-shell"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_openpaw"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            result.stdout.is_empty(),
+            "must not emit a fake configuration or completion script"
+        );
+        let error = String::from_utf8(result.stderr).unwrap();
+        assert!(
+            error.contains("error:") && error.contains("why:") && error.contains("next:"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn chat_help_states_automatic_approval_and_host_boundary() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_openpaw"))
+        .args(["chat", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "automatically approved",
+        "not an OS sandbox",
+        "only to engine-host",
+        "not advertised",
+    ] {
+        assert!(text.contains(expected), "{expected}: {text}");
+    }
+}

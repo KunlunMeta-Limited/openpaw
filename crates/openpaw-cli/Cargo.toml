@@ -31,7 +31,6 @@ openpaw-tools.workspace = true
 rmcp = { workspace = true, optional = true }
 clap.workspace = true
 tokio.workspace = true
-anyhow.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]

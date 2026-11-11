@@ -41,8 +41,8 @@ use openpaw_goal_ledger::{last_next_action, FsGoalStore, GoalStore};
 use openpaw_memory::{Confidence, FsMemoryStore, MemoryFrontmatter, MemoryStore, Scope, Source};
 use openpaw_reflect_lite::scan_unverified;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, Content, JsonObject,
-    ListToolsResult, ServerJsonRpcMessage, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ContentBlock,
+    JsonObject, ListToolsResult, ServerJsonRpcMessage, Tool,
 };
 use rmcp::serde_json::{self, Value};
 use rmcp::service::RequestContext;
@@ -118,7 +118,7 @@ impl SidecarServer {
             .filter(|m| m.role == openpaw_core::Role::Assistant)
             .map(|m| m.text())
             .unwrap_or_default();
-        Ok(CallToolResult::success(vec![Content::text(reply)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(reply)]))
     }
 
     /// `memory_set` implementation: upsert one user-scope memory by id.
@@ -136,7 +136,7 @@ impl SidecarServer {
                 .map_err(|e| {
                     ErrorData::internal_error(format!("memory update failed: {e}"), None)
                 })?;
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "updated memory `{id}`"
             ))]));
         }
@@ -144,7 +144,7 @@ impl SidecarServer {
         frontmatter.id = id.clone();
         MemoryStore::put(&store, Scope::User, frontmatter, &content)
             .map_err(|e| ErrorData::internal_error(format!("memory write failed: {e}"), None))?;
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "saved memory `{id}`"
         ))]))
     }
@@ -163,7 +163,7 @@ impl SidecarServer {
             memory.frontmatter.created.format("%Y-%m-%dT%H:%M:%SZ"),
             memory.body.trim()
         );
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     /// `memory_search` implementation: relevance-ranked hits.
@@ -177,7 +177,7 @@ impl SidecarServer {
             .search_memories(&query, limit.unwrap_or(20))
             .map_err(|e| ErrorData::internal_error(format!("memory search failed: {e}"), None))?;
         if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(format!(
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "(no memories matching '{query}')"
             ))]));
         }
@@ -192,7 +192,7 @@ impl SidecarServer {
                 )
             })
             .collect();
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             lines.join("\n"),
         )]))
     }
@@ -249,7 +249,7 @@ impl SidecarServer {
             }
             Err(e) => lines.push(format!("goals: cannot list ({e})")),
         }
-        Ok(CallToolResult::success(vec![Content::text(
+        Ok(CallToolResult::success(vec![ContentBlock::text(
             lines.join("\n"),
         )]))
     }
@@ -377,8 +377,8 @@ fn optional_string_list(args: &JsonObject, key: &str) -> Vec<String> {
 }
 
 impl ServerHandler for SidecarServer {
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo::new(
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),
@@ -400,11 +400,11 @@ impl ServerHandler for SidecarServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         // Serialize all tool invocations (see struct doc).
         let _gate = self.gate.lock().await;
         let args = request.arguments.unwrap_or_default();
-        match request.name.as_ref() {
+        let result = match request.name.as_ref() {
             "ask" => {
                 let input = required_string(&args, "input")?;
                 let provider = optional_string(&args, "provider");
@@ -433,7 +433,8 @@ impl ServerHandler for SidecarServer {
                 format!("unknown tool `{other}`"),
                 None,
             )),
-        }
+        };
+        result.map(Into::into)
     }
 }
 

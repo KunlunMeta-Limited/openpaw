@@ -76,6 +76,14 @@ fn knowledge_roots(home: &Path, project: Option<&Path>) -> Vec<(&'static str, Pa
 
 /// `openpaw evolve status` — ratio table + goal overview. Exit 0 unless a
 /// scan fails hard (unreadable directory), which is a three-segment error.
+/// 功能：统计知识审查状态并列出目标账本进度。
+/// 参数：home为数据根，project为可选项目根。
+/// 返回：成功为0，目录或账本读取失败为1。
+/// 错误：报告原读取原因，不将错误当作空历史。
+/// 状态：只读，不启动AgentLoop或修改知识与目标。
+/// 并发与取消：沿原同步本地查询，无新增等待锁。
+/// 权限：仅查询调用者已选择的数据根。
+/// 关联：账本错误修复；需求REQ-OP-005；设计DES-OP-004；能力与错误边界修复。
 pub fn run_status(home: &Path, project: Option<&Path>) -> i32 {
     println!("unverified knowledge artifacts:");
     let mut total_files = 0usize;
@@ -126,7 +134,17 @@ pub fn run_status(home: &Path, project: Option<&Path>) -> i32 {
     }
     for doc in &goals {
         let fm = &doc.frontmatter;
-        let (progress, next) = run_digest(&store, &fm.id);
+        let (progress, next) = match run_digest(&store, &fm.id) {
+            Ok(digest) => digest,
+            Err(e) => {
+                report_error(
+                    format!("cannot read goal ledger `{}`: {e}", fm.id),
+                    "ledger read errors cannot be treated as empty history.",
+                    "check the goal event file and permissions before retrying.",
+                );
+                return 1;
+            }
+        };
         println!("  {}  [{:?}]  progress={progress}", fm.id, fm.status);
         if !fm.objective.is_empty() {
             println!("      objective: {}", fm.objective);
@@ -138,14 +156,19 @@ pub fn run_status(home: &Path, project: Option<&Path>) -> i32 {
     0
 }
 
-/// Progress digest for one goal, taken from the newest `run_summary` ledger
-/// event: the numeric `[GOAL_PROGRESS:x]` / terminal markers embedded in the
-/// summary text (parsed via `RunOutcome`), or the outcome name when the text
-/// carries no marker. Goals without run history report `-`.
-///
-/// Shared with `openpaw goal status`, which prints the same overview.
-pub(crate) fn run_digest(store: &FsGoalStore, id: &str) -> (String, Option<String>) {
-    let events = GoalStore::query_events(store, id).unwrap_or_default();
+/// 功能：从原目标账本生成状态摘要并保留读取错误。
+/// 参数：store为原存储，id为准确目标标识。
+/// 返回：进度文字和下一步；合法空历史返回横线。
+/// 错误：账本读取失败向调用者返回，不当作空历史。
+/// 状态：只读原账本，不生成执行决定。
+/// 并发与取消：同步有界本地读取，无共享写锁。
+/// 权限：沿调用者已选择的数据根。
+/// 关联：需求/设计：CHG-2026-0007 §12.169；能力与错误边界修复。
+pub(crate) fn run_digest(
+    store: &FsGoalStore,
+    id: &str,
+) -> openpaw_goal_ledger::Result<(String, Option<String>)> {
+    let events = GoalStore::query_events(store, id)?;
     let summary_text = events
         .iter()
         .rev()
@@ -162,7 +185,7 @@ pub(crate) fn run_digest(store: &FsGoalStore, id: &str) -> (String, Option<Strin
             None => format!("{outcome:?}").to_lowercase(),
         }
     };
-    (progress, last_next_action(&events))
+    Ok((progress, last_next_action(&events)))
 }
 
 // ── evolve reset ─────────────────────────────────────────────────────────

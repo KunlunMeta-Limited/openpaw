@@ -1,6 +1,6 @@
 [package]
 name = "openpaw-sandbox"
-description = "Cross-platform sandbox for secure command execution (Windows Restricted Token + Job Object, Linux bwrap, macOS Seatbelt)."
+description = "Cross-platform sandbox for secure command execution (Windows Restricted Token + Job Object, Linux bwrap)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-openpaw-core.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -32,7 +31,7 @@ tempfile.workspace = true
 [lints.rust]
 # The Windows Restricted Token / Job Object and Unix flock backends require
 # raw FFI. This crate is the single deliberate exception to the workspace
-# `unsafe_code = "forbid"` discipline (see docs/devlog.md, deviation D-9):
+# `unsafe_code = "forbid"` discipline (see README.md, architecture and module boundaries):
 # the workspace stays on `forbid`, this crate locally downgrades to `allow`,
 # mirroring the upstream sandbox crate's lint setup.
 unsafe_code = "allow"

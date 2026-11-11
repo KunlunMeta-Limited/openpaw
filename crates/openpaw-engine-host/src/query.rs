@@ -7,6 +7,64 @@ use crate::{
     QueryRequest,
 };
 use tokio_util::sync::CancellationToken;
+/// 用途：同一次Store读取中的运行及业务计划事实，供各展示转换消费。
+/// 字段：run沿用生命周期、revision、工具阶段、等待原因与结果引用；plan为原证据步骤。
+/// 来源去向：原Db/RunView读取到Office投影与详情；不包含Office人物或文案映射。
+/// 约束：执行完成与业务验收分别计算；不新增缓存、持久表或异步读取。
+/// 稳定性：Host私有事实视图。
+/// 关联：需求/设计：task_progress、projection、details。
+pub(crate) struct RunFacts<'a> {
+    run: &'a crate::RunView,
+    plan: Option<serde_json::Value>,
+}
+impl<'a> RunFacts<'a> {
+    /// 功能：在原Store序列内读取同一运行的进度事实。
+    /// 参数：db为当前Store，run为已经授权的运行。
+    /// 返回：引用原RunView的事实视图。
+    /// 错误：原进度读取错误透传。
+    /// 状态：只读原数据，无新事实或缓存。
+    /// 并发与取消：不跨await，不改变原事务顺序。
+    /// 权限：调用方先按原Session/Delegation校验scope。
+    /// 关联：需求/设计：task_progress::execution_project。
+    pub(crate) fn read(db: &crate::store::Db, run: &'a crate::RunView) -> HostResult<Self> {
+        Ok(Self {
+            run,
+            plan: db.progress(&run.run_id)?,
+        })
+    }
+    /// 功能：计算原子执行步骤进度，保留业务验收独立性。
+    /// 参数：self为原事实视图。
+    /// 返回：原步骤和原执行百分比。
+    /// 错误：原计划解析错误。
+    /// 状态：不写入、不补造证据。
+    /// 并发与取消：同步纯转换。
+    /// 权限：不扩大查询范围。
+    /// 关联：需求/设计：task_progress::execution_project。
+    pub(crate) fn execution(self) -> HostResult<(Vec<serde_json::Value>, u64)> {
+        crate::task_progress::execution_project(self.plan, self.run)
+    }
+}
+/// 功能：读取并校验委派绑定对应的子运行元数据。
+/// 参数：db为原Store，assignment为已验证的持久委派。
+/// 返回：原RunView元数据，不解析工具或正文。
+/// 错误：找不到、存储错误、子会话不一致明确返回。
+/// 状态：只读，不把缺失运行补造成完成。
+/// 并发与取消：留在原Store有序读取中。
+/// 权限：沿用delegations的父子scope校验，并核对子session。
+/// 关联：Office聊天节点、原Delegation。
+pub(crate) fn delegated_run_metadata(
+    db: &crate::store::Db,
+    assignment: &crate::orchestration::Delegation,
+) -> HostResult<crate::RunView> {
+    let child = db.run_metadata(&assignment.child_run)?;
+    if child.session_id != assignment.child_session {
+        return Err(HostError::new(
+            "storage_unavailable",
+            "子运行与持久委派所属不一致",
+        ));
+    }
+    Ok(child)
+}
 impl Host {
     /// 功能：按作用域提供六类真实只读查询。
     /// 参数：scope为可信范围，request为会话、类型与分页。

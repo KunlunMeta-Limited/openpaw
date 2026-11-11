@@ -3,7 +3,8 @@
 # Deviation D-5: the plan calls for pinning an exact version. The local
 # rustup dist mirror does not carry versioned manifests (404 on
 # `1.98.0-x86_64-pc-windows-msvc` sync), so the channel is pinned to
-# `stable` (currently 1.98.0) while the MSRV floor stays at 1.88
+# `stable`; the actual installed version is recorded in each report.
+# Current MSRV is 1.89 (r39 rusqlite security upgrade); the historical floor was 1.88
 # (workspace.package.rust-version; raised from 1.80 by the MSRV-floor
 # decision, devlog session 39 — the locked tree carries edition2024
 # dependencies and the rmcp macro stack needs darling 0.23 / rustc 1.88).

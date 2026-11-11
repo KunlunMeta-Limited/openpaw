@@ -1,12 +1,9 @@
 name: release
 
-# M6 release engineering: signed (Sigstore keyless), reproducible builds of
-# the openpaw CLI plus a crates.io publish dry-run of the placeholder crates.
-#
-# Triggers:
-# - push of a v* tag -> full pipeline: build + sign + attach to the Release
-# - workflow_dispatch -> build + sign + publish dry-run only (the release
-#   job is skipped because there is no tag ref to release against)
+# Default CLI packages for Linux/Windows; Host/Office are built from source.
+# Checksums and Sigstore signatures authenticate artifacts; byte-for-byte
+# reproducibility still requires an independent repeated-build comparison.
+# Tags publish a Release; workflow_dispatch only builds/signs and dry-runs crates.
 
 on:
   push:
@@ -58,7 +55,7 @@ jobs:
           echo "RELEASE_EXT=${ext}" >> "$GITHUB_ENV"
           echo "RELEASE_BIN=${bin}" >> "$GITHUB_ENV"
 
-      - name: Reproducible release build (--locked, -p openpaw-cli)
+      - name: Locked default CLI release build
         run: cargo build --release --locked -p openpaw-cli
 
       - name: Package archive (zip on Windows, tar.gz elsewhere)
@@ -69,10 +66,23 @@ jobs:
           $bin = "target/release/$env:RELEASE_BIN"
           if (-not (Test-Path $bin)) { throw "$bin not found" }
           $archive = "dist/openpaw-$env:RELEASE_VERSION-$env:RELEASE_PLATFORM.$env:RELEASE_EXT"
+          $payload = Join-Path $env:RUNNER_TEMP 'openpaw-release-payload'
+          New-Item -ItemType Directory -Path $payload | Out-Null
+          Copy-Item $bin -Destination $payload
+          foreach ($notice in @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.md')) {
+            Copy-Item $notice -Destination $payload
+          }
+          New-Item -ItemType Directory -Path (Join-Path $payload 'third-party-licenses') | Out-Null
+          $licenseFiles = git ls-files -- third-party-licenses
+          if ($LASTEXITCODE -ne 0 -or -not $licenseFiles) { throw 'tracked third-party licenses missing' }
+          foreach ($license in $licenseFiles) {
+            Copy-Item $license -Destination (Join-Path $payload $license)
+          }
           if ($IsWindows) {
-            Compress-Archive -Path $bin -DestinationPath $archive -Force
+            Compress-Archive -Path (Join-Path $payload '*') -DestinationPath $archive -Force
           } else {
-            tar -czf $archive -C target/release $env:RELEASE_BIN
+            tar -czf $archive -C $payload .
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           Write-Output "packaged: $archive"
 
@@ -132,10 +142,8 @@ jobs:
           # first. Any other failure fails the job.
           set -uo pipefail
           failed=0
-          # openpaw-engine-host is excluded from the release manifest: it was
-          # archived onto the community-experiment track by ADR-001 (no public
-          # engine-replacement surface exists; restart conditions are recorded
-          # in the ADR).
+          # This job dry-runs the default CLI dependency chain only.
+          # The optional engine-host source is supported but is not published here.
           for crate in \
             openpaw-core \
             openpaw-store \

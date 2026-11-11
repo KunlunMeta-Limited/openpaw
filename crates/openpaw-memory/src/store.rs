@@ -123,12 +123,6 @@ impl FsMemoryStore {
         self
     }
 
-    /// Private helper: delegate to `MemoryStore::list`.
-    #[allow(dead_code)] // methods `store_list`, `store_put`, and `store_delete` are never used
-    fn store_list(&self) -> Result<Vec<LoadedMemory>> {
-        MemoryStore::list(self)
-    }
-
     /// Private helper: delegate to `MemoryStore::list_active`.
     fn store_list_active(&self) -> Result<Vec<LoadedMemory>> {
         MemoryStore::list_active(self)
@@ -137,23 +131,6 @@ impl FsMemoryStore {
     /// Private helper: delegate to `MemoryStore::get`.
     fn store_get(&self, id: &str) -> Result<Option<LoadedMemory>> {
         MemoryStore::get(self, id)
-    }
-
-    /// Private helper: delegate to `MemoryStore::put`.
-    #[allow(dead_code)] // method `store_put` is never used
-    fn store_put(
-        &self,
-        scope: Scope,
-        frontmatter: MemoryFrontmatter,
-        body: &str,
-    ) -> Result<PathBuf> {
-        MemoryStore::put(self, scope, frontmatter, body)
-    }
-
-    /// Private helper: delegate to `MemoryStore::delete`.
-    #[allow(dead_code)] // method `store_delete` is never used
-    fn store_delete(&self, scope: Scope, id: &str) -> Result<bool> {
-        MemoryStore::delete(self, scope, id)
     }
 
     /// Standard roots: `~/.openpaw/memories` plus (optional)

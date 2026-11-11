@@ -206,3 +206,11 @@ test('member creation and instance layout use pinned upstream schemas without a 
   assert.equal(officeRequestSchema.safeParse({type:'office.layout.set',layoutId:'members',seq:1}).success,false)
   officeSnapshotSchema.parse(f.snapshot)
 })
+
+
+test('existing Office build verifier rejects wrong source/build and preserves accepted files', async () => {
+  const { execFileSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const text=execFileSync(process.execPath,[fileURLToPath(new URL('./office-product.mjs',import.meta.url)),'--test-existing-build-verifier'],{encoding:'utf8',timeout:30000})
+  assert.match(text,/checks passed/)
+})

@@ -22,7 +22,7 @@ use crate::{config_cmd, evolve_cmd, goal_cmd, memory_cmd, model_cmd, session_cmd
     name = "openpaw",
     version,
     about = "OpenPaw — an open, evolvable personal AI agent",
-    after_help = "Run `openpaw hello` for a zero-config echo conversation, `openpaw chat` for the full agent loop, `openpaw doctor` for environment checks, and `openpaw init` to create the home skeleton."
+    after_help = "Run `openpaw hello` for a zero-config echo conversation, `openpaw chat` for the full agent loop (local tools are automatically approved; Host policy applies only to engine-host), `openpaw doctor` for environment checks, and `openpaw init` to create the home skeleton."
 )]
 pub struct Cli {
     /// 用途：显式选择模型.env，覆盖OpenPaw数据目录默认文件。
@@ -108,6 +108,9 @@ pub enum Command {
     /// 约束：保留离线入口，显式模型非空，端点不得含密钥。
     /// 稳定性：新增可选参数。
     /// 关联：需求REQ-OP-003、REQ-OP-004。
+    #[command(
+        long_about = "Run the shared agent loop. Local CLI tools are automatically approved within --workspace; this is not an OS sandbox. Host tool allowlists and interactive approval policy apply only to engine-host. Unsupported plan-mode and clarify tools are not advertised by this CLI."
+    )]
     Chat {
         /// 模型Provider；显式参数优先，其次.env，无配置默认mock。
         #[arg(long)]

@@ -23,7 +23,7 @@ serde_yml.workspace = true
 default = []
 # Name-only placeholder frozen at 1.0 (plan §3.7): the flag is kept so the
 # future fastembed integration lands as an additive opt-in feature.
-# Relevance is lexical (TF-IDF + CJK bigram); see docs/compatibility.md §6.
+# Relevance is lexical (TF-IDF + CJK bigram); see README.md (architecture and module boundaries).
 embed = []
 
 [dev-dependencies]

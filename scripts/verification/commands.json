@@ -30,7 +30,8 @@
       "platforms": [
         "linux",
         "windows"
-      ]
+      ],
+      "require_test_output": "rust"
     },
     {
       "id": "TEST-RUST-ALL",
@@ -46,7 +47,8 @@
       "platforms": [
         "linux",
         "windows"
-      ]
+      ],
+      "require_test_output": "rust"
     },
     {
       "id": "TEST-CLIPPY-DEFAULT",
@@ -109,7 +111,7 @@
       "id": "TEST-MSRV-DEFAULT",
       "argv": [
         "cargo",
-        "+1.88.0",
+        "+1.89.0",
         "check",
         "--locked",
         "--workspace",
@@ -126,7 +128,7 @@
       "id": "TEST-MSRV-ALL",
       "argv": [
         "cargo",
-        "+1.88.0",
+        "+1.89.0",
         "check",
         "--locked",
         "--workspace",
@@ -343,69 +345,8 @@
       "platforms": [
         "linux",
         "windows"
-      ]
-    },
-    {
-      "id": "TEST-GOV",
-      "argv": [
-        "{python}",
-        "-m",
-        "unittest",
-        "discover",
-        "-s",
-        "governance/tests",
-        "-v"
       ],
-      "suite": "governance",
-      "cwd": ".",
-      "platforms": [
-        "linux",
-        "windows"
-      ]
-    },
-    {
-      "id": "TEST-GOV-VALIDATE",
-      "argv": [
-        "{python}",
-        "governance/check.py",
-        "validate"
-      ],
-      "suite": "governance",
-      "cwd": ".",
-      "platforms": [
-        "linux",
-        "windows"
-      ]
-    },
-    {
-      "id": "TEST-GOV-INDEX",
-      "argv": [
-        "{python}",
-        "governance/check.py",
-        "index",
-        "--check"
-      ],
-      "suite": "governance",
-      "cwd": ".",
-      "platforms": [
-        "linux",
-        "windows"
-      ]
-    },
-    {
-      "id": "TEST-GOV-TRACE",
-      "argv": [
-        "{python}",
-        "governance/check.py",
-        "trace",
-        "--check"
-      ],
-      "suite": "governance",
-      "cwd": ".",
-      "platforms": [
-        "linux",
-        "windows"
-      ]
+      "require_test_output": "node"
     },
     {
       "id": "TEST-COMMENTS",
@@ -422,25 +363,7 @@
         "--head",
         "{head}"
       ],
-      "suite": "governance",
-      "cwd": ".",
-      "platforms": [
-        "linux",
-        "windows"
-      ]
-    },
-    {
-      "id": "TEST-GOV-DIFF",
-      "argv": [
-        "{python}",
-        "governance/check.py",
-        "pr-check",
-        "--base",
-        "{base}",
-        "--head",
-        "{head}"
-      ],
-      "suite": "governance",
+      "suite": "quality",
       "cwd": ".",
       "platforms": [
         "linux",
@@ -459,6 +382,27 @@
         "linux",
         "windows"
       ]
+    },
+    {
+      "id": "TEST-VERIFIER",
+      "argv": [
+        "{python}",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/tests",
+        "-p",
+        "test_*.py",
+        "-v"
+      ],
+      "suite": "runner",
+      "cwd": ".",
+      "platforms": [
+        "linux",
+        "windows"
+      ],
+      "require_test_output": "python"
     }
   ]
 }

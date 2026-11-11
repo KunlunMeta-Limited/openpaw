@@ -18,7 +18,6 @@ use openpaw_engine::{AgentEvent, AgentLoop, RunContext, RunObserver, RunStatus};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
-        atomic::AtomicUsize,
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
@@ -81,35 +80,13 @@ pub(crate) struct Inner {
     acceptance: tokio::sync::Mutex<()>,
     notices: broadcast::Sender<HostNotice>,
     live: Arc<Mutex<HashMap<String, RunText>>>,
-    /// 用途：Office只读详情的最近完整投影，降低人物点击的首屏延迟。
-    /// 字段：按办公室作用域索引的规范JSON快照。
-    /// 来源去向：Coordinator从Store更新，actions只读消费。
-    /// 约束：事实仍以Store中的JSONL/SQLite为准；删除或作用域变化必须失效。
-    /// 稳定性：T6内部缓存，不是第二份账本或授权来源。
-    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007/009。
-    /// 启动时从持久投影预热，投影保存后更新；删除会话后必须失效对应团队。
-    pub(crate) office_projection_cache: Arc<Mutex<HashMap<String, serde_json::Value>>>,
-    /// 用途：合并同一办公室同时到达的只读投影请求。
-    /// 字段：按办公室作用域的异步互斥锁；不锁不同办公室。
-    /// 来源去向：Office read/UI 与后台同步到单次事实扫描。
-    /// 约束：等待者在首个扫描完成后复用持久投影，不能重复扫描整本账本。
-    /// 稳定性：T6内部协调状态，不是业务数据或第二份账本。
-    /// 关联：需求/设计REQ-OP-011/014；DES-OP-007/008。
-    pub(crate) office_projection_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    /// 用途：标记当前Office UI动作，避免后台投影扫描争用Store。
-    /// 字段：活动动作计数器。
-    /// 来源去向：actions入口增减，projection在扫描边界读取。
-    /// 约束：只影响后台扫描调度，不跳过UI事实校验或降低权限。
-    /// 稳定性：T6内部协调状态，不持久化。
-    /// 关联：需求/设计REQ-OP-011；DES-OP-009。
-    pub(crate) office_ui_busy: Arc<AtomicUsize>,
-    /// 用途：缓存已结束Run的只读完整视图，避免重复解析大型JSONL。
-    /// 字段：按Run ID索引的终态RunView。
-    /// 来源去向：projection从Store装载，详情查询只读消费。
-    /// 约束：仅缓存终态；活动Run始终回到Store读取最新事实，不能作为授权来源。
-    /// 稳定性：T6进程内缓存，重启后可重建。
-    /// 关联：需求/设计REQ-OP-011/012；DES-OP-007。
-    pub(crate) office_terminal_runs: Arc<Mutex<HashMap<String, RunView>>>,
+    /// 用途：内聚Office进程内展示缓存与动作协调资源。
+    /// 字段：Office私有RuntimeState。
+    /// 来源去向：Host生命周期到Office适配器。
+    /// 约束：缓存不是授权来源，删除仍按作用域显式失效。
+    /// 稳定性：Host私有装配。
+    /// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-011；DES-OP-007。
+    pub(crate) office_state: crate::office::RuntimeState,
 }
 struct Active {
     execution: Option<crate::orchestration::Execution>,
@@ -278,9 +255,6 @@ impl Host {
             .map_err(HostError::storage)??;
         let (notices, _) = broadcast::channel(256);
         let live = Arc::new(Mutex::new(HashMap::new()));
-        let office_projection_cache = Arc::new(Mutex::new(HashMap::new()));
-        let office_projection_locks = Arc::new(Mutex::new(HashMap::new()));
-        let office_terminal_runs = Arc::new(Mutex::new(HashMap::new()));
         let store = Store::open(
             home,
             roots
@@ -315,10 +289,7 @@ impl Host {
                 acceptance: tokio::sync::Mutex::new(()),
                 notices,
                 live,
-                office_projection_cache,
-                office_projection_locks,
-                office_ui_busy: Arc::new(AtomicUsize::new(0)),
-                office_terminal_runs,
+                office_state: crate::office::RuntimeState::default(),
             }),
         })
     }
@@ -651,7 +622,15 @@ impl Host {
                 .store
                 .call_priority(move |db| {
                     if let Some(history) = history {
-                        db.reconcile_history(&view.session_id, &history)?;
+                        if db.binding(&view.session_id)?.scope.namespace == "office" {
+                            db.reconcile_history_with_display(
+                                &view.session_id,
+                                &history,
+                                Some(crate::office::chat_display),
+                            )?;
+                        } else {
+                            db.reconcile_history(&view.session_id, &history)?;
+                        }
                     }
                     let offset = db.events(&view.session_id)?.len();
                     let mut view = db.save_run_with_request(view, offset, request)?;
@@ -2466,5 +2445,103 @@ mod runtime_context_tests {
             serde_json::to_value(provider.with_context(compact)).unwrap(),
             original
         );
+    }
+}
+
+impl Host {
+    /// 功能：持久登记删除并等待目标Run清理后移除历史。
+    /// 参数：scope为可信完整范围。
+    /// 返回：已删除的最小视图；重复删除返回同一墓碑。
+    /// 错误：不存在或存储删除失败；失败保留意图供重试和恢复。
+    /// 状态：不回滚已发生工具副作用，不重新执行旧Run。
+    /// 并发与取消：登记后的删除不随HTTP断开中止，串行Store防接受竞争。
+    /// 权限：只处理匹配scope的原会话，工作区文件保留。
+    /// 关联：REQ-OP-014；CHG-2026-0006第9.4节。 需求/设计REQ-OP-014。
+    pub async fn delete_session(&self, scope: &ClientScope) -> HostResult<DeleteView> {
+        let scope = scope.clone();
+        let host = self.clone();
+        let guard = self.reserve_deletion()?;
+        // 删除是持久生命周期；调用future被丢弃也必须走完清理或保留可恢复意图。
+        tokio::spawn(async move {
+            let _guard = guard;
+            let s = scope.clone();
+            let view = host.inner.store.call(move |db| db.begin_delete(&s)).await?;
+            if view.phase == "deleted" {
+                return Ok(view);
+            }
+            host.quiesce_session(&view.session_id).await;
+            let session = view.session_id.clone();
+            let removed = {
+                let target = session.clone();
+                host.inner
+                    .store
+                    .call(move |db| {
+                        Ok(db
+                            .runs()?
+                            .into_iter()
+                            .filter(|run| run.session_id == target)
+                            .map(|run| run.run_id)
+                            .collect::<Vec<_>>())
+                    })
+                    .await?
+            };
+            let key = serde_json::to_string(&scope).map_err(HostError::storage)?;
+            host.inner
+                .store
+                .call(move |db| db.purge_session(&key, &session))
+                .await?;
+            host.inner
+                .office_state
+                .projection_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&scope.slot_id);
+            // 删除后的Run标识不可复活；清掉终态视图，避免人物详情在墓碑之后
+            // 命中旧内存数据。不同办公室的缓存仍保留。
+            host.inner
+                .office_state
+                .terminal_runs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|id, _| !removed.iter().any(|removed_id| removed_id == id));
+            Ok(DeleteView {
+                phase: "deleted".into(),
+                ..view
+            })
+        })
+        .await
+        .map_err(HostError::storage)?
+    }
+}
+
+#[cfg(test)]
+mod deletion_tests {
+    use super::*;
+    use serde_json::json;
+    #[tokio::test]
+    async fn shutdown_waits_for_accepted_deletion_and_rejects_new_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let cfg = serde_json::from_value(json!({"home":tmp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(cfg).await.unwrap();
+        let guard = host.reserve_deletion().unwrap();
+        let h = host.clone();
+        let shutdown = tokio::spawn(async move { h.shutdown().await });
+        // shutdown在原注册表设置closing后必须等待持有的删除生命周期。
+        let mut idle = Box::pin(host.wait_idle());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut idle)
+                .await
+                .is_err()
+        );
+        assert!(host.reserve_deletion().is_err());
+        assert!(!shutdown.is_finished());
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }
