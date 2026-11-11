@@ -10,6 +10,33 @@ use std::collections::BTreeSet;
 
 const NAME: &str = "report_progress";
 
+/// 功能：统一判断父计划是否已用准确委派调用证据验收子成果。
+/// 参数：plan为父计划，call_id为真实委派调用，run为子运行，percent为原执行进度。
+/// 返回：正常子终态且被父计划准确验收时为true；无父计划沿原100%执行结果。
+/// 错误：无，缺证据不推定验收。
+/// 状态：只读；执行完成和业务完成保持分离。
+/// 并发与取消：同步纯函数。
+/// 权限：只能消费Store已经授权的事实。
+/// 关联：Office投影与历史详情共用验收规则。
+pub(crate) fn delegation_verified(
+    plan: Option<&Value>,
+    call_id: &str,
+    run: &RunView,
+    percent: u64,
+) -> bool {
+    run.state == RunState::Completed
+        && plan
+            .map(|p| {
+                p["steps"].as_array().into_iter().flatten().any(|step| {
+                    step["state"] == "completed"
+                        && step["evidenceCallIds"]
+                            .as_array()
+                            .is_some_and(|ids| ids.iter().any(|id| id == call_id))
+                })
+            })
+            .unwrap_or(percent == 100)
+}
+
 /// 功能：识别可提供真实文件产出证据的现有工具。
 /// 参数：name为原注册表记录的工具名。
 /// 返回：文件写入或媒体保存工具返回true。
@@ -152,7 +179,7 @@ fn is_coordination_step(title: &str, run: &RunView) -> bool {
 /// 关联：REQ-OP-012；CHG-2026-0006第9.9节。
 pub(crate) fn spec() -> ToolSpec {
     let definition = json!({"type":"object","additionalProperties":false,"required":["id","title"],"properties":{"id":{"type":"string","minLength":1,"maxLength":80},"title":{"type":"string","minLength":1,"maxLength":160}}});
-    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。多步骤任务先create固定计划，再update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；同一步后续核验可补报新的真实证据，Host保留旧证据并合并，不能回退已完成状态；文件步骤须引用write_file/edit_file/render_visual/generate_image；真实协作也可引用父delegate_task调用ID，Host再核验该成功子Run的实际写入和相同产物路径。不能把子调用ID当父Run证据。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
+    serde_json::from_value(json!({"name":NAME,"description":"报告本轮用户目标的业务步骤及进度，不执行任何项目操作。仅必要的多步骤任务先create固定计划，再update。可以同批报告已取得证据的完成、下一步开始及独立工具，依赖未返回结果不能提前completed，create未成功不能update。保存/记录步骤标题须说明产物路径，completed必须引用本轮已成功的真实调用ID；同一步后续核验可补报新的真实证据，Host保留旧证据并合并，不能回退已完成状态；文件步骤须引用write_file/edit_file/render_visual/generate_image；真实协作也可引用父delegate_task调用ID，Host再核验该成功子Run的实际写入和相同产物路径。不能把子调用ID当父Run证据。无工具的整理步骤保持in_progress，最终交付由Host确认。不能用此工具代替真实联网、文件写入或审批。","input_schema":{"type":"object","oneOf":[{"type":"object","additionalProperties":false,"required":["type","steps"],"properties":{"type":{"const":"create"},"steps":{"type":"array","minItems":1,"maxItems":12,"items":definition}}},{"type":"object","additionalProperties":false,"required":["type","stepId","state"],"properties":{"type":{"const":"update"},"stepId":{"type":"string"},"state":{"enum":["pending","in_progress","completed"]},"evidenceCallIds":{"type":"array","maxItems":32,"items":{"type":"string"}}}}]}})).expect("固定工具声明合法")
 }
 
 /// 功能：校验报告的结构，实际证据在Store序列内再次校验。
@@ -188,7 +215,7 @@ pub(crate) fn with_execution_receipt(
         } else {
             "保存步骤仍须引用对应路径的实际write_file/edit_file/render_visual/generate_image回执。"
         };
-        outcome.content.push_str(&format!("\n\n[Host执行回执]\n{receipt}\n以上仅确认本次工具执行成功，不代表资料内容有效或业务步骤已完成。核对结果符合对应步骤要求后，在进入下一步骤或最终回复前调用report_progress：{{\"type\":\"update\",\"stepId\":\"当前计划中对应步骤的id\",\"state\":\"completed\",\"evidenceCallIds\":[{}]}}。必须替换stepId，逐字使用此callId；若内容无效先继续检索，不得报告完成。{evidence}\n[/Host执行回执]", json!(binding.call_id)));
+        outcome.content.push_str(&format!("\n\n[Host执行回执]\n{receipt}\n仅确认执行成功，不代表内容有效或步骤完成。已有对应计划步骤时，核验后用真实callId填evidenceCallIds报告completed；无效内容不得完成。没有计划则不为这条回执额外创建计划；不要重复读取或执行来重新取得证据。{evidence}\n[/Host执行回执]"));
     }
     outcome
 }
@@ -209,7 +236,7 @@ pub(crate) fn accepted_plan_hint(value: Option<Value>) -> HostResult<String> {
         .iter()
         .map(|s| json!({"id":s.id,"title":s.title,"state":s.state,"evidenceCallIds":s.evidence}))
         .collect::<Vec<_>>();
-    Ok(format!("业务步骤已记录；真实操作和文件仍须通过原工具及审批执行。当前步骤：{}。in_progress尚未完成；核验真实操作结果后，用对应Host执行回执的callId报告completed，再处理下一步。同一步后续同事的核验可用completed补报准确证据，Host只追加保留旧证据；每个实际委派均须核验，不能因计划中已有completed而漏报额外同事。最终答复前核对清单，无工具的整理答复由最终可靠结束确认。",json!(steps)))
+    Ok(format!("业务步骤已记录；真实操作和文件仍须通过原工具及审批执行。当前步骤：{}。in_progress尚未完成；核验后用真实callId报告completed；已完成状态只追加新证据，不回退。可以同批提交无前置依赖的更新与实际工具，不为本清单重复读取/写入。每项实际委派仍须核验，无工具整理步骤由最终可靠结束确认。",json!(steps)))
 }
 
 /// 功能：为无效进度报告提供本轮真实成功调用的有界恢复提示。
@@ -954,6 +981,11 @@ mod tests {
         assert!(result.content.starts_with(&outcome.content));
         assert!(result.content.contains("\"callId\":\"actual-call\""));
         assert!(result.content.contains("evidenceCallIds") && result.content.contains("不代表"));
+        assert!(result.content.contains("已有对应计划步骤时"));
+        assert!(result
+            .content
+            .contains("没有计划则不为这条回执额外创建计划"));
+        assert!(result.content.contains("不要重复读取或执行来重新取得证据"));
         assert!(!result.content.contains("private-input"));
         assert_eq!(result.structured, outcome.structured);
         assert!(!result.is_error);

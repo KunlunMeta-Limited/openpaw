@@ -37,3 +37,19 @@ Thumbs.db
 # Python governance caches
 __pycache__/
 *.pyc
+
+# Local development records; public runtime/setup inputs remain under docs.
+/docs/*
+!/docs/engine-host/
+/docs/engine-host/*
+!/docs/engine-host/contracts/
+!/docs/engine-host/host-config.example.toml
+/docs/engine-host/contracts/*
+!/docs/engine-host/contracts/sources.json
+/governance/
+/CHANGELOG.md
+/CONTRIBUTING.md
+/tests/engine-host-contracts/README.md
+/tests/engine-host-contracts/upstream-office/README.md
+/tests/engine-host-contracts/status-repeat-100.mjs
+/third-party-licenses/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt

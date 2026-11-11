@@ -80,6 +80,14 @@ pub fn run_new(goals_dir: &Path, objective: &str) -> i32 {
 
 /// `openpaw goal status` — one line per goal profile with its ledger
 /// progress digest (same overview shape as `openpaw evolve status`).
+/// 功能：列出目标档案及真实账本进度。
+/// 参数：home为调用者已解析的数据根。
+/// 返回：成功为0，目录或账本读取失败为1。
+/// 错误：报告原读取原因，不将错误当作空历史。
+/// 状态：只读，不启动AgentLoop或修改知识与目标。
+/// 并发与取消：沿原同步本地查询，无新增等待锁。
+/// 权限：仅查询调用者已选择的数据根。
+/// 关联：账本错误修复；需求REQ-OP-005；设计DES-OP-004；能力与错误边界修复。
 pub fn run_status(home: &Path) -> i32 {
     let goals_dir = home.join("goals");
     let store = FsGoalStore::new(goals_dir.clone());
@@ -101,7 +109,17 @@ pub fn run_status(home: &Path) -> i32 {
     }
     for doc in &goals {
         let fm = &doc.frontmatter;
-        let (progress, next) = run_digest(&store, &fm.id);
+        let (progress, next) = match run_digest(&store, &fm.id) {
+            Ok(digest) => digest,
+            Err(e) => {
+                report_error(
+                    format!("cannot read goal ledger `{}`: {e}", fm.id),
+                    "ledger read errors cannot be treated as empty history.",
+                    "check the goal event file and permissions before retrying.",
+                );
+                return 1;
+            }
+        };
         println!("  {}  [{:?}]  progress={progress}", fm.id, fm.status);
         if !fm.objective.is_empty() {
             println!("      objective: {}", fm.objective);
@@ -116,6 +134,14 @@ pub fn run_status(home: &Path) -> i32 {
 /// `openpaw goal resume <id>` — read the ledger's newest run summary and
 /// print the resume decision. No agent loop is driven; the printed
 /// decision is the seam the execution side will consume later.
+/// 功能：从准确目标的原账本计算恢复建议。
+/// 参数：home为数据根，id为精确目标标识。
+/// 返回：成功为0，目录或账本读取失败为1。
+/// 错误：报告原读取原因，不将错误当作空历史。
+/// 状态：只读，不启动AgentLoop或修改知识与目标。
+/// 并发与取消：沿原同步本地查询，无新增等待锁。
+/// 权限：仅查询调用者已选择的数据根。
+/// 关联：账本错误修复；需求REQ-OP-005；设计DES-OP-004；能力与错误边界修复。
 pub fn run_resume(home: &Path, id: &str) -> i32 {
     let goals_dir = home.join("goals");
     let store = FsGoalStore::new(goals_dir);
@@ -138,7 +164,17 @@ pub fn run_resume(home: &Path, id: &str) -> i32 {
             return 1;
         }
     };
-    let events = GoalStore::query_events(&store, id).unwrap_or_default();
+    let events = match GoalStore::query_events(&store, id) {
+        Ok(events) => events,
+        Err(e) => {
+            report_error(
+                format!("cannot read goal ledger `{id}`: {e}"),
+                "the resume decision requires readable history; no decision was made.",
+                "check the goal event file and permissions before retrying.",
+            );
+            return 1;
+        }
+    };
     let fm = &doc.frontmatter;
     println!("goal: {id}  [{:?}]", fm.status);
     match decide_resume(fm, &events) {

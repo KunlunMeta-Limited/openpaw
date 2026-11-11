@@ -15,18 +15,19 @@ run_timeout_secs = 1800
 stream_idle_secs = 60
 tool_timeout_secs = 300
 approval_timeout_secs = 300
-# 写入和bash需显式加入；每次调用仍必须通过Host持久审批。
+# 写入和bash需显式加入；未预授权的调用通过Host持久审批。
 tools = ["read_file", "glob", "grep", "todo_list", "think"]
 # 需要查询天气、公开资料等时，用下面一行替换上行；不改Office或模型.env。
 # tools = ["read_file", "glob", "grep", "todo_list", "think", "web_search", "web_fetch"]
 # 联网工具使用原HTTP客户端/系统代理；fresh绕本地缓存不保证站点数据为当天。
 # 公开站点超时/反爬/动态页面可能无法获取有效数据，不以旧数据伪装实时结果。
-# T5显式开放示例：在上方tools数组逐项加入write_file、edit_file、todo_add、todo_update或bash。
-# 每call都要在Office菜单选择“允许本次”；不提供永久允许。notebook_edit/sleep未向Office开放。
+# 写入工具示例：在上方tools数组逐项加入write_file、edit_file、todo_add、todo_update或bash。
+# 可在顶层配置auto_approve_tools = ["write_file", "edit_file", "render_visual"]持久预授权；逐次保留审计。
+# 仅列出已加入tools的工具，权限选择以setup实际生成的配置为准。
 # bash在Linux使用sh、Windows使用cmd；这是普通本机执行，具有当前用户权限，根锁不构成OS隔离。
 # 不可落实的受限执行仍拒绝，不能降为普通执行；取消保持cancelling直到进程/管道清理完成。
-# Windows原生验证按用户安排暂缓，示例可移植不等于已经发布验证。
-# T7预留：必须成对配置，T4启用office段后增加官方聊天接口；OpenCode认证路由尚未交付。
+# Windows原生支持；某次Linux验证不等于该版本Windows已验，结果分别记录。
+# 嵌入式认证配置须成对提供；不表示已实现完整OpenCode HTTP服务。
 # basic_username_env = "OPENPAW_HOST_USER"
 # basic_password_env = "OPENPAW_HOST_PASSWORD"
 [roots]
@@ -49,7 +50,7 @@ office-4 = "project-4"
 # allowed_origins = ["http://127.0.0.1:8765"]
 # 先在[roots]/[slots]声明真实根及稳定槽，再把等待页面创建的槽填入此项。
 # 默认空，全部原办公室仍自动初始化；每槽只分配一次，名称不变成路径。
-# activity_window = true # 可选：人物只显示在途/排队任务，标题显示真实工具动作；页面计数变为当前窗口口径。
+# activity_window = true # 可选：人物只显示在途/排队任务，业务标题与实时动作分别传递；计数为当前窗口口径。
 # creation_slots = [] # 例如 ["office-reserved"]；该槽须已在[slots]存在
 # [office.names]
 # office-1 = "研发办公室"
@@ -73,7 +74,7 @@ office-4 = "project-4"
 # 新根中新产物另行保留，不以回退为由删除。共享根仅为明确配置的可选旧行为。
 
 # 单对话持续协作：以下是显式启用示例，不能直接追加为同名重复TOML表。
-# 将上方max_active_runs改为6、run_timeout_secs改为0；零只取消总时限，
+# 将上方max_active_runs按实际并发需求调大（setup默认24）、run_timeout_secs改为0；零只取消总时限，
 # 网络空闲、单工具和审批超时继续生效。tools按需增加write_file/edit_file/render_visual/generate_image。
 # [agents]
 # enabled = true
@@ -88,7 +89,7 @@ office-4 = "project-4"
 # auto_approve = true
 # stage_pause_ms = 250
 # 同时开放的业务事项上限，不是子Agent数量。
-max_open_items = 2
+# max_open_items = 4
 # 独立生图服务可选；DeepSeek聊天密钥不会自动作为图片凭据。
 # 地址须支持POST /images/generations，返回data[0].b64_json实际PNG/JPEG/WebP。
 # [agents.images]

@@ -1,8 +1,9 @@
 //! `openpaw chat` — the interactive conversation entry point (M2 wiring).
 //!
-//! Wires AgentLoop + ToolRegistry + session JSONL persistence. Offline by
-//! default (mock/echo providers); real network providers plug into the
-//! same `--provider` seam as they land.
+//! 职责：装配原AgentLoop、工具与会话持久化，缺省模型沿统一环境配置。
+//! 输入输出：终端输入到模型回复、工具结果与JSONL。
+//! 依赖：原共享引擎和显式CLI数据根。
+//! 禁止职责：不导入Host授权配置；本地工具自动批准不代表OS隔离。
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -20,7 +21,7 @@ const EXIT_WORDS: [&str; 4] = ["exit", "quit", "/exit", "/quit"];
 /// 约束：密钥只从服务端环境读取
 /// 稳定性：新增可选项
 /// 关联：需求/设计 REQ-OP-003。
-#[derive(Debug, clap::Args)]
+#[derive(Debug)]
 pub struct ChatArgs {
     /// 用途：显式Provider；缺省使用统一环境或原mock默认。
     /// 字段：可选Provider名称。
@@ -28,7 +29,6 @@ pub struct ChatArgs {
     /// 约束：未知或空值拒绝。
     /// 稳定性：保持原命令兼容。
     /// 关联：需求/设计REQ-OP-003；DES-OP-002。
-    #[arg(long)]
     pub provider: Option<String>,
     /// 用途：选择共用模型配置文件。
     /// 字段：可选.env路径。
@@ -36,7 +36,6 @@ pub struct ChatArgs {
     /// 约束：只读且不向工具环境注入。
     /// 稳定性：新增可选字段。
     /// 关联：需求/设计REQ-OP-003；DES-OP-002。
-    #[arg(long)]
     pub env_file: Option<PathBuf>,
     /// 用途：显式覆盖Provider默认模型
     /// 字段：可选名称
@@ -44,7 +43,6 @@ pub struct ChatArgs {
     /// 约束：非空
     /// 稳定性：新增
     /// 关联：需求/设计 REQ-OP-003。
-    #[arg(long)]
     pub model: Option<String>,
     /// 用途：已授权Provider端点
     /// 字段：可选URL
@@ -52,14 +50,23 @@ pub struct ChatArgs {
     /// 约束：不包含密钥
     /// 稳定性：新增
     /// 关联：需求/设计 DES-OP-002。
-    #[arg(long)]
     pub base_url: Option<String>,
     /// Workspace the tool host operates in (default: current directory).
-    #[arg(long)]
+    /// 用途：保持原命令/参数在当前入口的准确语义。
+    /// 字段：沿用声明中的参数或成员。
+    /// 来源去向：原调用方到当前装配入口。
+    /// 约束：不新增隐式权限、持久化或不支持的能力保证。
+    /// 稳定性：保持原接口，行为边界见本轮记录。
+    /// 关联：需求/设计：REQ-OP-003；DES-OP-002。
     pub workspace: Option<PathBuf>,
     /// OpenPaw home for session storage (default: OPENPAW_HOME or
     /// ~/.openpaw).
-    #[arg(long)]
+    /// 用途：保持原命令/参数在当前入口的准确语义。
+    /// 字段：沿用声明中的参数或成员。
+    /// 来源去向：原调用方到当前装配入口。
+    /// 约束：不新增隐式权限、持久化或不支持的能力保证。
+    /// 稳定性：保持原接口，行为边界见本轮记录。
+    /// 关联：需求/设计：REQ-OP-003；DES-OP-002。
     pub home: Option<PathBuf>,
 }
 
@@ -105,7 +112,9 @@ pub fn run(args: ChatArgs) -> i32 {
         }
     };
 
-    let tool_host = openpaw_tools::arc_registry(&workspace);
+    let tool_host: Arc<dyn openpaw_core::ToolHost> = Arc::new(
+        openpaw_tools::ToolRegistry::new(&workspace).with_session_index(home.join("index.db")),
+    );
 
     let mut session = Session::new(&model, provider.name());
     let rt = match tokio::runtime::Runtime::new() {

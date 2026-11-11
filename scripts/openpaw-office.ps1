@@ -5,7 +5,7 @@
 .DESCRIPTION
   与 openpaw-office.sh 保持相同的 setup/build/start/stop/status 语义。
   只使用本机配置；不会复制 .env、打印密钥或删除运行数据。
-  Windows 原生运行本轮仅提供入口，验收状态仍以 handoff.md 为准。
+  Windows 原生运行本轮仅提供入口，验收范围和平台状态见 README.md。
 #>
 [CmdletBinding()]
 param(

@@ -1,55 +1,47 @@
-# OpenPaw coding agent 开发规则
+# OpenPaw 开发约定
 
-本仓库复用 OpenPaw 引擎、工具和存储，在 openpaw-engine-host 中适配 Office 官方 HTTP/NDJSON 与固定版 OpenCode SDK。Linux 主开发，Windows 10/11 x64 原生支持；不适配 macOS。背景、交互和 T0—T8 以 docs/engine-host/master.md 为准，不能把计划写成已实现。
+## 工作区与授权
 
-## 主开发目录与产物
+开始前确认仓库根、分支、HEAD、暂存区和既有用户改动；记录实际验证源码。
+个人路径和配置不写死在共享规则中。不覆盖、还原或提交无关用户修改。
+先审核调用链、数据、权限、平台和现有测试，再按用户明确同意的范围实施。
+新增公共接口、权限、依赖或持久格式，先说明兼容性、迁移与回退，取得需要的授权。
+内部开发资料可以本地保留；公开贡献不依赖私有 CHG、Tx 台账或内部审批工具。
 
-每轮先确认当前仓库根目录、分支、HEAD、暂存区和用户改动；开发、验证和交付须标明实际工作副本及准确版本。允许独立克隆和工作树，但不得遗漏用户改动、混淆验证源码或运行旧构建。个人开发路径属于本机配置与会话约定，不作为共享仓库中的固定目录要求。
+## 模块边界
 
-artifacts只保留真实会话/备份、必要成功与失败证据、当前运行依赖和用途/清理清单；重复测试clone、可重建依赖和停用debug二进制按清单清理。清理前核对进程、Git未提交内容及报告依赖，不删除原始失败以掩盖问题，不删除用户数据或密钥配置。
+- CLI 与 Host 复用 Engine、AgentLoop、工具和 Store，不复制执行循环、会话或审批机制。
+- Office 协议 DTO、路由和展示转换留在 openpaw-engine-host；通用缺陷修所属 crate。
+- 默认 CLI 不引入 Axum/Host；可选 engine-host、sidecar 与普通 CLI 均保持兼容。
+- Office 是独立上游工程。没有逐项明确授权，不修改其源码、配置、测试、锁文件或生成文件。
+- 模型及 Office 密钥不得进入浏览器 VITE_*、Git、日志、事件或工具环境。
+- 审批绑定最终输入；等待审批不持资源锁；取消后等待实际工具/进程清理。
+- 不通过放宽权限、降级隔离、删除安全断言或跳过失败测试获得通过。
 
-发现或调整任何Office工程修改需求时，必须在用户可见更新及交付中明确提醒查看 `docs/engine-host/office-change-requests.md`，给出具体Rx章节、版本、原因和状态；Office仍须逐项人工批准。小写r2/r3是OpenPaw方案修订，大写Rx是Office修改申请，不得混为授权。
+## 代码与测试
 
-## 开始前
+新增或改变行为的公共/跨模块 Rust 声明使用中文 Rustdoc。函数和方法说明功能、参数、返回、错误、状态、并发与取消、权限、关联；不适用写无。类型及模块说明职责、来源去向和约束。保留 SAFETY、Stability 等机器标识。
+解释复杂逻辑的不变量和原因；不批量改写未触及的历史注释。
+按职责组织模块，不设文件/crate 行数上限，不为避开检查搬运代码。
+扩展有意义的现有回归，共用测试夹具；专用测试须有实际 Cargo 入口，不为测试扩大 public。
+零匹配、跳过、未运行或旧版本结果不计为通过；受控模型、真实模型、浏览器和原生 Windows 的结果分别记录。
+100/200 轮重复 UI 验收属于明确指定的专项，不是每次编译要求。
 
-1. 阅读本文件、docs/requirements/产品需求说明.md、docs/design/软件设计说明.md、相关规格、当前主 CHG 与 docs/governance/依赖与资料基线.md。
-2. 先只读审核调用链、数据写入、权限、平台与现有测试；在 CHG 写明复用、延展、修改、新增及必要性。禁止复制 AgentLoop、Session、工具注册表、审批或已有解析器。
-3. 每项功能、缺陷、文档和工程变更在改代码前先进入 docs/changes/ 的可审核 CHG；逐文件说明现状、原因、具体方法/复用、影响和完成标准，批准准确提案版本后才实施。一 Tx 一主 CHG，缺陷以独立 D 条目/回归跟踪，相关修复可按完整逻辑整合提交，提交信息优先中文；后续普通变更一 CHG 一范围。
-4. 需求和设计批准、实施授权、当前提交 PR 审核是不同事实。用户对具体CHG版本的明确批准作为实施授权，须登记版本、人、时间精度与真实证据；泛化“继续”不替代尚未批准的实质方案；AI 不执行 approve、不自填人工批准、不自行合入。
-5. 已批准范围内可迭代私有实现细节；新增公共协议、权限、依赖、数据格式或越出允许文件时先更新方案并取得所需授权。不得顺手重构。
+## 验证与交付
 
-## 不可越过的边界
+公开说明及完整命令见 README。技术执行器：
 
-- Office 源码、文档、测试、配置、锁文件、生成文件和格式化均不得未经人工批准修改。缺陷、必要扩展和新增功能先提交 Rx 的原因、方案、影响、准确范围、验证和回退，用户明确批准该版本后才能实施；批准总计划不等于批准 Rx。
-- Office API Key 和模型密钥不进浏览器 VITE_*、日志、事件或工具环境；teamId/runId 不是授权凭证。
-- 协议 DTO/路由/映射留 Host，通用缺陷修所属 crate；默认 feature 不引入 axum，CLI/离线/sidecar 保持兼容。
-- 审批绑定最终输入；等待不持资源锁，取消后等待实际清理；不得以降级隔离、放宽权限或削弱测试获得通过。
-- 不覆盖、还原或提交用户已有工作区改动，除非用户明确授权对应路径。
-- 不设文件/crate 行数上限，不复制或搬运代码规避门禁。
-- 历史 ADR、报告和日志保留当时语境；纠正当前规则使用新基线，不删除历史来掩盖差异。
+```text
+python scripts/verify.py --suite all --source worktree --base <审核基线> --output <仓库外新目录>
+```
 
-## 文档、注释和测试
+修改后执行适当定向验证，交付前完成技术清单；外部服务失败或平台缺少结果如实报告。
+默认/全 feature 测试、Clippy、MSRV、依赖与协议校验保持有效。功能变更需要对应真实应用验证。
+测试报告使用独立目录，保留退出码、源码摘要、必要成功与失败证据，不收集真实凭证。
+CI 通过不代表人工审核或合入。提交使用 DCO Signed-off-by；未授权不提交、推送、发布、强推或自动合入。
 
-新增功能和 bug 必须同步 CHG 与对应需求/设计/使用说明；文档影响表写明章节或不涉及理由。规范分别见 docs/governance/开发与变更规范.md、注释规范与示例.md、测试与验证规范.md。
+## 本地资料与来源
 
-新增或行为变化的公共/跨模块 Rust 声明使用中文 Rustdoc。函数/方法含“功能、参数、返回、错误、状态、并发与取消、权限、关联”八栏目，不适用写“无”；类型/模块按专用栏目。保留 SAFETY、Stability 等机器标识。历史未触及缺口报告，不批量翻译；复杂逻辑注释解释原因与不变量。
-
-功能/回归测试优先扩展既有测试；专用目录使用显式 Cargo 入口，私有不变量保持 inline，不为测试扩大 public。每个可交付版本，包括文档变更，都完成规定全量验证；定向测试不能替代交付验证，失败修复后重新完整运行。未运行/skip/历史绿灯不能写作通过。
-
-## 命令与交接
-
-~~~text
-python governance/check.py validate --stage proposal
-python governance/check.py index --check
-python governance/check.py trace --check
-python -m unittest discover -s governance/tests -v
-cargo run --locked -p xtask -- comments --base <集成基线> --head HEAD
-python governance/check.py pr-check --stage implementation --base <集成基线> --head HEAD
-python governance/verify.py --suite all --source worktree --stage implementation --base <集成基线> --output <仓库外新证据目录>
-~~~
-
-当前实现/精确行为见 governance/README.md。交付技术核查通过后，先由用户验收准确交付版本，再创建PR；PR审核和实际合入另行记录。原T0完成与0001治理修订分开，后者按用户批准随T3共同PR，不新建治理Tx/CHG。工作区尚未提交时可用 comments/pr-check 的 --worktree；该模式包括用户未提交改动，越界必须报告，不能偷偷忽略。提交前只暂存本 CHG 授权文件。
-
-初期按 docs/engine-host/master.md 第14节先核查本Tx里程碑及Office文档→方案→代码/测试证据，必需项和双平台验证全部满足才创建PR（含Draft）。先push Tx开发分支取得原生CI，不为触发CI先开PR；原T0 #4已合入，其Draft修订履历保留，旧PR批准不覆盖本次新修订。主CHG记录核查版本/结论，技术核查不是人工批准。进入下一Tx前先补登前序真实PR/审核/合入记录，再同步master里程碑、主CHG及交接；PR批准并合入后才记已完成。
-
-初期每 Tx 独立 PR，目标 merge/ai-ofice-react-overagent；上一 Tx 当前提交获批并合入才开始下一 Tx，等待只处理当前 PR。T0—T8 全部约定范围验收后登记阶段结束，转 CHG 持续开发，取消 Tx 串行要求，正常 PR/文档/测试/Rx 规则保留。CI 通过不代替非作者审核。使用 DCO Signed-off-by，禁止自动合入和强推。
+不删除用户会话、工作文件、密钥、备份或原始失败来掩盖问题。
+第三方许可和来源随代码保留；当前树停止跟踪不代表 Git 历史已经清理。
+Office 合同来源唯一清单为 docs/engine-host/contracts/sources.json；冻结协议与实际运行版本分别标记。

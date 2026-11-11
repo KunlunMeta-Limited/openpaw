@@ -15,7 +15,7 @@
 #
 # Onboarding success-rate metric: one exit-0 run counts as one successful
 # onboarding sample. In CI the rate is the share of matrix runners
-# (windows-latest / ubuntu-latest / macos-latest) where this script passes.
+# (windows-latest / ubuntu-latest) where this script passes.
 #
 # Every run is hermetic: OpenPaw state goes to a temp home, never ~/.openpaw.
 

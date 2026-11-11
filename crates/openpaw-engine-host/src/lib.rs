@@ -7,11 +7,15 @@ mod agents;
 #[cfg(feature = "engine-host")]
 mod approval;
 #[cfg(feature = "engine-host")]
+mod artifacts;
+#[cfg(feature = "engine-host")]
 mod config;
 #[cfg(feature = "engine-host")]
 mod continuous;
 #[cfg(feature = "engine-host")]
 mod query;
+#[cfg(feature = "engine-host")]
+mod question;
 #[cfg(feature = "engine-host")]
 mod resource;
 #[cfg(feature = "engine-host")]
@@ -39,9 +43,6 @@ mod office;
 pub use office::OfficeConfig;
 
 #[cfg(feature = "engine-host")]
-mod session_delete;
-
-#[cfg(feature = "engine-host")]
 mod task_progress;
 
 #[cfg(feature = "engine-host")]
@@ -51,3 +52,38 @@ mod orchestration;
 mod workspace_migration;
 #[cfg(feature = "engine-host")]
 pub use workspace_migration::{apply_workspaces, plan_workspaces};
+
+#[cfg(feature = "engine-host")]
+mod delivery;
+
+#[cfg(all(test, feature = "engine-host"))]
+mod test_support;
+
+#[cfg(all(test, feature = "engine-host"))]
+mod child_proof_tests {
+    #[test]
+    fn rejects_zero_filter_early_return_incomplete_and_stale_proofs() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!super::test_support::proof_matches(dir.path(), "current"));
+        std::fs::write(dir.path().join("started"), "current").unwrap();
+        assert!(!super::test_support::proof_matches(dir.path(), "current"));
+        std::fs::write(dir.path().join("completed"), "old").unwrap();
+        assert!(!super::test_support::proof_matches(dir.path(), "current"));
+        std::fs::write(dir.path().join("completed"), "current").unwrap();
+        assert!(super::test_support::proof_matches(dir.path(), "current"));
+        for name in [
+            "does_not_exist_r39",
+            "office::scene::tests::scene_fixture_child",
+        ] {
+            let result = std::panic::catch_unwind(|| {
+                super::test_support::run_child(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", name])
+                        .env_remove("OPENPAW_SCENE_CHILD"),
+                    name,
+                );
+            });
+            assert!(result.is_err(), "成功退出而未执行真实场景必须拒绝：{name}");
+        }
+    }
+}

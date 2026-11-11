@@ -15,7 +15,7 @@ use std::time::Duration;
 /// 约束：不实现Debug、不将密钥放入事件或工具环境。
 /// 稳定性：T4内部接口。
 /// 关联：需求/设计REQ-OP-011；DES-OP-007。
-pub(super) struct Client {
+pub(crate) struct Client {
     http: reqwest::Client,
     url: String,
     authorization: reqwest::header::HeaderValue,
@@ -32,6 +32,38 @@ struct Envelope {
     code: u16,
     msg: String,
     data: Value,
+}
+fn valid_decision_answer(decision: &Value, data: &Value) -> bool {
+    let Some(object) = data.as_object() else {
+        return false;
+    };
+    match decision["kind"].as_str() {
+        Some("confirmation") => {
+            let label = match data["choiceId"].as_str() {
+                Some("confirm") => &decision["confirmLabel"],
+                Some("reject") => &decision["rejectLabel"],
+                _ => return false,
+            };
+            object.len() == 5 && data["label"] == *label
+        }
+        Some("choice") if data["choiceId"] == "custom" => {
+            object.len() == 6
+                && decision["allowCustom"] == true
+                && data["label"] == "其他"
+                && data["customText"].as_str().is_some_and(|s| {
+                    !s.trim().is_empty() && s.trim() == s && s.encode_utf16().count() <= 1000
+                })
+        }
+        Some("choice") => {
+            object.len() == 5
+                && decision["options"].as_array().is_some_and(|options| {
+                    options
+                        .iter()
+                        .any(|v| v["id"] == data["choiceId"] && v["label"] == data["label"])
+                })
+        }
+        _ => false,
+    }
 }
 impl Client {
     /// 功能：读取Office专用凭据并创建禁止重定向的客户端。
@@ -76,7 +108,7 @@ impl Client {
     /// 并发与取消：单次有限超时，future可取消；不持资源锁。
     /// 权限：密钥只发固定端点，禁止重定向。
     /// 关联：需求/设计REQ-OP-011；API-OFFICE-MESSAGES。
-    pub(super) async fn post(&self, request: Value) -> HostResult<(u16, Value)> {
+    pub(crate) async fn post(&self, request: Value) -> HostResult<(u16, Value)> {
         let bytes = serde_json::to_vec(&request).map_err(HostError::storage)?;
         if bytes.len() > 65536 || !dto::protocol_value(&request) {
             return Err(HostError::new(
@@ -207,19 +239,11 @@ impl Client {
                 }
             }
             Some("decision.request") => {
-                let confirm = data["choiceId"] == "confirm";
                 if status != 200
                     || data["teamId"] != request["teamId"]
                     || data["conversationId"] != request["conversationId"]
                     || data["decisionId"] != request["decision"]["id"]
-                    || (!confirm && data["choiceId"] != "reject")
-                    || data["label"]
-                        != request["decision"][if confirm {
-                            "confirmLabel"
-                        } else {
-                            "rejectLabel"
-                        }]
-                    || data.as_object().is_none_or(|o| o.len() != 5)
+                    || !valid_decision_answer(&request["decision"], &data)
                 {
                     return Err(HostError::new("protocol_error", "审批响应绑定不匹配"));
                 }
@@ -596,5 +620,40 @@ mod tests {
             }
         }
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod question_answers {
+    use super::*;
+    #[test]
+    fn choice_does_not_weaken_confirmation_or_accept_forged_custom_payloads() {
+        let confirmation =
+            json!({"kind":"confirmation","confirmLabel":"允许本次","rejectLabel":"拒绝"});
+        let choice = json!({"kind":"choice","allowCustom":true,"options":[{"id":"option-0","label":"a"},{"id":"option-1","label":"b"}]});
+        let mut value = json!({"teamId":"t","conversationId":"c","decisionId":"d","choiceId":"confirm","label":"允许本次"});
+        assert!(valid_decision_answer(&confirmation, &value));
+        value["customText"] = json!("永久允许");
+        assert!(!valid_decision_answer(&confirmation, &value));
+        value.as_object_mut().unwrap().remove("customText");
+        value["choiceId"] = json!("option-0");
+        value["label"] = json!("a");
+        assert!(valid_decision_answer(&choice, &value));
+        value["label"] = json!("forged");
+        assert!(!valid_decision_answer(&choice, &value));
+        value["choiceId"] = json!("custom");
+        value["label"] = json!("其他");
+        for text in ["", " ", " untrimmed", &"😀".repeat(501)] {
+            value["customText"] = json!(text);
+            assert!(!valid_decision_answer(&choice, &value));
+        }
+        value["customText"] = json!("真实答案");
+        assert!(valid_decision_answer(&choice, &value));
+        let mut disabled = choice.clone();
+        disabled["allowCustom"] = json!(false);
+        assert!(!valid_decision_answer(&disabled, &value));
+        assert!(!valid_decision_answer(&confirmation, &value));
+        value["unexpected"] = json!(true);
+        assert!(!valid_decision_answer(&choice, &value));
     }
 }

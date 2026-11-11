@@ -111,7 +111,7 @@ fn golden(root: &Path) -> Result<()> {
     );
 
     // D8 (ReflectionOutput) golden samples: schema-shape check. The
-    // knowledge-format 1.0 spec (docs/specs/knowledge-format-1.0.md) pins
+    // knowledge-format golden fixtures pin
     // these keys; a sample that drifts from the schema fails here.
     let d8_dir = root.join("tests/golden/knowledge-format");
     let mut d8_entries: Vec<PathBuf> = std::fs::read_dir(&d8_dir)

@@ -1,3 +1,8 @@
+//! 职责：定义共享模型、消息、工具、审批和策略抽象。
+//! 输入输出：运行层消费的类型与特征，不执行模型或工具。
+//! 依赖：基础数据类型；不依赖UI、传输或存储实现。
+//! 禁止职责：不装配宿主、网络服务或持久化后端。
+//!
 //! openpaw-core: foundation traits and types.
 //!
 //! This crate declares the project's central abstractions: the LLM provider
@@ -11,9 +16,9 @@
 //!
 //! - `Stability: stable` — frozen at 1.0. Breaking changes require an RFC
 //!   plus a deprecation window of two minor releases (see
-//!   docs/compatibility.md).
+//!   the root README, file formats and compatibility).
 //! - `Stability: unstable` — allowed to iterate; promotion to stable follows
-//!   the 1.0 freeze process (design plan section 7.8).
+//!   an explicit compatibility review.
 //!
 //! The `xtask stability` gate asserts that every public item carries one of
 //! these tags; an untagged public item fails CI.

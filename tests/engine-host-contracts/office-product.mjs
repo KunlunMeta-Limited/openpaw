@@ -6,7 +6,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer } from 'node:http'
 import { createServer as tcpServer } from 'node:net'
-import { mkdir, readFile, writeFile, access, readdir, realpath, copyFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, access, readdir, realpath, copyFile, lstat, mkdtemp, rm } from 'node:fs/promises'
 import { dirname, join, resolve, relative, delimiter } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { tmpdir } from 'node:os'
@@ -16,22 +16,84 @@ import { officeRequestSchema, officeResultSchema, officeSnapshotSchema } from '.
 import { chatEventSchema, chatOperationSchema, chatHistoryPageSchema, chatCancelResultSchema } from './upstream-office/packages/protocol/src/chat.ts'
 import { assertProtocolValue, responseEnvelopeSchema } from './upstream-office/packages/protocol/src/schema.ts'
 
+// Explicit opt-in: validate a trusted build receipt; never install/build/write Office.
+async function runtimeFiles(office) {
+  const roots = ['dist', 'server/dist']
+  try { for (const entry of await readdir(join(office, 'packages'))) {
+    try { if ((await lstat(join(office,'packages',entry,'dist'))).isDirectory()) roots.push('packages/'+entry+'/dist') } catch (error) { if(error.code!=='ENOENT')throw error }
+  } } catch (error) { if(error.code!=='ENOENT')throw error }
+  const files = {}
+  async function visit(path) {
+    const full = join(office,path), stat = await lstat(full)
+    assert.ok(!stat.isSymbolicLink(), 'Build contains symlink: '+path)
+    if(stat.isDirectory()) { for(const child of (await readdir(full)).sort()) await visit(path+'/'+child) }
+    else { assert.ok(stat.isFile());files[path]=createHash('sha256').update(await readFile(full)).digest('hex') }
+  }
+  for(const path of roots) await visit(path)
+  assert.ok(files['dist/index.html'] && files['server/dist/index.js'], 'Both frontend and server build entrypoints are required')
+  return files
+}
+async function verifyExistingBuild(office, receiptPath, frozen) {
+  office=await realpath(office)
+  const receipt=JSON.parse(await readFile(receiptPath,'utf8'))
+  const git=(...args)=>execFileSync('git',args,{cwd:office,encoding:'utf8'}).trim()
+  assert.equal(git('status','--porcelain'),'', 'Existing Office must be clean')
+  assert.equal(git('rev-parse','HEAD'),receipt.sourceCommit, 'Build source commit mismatch')
+  assert.equal(git('rev-parse','HEAD^{tree}'),receipt.sourceTree, 'Build source tree mismatch')
+  assert.equal(receipt.contractCommit,frozen.commit,'Frozen contract reference mismatch')
+  for(const item of frozen.files) assert.equal(createHash('sha256').update(await readFile(join(office,item.path))).digest('hex'),item.sha256,'Office contract mismatch: '+item.path)
+  assert.ok(receipt.buildRecord?.path && receipt.buildRecord?.sha256,'An independently retained successful build record is required')
+  const log=await readFile(receipt.buildRecord.path)
+  assert.equal(createHash('sha256').update(log).digest('hex'),receipt.buildRecord.sha256,'Build record changed')
+  assert.ok(log.toString().includes('build:full') && log.toString().includes('server:build'),'Build record must cover frontend and server')
+  assert.deepEqual(await runtimeFiles(office),receipt.buildFiles,'Existing build differs from trusted receipt')
+  return {sourceCommit:receipt.sourceCommit,sourceTree:receipt.sourceTree,receiptSha256:createHash('sha256').update(await readFile(receiptPath)).digest('hex'),buildFileCount:Object.keys(receipt.buildFiles).length}
+}
+async function existingBuildVerifierSelftest() {
+  const directory=await mkdtemp(join(tmpdir(),'openpaw-build-verifier-'))
+  // Minimal generated test data, not an Office checkout or clone.
+  try {
+    await mkdir(join(directory,'dist'));await mkdir(join(directory,'server/dist'),{recursive:true})
+    await writeFile(join(directory,'.gitignore'),'dist/\nserver/dist/\n')
+    await writeFile(join(directory,'contract.json'),'original contract')
+    const git=(...args)=>execFileSync('git',args,{cwd:directory,encoding:'utf8'}).trim()
+    git('init','--quiet');git('add','.');git('-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--quiet','-m','generated verification fixture')
+    await writeFile(join(directory,'dist/index.html'),'frontend');await writeFile(join(directory,'server/dist/index.js'),'server')
+    const record=join(directory,'../'+directory.split(/[\\/]/).pop()+'.build.log'),receiptPath=record+'.json'
+    try {
+      await writeFile(record,'build:full\nserver:build\n')
+      const frozen={commit:'frozen-fixture',files:[{path:'contract.json',sha256:createHash('sha256').update('original contract').digest('hex')}]}
+      const receipt={sourceCommit:git('rev-parse','HEAD'),sourceTree:git('rev-parse','HEAD^{tree}'),contractCommit:frozen.commit,buildRecord:{path:record,sha256:createHash('sha256').update(await readFile(record)).digest('hex')},buildFiles:await runtimeFiles(directory)}
+      await writeFile(receiptPath,JSON.stringify(receipt))
+      const before=await runtimeFiles(directory);await verifyExistingBuild(directory,receiptPath,frozen);assert.deepEqual(await runtimeFiles(directory),before)
+      await writeFile(receiptPath,JSON.stringify({...receipt,sourceCommit:'wrong'}));await assert.rejects(verifyExistingBuild(directory,receiptPath,frozen),/source commit mismatch/)
+      await writeFile(receiptPath,JSON.stringify(receipt));await writeFile(join(directory,'dist/index.html'),'tampered');await assert.rejects(verifyExistingBuild(directory,receiptPath,frozen),/differs from trusted receipt/)
+      await writeFile(join(directory,'dist/index.html'),'frontend');await writeFile(join(directory,'contract.json'),'modified source');await assert.rejects(verifyExistingBuild(directory,receiptPath,frozen),/must be clean/)
+      console.log('Existing-build verifier: valid read-only build, wrong source, wrong build and dirty checkout checks passed')
+    } finally { await rm(record,{force:true});await rm(receiptPath,{force:true}) }
+  } finally { await rm(directory,{recursive:true,force:true}) }
+}
+if(process.argv.includes('--test-existing-build-verifier')) { await existingBuildVerifierSelftest();process.exit(0) }
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const manifest = JSON.parse(await readFile(join(root, 'docs/engine-host/contracts/sources.json'), 'utf8'))
 const source = process.env.OPENPAW_OFFICE_SOURCE
 if (!source) throw new Error('OPENPAW_OFFICE_SOURCE must name the read-only Office checkout')
+const existingBuild = process.env.OPENPAW_OFFICE_EXISTING_BUILD
+const existingBuildReceipt = existingBuild ? await verifyExistingBuild(resolve(source),resolve(existingBuild),manifest.office) : undefined
+if(process.argv.includes('--verify-existing-build-only')) { assert.ok(existingBuildReceipt,'OPENPAW_OFFICE_EXISTING_BUILD required');console.log(JSON.stringify(existingBuildReceipt));process.exit(0) }
 const output = process.env.OPENPAW_OFFICE_PRODUCT_OUTPUT
   ? resolve(process.env.OPENPAW_OFFICE_PRODUCT_OUTPUT)
   : join(tmpdir(), 'openpaw-office-product-' + Date.now() + '-' + randomBytes(3).toString('hex'))
 if (!relative(root, output).startsWith('..')) throw new Error('Evidence must be outside the repository')
 await mkdir(output, { recursive: false })
-const report = { startedAt: new Date().toISOString(), platform: process.platform, commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim(), officeCommit: manifest.office.commit,
+const report = { startedAt: new Date().toISOString(), platform: process.platform, commit: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root }).toString().trim(), officeCommit: existingBuildReceipt?.sourceCommit ?? manifest.office.commit, officeContractCommit: manifest.office.commit,
   sourceDirty: Boolean(execFileSync('git', ['status', '--porcelain'], { cwd: root }).toString().trim()),
   provider: 'deterministic OpenAI protocol fixture; actual AgentLoop and tools', commands: [], browserRequests: [], browserErrors: [], modelRequests: [], messages: [], assertions: [], reviewFindings: [], result: 'running' }
 const processes = []
 let browser, context, providerServer, page, webFixtureServer, webBase
 const webFixture = { requests: [], active: 0, cancelled: 0 }
 const teamGates = new Map()
+const interruptedModelRequests = new Map()
 let networkGate
 const delay = ms => new Promise(r => setTimeout(r, ms))
 async function waitFor(fn, timeout = 30000) {
@@ -92,6 +154,23 @@ function provider() {
       const lastUser = data.messages.findLastIndex(m => m.role === 'user')
       const prompt = data.messages[lastUser]?.content ?? ''
       const results = data.messages.slice(lastUser + 1).filter(m => m.role === 'tool')
+      if (['D168-断流恢复','D168-断流耗尽','D168-部分正文断流'].includes(prompt)) {
+        const attempts=interruptedModelRequests.get(prompt)??[]
+        attempts.push(data);interruptedModelRequests.set(prompt,attempts)
+        if (prompt==='D168-断流恢复') {
+          if (attempts.length===1) {
+            finish({tool_calls:[{index:0,id:'d168-read-once',type:'function',function:{name:'read_file',arguments:'{"path":"README.md"}'}}]},'tool_calls')
+            return
+          }
+          assert.equal(results.length,1);assert.match(results[0].content,/README-/)
+          if(attempts.length===3){finish({content:'D168-已恢复当前请求，读取结果仍有效。'});return}
+        }
+        const partial=prompt==='D168-部分正文断流'
+        const sse=partial?'data: '+JSON.stringify({choices:[{delta:{content:'D168-已保留部分正文。'}}]})+'\n\n':': heartbeat\n\n'
+        res.writeHead(200,{'content-type':'text/event-stream','content-length':Buffer.byteLength(sse)+100,'connection':'close'})
+        res.end(sse)
+        return
+      }
       if (prompt==='R30版本一图文与数据') {
         const calls=[['render_visual',{path:'reports/images/R30-flow.svg',title:'真实流程图',kind:'diagram',nodes:[{id:'a',label:'输入'},{id:'b',label:'结果'}],edges:[{from:'a',to:'b'}]}],
           ['write_file',{path:'reports/R30-notes.md',content:'# R30 phase-one\n\n这是第一版真实图文。\n\n![流程图](images/R30-flow.svg)\n'}],
@@ -247,14 +326,17 @@ function provider() {
   })
 }
 try {
-  const office = join(output, 'office')
+  const office = existingBuild ? resolve(source) : join(output, 'office')
+  report.officeExistingBuild = existingBuildReceipt ?? null
+  if(!existingBuild) {
   await run('git', ['clone', '--no-hardlinks', '--no-checkout', '--', resolve(source), office], root, childEnv, 'office-clone')
   await run('git', ['checkout', '--detach', manifest.office.commit], office, childEnv, 'office-checkout')
   for (const item of manifest.office.files) {
     const bytes = await readFile(join(office, item.path)); assert.equal(createHash('sha256').update(bytes).digest('hex'), item.sha256)
   }
-  const npm = await npmCli()
-  await run(process.execPath, [npm, 'ci', '--prefer-offline', '--ignore-scripts', '--no-audit', '--no-fund'], office, childEnv, 'office-install')
+  }
+  const npm = existingBuild ? null : await npmCli()
+  if(!existingBuild) await run(process.execPath, [npm, 'ci', '--prefer-offline', '--ignore-scripts', '--no-audit', '--no-fund'], office, childEnv, 'office-install')
   const officePort = await freePort(); const officeBase = 'http://127.0.0.1:' + officePort
   // 仅隔离产品子进程放行受控环回网页；真实演示绝不设置该门控。
   childEnv.OPENPAW_WEB_TEST_ALLOW_LOOPBACK = '1'
@@ -288,12 +370,20 @@ try {
   const hostBase = await waitFor(() => host.stdout().match(/openpaw engine host listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1])
   report.hostBinarySha256 = createHash('sha256').update(await readFile(resolve(binary))).digest('hex')
   const buildEnv = { ...childEnv } // chat.url由Host运行时注册，不再注入VITE配置
-  await run(process.execPath, [npm, 'run', 'build:full'], office, buildEnv, 'office-build')
+  if(!existingBuild) await run(process.execPath, [npm, 'run', 'build:full'], office, buildEnv, 'office-build')
   let officeProcess = start(process.execPath, ['server/dist/index.js'], office, { ...childEnv, PORT: String(officePort), HOST: '127.0.0.1', PAWOFFICE_PUBLIC_ORIGIN: officeBase }, 'office-server')
   await waitFor(async () => { try { return (await fetch(officeBase + '/office/')).ok } catch { return false } })
   const { chromium } = await import(pathToFileURL(join(office, 'node_modules/playwright-core/index.mjs')))
   browser = await chromium.launch({ headless: true, ...(process.env.OPENPAW_CHROMIUM ? { executablePath: process.env.OPENPAW_CHROMIUM } : {}), args: ['--use-angle=swiftshader', '--enable-webgl', '--enable-unsafe-swiftshader'] })
   context = await browser.newContext({ viewport: { width: 1440, height: 1050 }, locale: 'zh-CN', permissions: ['clipboard-read', 'clipboard-write'], recordVideo: { dir: join(output, 'video') } })
+  // The full product journey targets the official single-office shell. Other pages
+  // created by existing resilience scenarios must use that same real entrypoint.
+  await context.addInitScript(() => {
+    if(window.top===window && location.pathname==='/office/' && !new URLSearchParams(location.search).has('conference')) {
+      const target=new URL(location.href);target.searchParams.set('conference','0');location.replace(target.href)
+    }
+  })
+  report.officeEntry='/office/?conference=0'
   await context.tracing.start({ screenshots: true, snapshots: true, sources: false })
   page = await context.newPage()
   // Passive CDP capture survives HttpChatSource reader.cancel() after done.
@@ -368,7 +458,7 @@ try {
   const conv=(result,id)=>result.data.snapshot.conversations.find(c=>c.id===id)
   const latestSend=()=>report.browserRequests.findLast(r=>r.request.type==='send')
   const terminal=e=>e.type==='done'||e.type==='snapshot'&&e.state==='complete'
-  await page.goto(officeBase + '/office/', { waitUntil: 'domcontentloaded' })
+  await page.goto(officeBase + '/office/?conference=0', { waitUntil: 'domcontentloaded' })
   await chooseOffice()
   await newConversation()
   await page.screenshot({path:join(output,'01-connected.png'),fullPage:true})
@@ -437,7 +527,7 @@ try {
   await page.screenshot({path:join(output,'06-explicit-cancel-confirmed.png'),fullPage:true})
   // Fresh browser storage discovers the exact conversation IDs from the live catalogue.
   const secondContext=await browser.newContext({viewport:{width:1440,height:1050},locale:'zh-CN'})
-  const second=await secondContext.newPage();await second.goto(officeBase+'/office/',{waitUntil:'domcontentloaded'});await chooseOffice(second)
+  const second=await secondContext.newPage();await second.goto(officeBase+'/office/?conference=0',{waitUntil:'domcontentloaded'});await chooseOffice(second)
   await second.getByRole('button',{name:'展开对话',exact:true}).click()
   await second.getByRole('tab',{name:/B会话你好/}).click()
   await waitFor(async()=>(await second.getByRole('log',{name:'对话内容'}).innerText()).includes('网页协议对话正常'))
@@ -500,7 +590,7 @@ try {
   await pagingContext.tracing.start({screenshots:true,snapshots:true,sources:false})
   try {
     const p=await pagingContext.newPage();await observe(p,pagingContext)
-    await p.goto(officeBase+'/office/',{waitUntil:'domcontentloaded'});await chooseOffice(p);await select(p,'UI-分页与草稿A')
+    await p.goto(officeBase+'/office/?conference=0',{waitUntil:'domcontentloaded'});await chooseOffice(p);await select(p,'UI-分页与草稿A')
     await waitFor(()=>report.browserRequests.some(r=>r.request.type==='history'&&r.request.conversationId===uiA&&r.json?.data?.hasMore))
     await stopHost();await transcriptOf(p).evaluate(el=>el.scrollTop=0)
     await p.getByRole('button',{name:'加载更早消息',exact:true}).click()
@@ -533,6 +623,26 @@ try {
   await page.screenshot({path:join(output,'14-provider-auth-error.png'),fullPage:true})
   await page.getByRole('button',{name:'重新同步',exact:true}).click();await waitFor(async()=>!await page.getByText('正在同步聊天记录…',{exact:true}).isVisible())
   await uiSend(page,'UI-模型失败后恢复')
+  for(const [prompt,expected,count] of [
+    ['D168-断流恢复','D168-已恢复当前请求，读取结果仍有效。',3],
+    ['D168-断流耗尽','本请求已尝试断流重试',2],
+    ['D168-部分正文断流','D168-已保留部分正文。',1],
+  ]){
+    await fresh(page);await box(page).fill(prompt);await page.getByRole('button',{name:'发送消息',exact:true}).click()
+    await waitFor(async()=>{const t=await transcriptOf(page).innerText();return t.includes(expected)&&(count===3||t.includes('回复未完成'))})
+    await page.getByRole('button',{name:'停止生成',exact:true}).waitFor({state:'hidden',timeout:30000})
+    const before=await transcriptOf(page).innerText()
+    assert.equal(before.includes('回复未完成'),count!==3)
+    if(count!==3)assert.match(before,/本次未触发 OpenPaw 空闲超时/)
+    assert.equal(interruptedModelRequests.get(prompt).length,count)
+    if(count===3)assert.deepEqual(interruptedModelRequests.get(prompt)[1],interruptedModelRequests.get(prompt)[2])
+    if(count===2)assert.deepEqual(...interruptedModelRequests.get(prompt))
+    await page.reload({waitUntil:'domcontentloaded'});await chooseOffice();await select(page,prompt)
+    await waitFor(async()=>{const t=await transcriptOf(page).innerText();return t.includes(expected)&&(count===3||t.includes('回复未完成'))})
+    assert.equal(interruptedModelRequests.get(prompt).length,count)
+    await page.screenshot({path:join(output,'d168-'+count+'-requests.png'),fullPage:true})
+  }
+  report.assertions.push('D168: real HTTP early truncation retries identical request after prior tool; repeated failure and partial output survive real browser reload without replay')
   await fresh(page);await stopHost();const beforeOffline=report.modelRequests.length
   await box(page).fill('UI-首次发送连接失败');await page.getByRole('button',{name:'发送消息',exact:true}).click()
   await waitFor(async()=>(await transcriptOf(page).innerText()).includes('回复未完成'))

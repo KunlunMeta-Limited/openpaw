@@ -6,3 +6,21 @@ This product includes software developed by the OpenPaw project.
 Licensed under the Apache License, Version 2.0. You may not use this
 product except in compliance with the License. A copy of the License is
 distributed with this product (see LICENSE).
+
+Source provenance
+
+The development source registry records adaptations from an upstream runtime
+supplied during development, including shared frontmatter formats; message,
+session, provider and tool-host abstractions; guardrails, retry and budget
+logic; LLM streaming adapters; filesystem and command tools; AgentLoop and
+context compaction; plugin HookPoint definitions; goal-ledger and reflection
+formats. Some implementations are trimmed or reimplemented rather than copied
+verbatim. Existing source notices and authorship remain applicable; this
+summary does not grant rights to upstream material or replace its terms.
+
+The Office protocol test snapshot is separately attributed and MIT-licensed;
+see THIRD-PARTY-NOTICES.md and its retained upstream LICENSE. Historical
+internal development records are retained locally. Before publishing complete
+Git history, maintainers must also review upstream redistribution rights and
+historical private data; removing records from the current tree does not remove
+them from earlier commits.

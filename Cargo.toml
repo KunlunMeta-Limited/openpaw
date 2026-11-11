@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 authors = ["OpenPaw contributors"]
 
@@ -44,7 +44,7 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Preserve the source dependency key while replacing the archived, unsound backend.
-# Public YAML types change identity; see docs/engine-host/dependency-baseline.md.
+# Public YAML types change identity; see README.md (build and compatibility).
 serde_yml = { package = "serde_norway", version = "0.9.42" }
 toml = "0.8"
 
@@ -59,7 +59,7 @@ tempfile = "3"
 dirs = "5"
 
 # Database
-rusqlite = { version = "0.33", features = ["bundled", "column_decltype"] }
+rusqlite = { version = "=0.41.0", features = ["bundled", "column_decltype", "fallible_uint"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -71,11 +71,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 
 # MCP protocol SDK (openpaw-mcp client; openpaw-cli sidecar server — R9 single-point
 # dependency, transport wrapped behind a thin trait)
-rmcp = { version = "1.6", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
 
 # Web tool stack (openpaw-tools web; url parsing, LRU fetch cache, query encoding, base64 data URIs)
 url = "2"
 urlencoding = "2"
+encoding_rs = "=0.8.35"
 lru = "0.18.5"
 base64 = "0.22"
 

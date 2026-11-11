@@ -124,3 +124,51 @@ fn status_lists_domains_and_goals_and_project_scope() {
     );
     assert_eq!(evolve_cmd::run_status(hp, Some(project.path())), 0);
 }
+
+#[test]
+fn goal_commands_preserve_empty_history_but_reject_unreadable_ledger() {
+    use openpaw_goal_ledger::GoalFrontmatter;
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    let store = FsGoalStore::new(home.path().join("goals"));
+    let goal = GoalFrontmatter::new("ledger I/O regression");
+    let id = goal.id.clone();
+    store.create_goal(goal, "objective").unwrap();
+    for command in [
+        vec!["goal", "resume", id.as_str()],
+        vec!["goal", "status"],
+        vec!["evolve", "status"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_openpaw"))
+            .args(&command)
+            .arg("--home")
+            .arg(home.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "empty history is valid: {result:?}"
+        );
+    }
+    let events = home.path().join("goals/.events");
+    std::fs::create_dir_all(&events).unwrap();
+    std::fs::create_dir(events.join(format!("{id}.jsonl"))).unwrap();
+    for command in [
+        vec!["goal", "resume", id.as_str()],
+        vec!["goal", "status"],
+        vec!["evolve", "status"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_openpaw"))
+            .args(&command)
+            .arg("--home")
+            .arg(home.path())
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "I/O error must not become empty history: {result:?}"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("cannot read goal ledger"));
+        assert!(!String::from_utf8_lossy(&result.stdout).contains("resume decision:"));
+    }
+}

@@ -2,6 +2,8 @@
 //! 输入输出：真实配置及隔离数据到授权/只读断言。
 //! 依赖：现有Host与原技能/目标/Todo查询。
 //! 禁止职责：不将共享服务测试冒充真实Office浏览器验证。
+#[path = "../../src/test_support.rs"]
+mod test_support;
 use openpaw_engine_host::*;
 use serde_json::json;
 fn config(base: &std::path::Path) -> HostConfig {
@@ -75,22 +77,25 @@ async fn readonly_categories_do_not_create_files_and_deleted_scope_cannot_query(
 
 #[test]
 fn office_approval_and_ui_use_real_http_with_shared_cas() {
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "interaction_fixture_child", "--nocapture"])
-        .env("OPENPAW_INTERACTION_CHILD", "1")
-        .env("PAWOFFICE_TEST_KEY", "isolated-office-key")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "interaction_fixture_child", "--nocapture"])
+            .env("OPENPAW_INTERACTION_CHILD", "1")
+            .env("PAWOFFICE_TEST_KEY", "isolated-office-key"),
+        "interaction_fixture_child",
+    );
 }
 #[test]
 fn interaction_fixture_child() {
     if std::env::var("OPENPAW_INTERACTION_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let proof = test_support::ChildProof::start("interaction_fixture_child");
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(interaction_scenario());
+
+    proof.complete();
 }
 #[derive(Default)]
 struct Fixture {
@@ -679,22 +684,25 @@ fn reserved_creation_slots_must_be_unique_and_pre_authorized() {
 
 #[test]
 fn creation_http_recovers_410_serializes_allocations_and_restores_names() {
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "creation_http_fixture_child", "--nocapture"])
-        .env("OPENPAW_CREATION_HTTP_CHILD", "1")
-        .env("PAWOFFICE_TEST_KEY", "isolated-key")
-        .status()
-        .unwrap();
-    assert!(result.success());
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "creation_http_fixture_child", "--nocapture"])
+            .env("OPENPAW_CREATION_HTTP_CHILD", "1")
+            .env("PAWOFFICE_TEST_KEY", "isolated-key"),
+        "creation_http_fixture_child",
+    );
 }
 #[test]
 fn creation_http_fixture_child() {
     if std::env::var("OPENPAW_CREATION_HTTP_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let proof = test_support::ChildProof::start("creation_http_fixture_child");
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(creation_http_scenario());
+
+    proof.complete();
 }
 async fn creation_http_scenario() {
     use axum::response::IntoResponse;
@@ -987,4 +995,383 @@ async fn creation_http_scenario() {
     eprintln!("ui.next 503恢复、领取后真实断链、SQLite登记拒绝、410/503确认未知及重启重复投递均通过；三个槽/Session只分配一次，未执行模型");
     stop.cancel();
     serving.await.unwrap();
+}
+
+#[test]
+fn r37_clarify_requires_explicit_office_permission_and_never_grants_write_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    assert!(!cfg.tools.iter().any(|t| t == "clarify"));
+    cfg.tools.push("clarify".into());
+    cfg.validate().unwrap();
+    assert!(cfg.auto_approve_tools.is_empty());
+    cfg.office = None;
+    assert_eq!(cfg.validate().unwrap_err().kind, "unsupported");
+}
+
+#[test]
+fn r37_real_question_http_lifecycle() {
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "r37_question_fixture_child", "--nocapture"])
+            .env("OPENPAW_QUESTION_CHILD", "1")
+            .env("PAWOFFICE_TEST_KEY", "isolated-question-key"),
+        "r37_question_fixture_child",
+    );
+}
+#[test]
+fn r37_question_fixture_child() {
+    if std::env::var("OPENPAW_QUESTION_CHILD").as_deref() != Ok("1") {
+        return;
+    }
+    let proof = test_support::ChildProof::start("r37_question_fixture_child");
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(r37_question_scenario());
+
+    proof.complete();
+}
+async fn r37_question_scenario() {
+    use axum::response::IntoResponse;
+    use axum::{extract::State, routing::post, Json, Router};
+    use openpaw_core::{Capabilities, CompletionRequest, CompletionResponse, LlmProvider};
+    use openpaw_llm::MockProvider;
+    use serde_json::Value;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Mutex;
+    #[derive(Default)]
+    struct Questions {
+        snapshot: Option<Value>,
+        requests: Vec<Value>,
+        hold: bool,
+        custom: bool,
+        wrong: bool,
+    }
+    async fn handle(
+        State(shared): State<Arc<Mutex<Questions>>>,
+        Json(r): Json<Value>,
+    ) -> axum::response::Response {
+        let mut s = shared.lock().await;
+        let data = match r["type"].as_str().unwrap() {
+            "office.capabilities" => {
+                json!({"scene":{"protocolVersion":"2.0","actors":[{"id":"office-lead"},{"id":"file-agent"},{"id":"data-agent"},{"id":"code-agent"},{"id":"app-agent"},{"id":"review-agent"}],"capabilities":[]},"ui":{"whiteboardSchema":{}},"requests":{},"responses":{"success":{},"error":{}}})
+            }
+            "office.read" if r.get("teamId").is_some() => {
+                json!({"snapshot":s.snapshot,"scene":{},"pendingDecisions":[]})
+            }
+            "office.read" | "offices.initialize" => {
+                if r["type"] == "offices.initialize" {
+                    if let Some(first) = r["offices"].as_array().and_then(|v| v.first()) {
+                        s.snapshot = Some(first.clone());
+                    }
+                }
+                json!({"offices":if s.snapshot.is_some(){vec![json!({"id":"office-1"})]}else{vec![]},"actors":[],"supportedMessages":[],"sceneCommandProtocol":"2.0","ui":{}})
+            }
+            "office.snapshot" => {
+                s.snapshot = Some(r["snapshot"].clone());
+                json!({"teamId":r["teamId"],"seq":r["snapshot"]["seq"],"status":"applied"})
+            }
+            "ui.next" => {
+                drop(s);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                json!({"actions":[]})
+            }
+            "decision.request" => {
+                s.requests.push(r.clone());
+                drop(s);
+                loop {
+                    if !shared.lock().await.hold {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let s = shared.lock().await;
+                if r["decision"]["kind"] == "confirmation" {
+                    json!({"teamId":r["teamId"],"conversationId":r["conversationId"],"decisionId":r["decision"]["id"],"choiceId":"reject","label":r["decision"]["rejectLabel"]})
+                } else {
+                    let mut v = json!({"teamId":if s.wrong {json!("other")}else{r["teamId"].clone()},"conversationId":r["conversationId"],"decisionId":r["decision"]["id"],"choiceId":r["decision"]["options"][1]["id"],"label":r["decision"]["options"][1]["label"]});
+                    if s.custom {
+                        v["choiceId"] = json!("custom");
+                        v["label"] = json!("其他");
+                        v["customText"] = json!("真实补充：三人同行，不授权任何写入");
+                    }
+                    v
+                }
+            }
+            _ => panic!("unexpected request {r}"),
+        };
+        Json(json!({"code":200,"msg":"isolated question fixture","data":data})).into_response()
+    }
+    struct Provider(std::sync::Mutex<Vec<CompletionRequest>>);
+    #[async_trait::async_trait]
+    impl LlmProvider for Provider {
+        async fn complete(
+            &self,
+            req: CompletionRequest,
+        ) -> openpaw_core::Result<CompletionResponse> {
+            self.0.lock().unwrap().push(req.clone());
+            let results: Vec<_> = req
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .filter_map(|b| match b {
+                    openpaw_core::ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                    _ => None,
+                })
+                .collect();
+            let user = req
+                .messages
+                .iter()
+                .find(|m| m.role == openpaw_core::Role::User)
+                .unwrap()
+                .text();
+            if results.is_empty() {
+                let (name, args) = if user == "independent-write" {
+                    (
+                        "write_file",
+                        json!({"path":"independent.txt","content":"independent write"}),
+                    )
+                } else if user == "team"
+                    && req
+                        .system
+                        .as_deref()
+                        .is_some_and(|s| s.contains("（lead）"))
+                {
+                    (
+                        "delegate_task",
+                        json!({"role_id":"organize","title":"确认必要信息","instructions":"调用clarify询问关键选择，收到真实答案后返回简短结果","acceptance":"准确返回用户答案"}),
+                    )
+                } else {
+                    (
+                        "clarify",
+                        if user == "fallback" {
+                            json!({"question":"需要补充吗？"})
+                        } else {
+                            json!({"question":"选择方案？","options":["方案甲","方案乙"],"context":"需要真实信息后继续"})
+                        },
+                    )
+                };
+                MockProvider::tool_use(name, args, "等待真实回答")
+                    .complete(req)
+                    .await
+            } else {
+                MockProvider::fixed(format!(
+                    "原Run继续，准确收到：{}",
+                    serde_json::to_string(&results).unwrap()
+                ))
+                .complete(req)
+                .await
+            }
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        fn name(&self) -> &str {
+            "question-fixture"
+        }
+        fn default_model(&self) -> &str {
+            "question-fixture"
+        }
+    }
+    let shared = Arc::new(Mutex::new(Questions::default()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/api/pawoffice/messages", post(handle))
+        .with_state(shared.clone());
+    let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(dir.path());
+    cfg.office.as_mut().unwrap().base_url = base;
+    cfg.tools = vec!["clarify".into(), "write_file".into()];
+    cfg.auto_approve_tools = vec!["write_file".into()];
+    cfg.run_timeout_secs = 0;
+    cfg.tool_timeout_secs = 1;
+    cfg.agents = Some(AgentsConfig {
+        enabled: true,
+        ..Default::default()
+    });
+    let capture = Arc::new(Provider(std::sync::Mutex::new(Vec::new())));
+    let host = Host::with_provider(cfg.clone(), capture.clone())
+        .await
+        .unwrap();
+    let server = HostServer::bind(host.clone(), 0).await.unwrap();
+    let dbpath = cfg.home.join("engine-host/host.db");
+    for (index, (user, custom, wrong, cancel)) in [
+        ("standard", false, false, false),
+        ("custom", true, false, false),
+        ("fallback", false, false, false),
+        ("forged", false, true, false),
+        ("cancel", false, false, true),
+        ("team", false, false, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        {
+            let mut s = shared.lock().await;
+            s.hold = true;
+            s.custom = custom;
+            s.wrong = wrong;
+        }
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: format!("question-{index}"),
+        };
+        let b = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(&scope, &b.session_id, user.into())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if shared
+                    .lock()
+                    .await
+                    .requests
+                    .iter()
+                    .any(|r| r["conversationId"] == scope.conversation_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (question_run, question_scope) = if user == "team" {
+            let db = rusqlite::Connection::open(&dbpath).unwrap();
+            let raw:String=db.query_row("SELECT reference FROM host_events WHERE kind='agent_delegation' AND json_extract(reference,'$.run_id')=?1",[&run.run_id],|r|r.get(0)).unwrap();
+            let d: Value = serde_json::from_str(&raw).unwrap();
+            (
+                d["child_run"].as_str().unwrap().to_owned(),
+                serde_json::from_value::<ClientScope>(d["child_scope"].clone()).unwrap(),
+            )
+        } else {
+            (run.run_id.clone(), scope.clone())
+        };
+        assert!(host
+            .get_run(&question_scope, &question_run)
+            .await
+            .unwrap()
+            .tools
+            .iter()
+            .any(|t| t.state == "awaiting_user"));
+        assert!(host.pending_approvals(&scope).await.unwrap().is_empty());
+        assert_eq!(
+            host.submit_run(&scope, &b.session_id, "普通聊天不能冒充答案".into())
+                .await
+                .unwrap_err()
+                .kind,
+            "session_busy"
+        );
+        // 大于原1秒工具超时仍可等待；同根另一会话写文件应独立完成。
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            host.get_run(&scope, &run.run_id).await.unwrap().state,
+            RunState::Running
+        );
+        if index == 0 {
+            let other = ClientScope {
+                conversation_id: "independent".into(),
+                ..scope.clone()
+            };
+            let b = host.open_session(other.clone()).await.unwrap();
+            let independent = host
+                .submit_run(&other, &b.session_id, "independent-write".into())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if host
+                        .get_run(&other, &independent.run_id)
+                        .await
+                        .unwrap()
+                        .state
+                        .is_terminal()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(cfg.roots["r"].join("independent.txt")).unwrap(),
+                "independent write"
+            );
+        }
+        if cancel {
+            host.cancel_run(&scope, &run.run_id).await.unwrap();
+        }
+        shared.lock().await.hold = false;
+        tokio::time::timeout(Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let final_run = host.get_run(&scope, &run.run_id).await.unwrap();
+        assert_eq!(
+            final_run.state,
+            if cancel {
+                RunState::Cancelled
+            } else {
+                RunState::Completed
+            }
+        );
+        if !cancel {
+            assert!(
+                final_run.text.contains(if wrong {
+                    "display_failed"
+                } else if user == "fallback" {
+                    "declined"
+                } else {
+                    "answered"
+                }),
+                "{}",
+                final_run.text
+            );
+            if custom {
+                assert!(final_run.text.contains("三人同行"));
+            }
+            if user == "standard" {
+                assert!(final_run.text.contains("方案乙"));
+            }
+        }
+        let db = rusqlite::Connection::open(&dbpath).unwrap();
+        let facts:Vec<String>=db.prepare("SELECT reference FROM host_events WHERE kind='question' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").unwrap().query_map([&question_run],|r|r.get(0)).unwrap().map(Result::unwrap).collect();
+        assert!(facts.len() >= 3);
+        assert!(
+            !facts.join("").contains("三人同行"),
+            "控制事实不得复制答案全文"
+        );
+        let latest: Value = serde_json::from_str(facts.last().unwrap()).unwrap();
+        assert_ne!(latest["state"], "pending");
+        assert_eq!(
+            latest["scope"]["conversation_id"], scope.conversation_id,
+            "子问题必须显示在父对话"
+        );
+        assert_eq!(
+            latest["role_id"],
+            if user == "team" { "organize" } else { "lead" }
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM host_runs WHERE session=?1",
+                [&b.session_id],
+                |r| r.get::<_, usize>(0)
+            )
+            .unwrap(),
+            1,
+            "回答后必须继续原Run"
+        );
+    }
+    assert!(capture.0.lock().unwrap().iter().any(|r| r
+        .system
+        .as_deref()
+        .unwrap_or("")
+        .contains("关键缺失信息")));
+    server.shutdown().await.unwrap();
+    serving.abort();
+    let _ = serving.await;
 }

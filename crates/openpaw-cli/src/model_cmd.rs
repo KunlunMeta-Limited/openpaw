@@ -22,12 +22,23 @@ const PROVIDERS: [(&str, &str, &str); 4] = [
 ];
 
 /// Subcommands of `openpaw model`.
+/// 用途：保持原命令/参数在当前入口的准确语义。
+/// 字段：沿用声明中的参数或成员。
+/// 来源去向：原调用方到当前装配入口。
+/// 约束：不新增隐式权限、持久化或不支持的能力保证。
+/// 稳定性：保持原接口，行为边界见本轮记录。
+/// 关联：需求/设计：REQ-OP-003；DES-OP-002。
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
     /// Print the built-in providers and their default models.
     List,
-    /// Record the default provider choice (placeholder: no file is
-    /// written yet).
+    /// Report that persisting a default provider is unsupported; use --provider or .env.
+    /// 用途：保持原命令/参数在当前入口的准确语义。
+    /// 字段：沿用声明中的参数或成员。
+    /// 来源去向：原调用方到当前装配入口。
+    /// 约束：不新增隐式权限、持久化或不支持的能力保证。
+    /// 稳定性：保持原接口，行为边界见本轮记录。
+    /// 关联：需求/设计：REQ-OP-003；DES-OP-002。
     Default {
         /// Provider name as shown by `openpaw model list`.
         name: String,
@@ -43,8 +54,14 @@ pub fn run_list() -> i32 {
     0
 }
 
-/// `openpaw model default <name>` — accepts a known provider name and
-/// prints the placeholder notice (config file persistence lands later).
+/// 功能：明确拒绝尚未实现的默认模型持久化命令。
+/// 参数：name为原支持的Provider名称。
+/// 返回：非零退出码，不伪报配置成功。
+/// 错误：未知Provider或尚未支持写入均说明原因与替代入口。
+/// 状态：不读写配置。
+/// 并发与取消：无等待或共享状态。
+/// 权限：不新增配置写权限，不请求模型服务。
+/// 关联：需求/设计：CHG-2026-0007 §12.169；能力与错误边界修复。
 pub fn run_default(name: &str) -> i32 {
     if !PROVIDERS.iter().any(|(known, _, _)| *known == name) {
         report_error(
@@ -54,10 +71,10 @@ pub fn run_default(name: &str) -> i32 {
         );
         return 1;
     }
-    println!("default provider `{name}` accepted (config file persistence lands in M5b).");
-    println!("why: no config file is read or written yet, so the choice is not persisted.");
-    println!(
-        "next: re-run after M5b to persist the default; `openpaw chat --provider` works today."
+    report_error(
+        "unsupported: persisting a default provider is not implemented".into(),
+        "no configuration was changed.",
+        "use `openpaw chat --provider <name>` or configure OPENPAW_PROVIDER in your .env.",
     );
-    0
+    1
 }

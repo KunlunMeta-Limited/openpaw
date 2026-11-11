@@ -1,8 +1,11 @@
-//! 职责：成功工具产物的不可变字节、单版本能力及Office官方交付适配。
+//! 职责：将已授权Host产物事实转换为Office官方交付与安全文件响应。
 //! 输入输出：真实工具目标到受限blob、确定版本URL和官方result/deliveries。
 //! 依赖：原Root锁、Store、路径安全、ring；不增加模型工具。
 //! 禁止职责：不扫描工作区补造历史，不把文件存在当作内容验收，不执行HTML。
 use super::{dto, OfficeConfig};
+use crate::artifacts::{capability, read_blob, read_secret};
+#[cfg(test)]
+use crate::artifacts::{publish_blob, secret, sha256, TOTAL_LIMIT};
 use crate::{Host, HostError, HostResult};
 use axum::{
     extract::{Path, RawQuery, State},
@@ -11,330 +14,8 @@ use axum::{
     routing::get,
     Router,
 };
-use ring::{
-    digest, hmac,
-    rand::{SecureRandom, SystemRandom},
-};
 use serde_json::{json, Value};
-use std::{
-    io::{Read, Write},
-    net::SocketAddr,
-    path::{Path as FsPath, PathBuf},
-};
-
-const FILE_LIMIT: u64 = 8 * 1024 * 1024;
-const TOTAL_LIMIT: u64 = 512 * 1024 * 1024;
-
-/// 功能：计算原始字节的小写SHA256。
-/// 参数：bytes为原始文件或能力字节。
-/// 返回：64位小写十六进制hash。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：只读或发布派生版本，不修改原工具及会话。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) fn sha256(bytes: &[u8]) -> String {
-    hex(digest::digest(&digest::SHA256, bytes).as_ref())
-}
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-/// 功能：建立仅当前用户访问的版本目录。
-/// 参数：dir为Host home内固定目录。
-/// 返回：原操作结果。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：只读或发布派生版本，不修改原工具及会话。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) fn private_dir(dir: &FsPath) -> HostResult<()> {
-    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(HostError::new("scope_denied", "版本目录不允许符号链接"));
-    }
-    std::fs::create_dir_all(dir).map_err(HostError::storage)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(HostError::storage)?;
-    }
-    // Only our unpublished UUID temporary files are restart garbage; no blob or workspace is removed.
-    for entry in std::fs::read_dir(dir).map_err(HostError::storage)? {
-        let entry = entry.map_err(HostError::storage)?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some(id) = name
-            .strip_prefix(".blob-")
-            .or_else(|| name.strip_prefix(".secret-"))
-        {
-            if id.len() == 32 && uuid::Uuid::parse_str(id).is_ok() {
-                std::fs::remove_file(entry.path()).map_err(HostError::storage)?;
-            }
-        }
-    }
-    Ok(())
-}
-fn private_file(path: &FsPath) -> HostResult<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path).map_err(HostError::storage)
-}
-/// 功能：读取或原子建立持久随机Host能力密钥。
-/// 参数：dir为私有版本目录。
-/// 返回：32字节随机密钥，仅在Host内存使用。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：只读或发布派生版本，不修改原工具及会话。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) fn secret(dir: &FsPath) -> HostResult<Vec<u8>> {
-    let path = dir.join("access.key");
-    if path.exists() {
-        return read_secret(&path);
-    }
-    let mut bytes = vec![0u8; 32];
-    SystemRandom::new()
-        .fill(&mut bytes)
-        .map_err(|_| HostError::new("storage_unavailable", "无法取得安全随机数"))?;
-    let temp = dir.join(format!(".secret-{}", uuid::Uuid::new_v4().simple()));
-    let mut f = private_file(&temp)?;
-    f.write_all(&bytes)
-        .and_then(|_| f.sync_all())
-        .map_err(HostError::storage)?;
-    drop(f);
-    std::fs::rename(&temp, &path).map_err(HostError::storage)?;
-    sync_dir(dir)?;
-    Ok(bytes)
-}
-fn read_secret(path: &FsPath) -> HostResult<Vec<u8>> {
-    if std::fs::symlink_metadata(path)
-        .map_err(HostError::storage)?
-        .file_type()
-        .is_symlink()
-    {
-        return Err(HostError::new("scope_denied", "能力密钥不允许符号链接"));
-    }
-    let bytes = std::fs::read(path).map_err(HostError::storage)?;
-    if bytes.len() != 32 {
-        return Err(HostError::new("storage_unavailable", "版本能力密钥损坏"));
-    }
-    Ok(bytes)
-}
-fn sync_dir(dir: &FsPath) -> HostResult<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(dir)
-            .and_then(|f| f.sync_all())
-            .map_err(HostError::storage)?;
-    }
-    let _ = dir;
-    Ok(())
-}
-/// 功能：从随机Host密钥和准确版本范围导出单版本能力。
-/// 参数：secret为持久随机密钥；version/scope/artifact为可信索引。
-/// 返回：不可用于其他版本的稳定能力，不写入模型或日志。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：只读或发布派生版本，不修改原工具及会话。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) fn capability(secret: &[u8], version: &str, scope: &str, artifact: &str) -> String {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
-    hex(hmac::sign(
-        &key,
-        format!("openpaw-artifact-v1\0{scope}\0{artifact}\0{version}").as_bytes(),
-    )
-    .as_ref())
-}
-/// 功能：常量工作量核对URL能力hash。
-/// 参数：access为请求能力，expected为可信hash。
-/// 返回：是否严格匹配；空或超长能力拒绝。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：只读或发布派生版本，不修改原工具及会话。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) fn valid_capability(access: &str, expected: &str) -> bool {
-    if access.len() != 64 || expected.len() != 64 || !access.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return false;
-    }
-    sha256(access.as_bytes())
-        .bytes()
-        .zip(expected.bytes())
-        .fold(0u8, |different, (a, b)| different | (a ^ b))
-        == 0
-}
-/// 功能：在总配额内原子保存内容地址blob。
-/// 参数：dir为固定私有目录；hash/bytes为一致内容。
-/// 返回：保存成功或已有相同blob。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：临时文件不公开；只删除本次失败临时文件，不回收用户或旧版本。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) fn publish_blob(dir: &FsPath, hash: &str, bytes: &[u8]) -> HostResult<()> {
-    if bytes.len() as u64 > FILE_LIMIT {
-        return Err(HostError::new(
-            "capacity_exceeded",
-            "文件已写入，但版本捕获超过单文件8MiB上限",
-        ));
-    }
-    let path = dir.join(format!("{hash}.blob"));
-    if path.exists() {
-        let data = read_exact_file(&path, FILE_LIMIT)?;
-        if sha256(&data) != hash {
-            return Err(HostError::new(
-                "storage_unavailable",
-                "已有版本blob校验失败",
-            ));
-        }
-        return Ok(());
-    }
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(dir).map_err(HostError::storage)? {
-        let entry = entry.map_err(HostError::storage)?;
-        if entry.file_name().to_string_lossy().ends_with(".blob") {
-            let m = entry.metadata().map_err(HostError::storage)?;
-            total = total.saturating_add(m.len());
-        }
-    }
-    if total.saturating_add(bytes.len() as u64) > TOTAL_LIMIT {
-        return Err(HostError::new(
-            "capacity_exceeded",
-            "文件已写入，但版本保存总量达到512MiB上限；旧版及工作区文件均保留",
-        ));
-    }
-    let temp = dir.join(format!(".blob-{}", uuid::Uuid::new_v4().simple()));
-    let result = (|| {
-        let mut f = private_file(&temp)?;
-        f.write_all(bytes)
-            .and_then(|_| f.sync_all())
-            .map_err(HostError::storage)?;
-        drop(f);
-        std::fs::rename(&temp, &path).map_err(HostError::storage)?;
-        sync_dir(dir)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
-}
-fn read_exact_file(path: &FsPath, limit: u64) -> HostResult<Vec<u8>> {
-    let meta = std::fs::symlink_metadata(path).map_err(HostError::storage)?;
-    if !meta.is_file() || meta.len() > limit {
-        return Err(HostError::new(
-            "scope_denied",
-            "版本目标必须是上限内普通文件",
-        ));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(HostError::storage)?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)
-        .map_err(HostError::storage)?;
-    if bytes.len() as u64 > limit {
-        return Err(HostError::new("capacity_exceeded", "文件读取超过8MiB上限"));
-    }
-    Ok(bytes)
-}
-/// 功能：读取与hash一致的已发布blob。
-/// 参数：dir为私有目录；row为可信版本索引。
-/// 返回：准确原始字节，不回退当前工作区。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：只读或发布派生版本，不修改原工具及会话。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) fn read_blob(dir: &FsPath, row: &Value) -> HostResult<Vec<u8>> {
-    let hash = row["hash"]
-        .as_str()
-        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-        .ok_or_else(|| HostError::new("storage_unavailable", "版本hash损坏"))?;
-    let bytes = read_exact_file(&dir.join(format!("{hash}.blob")), FILE_LIMIT)?;
-    if sha256(&bytes) != hash || row["bytes"].as_u64() != Some(bytes.len() as u64) {
-        return Err(HostError::new(
-            "storage_unavailable",
-            "版本原件SHA256或大小校验失败",
-        ));
-    }
-    Ok(bytes)
-}
-fn mime(path: &str) -> Option<&'static str> {
-    match FsPath::new(path)
-        .extension()?
-        .to_str()?
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "md" | "markdown" => Some("text/markdown"),
-        "txt" | "log" => Some("text/plain"),
-        "rs" | "py" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "css" | "toml" | "yaml" | "yml"
-        | "sh" => Some("text/plain"),
-        "csv" => Some("text/csv"),
-        "tsv" => Some("text/tab-separated-values"),
-        "json" => Some("application/json"),
-        "svg" => Some("image/svg+xml"),
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        "pdf" => Some("application/pdf"),
-        _ => None,
-    }
-}
-/// 功能：在原Root写许可仍持有时捕获真实工具目标。
-/// 参数：host/root/binding为可信工具上下文。
-/// 返回：捕获结果；未支持工具或文件类型不捕获。
-/// 错误：存储、作用域或数据损坏明确拒绝。
-/// 状态：不执行写工具第二次；失败由调用方单独报告。
-/// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
-/// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
-/// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
-pub(crate) async fn capture(
-    host: &Host,
-    root: PathBuf,
-    binding: openpaw_core::ToolCallBinding,
-) -> HostResult<()> {
-    if !matches!(
-        binding.tool_name.as_str(),
-        "write_file" | "edit_file" | "render_visual" | "generate_image"
-    ) {
-        return Ok(());
-    }
-    let Some(target) = binding.input["path"].as_str() else {
-        return Ok(());
-    };
-    let Some(mime) = mime(target) else {
-        return Ok(());
-    };
-    let target = target.to_owned();
-    let (path, bytes) = tokio::task::spawn_blocking(move || {
-        let actual = openpaw_tools::safety::resolve(&root, &target)
-            .map_err(|_| HostError::new("scope_denied", "产物路径不在原授权工作区内"))?;
-        let path = actual
-            .strip_prefix(&root)
-            .map_err(|_| HostError::new("scope_denied", "产物路径不在原授权工作区内"))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let bytes = read_exact_file(&actual, FILE_LIMIT)?;
-        Ok::<_, HostError>((path, bytes))
-    })
-    .await
-    .map_err(HostError::storage)??;
-    host.inner
-        .store
-        .call_priority(move |db| {
-            db.capture_artifact(&binding, &path, mime, &bytes)
-                .map(|_| ())
-        })
-        .await
-}
+use std::{net::SocketAddr, path::Path as FsPath};
 
 fn access(row: &Value, dir: &FsPath) -> HostResult<String> {
     let scope = serde_json::to_string(&row["scope"]).map_err(HostError::storage)?;
@@ -432,6 +113,19 @@ fn preview(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Option<Value
         json!({"kind":"custom","id":format!("preview-{}",row["version"].as_str().unwrap_or("")),"title":"图文预览","purpose":"artifact-preview","artifactId":row["artifact"],"versionId":row["version"],"span":"full","blocks":blocks}),
     ))
 }
+// 当前与历史均按准确version取核验说明；每文件仍最多一个section，遵守原8项上限。
+fn version_section(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Option<Value>> {
+    let preview = preview(row, rows, dir)?;
+    let Some(detail) = row["check_detail"].as_str() else {
+        return Ok(preview);
+    };
+    let mut section = preview.unwrap_or_else(||json!({"kind":"custom","id":format!("check-{}",row["version"].as_str().unwrap_or("")),"title":"版本核验依据","purpose":"evidence","artifactId":row["artifact"],"versionId":row["version"],"span":"full","blocks":[]}));
+    section["blocks"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"text","text":dto::bounded(detail,1800)}));
+    Ok(Some(section))
+}
 /// 功能：从可信版本构造固定历史交付。
 /// 参数：row为准确版本；rows为同会话版本目录；dir为私有blob根。
 /// 返回：只含该次真实写入的官方不可变交付对象。
@@ -441,8 +135,8 @@ fn preview(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Option<Value
 /// 权限：完整Office会话及原父子绑定，不接受模型指定范围。
 /// 关联：CHG-2026-0007第12.124节r30；REQ-OP-014；DES-OP-007。
 pub(crate) fn delivery(row: &Value, rows: &[Value], dir: &FsPath) -> HostResult<Value> {
-    let mut result = json!({"runId":row["delivery"],"title":row["title"],"status":"ready","producedAt":row["at"],"artifacts":[artifact(row,dir)?],"note":"原工具成功写出的确定版本；未进行内容验收。"});
-    if let Some(section) = preview(row, rows, dir)? {
+    let mut result = json!({"runId":row["delivery"],"title":row["title"],"status":"ready","producedAt":row["at"],"artifacts":[artifact(row,dir)?],"note":format!("原工具成功写出的确定版本；{}。", row["check_summary"].as_str().unwrap_or("本版本未登记核验"))});
+    if let Some(section) = version_section(row, rows, dir)? {
         result["sections"] = json!([section]);
     }
     Ok(
@@ -493,7 +187,7 @@ pub(crate) fn project(
             break;
         }
         current.push(artifact(row, &dir)?);
-        if let Some(section) = preview(row, &rows, &dir)? {
+        if let Some(section) = version_section(row, &rows, &dir)? {
             sections.push(section);
         }
     }
@@ -510,9 +204,26 @@ pub(crate) fn project(
     board["result"]["producedAt"] = rows[0]["at"].clone();
     // 新的成功文件不能覆盖同会话先前的捕获失败说明。
     let prior_note = board["result"]["note"].as_str().unwrap_or_default();
-    let note = "文件来自真实成功工具，版本原件可校验和下载；ready表示已保存，不表示内容审核通过。";
+    let mut checked = std::collections::HashSet::new();
+    let notes: Vec<_> = rows
+        .iter()
+        .filter(|row| checked.insert(row["artifact"].to_string()))
+        .take(3)
+        .map(|row| {
+            format!(
+                "{} v{}：{}",
+                dto::bounded(row["path"].as_str().unwrap_or("文件"), 40),
+                row["number"],
+                row["check_summary"].as_str().unwrap_or("未登记核验")
+            )
+        })
+        .collect();
+    let note = dto::bounded(
+        &format!("ready表示已保存，不代表整体验收；{}", notes.join("；")),
+        300,
+    );
     board["result"]["note"] = json!(if prior_note.is_empty() {
-        note.to_owned()
+        note.clone()
     } else {
         dto::bounded(&format!("{prior_note}；{note}"), 300)
     });
@@ -703,15 +414,34 @@ async fn serve(
         .inner
         .store
         .call_priority(move |db| {
-            let (bytes, mime) =
+            let (data, rows, dir) =
                 db.artifact_read(&version, &access, !matches!(view, FileView::Raw))?;
+            if matches!(view, FileView::Raw) {
+                let bytes = crate::artifacts::read_blob(&dir, &data)?;
+                return Ok((
+                    bytes,
+                    data["mime"]
+                        .as_str()
+                        .unwrap_or("application/octet-stream")
+                        .to_owned(),
+                ));
+            }
+            let checked = rows
+                .iter()
+                .find(|row| row["version"] == data["version"])
+                .unwrap_or(&data);
+            let original = delivery(checked, &rows, &dir)?;
+            let bytes = serde_json::to_vec(&original).map_err(HostError::storage)?;
+            if bytes.len() > 64000 {
+                return Err(HostError::new("capacity_exceeded", "历史交付JSON超过64KB"));
+            }
             if matches!(view, FileView::Catalog) {
-                let original = serde_json::from_slice(&bytes).map_err(HostError::storage)?;
-                let bytes =
-                    serde_json::to_vec(&catalog(original, &version)).map_err(HostError::storage)?;
-                Ok((bytes, mime))
+                Ok((
+                    serde_json::to_vec(&catalog(original, &version)).map_err(HostError::storage)?,
+                    "application/json".into(),
+                ))
             } else {
-                Ok((bytes, mime))
+                Ok((bytes, "application/json".into()))
             }
         })
         .await;
@@ -730,59 +460,7 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn immutable_blob_capability_integrity_quota_and_private_permissions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("versions");
-        private_dir(&dir).unwrap();
-        let secret_a = secret(&dir).unwrap();
-        assert_eq!(secret_a, secret(&dir).unwrap());
-        let a = capability(&secret_a, "v1", "team1-chat1", "file1");
-        assert!(valid_capability(&a, &sha256(a.as_bytes())));
-        for other in [
-            capability(&secret_a, "v2", "team1-chat1", "file1"),
-            capability(&secret_a, "v1", "team2-chat1", "file1"),
-            capability(&secret_a, "v1", "team1-chat2", "file1"),
-            capability(&secret_a, "v1", "team1-chat1", "file2"),
-        ] {
-            assert!(!valid_capability(&other, &sha256(a.as_bytes())));
-        }
-        let first = b"# original\n";
-        let hash = sha256(first);
-        publish_blob(&dir, &hash, first).unwrap();
-        publish_blob(&dir, &hash, first).unwrap();
-        let row = json!({"hash":hash,"bytes":first.len()});
-        assert_eq!(read_blob(&dir, &row).unwrap(), first);
-        std::fs::write(dir.join(format!("{hash}.blob")), b"corrupt").unwrap();
-        assert!(read_blob(&dir, &row).is_err());
-        assert!(publish_blob(&dir, &hash, first).is_err());
-        assert!(publish_blob(&dir, &sha256(b"large"), &vec![0; FILE_LIMIT as usize + 1]).is_err());
-        let sparse = dir.join(format!("{}.blob", "f".repeat(64)));
-        std::fs::File::create(&sparse)
-            .unwrap()
-            .set_len(TOTAL_LIMIT)
-            .unwrap();
-        assert!(publish_blob(&dir, &sha256(b"next"), b"next")
-            .unwrap_err()
-            .message
-            .contains("512MiB"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-            assert_eq!(
-                std::fs::metadata(dir.join("access.key"))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o600
-            );
-        }
-    }
+
     #[test]
     fn captured_markdown_images_bind_to_capture_time_version_without_mutating_original() {
         let tmp = tempfile::tempdir().unwrap();
@@ -858,19 +536,168 @@ mod tests {
             assert_eq!(preview(&doc, &newer, dir).unwrap().unwrap(), rendered);
         }
     }
-    #[cfg(unix)]
-    #[test]
-    fn blob_and_secret_symlink_targets_are_rejected() {
+
+    #[tokio::test]
+    async fn d170_real_inspection_receipt_is_accepted_by_original_progress_and_survives_restart() {
+        use crate::{ClientScope, HostConfig, RunState};
+        use openpaw_core::{
+            Capabilities, CompletionRequest, CompletionResponse, ContentBlock, LlmProvider,
+            StopReason,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Checks(AtomicUsize);
+        #[async_trait::async_trait]
+        impl LlmProvider for Checks {
+            async fn complete(
+                &self,
+                req: CompletionRequest,
+            ) -> openpaw_core::Result<CompletionResponse> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let last =
+                    req.messages
+                        .iter()
+                        .flat_map(|m| &m.content)
+                        .rev()
+                        .find_map(|c| match c {
+                            ContentBlock::ToolResult {
+                                content, is_error, ..
+                            } => {
+                                assert!(!is_error, "{content}");
+                                Some(content)
+                            }
+                            _ => None,
+                        });
+                let parsed = || serde_json::from_str::<Value>(last.unwrap()).unwrap();
+                let (name, input) = match n {
+                    0 => (
+                        "report_progress",
+                        json!({"type":"create","steps":[{"id":"verify","title":"核对限定内容"}]}),
+                    ),
+                    1 => (
+                        "write_file",
+                        json!({"path":"checks.md","content":"# 核验\n金额100元"}),
+                    ),
+                    2 => ("inspect_delivery", json!({"action":"list"})),
+                    3 => (
+                        "inspect_delivery",
+                        json!({"action":"read","version":parsed()["versions"][0]["version"]}),
+                    ),
+                    4 => {
+                        let r = parsed();
+                        assert_eq!(r["full_text"], true);
+                        (
+                            "inspect_delivery",
+                            json!({"action":"check","version":r["version"],"inspected_call_id":r["read_call_id"],"contains":["100元"],"excludes":["200元"]}),
+                        )
+                    }
+                    5 => {
+                        assert_eq!(parsed()["deterministic_failed"], 0);
+                        (
+                            "report_progress",
+                            json!({"type":"update","stepId":"verify","state":"completed","evidenceCallIds":["inspection-4"]}),
+                        )
+                    }
+                    _ => {
+                        return Ok(CompletionResponse {
+                            content: vec![ContentBlock::Text {
+                                text: "已核对两项实际内容，其他要求未核验".into(),
+                            }],
+                            stop_reason: StopReason::EndTurn,
+                            usage: Default::default(),
+                        })
+                    }
+                };
+                Ok(CompletionResponse {
+                    content: vec![ContentBlock::ToolUse {
+                        id: format!("inspection-{n}"),
+                        name: name.into(),
+                        input,
+                    }],
+                    stop_reason: StopReason::ToolUse,
+                    usage: Default::default(),
+                })
+            }
+            fn capabilities(&self) -> Capabilities {
+                Capabilities::default()
+            }
+            fn name(&self) -> &str {
+                "delivery-fixture"
+            }
+            fn default_model(&self) -> &str {
+                "delivery-fixture"
+            }
+        }
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("private");
-        private_dir(&dir).unwrap();
-        let outside = tmp.path().join("outside");
-        std::fs::write(&outside, b"x").unwrap();
-        std::os::unix::fs::symlink(&outside, dir.join("access.key")).unwrap();
-        assert!(secret(&dir).is_err());
-        std::os::unix::fs::symlink(&outside, dir.join(format!("{}.blob", sha256(b"x")))).unwrap();
-        assert!(read_blob(&dir, &json!({"hash":sha256(b"x"),"bytes":1})).is_err());
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        let cfg:HostConfig=serde_json::from_value(json!({"home":tmp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"mock","tools":["write_file"],"auto_approve_tools":["write_file"],"office":{"base_url":"http://127.0.0.1:9","api_key_env":"PAWOFFICE_UNUSED","allowed_origins":["http://127.0.0.1:8765"]}})).unwrap();
+        let host = Host::with_provider(cfg.clone(), Arc::new(Checks(AtomicUsize::new(0))))
+            .await
+            .unwrap();
+        host.inner
+            .store
+            .call(|db| db.artifact_origin("http://127.0.0.1:12345"))
+            .await
+            .unwrap();
+        let scope = ClientScope {
+            namespace: "office".into(),
+            slot_id: "office-1".into(),
+            conversation_id: "checks".into(),
+        };
+        let session = host.open_session(scope.clone()).await.unwrap();
+        let run = host
+            .submit_run(&scope, &session.session_id, "保存并核验".into())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
+            .await
+            .unwrap();
+        let final_run = host.get_run(&scope, &run.run_id).await.unwrap();
+        assert_eq!(
+            final_run.state,
+            RunState::Completed,
+            "{:?}",
+            final_run.error
+        );
+        assert_eq!(final_run.tools.len(), 6);
+        assert!(final_run.tools.iter().all(|t| t.state == "completed"));
+        let id = run.run_id.clone();
+        host.inner
+            .store
+            .call(move |db| {
+                assert_eq!(db.progress(&id)?.unwrap()["steps"][0]["state"], "completed");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
+        let host = Host::with_provider(cfg, Arc::new(openpaw_llm::MockProvider::fixed("未调用")))
+            .await
+            .unwrap();
+        host.inner
+            .store
+            .call(move |db| {
+                let (rows, dir) = db.artifacts(&scope)?;
+                assert_eq!(rows.len(), 1);
+                assert!(rows[0]["check_summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains("0项未通过"));
+                let d = delivery(&rows[0], &rows, &dir)?;
+                assert!(d["result"]["sections"][0]["blocks"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("100元"));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        host.shutdown().await.unwrap();
     }
+
     #[tokio::test]
     async fn real_tools_http_versions_restart_scope_revocation_and_capture_warning() {
         use crate::{ClientScope, HostConfig, RunState};

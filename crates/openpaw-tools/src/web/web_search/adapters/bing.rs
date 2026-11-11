@@ -62,16 +62,14 @@ impl WebSearchAdapter for BingAdapter {
             .headers(headers)
             .send()
             .await
-            .map_err(|e| SearchError::Http(e.to_string()))?;
+            .map_err(|e| {
+                SearchError::Http(crate::web::web_fetch::transport_diagnostic(
+                    &e,
+                    "search_request",
+                ))
+            })?;
 
-        if !resp.status().is_success() {
-            return Err(SearchError::Http(format!("HTTP {}", resp.status())));
-        }
-
-        let html = resp
-            .text()
-            .await
-            .map_err(|e| SearchError::Http(e.to_string()))?;
+        let html = super::super::search_page(resp, query).await?;
 
         let mut results = parse_bing_html(&html, max);
         // 解码 Bing 重定向 URL 为真实 URL

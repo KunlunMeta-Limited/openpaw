@@ -3,6 +3,7 @@
 //! 依赖：原Host::query、原账本工具事实和Store导航元数据。
 //! 禁止职责：不解析Skill/Goal/Todo文件、不保存正文副本、不接受任意文件路径。
 use super::dto;
+use super::RolePresentation;
 use crate::{store::Db, RunView};
 use crate::{ClientScope, Host, HostError, HostResult, QueryKind, QueryRequest};
 use serde_json::{json, Value};
@@ -67,7 +68,7 @@ pub(super) async fn render(
             crate::agents::ROLES
                 .iter()
                 .find(|role| {
-                    role.employee == employee && context["actorId"].as_str() == Some(role.actor)
+                    role.employee() == employee && context["actorId"].as_str() == Some(role.actor())
                 })
                 .ok_or_else(|| HostError::new("scope_denied", "成员身份与人物绑定不匹配"))
         })
@@ -82,7 +83,7 @@ pub(super) async fn render(
         })
         .await?;
     let agents_enabled = host.inner.config.agents.as_ref().is_some_and(|a| a.enabled);
-    let terminal_runs = host.inner.office_terminal_runs.clone();
+    let terminal_runs = host.inner.office_state.terminal_runs.clone();
     let member_child = if let Some(role) = member.filter(|r| r.id != "lead" && agents_enabled) {
         let (s, role_id, wanted) = (
             scope.clone(),
@@ -174,7 +175,7 @@ pub(super) async fn render(
                 let (s, sid, cache) = (
                     scope.clone(),
                     session.to_owned(),
-                    host.inner.office_terminal_runs.clone(),
+                    host.inner.office_state.terminal_runs.clone(),
                 );
                 host.inner
                     .store
@@ -228,7 +229,7 @@ pub(super) async fn render(
             } else if !agents_enabled
                 && active.is_some_and(|r| {
                     r.tools.iter().any(|t| {
-                        super::projection::actor(&t.tool_name).0 == role.employee
+                        super::projection::actor(&t.tool_name).0 == role.employee()
                             && matches!(
                                 t.state.as_str(),
                                 "running" | "awaiting_approval" | "awaiting_resource"
@@ -254,7 +255,7 @@ pub(super) async fn render(
                 .map(|(d, _)| (d.run_id.clone(), Some(d.task_id.clone())))
                 .or_else(|| current.map(|r| (r.run_id.clone(), None)));
             let tasks = if let Some(focus) = focus {
-                task_views_focused(host, scope, session, Some(role.employee), Some(focus)).await?
+                task_views_focused(host, scope, session, Some(role.employee()), Some(focus)).await?
             } else {
                 Vec::new()
             };
@@ -294,7 +295,7 @@ pub(super) async fn render(
                     .iter()
                     .filter(|tool| {
                         agents_enabled
-                            || super::projection::actor(&tool.tool_name).0 == role.employee
+                            || super::projection::actor(&tool.tool_name).0 == role.employee()
                     })
                     .collect();
                 fields.push(json!({"label":"已关联操作","value":format!("最近一次会话运行中有 {} 次工具操作；这是执行记录，不代表独立Agent。",tools.len())}));
@@ -349,12 +350,12 @@ pub(super) async fn render(
                 host,
                 scope,
                 session,
-                member.map(|role| role.employee),
+                member.map(|role| role.employee()),
                 Some(focus),
             )
             .await?
         } else {
-            task_views(host, scope, session, member.map(|role| role.employee)).await?
+            task_views(host, scope, session, member.map(|role| role.employee())).await?
         };
         if kind == "task" {
             let (task, run, _) = tasks
@@ -375,7 +376,7 @@ pub(super) async fn render(
             description = "当前任务使用同步快照；历史任务按原委派和计划查询。执行状态与结果来自真实运行，结束回复不代表全部业务已核验。".into();
             let owner = crate::agents::ROLES
                 .iter()
-                .find(|r| task["assigneeId"] == r.employee)
+                .find(|r| task["assigneeId"] == r.employee())
                 .map(|r| r.name)
                 .unwrap_or("未分配");
             fields.extend([
@@ -642,8 +643,8 @@ pub(super) async fn render(
     }
     if let Some(role) = member {
         for (key, value) in options.iter_mut() {
-            value["employeeId"] = json!(role.employee);
-            value["actorId"] = json!(role.actor);
+            value["employeeId"] = json!(role.employee());
+            value["actorId"] = json!(role.actor());
             if let Some((d, _)) = member_child.as_ref().filter(|_| key != "refresh") {
                 if value.get("childTaskId").is_none() {
                     value["childTaskId"] = json!(d.task_id);
@@ -712,7 +713,7 @@ async fn task_views_focused(
         session.to_owned(),
         employee.map(str::to_owned),
     );
-    let terminal_runs = host.inner.office_terminal_runs.clone();
+    let terminal_runs = host.inner.office_state.terminal_runs.clone();
     let activity_window = host
         .inner
         .config
@@ -849,7 +850,7 @@ async fn task_views_focused(
                 let role = crate::agents::role(&d.role_id)
                     .ok_or_else(|| HostError::new("storage_unavailable", "历史委派引用未知角色"))?;
                 if covered.contains(&d.task_id)
-                    || employee.as_ref().is_some_and(|e| e != role.employee)
+                    || employee.as_ref().is_some_and(|e| e != role.employee())
                 {
                     continue;
                 }
@@ -861,20 +862,13 @@ async fn task_views_focused(
                 };
                 // 导航仅接受原委派中的可信子绑定，不能用浏览器提供的任务ID跨会话读取。
                 crate::service::check_scope(&db.binding(&d.child_session)?, &d.child_scope)?;
-                let (_, percent) =
-                    crate::task_progress::execution_project(db.progress(&child.run_id)?, &child)?;
-                let verified = child.state == crate::RunState::Completed
-                    && plan
-                        .as_ref()
-                        .map(|p| {
-                            p["steps"].as_array().into_iter().flatten().any(|step| {
-                                step["state"] == "completed"
-                                    && step["evidenceCallIds"]
-                                        .as_array()
-                                        .is_some_and(|ids| ids.iter().any(|id| id == &d.call_id))
-                            })
-                        })
-                        .unwrap_or(percent == 100);
+                let (_, percent) = crate::query::RunFacts::read(db, &child)?.execution()?;
+                let verified = crate::task_progress::delegation_verified(
+                    plan.as_ref(),
+                    &d.call_id,
+                    &child,
+                    percent,
+                );
                 let complete =
                     child.state == crate::RunState::Completed && (verified || percent == 100);
                 let state = if complete {
@@ -891,7 +885,7 @@ async fn task_views_focused(
                 } else {
                     super::turns::message(&child)
                 };
-                let task = json!({"id":d.task_id,"title":d.title,"assigneeId":role.employee,"status":state,
+                let task = json!({"id":d.task_id,"title":d.title,"assigneeId":role.employee(),"status":state,
                         "progress":if complete {100}else{percent},"summary":summary,"updatedAt":d.created_at});
                 covered.insert(d.task_id.clone());
                 result.push((task, child, Some(d.task_id.clone())));
@@ -1021,14 +1015,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let office = super::super::OfficeConfig {
-            activity_window: true,
-            base_url: "http://127.0.0.1:9".into(),
-            api_key_env: "UNUSED".into(),
-            allowed_origins: vec![],
-            names: Default::default(),
-            creation_slots: vec![],
-        };
+        let office = crate::test_support::office_config();
         let projected = super::super::projection::prepare(&host, &office, "office-1")
             .await
             .unwrap();
@@ -1203,14 +1190,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), host.wait_idle())
             .await
             .unwrap();
-        let office = super::super::OfficeConfig {
-            activity_window: true,
-            base_url: "http://127.0.0.1:9".into(),
-            api_key_env: "UNUSED".into(),
-            allowed_origins: vec![],
-            names: Default::default(),
-            creation_slots: vec![],
-        };
+        let office = crate::test_support::office_config();
         super::super::projection::prepare(&host, &office, "office-1")
             .await
             .unwrap();
@@ -1229,7 +1209,12 @@ mod tests {
         // 当前人物不应为获取自己的状态而读取另一角色的损坏长历史；
         // 真正查询那位角色时仍必须透传错误，不能将损坏吞成“暂无数据”。
         std::fs::write(&path, b"{broken-json\n").unwrap();
-        host.inner.office_terminal_runs.lock().unwrap().clear();
+        host.inner
+            .office_state
+            .terminal_runs
+            .lock()
+            .unwrap()
+            .clear();
         let selected = render(
             &host,
             &scope,
@@ -1255,7 +1240,7 @@ mod tests {
             &scope,
             &binding.session_id,
             "broken-member",
-            json!({"kind":"member","employeeId":audit.employee,"actorId":audit.actor}),
+            json!({"kind":"member","employeeId":audit.employee(),"actorId":audit.actor()}),
             &CancellationToken::new()
         )
         .await

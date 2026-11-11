@@ -4,16 +4,15 @@ use openpaw_core::ToolExecutor;
 use openpaw_tools::ToolRegistry;
 use serde_json::json;
 
-async fn host() -> ToolRegistry {
+async fn host() -> (tempfile::TempDir, ToolRegistry) {
     let dir = tempfile::tempdir().unwrap();
-    let path = std::path::PathBuf::from(dir.path());
-    std::mem::forget(dir);
-    ToolRegistry::new(path)
+    let host = ToolRegistry::new(dir.path());
+    (dir, host)
 }
 
 #[tokio::test]
 async fn todo_lifecycle_add_update_list() {
-    let h = host().await;
+    let (_dir, h) = host().await;
     let added = h
         .call("todo_add", json!({"title": "write docs"}))
         .await
@@ -31,22 +30,20 @@ async fn todo_lifecycle_add_update_list() {
     assert!(listed.content.contains("#1 [in_progress] write docs"));
 
     // Persistence: a new registry over the same workspace sees the todo.
-    let ws = std::path::PathBuf::from("target/meta-todo-persist");
-    let _ = std::fs::remove_dir_all(&ws);
-    std::fs::create_dir_all(&ws).unwrap();
-    let h2 = ToolRegistry::new(&ws);
+    let persisted = tempfile::tempdir().unwrap();
+    let ws = persisted.path();
+    let h2 = ToolRegistry::new(ws);
     h2.call("todo_add", json!({"title": "persisted"}))
         .await
         .unwrap();
-    let h3 = ToolRegistry::new(&ws);
+    let h3 = ToolRegistry::new(ws);
     let listed = h3.call("todo_list", json!({})).await.unwrap();
     assert!(listed.content.contains("persisted"), "{}", listed.content);
-    let _ = std::fs::remove_dir_all(&ws);
 }
 
 #[tokio::test]
 async fn todo_failures() {
-    let h = host().await;
+    let (_dir, h) = host().await;
     // Invalid status.
     let out = h
         .call("todo_update", json!({"id": 1, "status": "archived"}))
@@ -65,7 +62,7 @@ async fn todo_failures() {
 
 #[tokio::test]
 async fn clarify_contract_with_options_and_context() {
-    let h = host().await;
+    let (_dir, h) = host().await;
     let out = h
         .call(
             "clarify",
@@ -77,19 +74,17 @@ async fn clarify_contract_with_options_and_context() {
         )
         .await
         .unwrap();
-    assert!(!out.is_error);
-    assert!(out
-        .content
-        .contains("Clarification needed: which database?"));
-    assert!(out.content.contains("1. sqlite"));
-    assert!(out.content.contains("2. postgres"));
-    assert!(out.content.contains("Context: schema not decided"));
-    assert!(out.content.contains("[Waiting for user response...]"));
+    assert!(out.is_error);
+    assert!(out.content.contains("unsupported"));
+    assert!(out.content.contains("no answer was received"));
+    assert!(!out.content.contains("Waiting for user response"));
+    let specs = h.list_tools().await.unwrap();
+    assert!(!specs.iter().any(|s| s.name == "clarify"));
 }
 
 #[tokio::test]
 async fn clarify_failure_missing_question() {
-    let h = host().await;
+    let (_dir, h) = host().await;
     let out = h.call("clarify", json!({"options": ["a"]})).await.unwrap();
     assert!(out.is_error);
     assert!(out.content.contains("question parameter is required"));
@@ -97,16 +92,19 @@ async fn clarify_failure_missing_question() {
 
 #[tokio::test]
 async fn plan_mode_transitions() {
-    let h = host().await;
-    let enter = h.call("enter_plan_mode", json!({})).await.unwrap();
-    assert!(enter.content.contains("plan mode entered"));
-    let exit = h.call("exit_plan_mode", json!({})).await.unwrap();
-    assert!(exit.content.contains("plan mode exited"));
+    let (_dir, h) = host().await;
+    for name in ["enter_plan_mode", "exit_plan_mode"] {
+        let outcome = h.call(name, json!({})).await.unwrap();
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("unsupported"));
+        assert!(outcome.content.contains("no mode transition occurred"));
+        assert!(!h.list_tools().await.unwrap().iter().any(|s| s.name == name));
+    }
 }
 
 #[tokio::test]
 async fn structured_output_contract_and_failures() {
-    let h = host().await;
+    let (_dir, h) = host().await;
     let out = h
         .call(
             "structured_output",
@@ -157,6 +155,20 @@ async fn session_search_finds_indexed_message() {
     assert!(out.content.contains("xylophone"), "{}", out.content);
     assert!(out.content.contains(&session.meta.id));
     assert!(out.content.contains("(1 result(s))"));
+    let registry = ToolRegistry::new(dir.path()).with_session_index(&db_path);
+    let actual = registry
+        .call("session_search", json!({"query":"xylophone"}))
+        .await
+        .unwrap();
+    assert!(!actual.is_error);
+    assert!(actual.content.contains(&session.meta.id));
+    let missing =
+        ToolRegistry::new(dir.path()).with_session_index(dir.path().join("missing/index.db"));
+    let actual = missing
+        .call("session_search", json!({"query":"xylophone"}))
+        .await
+        .unwrap();
+    assert!(actual.content.contains("no session index yet"));
 }
 
 #[tokio::test]
@@ -172,7 +184,7 @@ async fn session_search_contract_and_empty_states() {
     assert!(out.content.contains("no session index yet"));
 
     // Missing query is a tool error.
-    let h = host().await;
+    let (_dir, h) = host().await;
     let out = h.call("session_search", json!({"limit": 5})).await.unwrap();
     assert!(out.is_error);
     assert!(out.content.contains("query parameter is required"));

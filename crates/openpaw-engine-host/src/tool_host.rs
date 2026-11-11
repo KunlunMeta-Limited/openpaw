@@ -35,13 +35,20 @@ pub(crate) struct HostTools {
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub(crate) execution: Option<crate::orchestration::Execution>,
-    /// 用途：协作主角色普通工具执行预算，委派使用父期限。
-    /// 字段：Option<std::time::Duration>，协作主角色普通工具执行预算，委派使用父期限。
+    /// 用途：主角色及问答启用Run的普通工具预算，委派使用父期限、提问使用固定问题期限。
+    /// 字段：Option<std::time::Duration>，主角色及问答启用Run的普通工具预算，委派使用父期限、提问使用固定问题期限。
     /// 来源去向：可信Host装配、原Store与本次运行。
     /// 约束：不得由浏览器或模型覆盖权限及所属关系。
     /// 稳定性：T6宿主字段，旧默认运行保持兼容。
     /// 关联：需求/设计REQ-OP-021/022；DES-OP-012。
     pub(crate) ordinary_timeout: Option<std::time::Duration>,
+    /// 用途：本次运行不可延长的绝对期限，用于限制用户问题等待。
+    /// 字段：Option<tokio::time::Instant>，无期限时仍受300秒问题期限约束。
+    /// 来源去向：可信Run/协作组装配到clarify桥接。
+    /// 约束：模型和Office刷新不得修改。
+    /// 稳定性：Host私有r37字段。
+    /// 关联：REQ-OP-013；DES-OP-008；CHG-2026-0007第9.16节。
+    pub(crate) question_deadline: Option<tokio::time::Instant>,
     /// 用途：仅当前Office绑定运行暴露进度元数据工具。
     /// 字段：bool，非权限凭据。
     /// 来源去向：可信Session绑定到原工具装配。
@@ -143,8 +150,24 @@ impl ToolExecutor for HostTools {
             .list_tools()
             .await?
             .into_iter()
-            .filter(|s| self.allowed.contains(&s.name))
+            .filter(|s| {
+                self.allowed.contains(&s.name)
+                    && (s.name != "clarify"
+                        || self.progress_enabled && self.host.inner.config.office.is_some())
+            })
             .collect();
+        if self.allowed.iter().any(|s| s == "clarify")
+            && self.progress_enabled
+            && self.host.inner.config.office.is_some()
+        {
+            let mut spec = openpaw_tools::meta::clarify::spec();
+            spec.description = "仅当关键缺失信息实质影响正确性或执行范围时提问；Office显示选项和其他需求输入，等待真实回答后继续同Run。问题最多120 UTF-16单元，上下文1800；选项省略或2—8个互异非空短文本。回答不授权文件或命令操作。".into();
+            spec.input_schema["additionalProperties"] = serde_json::json!(false);
+            spec.input_schema["properties"]["options"]["minItems"] = serde_json::json!(2);
+            spec.input_schema["properties"]["options"]["maxItems"] = serde_json::json!(8);
+            spec.input_schema["properties"]["options"]["uniqueItems"] = serde_json::json!(true);
+            specs.push(spec);
+        }
         if self.execution.as_ref().is_some_and(|e| e.role == "lead") {
             specs.push(crate::orchestration::spec());
             specs.push(crate::orchestration::status_spec());
@@ -160,6 +183,7 @@ impl ToolExecutor for HostTools {
         }
         if self.progress_enabled {
             specs.push(crate::task_progress::spec());
+            specs.push(crate::delivery::spec());
         }
         Ok(specs)
     }
@@ -177,7 +201,7 @@ impl ToolExecutor for HostTools {
         tokio::pin!(call);
         if let Some(timeout) = self
             .ordinary_timeout
-            .filter(|_| !matches!(name, "delegate_task" | "delegation_status"))
+            .filter(|_| !matches!(name, "delegate_task" | "delegation_status" | "clarify"))
         {
             tokio::select! { biased;
                 result=&mut call=>result,
@@ -219,11 +243,20 @@ impl ToolHostValidator for HostTools {
         {
             return crate::orchestration::validate_status(input).map_err(|e| e.message);
         }
+        if self.progress_enabled && name == "inspect_delivery" {
+            return crate::delivery::validate(input).map_err(|e| e.message);
+        }
         if self.progress_enabled && name == "report_progress" {
             return crate::task_progress::validate(input).map_err(|e| e.message);
         }
         if !self.allowed.iter().any(|s| s == name) {
             return Err("工具未在Host授权清单".into());
+        }
+        if name == "clarify" {
+            if !self.progress_enabled || self.host.inner.config.office.is_none() {
+                return Err("clarify需要真实Office绑定".into());
+            }
+            return crate::question::validate(input).map_err(|e| e.to_string());
         }
         self.registry.validate_input(name, input).await
     }
@@ -245,6 +278,25 @@ impl HostTools {
         {
             return Err(Error::ToolHost("工具绑定不匹配".into()));
         }
+        if name == "clarify" {
+            return crate::question::ask(
+                &self.host,
+                self.question_deadline,
+                context.binding().clone(),
+                context.cancel(),
+            )
+            .await
+            .map_err(|e| {
+                if e.kind == "storage_unavailable" {
+                    self.control.fail(e.clone());
+                    Error::Store(e.message)
+                } else if e.kind == "cancelled" {
+                    Error::Cancelled
+                } else {
+                    Error::ToolHost(e.to_string())
+                }
+            });
+        }
         if name == "continuous_task" {
             if context.cancel().is_cancelled() {
                 return Err(Error::Cancelled);
@@ -265,6 +317,39 @@ impl HostTools {
                 }
                 Err(error) => Ok(ToolCallOutcome::error(error.to_string())),
             };
+        }
+        if self.progress_enabled && name == "inspect_delivery" {
+            if context.cancel().is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let context = context.with_observer(Arc::new(Started {
+                store: self.store.clone(),
+                control: self.control.clone(),
+            }));
+            context.execution_started(name, &args).await?;
+            let binding = context.binding().clone();
+            let cancel = context.cancel();
+            return self
+                .store
+                .call_priority(move |db| {
+                    let result = if cancel.is_cancelled() {
+                        Err(HostError::new("cancelled", "本轮正在停止"))
+                    } else { db.inspect_delivery(&binding, &args) };
+                    // 与原文件工具一样成对登记开始/结果，不能让started覆盖账本成功成为永久running。
+                    let revision = db.bump("tool_result", &serde_json::json!({"run_id":binding.run_id,"call_id":binding.call_id,"success":result.is_ok()}).to_string())?;
+                    let _ = db.notices.send(crate::HostNotice::Changed { revision });
+                    result.map(|v| v.to_string())
+                })
+                .await
+                .map(ToolCallOutcome::ok)
+                .map_err(|e| {
+                    if e.kind == "storage_unavailable" {
+                        self.control.fail(e.clone());
+                        Error::Store(e.message)
+                    } else {
+                        Error::ToolHost(e.to_string())
+                    }
+                });
         }
         if self.progress_enabled && name == "report_progress" {
             if context.cancel().is_cancelled() {
@@ -403,12 +488,8 @@ impl HostTools {
         let success = result.as_ref().is_ok_and(|r| !r.is_error);
         // Root许可仍持有：捕获只读取刚成功工具的准确目标，不再次执行副作用。
         if success && self.progress_enabled && self.host.inner.config.office.is_some() {
-            if let Err(error) = crate::office::artifacts::capture(
-                &self.host,
-                self.root.path.clone(),
-                binding.clone(),
-            )
-            .await
+            if let Err(error) =
+                crate::artifacts::capture(&self.host, self.root.path.clone(), binding.clone()).await
             {
                 if let Ok(outcome) = &mut result {
                     outcome.content.push_str(&format!("\n\n文件写入已成功，但不可变版本捕获失败：{}。工作区原文件保留；不能宣称该文件已可预览或下载。",error.message));

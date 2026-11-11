@@ -1,4 +1,9 @@
-//! M3 fuzz baseline (docs/audit-remediation/05-wp3, M3 acceptance item 2):
+//! 职责：以固定语料变异验证命令解析器不会崩溃。
+//! 输入输出：构造命令文本到解析与安全分析结果。
+//! 依赖：原工具解析器及显式启用的测试时间参数。
+//! 禁止职责：不执行生成的命令，不访问生产数据。
+//!
+//! Parser robustness baseline (optional extended acceptance):
 //! 30-minute seeded-corpus fuzz of the bash-ast parsers (parse_for_security /
 //! parse_cmd / analyze_command_safety) — no panic / crash / abort.
 //!

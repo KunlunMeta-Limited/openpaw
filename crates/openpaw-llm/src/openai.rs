@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use openpaw_core::{
     Capabilities, CompletionRequest, CompletionResponse, ContentBlock, Error, LlmProvider, Result,
     Role, StopReason, StreamEvent, Usage,
@@ -304,9 +304,18 @@ impl LlmProvider for OpenAiProvider {
             return Err(classify_http_error(status, &body, "openai"));
         }
 
-        let stream = resp
-            .bytes_stream()
-            .map_err(|e| Error::Provider(format!("stream read: {e}")));
+        let request_id = ["request-id", "x-request-id", "x-deepseek-request-id"]
+            .into_iter()
+            .filter_map(|key| resp.headers().get(key)?.to_str().ok())
+            .find(|id| {
+                !id.is_empty()
+                    && id.len() <= 96
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            })
+            .map(str::to_owned);
+        let stream = resp.bytes_stream();
 
         // Chunk assembler state: accumulating tool_calls by index.
         let state = (
@@ -314,34 +323,52 @@ impl LlmProvider for OpenAiProvider {
             stream,
             std::collections::VecDeque::new(),
             OpenAiStreamState::default(),
-            false,
+            Some(BodyPrefix::LineStart),
         );
         Ok(Box::pin(futures::stream::unfold(
             state,
-            |(mut decoder, mut stream, mut queue, mut state, mut finished)| async move {
-                loop {
-                    if let Some(ev) = queue.pop_front() {
-                        return Some((ev, (decoder, stream, queue, state, finished)));
-                    }
-                    if finished {
-                        return None;
-                    }
-                    match stream.next().await {
-                        Some(Ok(bytes)) => {
-                            for frame in decoder.feed(&bytes) {
-                                state.absorb(&frame, &mut queue);
-                            }
+            move |(mut decoder, mut stream, mut queue, mut state, mut prefix)| {
+                let request_id = request_id.clone();
+                async move {
+                    loop {
+                        if let Some(ev) = queue.pop_front() {
+                            return Some((ev, (decoder, stream, queue, state, prefix)));
                         }
-                        Some(Err(e)) => {
-                            queue.push_back(Err(e));
-                            finished = true;
-                        }
-                        None => {
-                            for frame in decoder.finish() {
-                                state.absorb(&frame, &mut queue);
+                        let Some(body_prefix) = &mut prefix else {
+                            return None;
+                        };
+                        match stream.next().await {
+                            Some(Ok(bytes)) => {
+                                body_prefix.observe(&bytes);
+                                for frame in decoder.feed(&bytes) {
+                                    state.absorb(&frame, &mut queue);
+                                }
                             }
-                            state.finish(&mut queue);
-                            finished = true;
+                            Some(Err(e)) => {
+                                let kind = body_error_kind(&e);
+                                let boundary = match (kind, *body_prefix) {
+                                    ("unknown" | "timeout", _) => "unclassified",
+                                    (_, BodyPrefix::LineStart) => "early-transient",
+                                    _ => "content-or-unknown",
+                                };
+                                if std::env::var_os("OPENPAW_HOST_DIAGNOSTICS").is_some() {
+                                    eprintln!(
+                                    "openpaw provider stream read boundary={boundary} kind={kind} request_id={}",
+                                    request_id.as_deref().unwrap_or("-")
+                                );
+                                }
+                                queue.push_back(Err(Error::Provider(format!(
+                                    "stream read: {boundary} {kind}"
+                                ))));
+                                prefix = None;
+                            }
+                            None => {
+                                for frame in decoder.finish() {
+                                    state.absorb(&frame, &mut queue);
+                                }
+                                state.finish(&mut queue);
+                                prefix = None;
+                            }
                         }
                     }
                 }
@@ -365,6 +392,54 @@ impl LlmProvider for OpenAiProvider {
     fn default_model(&self) -> &str {
         &self.default_model
     }
+}
+
+// 只认空行和完整注释，SSE的正文/事件解析仍由原解码器完成。
+// 未见有效事件不代表没有收到工具、推理或未拼完的正文。
+#[derive(Clone, Copy)]
+enum BodyPrefix {
+    LineStart,
+    BlankCr,
+    Comment,
+    Uncertain,
+}
+
+impl BodyPrefix {
+    fn observe(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            *self = match (*self, *byte) {
+                (Self::Uncertain, _) => break,
+                (_, b'\n') => Self::LineStart,
+                (Self::LineStart, b':') | (Self::Comment, _) => Self::Comment,
+                (Self::LineStart, b'\r') => Self::BlankCr,
+                _ => Self::Uncertain,
+            };
+        }
+    }
+}
+
+fn body_error_kind(error: &reqwest::Error) -> &'static str {
+    use std::{error::Error as _, io::ErrorKind};
+
+    if error.is_timeout() {
+        return "timeout";
+    }
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::BrokenPipe => {
+                    return "connection-interrupted";
+                }
+                ErrorKind::UnexpectedEof => return "unexpected-eof",
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+    "unknown"
 }
 
 // 参数正文可能包含文件、密钥或个人资料；诊断只保留安全结构信息。

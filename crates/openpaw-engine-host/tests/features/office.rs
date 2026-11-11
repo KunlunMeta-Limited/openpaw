@@ -2,6 +2,8 @@
 //! 输入输出：隔离Host与确定性Provider到协议及账本断言。
 //! 依赖：原AgentLoop/ToolRegistry和真实loopback监听。
 //! 禁止职责：不访问用户凭据、不注入浏览器答案或伪造Run。
+#[path = "../../src/test_support.rs"]
+mod test_support;
 use async_trait::async_trait;
 use futures::StreamExt;
 use openpaw_core::{Capabilities, CompletionRequest, CompletionResponse, LlmProvider, StreamEvent};
@@ -12,21 +14,24 @@ use std::{sync::Arc, time::Duration};
 
 #[test]
 fn office_http_product_contract() {
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "office_child_suite", "--nocapture"])
-        .env("OPENPAW_OFFICE_TEST_CHILD", "1")
-        .env("OPENPAW_WEB_TEST_ALLOW_LOOPBACK", "1")
-        .env("PAWOFFICE_TEST_KEY", "isolated-office-test-key")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "office_child_suite", "--nocapture"])
+            .env("OPENPAW_OFFICE_TEST_CHILD", "1")
+            .env("OPENPAW_WEB_TEST_ALLOW_LOOPBACK", "1")
+            .env("PAWOFFICE_TEST_KEY", "isolated-office-test-key"),
+        "office_child_suite",
+    );
 }
 #[test]
 fn office_child_suite() {
     if std::env::var("OPENPAW_OFFICE_TEST_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let proof = test_support::ChildProof::start("office_child_suite");
     tokio::runtime::Runtime::new().unwrap().block_on(suite());
+
+    proof.complete();
 }
 fn config(base: &std::path::Path) -> HostConfig {
     let root = base.join("项目 workspace");
@@ -326,7 +331,9 @@ async fn suite() {
                 .unwrap()
         )
         .await,
-        vec![json!({"type":"error","message":"当前运行容量已满，请稍后重试"})]
+        vec![
+            json!({"type":"error","message":"运行额度不足。Host 的 max_active_runs 是所有办公室共用的并发上限，协作还会预留子任务额度；请等待任务结束，或调整配置后重启 Host"})
+        ]
     );
     let capacity_scope = ClientScope {
         namespace: "office".into(),

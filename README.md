@@ -1,360 +1,276 @@
 # OpenPaw
 
-An open, evolvable personal AI agent runtime in Rust.
+OpenPaw 是用 Rust 实现的个人 AI Agent 运行框架。CLI 和可选 Engine Host 共用执行引擎、模型适配、工具与存储；Host 为独立的 AI Office 前端提供多 Agent 协作、审批、状态和成果适配。
 
-OpenPaw is a lean, open-source agent platform: a single binary that talks to
-LLM providers, runs tools in a guarded sandbox, remembers what matters in
-plain markdown files, and improves itself through a transparent reflection
-loop — with zero telemetry, by design.
+支持 Linux 与 Windows 10/11 x64。macOS 不属于当前支持和验收范围。项目不包含遥测上报；模型请求、联网工具及用户显式装配的扩展仍会访问相应服务。
 
-## Status
+## 快速开始
 
-All milestones M0–M6 are complete and frozen for 1.0 readiness. The one
-deferred M2 item — the MCP client host in `openpaw-mcp` — has since
-landed (config, stdio/HTTP transports, circuit breaker; sessions 38–40
-in [docs/devlog.md](docs/devlog.md)), with CLI wiring to follow. The
-MSRV floor is now Rust 1.88
-([docs/compatibility.md](docs/compatibility.md) §2). See the devlog for
-the full development log, the per-milestone exit reports
-(`docs/m*-exit-report.md`), and compatibility.md for the stability
-contract.
+先安装 Git、Rust stable（最低 1.89）和原生编译工具。Linux 需要 C/C++ 工具链及 pkg-config；Windows 使用 Rust MSVC 工具链及 Visual Studio Build Tools 的 C++ 工作负载和 Windows SDK。Office 另外需要 Node.js 24 LTS/npm，Linux 启动脚本需要 bash、curl 和 ss 或 lsof。
 
-## Quick start
+仅运行离线 CLI：
 
 ```sh
-cargo install --path crates/openpaw-cli --locked
-openpaw hello
+cargo build --locked -p openpaw-cli
+cargo run --locked -p openpaw-cli -- hello
 ```
 
-`openpaw hello` starts an echo-model conversation with no API key required —
-your first response lands within seconds, fully offline. New to OpenPaw?
-Follow the [beginner walkthrough](#first-session-a-beginners-walkthrough)
-below, then browse the [tutorials](#tutorials--cli-reference).
+`hello` 是离线 Echo 演示，不是实际 AI 回答。真实模型使用 `chat` 和下面的模型配置。
 
-## Feature highlights
+### Office 全新安装
 
-- **Agent engine** — the agent loop with streaming, retries, compaction,
-  and approval branches, ported from a production codebase and verified by
-  golden-session round-trips.
-- **21 tools** — filesystem (6), exec (3), web (3), and meta (9, including
-  session full-text search), each with
-  contract + failure-path tests. `bash` commands pass through a
-  tree-sitter AST safety chain (dangerous → blocked, uncertain → approval,
-  fail-closed).
+建议两个工程并列：
 
-  | Group | Tools |
-  |---|---|
-  | Filesystem (6) | `read_file` `write_file` `edit_file` `grep` `glob` `notebook_edit` |
-  | Exec (3) | `bash` `clipboard` `sleep` |
-  | Web (3) | `web_fetch` `web_search` `web_extract` |
-  | Meta (9) | `think` `todo_add` `todo_update` `todo_list` `clarify` `enter_plan_mode` `exit_plan_mode` `structured_output` `session_search` |
+```text
+workspace/
+├── openpaw/          本仓库
+└── ai-office-react/  独立上游 Office
+```
 
-- **OS-level sandbox** — Windows restricted tokens + job objects, Linux
-  bubblewrap, macOS Seatbelt; unsupported platforms fail closed. Exposed
-  to the tools through the `Environment` seam.
-- **Resilient LLM layer** — Anthropic + OpenAI over a unified SSE stack;
-  error classification drives exponential-backoff retries (±25% jitter,
-  `Retry-After` honored), context-overflow → model fallback, CJK-aware
-  context compaction, and a token budget that nudges long tasks instead of
-  dying at 90% usage.
-- **Plain-file memory & skills** — user/project dual-scope markdown stores
-  with YAML frontmatter, five-state skill lifecycle, TF-IDF + CJK-bigram
-  relevance scoring, SM-2 spaced review, and a `manage` tool as the single
-  write entry.
-- **Self-evolution loop** — `reflect-lite` produces unverified knowledge
-  artifacts that stay flagged until human review (`evolve status` shows
-  the ratios); a goal ledger tracks multi-session work.
-- **24-hook plugin system** — static trust-level security scanning, three
-  discovery sources (`bundled` / user / opt-in project), before/after
-  hooks on the tool path.
-- **MCP sidecar** — `openpaw --sidecar` exposes five tools to MCP clients
-  (Claude Code / Cursor / OpenWork / Trae) over stdio or loopback HTTP. See
-  [docs/tutorials/sidecar-clients.md](docs/tutorials/sidecar-clients.md).
-
-## Build from source
-
-Prerequisites: **Rust 1.88+** (the MSRV floor; the toolchain channel is
-pinned to `stable` via `rust-toolchain.toml`) and Git. Windows is the
-first-class platform; Linux and macOS are exercised in CI.
+在本仓库根目录执行。Linux：
 
 ```sh
-git clone <this repository>
-cd openpaw
-cargo build --release -p openpaw-cli
-# binary lands at target/release/openpaw (openpaw.exe on Windows)
+scripts/openpaw-office.sh setup
+scripts/openpaw-office.sh status
+scripts/openpaw-office.sh stop
 ```
 
-Feature flags of the CLI crate:
-
-| Feature | Default | Effect |
-|---|---|---|
-| *(none)* | on | all 12 subcommands; no MCP server |
-| `sidecar` | off | adds the `--sidecar` MCP server (pulls in `rmcp`) |
-
-```sh
-cargo build -p openpaw-cli --features sidecar   # with the MCP sidecar
-```
-
-Verify your build the way CI does:
-
-```sh
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
-cargo run -p xtask -- lines        # informational AST line statistics
-cargo run -p xtask -- golden       # knowledge-format round-trips
-```
-
-Platform notes: the sandbox backends need Bubblewrap on Linux
-(`bwrap`); macOS uses the built-in `sandbox-exec`; Windows uses native
-restricted tokens. A missing backend fails closed — it never degrades to
-unsandboxed execution. The `bash` tool runs commands through `sh -c` on
-Unix and `cmd /C` on Windows; the AST safety chain gates both.
-
-## Install & deployment
-
-**Install from source** (signed binary releases are CI-wired but the first
-publish cut is pending — see below):
-
-```sh
-cargo install --path crates/openpaw-cli --locked                  # core CLI
-cargo install --path crates/openpaw-cli --features sidecar --locked  # + MCP sidecar
-```
-
-**Releases.** Pushing a `v*` tag triggers `.github/workflows/release.yml`:
-reproducible builds (`--locked`, `SOURCE_DATE_EPOCH`, LTO) for
-windows-x86_64 / linux-x86_64 / macos-aarch64, SHA-256 manifests, Sigstore
-keyless signing, and GitHub Release attachment. The crates.io publish path
-is dry-run-validated in dependency order; the real publish awaits the
-registry token.
-
-**Data layout.** Everything lives under `OPENPAW_HOME` (default
-`~/.openpaw`; create the skeleton with `openpaw init`):
-
-```
-~/.openpaw/
-├── sessions/   per-session JSONL transcripts (the source of truth)
-├── memories/   user-scope memories (markdown + YAML frontmatter)
-├── skills/     user-scope skills (<name>/SKILL.md)
-├── goals/      goal profiles + append-only JSONL ledgers
-├── plugins/    plugin discovery root
-└── index.db    SQLite FTS5 search index (best-effort, rebuildable)
-```
-
-Relocate the whole deployment by setting `OPENPAW_HOME`; project-scope
-knowledge goes to `<project>/.openpaw/` instead.
-
-**模型配置 / Model configuration.** OpenPaw现在原生读取用户数据目录下的`.env`：
-默认Linux为`~/.openpaw/.env`，Windows为`$HOME\.openpaw\.env`；设置了`OPENPAW_HOME`则使用该目录。
-只读加载，不向上搜索项目目录，不执行shell，也不把文件密钥加入工具进程环境。
-
-首次从仓库复制模板（已有文件请直接编辑，不覆盖）：
-
-```bash
-mkdir -p ~/.openpaw
-cp -n .env.example ~/.openpaw/.env
-chmod 600 ~/.openpaw/.env
-```
-
-Windows PowerShell（无需WSL）：
+Windows PowerShell 5.1 或 7，无需 WSL：
 
 ```powershell
-$openpawConfigDir = if ($env:OPENPAW_HOME) { $env:OPENPAW_HOME } else { Join-Path $HOME '.openpaw' }
-New-Item -ItemType Directory -Force $openpawConfigDir | Out-Null
-$openpawEnvPath = Join-Path $openpawConfigDir '.env'
-if (-not (Test-Path $openpawEnvPath)) { Copy-Item .env.example $openpawEnvPath }
-notepad $openpawEnvPath
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\openpaw-office.ps1 setup
+.\scripts\openpaw-office.ps1 status
+.\scripts\openpaw-office.ps1 stop
 ```
 
-将模板中的DeepSeek密钥占位值替换为自己的密钥：
+setup 会提示协议、模型、基础 URL、密钥和权限选择，生成本机配置、独立 Office 服务密钥、空白会话目录及 32 个预授权工作目录。它不会复制作者聊天、文章或凭证。已有完整配置会保留，不会覆盖；不完整配置明确报错。
+
+权限选择是“逐次审批写文件/修改/绘图”或“持久允许这些工具”；仅作用于授权工作目录，每次调用保留审计，不开放 Shell。交互补充信息可单独选择，回答问题不会批准工具。
+
+Office 缺失时，setup 经确认克隆并检出[来源清单](docs/engine-host/contracts/sources.json)中的固定提交；已有目录不会自动更新。**下载 Office 需要相应仓库访问权限。** 合同测试携带许可允许的协议快照，不要求访问完整 Office 仓库。
+
+下一步可选择只生成配置、安装依赖并编译，或编译并启动。setup 不发送付费模型请求，成功不代表密钥/余额已验证。模型与 Office 都需可用才有真实对话。
+
+### 编译与运行
+
+Linux：
+
+```sh
+scripts/openpaw-office.sh build
+scripts/openpaw-office.sh start
+scripts/openpaw-office.sh status
+scripts/openpaw-office.sh stop
+```
+
+Windows：
+
+```powershell
+.\scripts\openpaw-office.ps1 build
+.\scripts\openpaw-office.ps1 start
+.\scripts\openpaw-office.ps1 status
+.\scripts\openpaw-office.ps1 stop
+```
+
+`build` 编译启用 engine-host/sidecar 的 debug 程序及 Office；`start` 使用现有构建，不自动编译或替换运行中的服务。停止先等待清理；仅确认确需强制终止时使用 Linux `stop --force` 或 Windows `stop -Force`。
+
+默认页面：`http://127.0.0.1:8765/office/`；单办公室入口：`http://127.0.0.1:8765/office/?conference=0`。总览和本地 mock 演示由上游 Office 提供；当前已验证上游的真实创建入口在单办公室菜单。它们不等于 Host 的真实空间，不能将本地演示回复当模型结果。
+
+默认 Host 健康检查为 `http://127.0.0.1:32885/health`。端口覆盖应在 setup 和后续命令使用相同变量，并与已有 TOML 的 Office 地址一致。
+
+## 配置和数据目录
+
+setup 默认使用用户目录的 `.openpaw`，不是仓库或临时目录：
+
+| 路径 | 用途 |
+|---|---|
+| `.env` | 模型协议、名称、URL 和密钥，仅本机使用 |
+| `engine-host-office.toml` | Host 数据根、工具、审批、工作区及并发配置 |
+| `.office-service-key` | Office 服务独立凭证，不能用模型密钥替代 |
+| `office-host-home/` | Host 会话、任务、审批、账本、索引和成果版本 |
+| `workspaces/office-1` 至 `office-32` | 文章、图片等用户工作文件 |
+
+Linux PID/日志默认在 `$XDG_RUNTIME_DIR/openpaw-office-<uid>`，无此变量时为 `/tmp/openpaw-office-<uid>`；Windows 在 `%LOCALAPPDATA%\OpenPaw\office-runtime`。仅运行状态和日志可临时存放，会话及工作文件使用持久目录。
+
+| 环境变量 | 覆盖内容 |
+|---|---|
+| `OPENPAW_SETUP_HOME` | setup 配置和数据根，默认 `~/.openpaw` |
+| `OPENPAW_ENV_FILE`、`OPENPAW_HOST_CONFIG` | 模型文件、Host TOML |
+| `OPENPAW_OFFICE_SOURCE` | Office 源码，默认相邻 `ai-office-react` |
+| `OPENPAW_OFFICE_KEY_FILE` | Office 密钥文件 |
+| `OPENPAW_HOST_BINARY` | Host 程序，默认 `target/debug/openpaw`，Windows 为 `.exe` |
+| `OPENPAW_RUN_DIR` | PID 与日志目录 |
+| `OPENPAW_HOST_PORT`、`OPENPAW_OFFICE_PORT` | 默认 32885、8765 |
+| `OPENPAW_NODE` | Node 可执行文件 |
+
+自定义变量要在 setup、build、start、stop、status 保持一致。普通 CLI 的 `OPENPAW_HOME` 是其数据/模型配置目录；`OPENPAW_SETUP_HOME` 属于 Office 脚本，二者用途不同。脚本会显式把模型文件和 TOML 传给 Host。
+
+密钥不要写进 Git、浏览器 `VITE_*`、测试报告或工具环境。配置只在启动时读取，修改后需要安全重启；不要为重启中断未确认的在途任务。
+
+### 独立 CLI 模型配置
+
+首次把 `.env.example` 复制到 `~/.openpaw/.env`（Windows 为 `$HOME\.openpaw\.env`），已有文件直接编辑，不覆盖。Linux 建议目录权限 700、文件权限 600。设置 `OPENPAW_HOME` 时使用相应位置。
 
 ```dotenv
 OPENPAW_PROVIDER=openai
 OPENPAW_MODEL=deepseek-chat
 OPENPAW_BASE_URL=https://api.deepseek.com/v1
-OPENAI_API_KEY=your_deepseek_api_key
+OPENAI_API_KEY=replace_with_your_own_key
 ```
 
-此处`openai`表示OpenAI兼容协议，实际服务为DeepSeek。随后执行：
+`openai` 表示 OpenAI 兼容协议；URL 填服务基础地址，不追加 `/chat/completions`。也支持 Anthropic。
 
-```bash
-openpaw config show          # 只显示有效模型、来源和密钥有无，不发模型请求
-openpaw chat                 # 不再每次输入模型、端点和密钥
-openpaw chat --env-file /absolute/path/model.env
+```sh
+cargo run --locked -p openpaw-cli -- config show
+cargo run --locked -p openpaw-cli -- chat
 ```
 
-优先级为：明确CLI参数或Host TOML模型字段 → 系统环境变量 → `.env` → 原默认值。
-未配置时chat仍为离线mock，Host仍为echo；模型为空、文件格式错误或显式文件不存在会失败，不静默降级。
-`--env-file`是全局选项，也可用于`config show`和`engine-host`；`chat --home`仅改变会话存储位置。
-默认文件不存在时保持旧用法。配置只在启动时读取，修改后重启。
-`.env`支持UTF-8（含BOM）、CRLF、注释、引号及dotenvy变量引用；重复字段拒绝。
-使用`OPENPAW_HOME`时Linux复制目标也应改成该目录。系统环境中已有同名变量会覆盖文件，可用`config show`核对来源。
+优先级：明确 CLI/TOML 字段 → 系统环境 → 选定 `.env` → 默认。可用全局 `--env-file <path>` 显式选择；配置检查只显示密钥有无，不验证余额。未配置时 CLI 为 mock、直接启动的 Host 为 echo；Office 启动脚本拒绝 Echo，避免把演示当真实模型。
 
-Host继续用原TOML指定数据目录、授权工作区和工具：
+高级 Host 示例保留在 [host-config.example.toml](docs/engine-host/host-config.example.toml)，默认只读与离线，不能把它直接当成 setup 的完整真实配置。
 
-```bash
-openpaw engine-host --config /absolute/path/host.toml
+## 架构与模块边界
+
+```text
+CLI                           Office / 其他可信适配器
+ │                                      │
+ │                     Engine Host：作用域、Run、审批、角色队列
+ │                     Office 转换：chat/UI/快照/白板/成果
+ └──────────────────────┬───────────────┘
+                 Engine / AgentLoop
+          模型流 → 工具请求 → 审批 → 工具结果 → 后续响应
+                        │
+       LLM / Tools / Store / Memory / Sandbox / MCP / Plugins
 ```
 
-希望Host沿用`.env`时，省略TOML的`provider`、`model`、`base_url`和`api_key_env`；
-明确写了`provider = "echo"`就继续离线运行。自定义`api_key_env`仍可从系统环境或选定.env读取。
-原`HostConfig::load`和`Host::start`嵌入式Rust入口保持原行为；新加载仅在CLI启动或显式调用新回退接口时启用。
-**配置模型并不代表Office聊天已接通，Office适配仍按T4计划单独验收。**
-
-原环境变量用法继续支持：`OPENAI_API_KEY` / `ANTHROPIC_API_KEY`配合`chat --provider ... --model ... --base-url ...`。
-密钥不进Git、浏览器、日志或错误原始行；`.env.example`只含占位值。
-
-**Run as an MCP sidecar.** There is no daemon: the editor/agent client
-launches `openpaw --sidecar --sidecar-transport stdio` itself and owns the
-process. The alternative `http` transport binds loopback-only with a
-dynamic port printed to stdout. Client-by-client wiring:
-[docs/tutorials/sidecar-clients.md](docs/tutorials/sidecar-clients.md).
-
-**Operating posture.** `hello`/`mock`/`echo` and every non-web tool work
-with networking unavailable; there is no telemetry of any kind (the
-`doctor` command prints a static network-audit report as evidence).
-Uninstall = remove the binary plus (optionally) your `OPENPAW_HOME`.
-
-## First session: a beginner's walkthrough
-
-About ten minutes, end to end. PowerShell and bash both work; commands are
-identical unless noted.
-
-1. **Create the home skeleton**
-
-   ```sh
-   openpaw init
-   ```
-
-2. **Check your environment** — home writability, provider keys present or
-   absent (both fine offline), index.db opens, network-audit report:
-
-   ```sh
-   openpaw doctor
-   ```
-
-3. **First conversation, fully offline** — an echo model, no key needed.
-   Type `exit` (or `quit`) to leave:
-
-   ```sh
-   openpaw hello
-   ```
-
-4. **Chat with the tool-enabled agent loop** — `mock` replies are
-   deterministic counters, so nothing leaves your machine:
-
-   ```sh
-   openpaw chat --provider mock
-   ```
-
-5. **Switch to a real model** — set a key, then pick the provider:
-
-   ```sh
-   $env:ANTHROPIC_API_KEY = "sk-ant-..."        # PowerShell
-   export ANTHROPIC_API_KEY="sk-ant-..."        # bash
-   openpaw chat --provider anthropic            # or: --provider openai
-   ```
-
-   Ask it to do something real: *"read Cargo.toml and summarize the
-   workspace members"* — tool calls print as `· tool — preview` lines, and
-   the final reply lands when the turn completes. The session is saved to
-   `<home>/sessions/<id>.jsonl` and indexed into `index.db`.
-
-6. **Find your sessions again**
-
-   ```sh
-   openpaw session list
-   openpaw session search "workspace members"
-   ```
-
-7. **Memory that persists** — ask the model in `chat` to save a memory
-   ("remember that I prefer lowercase commit messages"); it writes plain
-   markdown under `<home>/memories`. Inspect it from the CLI:
-
-   ```sh
-   openpaw memory list
-   openpaw memory search "commit messages"
-   openpaw memory show <id>
-   ```
-
-8. **Watch the evolution loop** — reflection candidates land flagged
-   `unverified` until you review them:
-
-   ```sh
-   openpaw evolve status   # unverified ratios + goal overview
-   openpaw evolve reset --yes   # clear flags after review (files kept)
-   ```
-
-9. **Track a longer effort**
-
-   ```sh
-   openpaw goal new "migrate the blog to the new theme" --project
-   openpaw goal status
-   ```
-
-10. **Plug it into your editor** — register the sidecar with Claude Code,
-    Cursor, OpenWork, or Trae:
-    [docs/tutorials/sidecar-clients.md](docs/tutorials/sidecar-clients.md).
-
-Tips: `chat` reads one message per line from stdin, so piping a script
-works too (`Get-Content prompt.txt | openpaw chat --provider echo`) —
-non-interactive output drops the `Paw:` prefix. `--home` / `--workspace`
-flags relocate storage and tool scope per command; `OPENPAW_HOME` sets it
-globally.
-
-## Tutorials & CLI reference
-
-| Guide | Content |
+| crate | 职责 |
 |---|---|
-| [docs/tutorials/sidecar-clients.md](docs/tutorials/sidecar-clients.md) | Wire the five-tool MCP sidecar into Claude Code / Cursor / OpenWork / Trae (stdio + HTTP, troubleshooting, security posture) |
-| [docs/engine-host/master.md](docs/engine-host/master.md) | OpenWork and AI Office wiring (not built yet) |
-| [docs/specs/knowledge-format-1.0.md](docs/specs/knowledge-format-1.0.md) | The frozen on-disk formats: memory/skill frontmatter, `unverified` flag, D8 reflection schema |
-| [docs/compatibility.md](docs/compatibility.md) | SemVer policy, MSRV floor, platform commitments, quality-gate inventory |
-| [docs/devlog.md](docs/devlog.md) | The full development log: decisions, deviations, per-session evidence |
-| [docs/boundary-decisions/ADR-001-engine-host-archived.md](docs/boundary-decisions/ADR-001-engine-host-archived.md) | Why engine-host is out of the 1.0 crate list |
+| `openpaw-cli` | 命令、模型配置加载、可选 Host 和 sidecar 启动 |
+| `openpaw-engine`、`openpaw-core` | AgentLoop、消息、事件、工具及策略抽象 |
+| `openpaw-engine-host` | 会话和 Run 生命周期、工作区授权、并发、角色队列、持久审批；Office 协议及展示转换 |
+| `openpaw-llm` | OpenAI/Anthropic、流式读取、错误分类及有边界的重试 |
+| `openpaw-tools` | 文件、命令、网络、任务及媒体工具与安全检查 |
+| `openpaw-store`、`openpaw-memory` | 会话 JSONL、索引、记忆和技能 |
+| `openpaw-goal-ledger`、`openpaw-reflect-lite` | 目标账本、反思与未核验知识的库能力 |
+| `openpaw-sandbox` | 显式装配的受限执行；普通本机执行不等于 OS 隔离 |
+| `openpaw-mcp`、`openpaw-plugins` | 可装配的 MCP 客户端和插件扩展 |
+| `xtask` | 格式/源码/协议以外的工程质量检查 |
 
-The 12 subcommands (plus the informational `sidecar` and the global
-`--sidecar` server flag):
+Host 调度角色、父子任务及队列，复用 Engine 执行模型与工具；Office 的 `office/` 模块负责把执行事实转成前端协议，不包含另一个 AgentLoop。工具结果、Run 终态、持久审批是事实来源，动画不是执行成功凭证。默认 CLI 不引入 Axum。
 
-| Command | Purpose |
-|---|---|
-| `hello` | Zero-config offline echo conversation (smoke entry) |
-| `chat` | Full agent loop: tools + JSONL session + FTS5 index (`--provider mock\|echo\|anthropic\|openai`) |
-| `session list\|show\|search` | List, inspect, and full-text-search past sessions |
-| `memory list\|search\|show\|delete` | Browse and search user/project memories |
-| `evolve status\|reset` | Unverified-knowledge ratios; clear flags after human review |
-| `doctor` | Environment checks + static network-audit report |
-| `goal new\|status\|resume` | Create goal profiles; progress digest; single-step resume decision |
-| `config show\|doctor` | Effective home + provider-key presence (values always masked) |
-| `model list\|default` | Static provider/model table (`default` is a placeholder for now) |
-| `tool list` | Print the 21 registered tool names |
-| `completions <shell>` | Placeholder until the clap_complete wiring lands |
-| `init` | Create the home skeleton; safe to re-run |
-| `sidecar status\|stop` | Informational only — the sidecar runs in-process via `--sidecar` |
+普通 `chat` 自动允许其本地工具请求，适用于可信本机；Host 才有配置根、工具白名单和持久审批，Host 权限不会自动套用到普通 CLI。Linux 受限执行需要 bubblewrap；无法落实的限制明确拒绝，不自动降级。
 
-## Quality gates
+反思、插件钩子、MCP 客户端和策略库提供扩展接口，但默认 CLI/Host 不自动装配所有库能力。`embed` 是兼容 feature，不会启用向量嵌入；`goal resume` 只报告恢复决定，不自动执行；CLI 不提供可工作的 clarify/计划模式。`model default`、`completions` 未实现并明确失败。
 
-CI retains AST-based line statistics for review, without numeric size caps.
-The other gates include a dependency whitelist, a zero-telemetry symbol scan,
-an offline smoke test, golden-file round-trips, trait-snapshot checks, a
-cold-build time budget, human-alignment invariants, and a
-secrets/internal-terms scrub.
+## 前后端和扩展接口
 
-## Design principles
+| 类别 | 方向和内容 | 边界 |
+|---|---|---|
+| 健康 | 本机调用 Host `GET /health` | ready/unavailable，不是会话授权 |
+| Office 聊天 | Office → Host `POST /office/chat` | 官方请求操作及 NDJSON 事件，含发送/恢复/取消；订阅断开不等于停止执行 |
+| UI 命令 | Office 原 HTTP 中继 → Host 命令处理 | 人物/任务详情、会话、审批等；没有自定义的任意任务控制端点 |
+| 场景投影 | Host → Office `/api/pawoffice/messages` | 快照/增量、成员、任务、进度、交接、白板、会话与成果元数据 |
+| 成果读取 | 浏览器 → Host `/office/artifacts/{version}` 及 delivery/catalog | 真实工具成功后捕获版本，按会话/版本凭证限制，只读访问 |
+| Host Rust API | 可信宿主 → Host/Store | scope、session、Run、事件订阅、审批和查询；不表示存在完整 OpenCode HTTP 服务 |
+| MCP sidecar | 外部客户端 → `openpaw --sidecar` | 可选 stdio 或 loopback HTTP |
+| 库扩展 | Rust Provider/Tool/Environment/Hook 等接口 | 显式装配，保留安全与取消契约 |
 
-- **Zero telemetry** — there is no `[telemetry]` section in the config
-  because there is no telemetry. Not "off by default": absent.
-- **Plain files are the database** — memories, skills, and goals are
-  markdown files with YAML frontmatter you can read, edit, and sync.
-- **Human alignment is non-negotiable** — every knowledge-writing policy
-  must keep `requires_human_alignment() == true`; CI enforces it.
-- **Reuse the core** — keep protocol adapters in the Host and reuse existing
-  engine, tools and storage. Review responsibilities and dependencies rather
-  than file or crate line counts.
+任务交接传递真实任务关系、发送/接收角色和事件标识；头顶动作与白板来自投影后的任务字段。完整历史保留账本，快照是有预算的当前视图，不能无限放入正文和历史。运行失败、取消、等待审批和成功分别表达，不把工具成功等同整个任务成功。
 
-## License
+### 版本与已知限制
 
-Apache-2.0. Contributions are subject to the Developer Certificate of
-Origin (see [CONTRIBUTING.md](CONTRIBUTING.md)).
+Office 合同唯一清单为 [sources.json](docs/engine-host/contracts/sources.json)：固定提交、文件哈希和 SDK 完整性。测试快照必须保留上游原字节及 LICENSE，不手动修改或浮动跟随 main。合同基线为 `5d21cf2e359d7ab2100e8344d08d58a09a20fe25`；本机另已验证上游运行提交 `a4c2a9b59ee60b8ed00c26f1b3aa6c030ab19fed`，两者不是同一概念，也不代表所有未来版本兼容。
 
-Office 接入使用可选 `engine-host` feature。完成模型 `.env` 后，还需在 Host TOML 中启用 `[office]`，并在 Office **构建前**配置公开聊天地址；只改模型配置不会改变已有的预览构建。完整配置、启动与原生 Linux/Windows 验证命令见 [Office 交接说明](docs/engine-host/handoff.md#当前t4实施交接官方v1聊天与真实投影0005-r3) 和 [配置示例](docs/engine-host/host-config.example.toml)。Office 与模型密钥分别保留在服务端，均不得进入 `VITE_*`。
+上游 Office 仍有跨会话场景残留、同接收者交接展示串行，以及部分通知层遮挡问题；OpenPaw 适配不能据此承诺所有动画都可见。真实交接不要求模型等待动画完成。具体现场仍需结合浏览器事件与账本排查。
+
+setup 默认全局运行容量 24、最多 5 个活动子任务、持续模式同时 4 个业务事项；这些不是“只能有一个办公室”。32 个工作槽用于预授权创建，不是运行并发数。实际值以本机 TOML 为准。
+
+`render_visual` 生成 SVG 图表。`generate_image` 需要单独支持图片生成的服务、模型和密钥，普通 DeepSeek 聊天配置不能直接提供真实图片。持续任务依赖显式配置、模型服务和任务停止条件，不承诺永久无人值守。
+
+## CLI、feature 与 sidecar
+
+```sh
+cargo build --release --locked -p openpaw-cli
+cargo build --release --locked -p openpaw-cli --features engine-host,sidecar
+```
+
+默认构建是 CLI；`engine-host` 增加 Host，`sidecar` 增加 MCP 服务入口。同一 target 目录后续构建普通 CLI 会覆盖同名程序；运行 Office 前重新执行脚本 build，或指定单独保留且已核验的 Host 二进制。二进制在 `target/release/`；脚本默认 debug，使用 release 时显式设置 `OPENPAW_HOST_BINARY`。
+
+常用命令包括 `hello`、`chat`、`session list/show/search`、`memory list/search/show/delete`、`goal new/status/resume`、`evolve status/reset`、`config show/doctor`、`doctor`、`tool list`、`init`；准确参数执行 `openpaw --help` 及子命令 `--help`。
+
+sidecar 由编辑器或客户端启动并拥有进程：
+
+```sh
+openpaw --sidecar --sidecar-transport stdio
+```
+
+客户端配置将 command 指向该二进制，args 为 `["--sidecar", "--sidecar-transport", "stdio"]`。HTTP 模式使用 `--sidecar-transport http`，只监听本机并输出动态地址。它不是独立安装的后台服务；`sidecar status/stop` 为信息入口，不管理其他进程。
+
+## 开发与验证
+
+格式、测试和编译命令都在仓库根目录执行，使用锁定依赖：
+
+```sh
+cargo fmt --all -- --check
+cargo test --locked --workspace
+cargo test --locked --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo +1.89.0 check --locked --workspace --all-targets --all-features
+python -m unittest discover -s scripts/tests -p 'test_*.py' -v
+```
+
+合同测试只需要 Node 24/npm，不需要完整 Office 或模型密钥：
+
+```sh
+cd tests/engine-host-contracts
+npm ci --ignore-scripts --no-audit --no-fund
+npm run prepare:office
+npm run check
+npm test
+```
+
+`fixtures/` 和 `tests/golden/` 是构造样例，不是作者聊天导出。`upstream-office/` 为 MIT 协议快照，其精确来源在清单和第三方声明中；如需只读核验完整 Office 源码，运行 `node prepare-office.mjs --office-source <existing-office>`。
+
+完整技术执行器：
+
+```sh
+python scripts/verify.py --suite all --source worktree --base <review-base> --output <new-directory-outside-repo>
+```
+
+把占位符替换为准确 Git 基线和新目录。支持 `rust/quality/contracts/runner` 套件；含 Rustdoc 差量审核时必须传入 `--base`。`--source head --head <commit>` 要求当前检出匹配且干净；工作区模式会记录未提交源码。执行器保存实际命令、退出码、源码摘要与日志，拒绝覆盖旧证据和零子测试假成功。Python 3.11+ 为开发验证依赖，不是普通运行依赖。
+
+### 真实 UI 验收
+
+`office-product.mjs` 执行真实 Office、Host、Chromium、公开 HTTP 和真实点击，覆盖状态/历史/审批/停止/多 Agent/成果版本等。模型使用受控 HTTP 回执，因此通过不等于真实模型能力验收。
+
+使用既有干净上游和可信构建回执时，设置：
+
+- `OPENPAW_OFFICE_SOURCE`：已有 Office 路径。
+- `OPENPAW_OFFICE_EXISTING_BUILD`：构建回执 JSON，包含 sourceCommit/sourceTree/contractCommit、buildRecord 的路径/哈希及完整 buildFiles。
+- `OPENPAW_HOST_BINARY`：本轮候选二进制，不能在验收前被其他 feature 构建覆盖；不设置时产品脚本会重新编译 Host。
+- `OPENPAW_OFFICE_PRODUCT_OUTPUT`：新的仓库外证据目录。
+
+运行 `node tests/engine-host-contracts/office-product.mjs`。该模式核对干净源码、合同、成功构建记录及所有运行文件，不克隆或改写 Office。回执依赖调用方信任，给未知 dist 自行计算哈希不能证明构建来源。`--verify-existing-build-only` 只核对来源，不是 UI 验收。
+
+不提供回执时，产品脚本会在证据目录准备固定 Office 副本并构建，需允许该操作及相应源码访问；本地开发可选择前述只读模式。`continuous-product.mjs` 是持续任务/图文/故障的可选专项，不纳入每次编译。历史一次性 100/200 轮验收不属于常规构建要求。
+
+Linux、原生 Windows、受控模型、付费真实模型和浏览器分别记录。当前本地 Linux 结果不能替代本次 Windows 原生结果；未运行、跳过和外部网络失败不能标成通过。真实模型验收需自己的服务与余额，会产生相应请求费用。
+
+## 文件格式与兼容性
+
+普通 CLI 在数据目录保存 sessions/*.jsonl、memories/、skills/、goals/ 和可重建的 index.db。Host 另维护其会话/审批/任务及成果版本，不能只复制数据库的一部分来迁移运行数据。
+
+记忆/技能采用 UTF-8 Markdown 与 YAML frontmatter，保留标识、类型、时间、标签和状态等字段；未核验反思成果保持 unverified，不能自动提升为已审核知识。固定样例在 tests/golden/，以解析器和往返测试为准。变更持久格式、公共接口或许可时说明兼容、迁移及回退；不以删除历史证据掩盖不兼容。
+
+## 贡献与问题报告
+
+PR 描述问题、实际行为变化、验证源码和命令，并说明公共接口/权限/数据影响。复用已有模块和夹具，保留有独立覆盖的回归；不要提交密钥、真实聊天、工作成果、target、node_modules 或本地备份。
+
+使用 `git commit -s` 添加 DCO Signed-off-by，声明有权提交贡献。CI 不代替人工审核。缺陷可提交脱敏 GitHub Issue，附平台、版本、复现、预期/实际及最小日志；安全漏洞或凭据不得发公开 Issue，使用仓库提供的私密安全报告入口，若入口尚未开放先向维护者请求安全渠道，不公开漏洞细节。
+
+## 许可证与发布范围
+
+项目根许可为 Apache-2.0，第三方代码分别遵守其许可。保留 [NOTICE](NOTICE)、[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) 及相应许可文本，Office 协议快照另附 MIT LICENSE。
+
+release workflow 当前构建 Linux/Windows 默认 CLI，附许可证、校验和及 Sigstore 签名；下载包不包含完整 Host/Office。签名和固定版本不表示已证明逐字节可复现。crates.io 步骤为 dry-run，内部依赖未发布可能延后，不等于包已正式发布。
+
+本地内部方案、原始证据和治理材料不属于当前公开源码树。停止跟踪不会清除 Git 历史；完整历史公开前仍需单独核查旧会话、内部资料和授权不明的上游代码，不能只看当前树。

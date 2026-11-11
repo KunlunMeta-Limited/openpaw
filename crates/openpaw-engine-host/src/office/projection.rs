@@ -2,6 +2,7 @@
 //! 输入输出：原JSONL和Host状态到持久seq/完整内容及官方消息。
 //! 依赖：原Store、官方client、单办公室协调任务。
 //! 禁止职责：不伪造进度、工具开始或多Agent，不复制会话账本。
+use super::RolePresentation;
 use super::{client::Client, dto, OfficeConfig};
 use crate::{ClientScope, Host, HostError, HostResult, RunState, RunView};
 use serde_json::{json, Value};
@@ -126,6 +127,7 @@ pub(crate) struct Coordinator {
     config: OfficeConfig,
     address: std::net::SocketAddr,
     ui_refresh: tokio::sync::broadcast::Sender<ClientScope>,
+    client: std::sync::Arc<Client>,
 }
 impl Coordinator {
     /// 功能：为每个授权办公室启动独立投影和同步循环。
@@ -170,7 +172,8 @@ impl Coordinator {
         {
             let mut cache = host
                 .inner
-                .office_projection_cache
+                .office_state
+                .projection_cache
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             for (team, snapshot) in cached {
@@ -190,7 +193,7 @@ impl Coordinator {
                 // 重启后首个点击被全量历史重建占住Store；后台仍在短窗口后刷新事实。
                 let has_cached_projection = host
                     .inner
-                    .office_projection_cache
+                    .office_state.projection_cache
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .contains_key(&team);
@@ -230,7 +233,7 @@ impl Coordinator {
                     if token.is_cancelled(){break;}
                     if host
                         .inner
-                        .office_ui_busy
+                        .office_state.ui_busy
                         .load(std::sync::atomic::Ordering::Acquire)
                         != 0
                     {
@@ -312,14 +315,35 @@ impl Coordinator {
             address,
             stop.clone(),
         )));
-        tasks.push(tokio::spawn(super::scene::run(host, client, stop.clone())));
+        tasks.push(tokio::spawn(super::scene::run(
+            host,
+            client.clone(),
+            stop.clone(),
+        )));
         Ok(Self {
             stop,
             tasks,
             config,
             address,
             ui_refresh,
+            client,
         })
+    }
+    /// 功能：取得同一Office连接池和恢复通知的短期问答句柄。
+    /// 参数：self为已启动协调器。
+    /// 返回：连接池、监听地址、恢复广播及关闭token的克隆。
+    /// 错误：无。
+    /// 状态：不创建网络请求，不延长问题期限。
+    /// 并发与取消：短读，不持协调器锁等待用户；关闭token保持同源。
+    /// 权限：内部句柄不授予工具或文件权限。
+    /// 关联：REQ-OP-013；DES-OP-008；CHG-2026-0007第9.16节。
+    pub(crate) fn question_transport(&self) -> crate::question::Transport {
+        crate::question::Transport {
+            client: self.client.clone(),
+            address: self.address,
+            refresh: self.ui_refresh.clone(),
+            stop: self.stop.clone(),
+        }
     }
     /// 功能：通知成功恢复聊天的会话需要重新展示待审批菜单。
     /// 参数：scope为已经轮次服务校验的完整作用域。
@@ -550,7 +574,7 @@ fn whiteboard_detail(title: &str, tasks: &[Value]) -> String {
         };
         let employee = task["assigneeId"]
             .as_str()
-            .and_then(|id| crate::agents::ROLES.iter().find(|r| r.employee == id))
+            .and_then(|id| crate::agents::ROLES.iter().find(|r| r.employee() == id))
             .map(|r| r.name)
             .unwrap_or("待分配");
         text.push_str(&format!(
@@ -589,7 +613,7 @@ fn structured_board(board: &mut Value, tasks: &[Value]) {
     };
     let task_rows: Vec<_> = rows.iter().map(|task| {
         let owner = task["assigneeId"].as_str()
-            .and_then(|id| crate::agents::ROLES.iter().find(|role| role.employee == id))
+            .and_then(|id| crate::agents::ROLES.iter().find(|role| role.employee() == id))
             .map(|role| role.name).unwrap_or("待分配");
         let state = match task["status"].as_str() {
             Some("completed") => "done", Some("running") => "doing",
@@ -1321,7 +1345,8 @@ async fn prepare_internal(
     let projection_lock = {
         let mut locks = host
             .inner
-            .office_projection_locks
+            .office_state
+            .projection_locks
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         locks
@@ -1330,10 +1355,10 @@ async fn prepare_internal(
             .clone()
     };
     let _projection_guard = projection_lock.lock().await;
-    let employees:Vec<_>=crate::agents::ROLES.iter().map(|role|json!({"id":role.employee,"name":role.name,"sceneActorId":role.actor,"role":role.duty,"online":crate::agents::enabled(role,&host.inner.config)})).collect();
+    let employees:Vec<_>=crate::agents::ROLES.iter().map(|role|json!({"id":role.employee(),"name":role.name,"sceneActorId":role.actor(),"role":role.duty,"online":crate::agents::enabled(role,&host.inner.config)})).collect();
     let diagnostics_team = team.clone();
-    let ui_busy = host.inner.office_ui_busy.clone();
-    let terminal_runs = host.inner.office_terminal_runs.clone();
+    let ui_busy = host.inner.office_state.ui_busy.clone();
+    let terminal_runs = host.inner.office_state.terminal_runs.clone();
     let activity_window = config.activity_window;
     let collaboration = host
         .inner
@@ -1527,21 +1552,20 @@ async fn prepare_internal(
                 let role=crate::agents::role(&d.role_id).ok_or_else(||HostError::new("storage_unavailable","委派引用未知角色"))?;
                 let show_card=display_calls.contains(&d.call_id);
                 let child=match read_run(&d.child_run) {Ok(v)=>Some(v),Err(e) if e.kind=="not_found"=>None,Err(e)=>return Err(e)};
-                let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
+                let state=child.as_ref().map(|c| if !c.state.is_terminal() && (c.state==RunState::Cancelling || c.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"|"awaiting_user"))) {"blocked"}else{status(c.state)}).unwrap_or(if r.state.is_terminal(){"failed"}else{"queued"});
                 let superseded=recovered.contains(&d.call_id);
                 let done=state=="completed";
                 // 正式业务卡以父计划的准确委派验收为准；子执行计划是未验收时的阶段展示。
                 // 文件验收仍由原Store核验实际子写入/路径，不能凭正文或终态跳过。
                 let (child_steps_view, child_percent)=match &child {
-                    Some(c)=>crate::task_progress::execution_project(db.progress(&c.run_id)?,c)?,
+                    Some(c)=>crate::query::RunFacts::read(db,c)?.execution()?,
                     None=>(Vec::new(),0),
                 };
-                let verified=done && plan.as_ref().map(|p|p["steps"].as_array().into_iter().flatten().any(|s|
-                    s["state"]=="completed" && s["evidenceCallIds"].as_array().is_some_and(|ids|ids.iter().any(|id|id==&d.call_id))
-                )).unwrap_or(child_percent==100);
+                let verified=child.as_ref().is_some_and(|c| crate::task_progress::delegation_verified(plan.as_ref(),&d.call_id,c,child_percent));
                 let summary=if let Some(c)=&child {
-                    if state=="queued" {"已接受任务，等待成员依次执行".into()}
+                    if state=="queued" {"待执行：正在排队，尚未开始工作".into()}
                     else if done {dto::bounded(&c.text,180)} else if c.state.is_terminal() {super::turns::message(c)}
+                    else if c.tools.iter().any(|t|t.state=="awaiting_user") {"等待用户补充信息，请在当前对话选择或填写其他需求".into()}
                     else if state=="blocked" {"等待确认、资源或清理".into()}
                     else if let Some(binding)=db.office_tool_activity(c)? {
                         format!("{}{}；已核验进度{child_percent}%",observed_tool_activity(&binding,c),child_steps_view.iter().find(|s|s["status"]=="running").and_then(|s|s["title"].as_str()).map(|title|format!("；正在{title}")).unwrap_or_default())
@@ -1571,7 +1595,7 @@ async fn prepare_internal(
                 });
                 if show_card { completed_children += u64::from(execution_complete && (verified || independent_acceptance)); }
                 let mut item=task(d.task_id.clone(),d.title.clone(),if done&&!execution_complete{"blocked"}else{state},if done&&!execution_complete{"独立执行已结束，文件步骤仍待核验".into()}else if execution_complete&&!verified{format!("执行已完成，父目标待验收；{summary}")}else{summary},&old,&now,if execution_complete{100}else{child_percent});
-                item["assigneeId"]=json!(role.employee);
+                item["assigneeId"]=json!(role.employee());
                 // 开始关联只是待核验提示；只有确认后的一对一证据才复用业务卡片。
                 let linked=assignments.get(&d.call_id).copied().filter(|i| {
                     *i<steps.len() && assignment_counts.get(i)==Some(&1) &&
@@ -1618,7 +1642,7 @@ async fn prepare_internal(
                         let id=format!("activity:{}:{phase}",d.task_id);
                         let existing=prior_conv.and_then(|v|v["events"].as_array()).and_then(|events|events.iter().find(|event|event["id"]==id));
                         if !observed&&existing.is_none() {continue;}
-                        lifecycle.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee}));
+                        lifecycle.push(json!({"id":id,"kind":kind,"summary":dto::bounded(&format!("{label}：{}",d.title),300),"occurredAt":existing.map(|event|event["occurredAt"].clone()).unwrap_or_else(||json!(now)),"taskId":task_id,"employeeId":role.employee()}));
                     }
                     child_events.extend(lifecycle);
                 }
@@ -1640,8 +1664,8 @@ async fn prepare_internal(
                 }
                 if started || existing_assignment.is_some() {
                 let existing=existing_assignment;
-                let from=d.source_task_id.as_ref().and_then(|id|delegations.iter().find(|previous|&previous.task_id==id)).and_then(|previous|crate::agents::role(&previous.role_id)).map_or("office-lead",|role|role.employee);
-                let mut assignment=existing.cloned().unwrap_or_else(||json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":now,"taskId":task_id,"employeeId":role.employee,"fromEmployeeId":from}));
+                let from=d.source_task_id.as_ref().and_then(|id|delegations.iter().find(|previous|&previous.task_id==id)).and_then(|previous|crate::agents::role(&previous.role_id)).map_or("office-lead",|role|role.employee());
+                let mut assignment=existing.cloned().unwrap_or_else(||json!({"id":format!("assign:{}",d.task_id),"kind":"task.assigned","summary":dto::bounded(&format!("交给{}：{}",role.name,d.title),300),"occurredAt":now,"taskId":task_id,"employeeId":role.employee(),"fromEmployeeId":from}));
                 // 精确业务证据后来把委派卡归并为唯一业务步骤时，事件仍是
                 // 同一次交接，但必须指向当前稳定任务ID，不能挂回临时卡。
                 // 事件ID和首次时间保持不变，因此不会重播拜访动画。
@@ -1676,6 +1700,7 @@ async fn prepare_internal(
                 RunState::Completed if percent<100=>"回复已结束；已完成部分保留，其余待核验或继续处理".to_owned(),
                 RunState::Completed=>"本次目标已完成".to_owned(),
                 _ if !unbounded && child_blocked && !child_tasks.iter().chain(child_steps.values()).any(|t|t["status"]=="running")=>"子任务等待确认、核验或可用资源".to_owned(),
+                _ if r.tools.iter().any(|t|t.state=="awaiting_user")=>"等待用户补充信息，请选择或填写其他需求".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_approval")=>"等待你确认本次操作".to_owned(),
                 _ if r.tools.iter().any(|t|t.state=="awaiting_resource")=>"等待可用资源".to_owned(),
                 _=>child_tasks.iter().chain(child_steps.values()).find(|t|t["status"]=="running")
@@ -1683,7 +1708,7 @@ async fn prepare_internal(
                         // 主卡展示团队概况，子卡仍展示本人动作；聚合时保留可信
                         // 负责人，避免把同事的读取/写入误显示为主角色亲自执行。
                         let owner=t["assigneeId"].as_str()
-                            .and_then(|id|crate::agents::ROLES.iter().find(|role|role.employee==id))
+                            .and_then(|id|crate::agents::ROLES.iter().find(|role|role.employee()==id))
                             .map(|role|role.name).unwrap_or("同事");
                         format!("团队进展 · {owner}：{}；已核验总进度{percent}%",t["summary"].as_str().unwrap_or("正在处理"))
                     })
@@ -1692,7 +1717,7 @@ async fn prepare_internal(
                         format!("正在{}；已核验进度{percent}%",s["title"].as_str().unwrap_or("处理任务"))))
                     .unwrap_or_else(||"正在分析并组织下一步；尚无新增核验进度".to_owned()),
             };
-            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (!unbounded && child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
+            let main_state=if r.state==RunState::Completed && child_failed {"failed"} else if r.state==RunState::Completed && percent<100 || !r.state.is_terminal() && (!unbounded && child_blocked || r.tools.iter().any(|t|matches!(t.state.as_str(),"awaiting_approval"|"awaiting_resource"|"awaiting_user")) || r.state==RunState::Cancelling) {"blocked"}else{status(r.state)};
             let business_title = input.lines().find(|line| !line.trim().is_empty()).unwrap_or(&input).trim();
             let mut tasks=vec![task(main_id,dto::bounded(business_title,80),main_state,summary.clone(),&old,&now,percent)];
             for (index,step) in steps.into_iter().enumerate() {
@@ -2087,7 +2112,8 @@ async fn sync_internal(
     {
         let mut cache = host
             .inner
-            .office_projection_cache
+            .office_state
+            .projection_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         cache.insert(cache_team, snapshot.clone());
@@ -2127,14 +2153,7 @@ mod tests {
         let host = Host::with_provider(config, Arc::new(MockProvider::scripted(script)))
             .await
             .unwrap();
-        let office = OfficeConfig {
-            activity_window: true,
-            base_url: "http://127.0.0.1:9".into(),
-            api_key_env: "UNUSED".into(),
-            allowed_origins: vec![],
-            names: Default::default(),
-            creation_slots: vec![],
-        };
+        let office = crate::test_support::office_config();
         let mut scopes = Vec::new();
         for index in 0..7 {
             let scope = ClientScope {
@@ -2782,14 +2801,7 @@ mod tests {
                 db.bump("tool_started", &json!({"run_id":"owner-run","call_id":"owner-read","tool_name":"read_file","input":{"path":"first.md"}}).to_string())?;
                 Ok(())
             }).await.unwrap();
-            let office = OfficeConfig {
-                activity_window: true,
-                base_url: "http://127.0.0.1:9".into(),
-                api_key_env: "UNUSED".into(),
-                allowed_origins: vec![],
-                names: Default::default(),
-                creation_slots: vec![],
-            };
+            let office = crate::test_support::office_config();
             let snapshot = prepare(&host, &office, "office-1").await.unwrap();
             let tasks = snapshot["conversations"][0]["tasks"].as_array().unwrap();
             assert_eq!(tasks.len(), 1);
@@ -3341,7 +3353,7 @@ mod tests {
             .iter()
             .map(|r| {
                 json!({
-                    "id":r.employee,"name":r.name,"sceneActorId":r.actor,"online":true,"role":r.duty
+                    "id":r.employee(),"name":r.name,"sceneActorId":r.actor(),"online":true,"role":r.duty
                 })
             })
             .collect();
@@ -5536,15 +5548,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let office = OfficeConfig {
-                activity_window: true,
-                base_url: "http://127.0.0.1:9".into(),
-                api_key_env: "UNUSED".into(),
-                allowed_origins: vec![],
-                names: Default::default(),
-                creation_slots: vec![],
-            };
-            let employee = crate::agents::role(role).unwrap().employee;
+            let office = crate::test_support::office_config();
+            let employee = crate::agents::role(role).unwrap().employee();
             let mut previous: Option<Value> = None;
             for file in ["first.md", "second.md"] {
                 tokio::time::timeout(Duration::from_secs(5), provider.ready.notified())
@@ -5713,8 +5718,8 @@ mod tests {
             let members = conversation["employees"].as_array().unwrap();
             assert_eq!(members.len(), 6, "容量裁剪不能移除会话人物绑定或左侧成员");
             for role in crate::agents::ROLES.iter() {
-                assert!(members.iter().any(|member| member["id"] == role.employee
-                    && member["sceneActorId"] == role.actor
+                assert!(members.iter().any(|member| member["id"] == role.employee()
+                    && member["sceneActorId"] == role.actor()
                     && member["name"] == role.name));
             }
         }

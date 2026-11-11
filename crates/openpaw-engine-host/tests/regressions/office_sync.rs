@@ -2,6 +2,8 @@
 //! 输入输出：隔离v1数据库到原Host恢复结果。
 //! 依赖：真实SQLite和Host，不依赖用户环境。
 //! 禁止职责：不把模拟Office回执写作浏览器验收。
+#[path = "../../src/test_support.rs"]
+mod test_support;
 use openpaw_engine_host::*;
 use serde_json::json;
 fn config(base: &std::path::Path) -> HostConfig {
@@ -76,22 +78,25 @@ async fn real_v3_without_new_tables_upgrades_without_rewriting_existing_history(
 
 #[test]
 fn sync_retry_cache_conflict_and_restart() {
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "sync_fixture_child", "--nocapture"])
-        .env("OPENPAW_OFFICE_SYNC_CHILD", "1")
-        .env("PAWOFFICE_TEST_KEY", "fixture-key")
-        .status()
-        .unwrap();
-    assert!(status.success());
+    test_support::run_child(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "sync_fixture_child", "--nocapture"])
+            .env("OPENPAW_OFFICE_SYNC_CHILD", "1")
+            .env("PAWOFFICE_TEST_KEY", "fixture-key"),
+        "sync_fixture_child",
+    );
 }
 #[test]
 fn sync_fixture_child() {
     if std::env::var("OPENPAW_OFFICE_SYNC_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let proof = test_support::ChildProof::start("sync_fixture_child");
     tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(sync_scenario());
+
+    proof.complete();
 }
 #[derive(Default)]
 struct Fixture {

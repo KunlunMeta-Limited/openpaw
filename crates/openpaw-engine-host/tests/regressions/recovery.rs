@@ -2,6 +2,8 @@
 //! 输入输出：隔离临时目录、确定性Provider与断言结果。
 //! 依赖：原引擎、原存储及受测共享服务。
 //! 禁止职责：不读取用户项目配置，不以模拟成功替代副作用断言。
+#[path = "../../src/test_support.rs"]
+mod test_support;
 use openpaw_engine_host::*;
 use openpaw_llm::{MockMode, MockProvider};
 use serde_json::json;
@@ -505,23 +507,26 @@ fn host_test_process_running(pid: u32) -> bool {
 #[tokio::test]
 async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval() {
     if std::env::var("OPENPAW_CHECKPOINT_HTTP_CHILD").as_deref() != Ok("1") {
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval",
-                "--nocapture",
-            ])
-            .env("OPENPAW_CHECKPOINT_HTTP_CHILD", "1")
-            .env(
-                "PAWOFFICE_CHECKPOINT_KEY",
-                "isolated-checkpoint-fixture-key",
-            )
-            .status()
-            .unwrap();
-        assert!(status.success());
+        test_support::run_child(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval",
+                    "--nocapture",
+                ])
+                .env("OPENPAW_CHECKPOINT_HTTP_CHILD", "1")
+                .env(
+                    "PAWOFFICE_CHECKPOINT_KEY",
+                    "isolated-checkpoint-fixture-key",
+                ),
+            "h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval",
+        );
         return;
     }
 
+    let proof = test_support::ChildProof::start(
+        "h08_real_process_crash_interrupts_without_replaying_and_invalidates_approval",
+    );
     for mode in [
         "accepted",
         "completed",
@@ -652,6 +657,7 @@ async fn h08_real_process_crash_interrupts_without_replaying_and_invalidates_app
         assert_eq!(std::fs::read(&report).ok(), before);
         host.shutdown().await.unwrap();
     }
+    proof.complete();
 }
 #[tokio::test]
 async fn h08_corrupt_middle_fails_start_torn_tail_repairs_and_unknown_schema_refuses() {

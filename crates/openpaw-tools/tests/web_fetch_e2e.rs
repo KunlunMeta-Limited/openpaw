@@ -46,6 +46,10 @@ fn lock_env() -> std::sync::MutexGuard<'static, ()> {
 /// Spawn a mock HTTP server that answers each accepted connection with the
 /// next raw response in `responses`. Returns `host:port`.
 fn spawn_mock(responses: Vec<String>) -> String {
+    spawn_mock_bytes(responses.into_iter().map(String::into_bytes).collect())
+}
+
+fn spawn_mock_bytes(responses: Vec<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
     let addr = listener.local_addr().expect("addr").to_string();
     std::thread::spawn(move || {
@@ -74,7 +78,7 @@ fn spawn_mock(responses: Vec<String>) -> String {
                 }
                 buf.extend_from_slice(&chunk[..n]);
             }
-            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(&resp);
             let _ = stream.flush();
         }
     });
@@ -106,6 +110,205 @@ fn http_redirect(location: &str) -> String {
     format!(
         "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     )
+}
+
+fn http_encoded(content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut response = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn gb2312_page(declaration: &str) -> Vec<u8> {
+    // “北京地铁”的真实GB2312字节；不通过被测解码库反向生成预期。
+    let mut body = format!("<html><head>{declaration}</head><body><h1>").into_bytes();
+    body.extend_from_slice(b"\xb1\xb1\xbe\xa9\xb5\xd8\xcc\xfa");
+    body.extend_from_slice(b"</h1></body></html>");
+    body
+}
+
+#[tokio::test]
+async fn r38_declared_charsets_decode_strictly_and_keep_success_cache_and_fresh() {
+    let _guard = lock_env();
+    set_gate();
+    let utf16 = "<h1>北京地铁</h1>"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let mut bom_utf16 = vec![0xff, 0xfe];
+    bom_utf16.extend_from_slice(&utf16);
+    let mut bom_utf16be = vec![0xfe, 0xff];
+    bom_utf16be.extend(
+        "<h1>北京地铁</h1>"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes),
+    );
+    let cases = [
+        ("http", "text/html; charset=gb2312", gb2312_page(""), "北京地铁"),
+        ("meta", "text/html", gb2312_page("<meta charset='gb2312'>"), "北京地铁"),
+        ("equiv", "text/html", gb2312_page("<meta content='text/html; charset=GB2312' http-equiv='Content-Type'>"), "北京地铁"),
+        ("aliases", "text/html; charset=GBK", gb2312_page("<meta charset=gb2312>"), "北京地铁"),
+        ("comment", "text/html", gb2312_page("<!-- <meta charset=bad-encoding> --><meta charset=gb2312>"), "北京地铁"),
+        ("script", "text/html", gb2312_page("<script>const example='<meta charset=bad-encoding>';</script><meta charset=gb2312>"), "北京地铁"),
+        ("utf8", "text/html; charset=UTF-8", "<h1>北京地铁</h1>".as_bytes().to_vec(), "北京地铁"),
+        ("utf8-original", "text/html; charset=GBK", "<h1>北京地铁</h1>".as_bytes().to_vec(), "北京地铁"),
+        ("bom-utf8", "text/html", b"\xef\xbb\xbf<h1>UTF8</h1>".to_vec(), "UTF8"),
+        ("bom-utf16", "text/html", bom_utf16, "北京地铁"),
+        ("bom-utf16be", "text/html", bom_utf16be, "北京地铁"),
+        ("http-utf16", "text/html; charset=utf-16le", utf16, "北京地铁"),
+        ("latin", "text/html; charset=windows-1252", b"<h1>caf\xe9</h1>".to_vec(), "café"),
+    ];
+    for (name, content_type, body, expected) in cases {
+        let addr = spawn_mock_bytes(vec![
+            http_encoded(content_type, &body),
+            http_html("<h1>Fresh replacement</h1>").into_bytes(),
+        ]);
+        let input = json!({"url":format!("http://{addr}/{name}")});
+        let first = web_fetch::run(Path::new("."), input.clone()).await.unwrap();
+        assert!(!first.is_error, "{name}: {}", first.content);
+        assert!(
+            first.content.contains(expected),
+            "{name}: {}",
+            first.content
+        );
+        assert!(!first.content.contains('\u{fffd}'));
+        let cached = web_fetch::run(Path::new("."), input.clone()).await.unwrap();
+        assert_eq!(
+            cached.content, first.content,
+            "{name}: original success cache must remain"
+        );
+        let mut fresh = input;
+        fresh["fresh"] = json!(true);
+        let fresh = web_fetch::run(Path::new("."), fresh).await.unwrap();
+        assert!(!fresh.is_error, "{name}: {}", fresh.content);
+        assert!(fresh.content.contains("Fresh replacement"));
+        assert!(fresh.content.contains("retrieval_mode: fresh"));
+    }
+    clear_gate();
+}
+
+#[tokio::test]
+async fn r38_unknown_conflicting_damaged_and_binary_text_is_refused_and_not_cached() {
+    let _guard = lock_env();
+    set_gate();
+    let mut late = vec![b' '; 1024];
+    late.extend(gb2312_page("<meta charset=gb2312>"));
+    let mut conflicting_utf16 = vec![0xff, 0xfe];
+    conflicting_utf16.extend(
+        "<meta charset=utf-8><h1>北京地铁</h1>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    let cases = [
+        ("no-declaration", "text/html", gb2312_page("")),
+        (
+            "unknown-http",
+            "text/html; charset=unknown-charset",
+            gb2312_page(""),
+        ),
+        (
+            "unknown-on-utf8",
+            "text/html; charset=unknown-charset",
+            b"<h1>Valid UTF8</h1>".to_vec(),
+        ),
+        ("utf16-conflict", "text/html", conflicting_utf16),
+        (
+            "unknown-meta",
+            "text/html",
+            gb2312_page("<meta charset=unknown-charset>"),
+        ),
+        (
+            "conflict",
+            "text/html; charset=UTF-8",
+            gb2312_page("<meta charset=GBK>"),
+        ),
+        (
+            "duplicate-http",
+            "text/html; charset=GBK; charset=UTF-8",
+            gb2312_page(""),
+        ),
+        ("empty-http", "text/html; charset=", gb2312_page("")),
+        (
+            "conflict-meta",
+            "text/html",
+            gb2312_page("<meta charset=GBK><meta charset=UTF-8>"),
+        ),
+        (
+            "bom-conflict",
+            "text/html; charset=GBK",
+            b"\xef\xbb\xbf<h1>UTF8</h1>".to_vec(),
+        ),
+        ("broken-gbk", "text/html; charset=GBK", b"<h1>\x81".to_vec()),
+        (
+            "binary",
+            "text/html; charset=GBK",
+            b"<h1>abc\0def</h1>".to_vec(),
+        ),
+        ("late-meta", "text/html", late),
+        (
+            "plain-meta",
+            "text/plain",
+            gb2312_page("<meta charset=GBK>"),
+        ),
+    ];
+    for (name, content_type, body) in cases {
+        let addr = spawn_mock_bytes(vec![
+            http_encoded(content_type, &body),
+            http_html("<h1>Recovered UTF8 page</h1>").into_bytes(),
+        ]);
+        let input = json!({"url":format!("http://{addr}/{name}")});
+        let bad = web_fetch::run(Path::new("."), input.clone()).await.unwrap();
+        assert!(bad.is_error, "{name}: {}", bad.content);
+        assert_eq!(
+            bad.structured.as_ref().unwrap()["kind"],
+            "unsupported_encoding",
+            "{name}"
+        );
+        let recovered = web_fetch::run(Path::new("."), input).await.unwrap();
+        assert!(!recovered.is_error, "{name}: {}", recovered.content);
+        assert!(recovered.content.contains("Recovered UTF8 page"));
+    }
+    clear_gate();
+}
+
+#[tokio::test]
+async fn d175_bad_http_binary_empty_and_challenge_responses_are_not_cached_success() {
+    let _guard = lock_env();
+    set_gate();
+    for (status, kind, body, expected) in [
+        ("404 Not Found", "text/html", "missing", "http_status"),
+        ("403 Forbidden", "text/html", "denied", "http_status"),
+        (
+            "429 Too Many Requests",
+            "text/html",
+            "limited",
+            "http_status",
+        ),
+        ("200 OK", "image/jpeg", "binary", "unsupported_content"),
+        (
+            "200 OK",
+            "text/html",
+            "<html><body> </body></html>",
+            "empty_content",
+        ),
+        (
+            "200 OK",
+            "text/html",
+            "<title>Just a moment</title><script src=\"/cf-chl-a\"></script>",
+            "challenge",
+        ),
+        ("200 OK", "text/html", "a\0b", "unsupported_encoding"),
+    ] {
+        let first=format!("HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+        let addr = spawn_mock(vec![first, http_html("<h1>Recovered actual page</h1>")]);
+        let input = json!({"url":format!("http://{addr}/same")});
+        let bad = web_fetch::run(Path::new("."), input.clone()).await.unwrap();
+        assert!(bad.is_error, "{expected}: {}", bad.content);
+        assert_eq!(bad.structured.as_ref().unwrap()["kind"], expected);
+        let good = web_fetch::run(Path::new("."), input).await.unwrap();
+        assert!(!good.is_error, "{}", good.content);
+        assert!(good.content.contains("Recovered actual page"));
+    }
+    clear_gate();
 }
 
 // ── 合同路径：GET 返回 HTML → 输出 Markdown ─────────────────────────────
@@ -213,6 +416,59 @@ async fn redirect_is_followed_to_mock_page() {
         "expected markdown of the redirect target page, got: {}",
         res.content
     );
+}
+
+#[tokio::test]
+async fn d188_expanding_excerpt_reuses_body_and_fresh_replaces_all_sizes() {
+    let _guard = lock_env();
+    set_gate();
+    // 每次真实连接消耗一个响应：fresh取得SECOND证明之前扩读没有重发HTTP。
+    let addr = spawn_mock(vec![
+        http_html("<p>正文😀第一版后续内容</p>"),
+        http_html("<p>SECOND新版后续内容</p>"),
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        http_html("<p>THIRD不同查询</p>"),
+    ]);
+    let url = format!("http://{addr}/expanded");
+    let first = web_fetch::run(Path::new("."), json!({"url":url,"max_chars":2}))
+        .await
+        .unwrap();
+    assert_eq!(first.content, "正文\n... (truncated at 2 chars)");
+    let expanded = web_fetch::run(Path::new("."), json!({"url":url,"max_chars":100}))
+        .await
+        .unwrap();
+    assert!(!expanded.is_error);
+    assert!(expanded.content.contains("正文😀第一版后续内容"));
+    assert!(!expanded.content.contains("truncated"));
+    let fresh = web_fetch::run(
+        Path::new("."),
+        json!({"url":url,"max_chars":3,"fresh":true}),
+    )
+    .await
+    .unwrap();
+    assert!(fresh.content.contains("SEC\n... (truncated at 3 chars)"));
+    assert!(fresh.content.contains("retrieval_mode: fresh"));
+    let expanded = web_fetch::run(Path::new("."), json!({"url":url,"max_chars":100}))
+        .await
+        .unwrap();
+    assert!(expanded.content.contains("SECOND新版后续内容"));
+    assert!(!expanded.content.contains("retrieval_mode: fresh"));
+    let refused = web_fetch::run(Path::new("."), json!({"url":url,"fresh":true}))
+        .await
+        .unwrap();
+    assert!(refused.is_error);
+    let retained = web_fetch::run(Path::new("."), json!({"url":url,"max_chars":100}))
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.content, expanded.content,
+        "fresh失败不能缓存错误或伪造刷新成功"
+    );
+    let other = web_fetch::run(Path::new("."), json!({"url":format!("{url}?other=1")}))
+        .await
+        .unwrap();
+    assert!(other.content.contains("THIRD不同查询"));
+    clear_gate();
 }
 
 #[tokio::test]

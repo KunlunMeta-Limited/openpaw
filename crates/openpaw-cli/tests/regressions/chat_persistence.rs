@@ -86,6 +86,7 @@ fn run_chat(
         .arg("--workspace")
         .arg(workspace)
         .env("OPENAI_API_KEY", "fixture-key")
+        .env("OPENPAW_HOME", home.join("unused-global-home"))
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
         .stdin(Stdio::piped())
@@ -195,6 +196,7 @@ fn invalid_model_and_embedded_credentials_fail_before_connecting() {
             .arg("--home")
             .arg(home.path())
             .env("OPENAI_API_KEY", "fixture-key")
+            .env("OPENPAW_HOME", home.path().join("unused-global-home"))
             .output()
             .unwrap();
         assert!(!output.status.success());
@@ -224,4 +226,83 @@ fn successful_tool_turn_persists_user_result_and_matching_ids() {
     assert!(out.events.iter().any(
         |e| matches!(e, SessionEvent::ToolCallComplete { call_id, .. } if call_id == "call-real-1")
     ));
+}
+
+#[test]
+fn cli_write_stays_autoapproved_and_unsupported_tools_are_not_advertised() {
+    let home = tempfile::tempdir().unwrap();
+    let write = json!({"tool_calls":[{"index":0,"id":"r39-write","type":"function","function":{"name":"write_file","arguments":"{\"path\":\"approved.txt\",\"content\":\"real local write\"}"}}]});
+    let (base, worker) = server(vec![
+        frame(write, json!("tool_calls")),
+        frame(json!({"content":"saved"}), json!("stop")),
+    ]);
+    let output = run_chat(home.path(), home.path(), &base, None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("approved.txt")).unwrap(),
+        "real local write"
+    );
+    let requests = worker.join().unwrap();
+    let tools = requests[0]["tools"].as_array().unwrap();
+    for name in ["clarify", "enter_plan_mode", "exit_plan_mode"] {
+        assert!(
+            !tools.iter().any(|t| t["function"]["name"] == name),
+            "未实现的能力不应向模型声明：{name}"
+        );
+    }
+    assert!(transcript(home.path()).events.iter().any(|e| matches!(e, SessionEvent::ToolCallComplete {call_id, success: true, ..} if call_id == "r39-write")));
+}
+
+#[test]
+fn explicit_chat_home_is_also_the_session_search_data_domain() {
+    let home = tempfile::tempdir().unwrap();
+    let wrong = tempfile::tempdir().unwrap();
+    let mut seed = Command::new(env!("CARGO_BIN_EXE_openpaw"))
+        .args(["chat", "--provider", "echo", "--home"])
+        .arg(home.path())
+        .env("OPENPAW_HOME", wrong.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seed.stdin
+        .take()
+        .unwrap()
+        .write_all(b"UNIQUE_R39_HOME_SCOPE\nexit\n")
+        .unwrap();
+    assert!(seed.wait_with_output().unwrap().status.success());
+    let search = json!({"tool_calls":[{"index":0,"id":"r39-search","type":"function","function":{"name":"session_search","arguments":"{\"query\":\"UNIQUE_R39_HOME_SCOPE\"}"}}]});
+    let (base, worker) = server(vec![
+        frame(search, json!("tool_calls")),
+        frame(json!({"content":"found"}), json!("stop")),
+    ]);
+    let output = run_chat(home.path(), home.path(), &base, None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = worker.join().unwrap();
+    let result = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["tool_call_id"] == "r39-search")
+        .unwrap();
+    assert!(
+        result["content"]
+            .as_str()
+            .unwrap()
+            .contains("UNIQUE_R39_HOME_SCOPE"),
+        "应读取显式home索引：{result}"
+    );
+    assert!(
+        !wrong.path().join("index.db").exists(),
+        "显式home不能在全局根创建索引"
+    );
 }

@@ -649,12 +649,15 @@ impl Db {
                 "tool_waiting_resource"
                 | "tool_started"
                 | "tool_result"
+                | "question"
                 | "run_progress"
                 | "continuous_task"
                 | "agent_group"
                 | "agent_budget"
                 | "agent_delegation"
                 | "artifact_published"
+                | "delivery_inspected"
+                | "delivery_checked"
                 | "artifact_capture_failed"
                 | "approval_policy" => {
                     let run = serde_json::from_str::<serde_json::Value>(&reference)
@@ -884,6 +887,29 @@ impl Db {
                     }
                 }
             }
+            let mut pending_questions=self.conn.prepare("SELECT reference FROM host_events WHERE kind='question' AND json_extract(reference,'$.run_id')=?1 ORDER BY revision").map_err(HostError::storage)?;
+            let rows = pending_questions
+                .query_map([id], |r| r.get::<_, String>(0))
+                .map_err(HostError::storage)?;
+            let mut questions = BTreeMap::new();
+            for row in rows {
+                let state: crate::question::State =
+                    serde_json::from_str(&row.map_err(HostError::storage)?)
+                        .map_err(HostError::storage)?;
+                if state.version != 1 {
+                    return Err(HostError::new("storage_unavailable", "问题控制版本不兼容"));
+                }
+                questions.insert(state.call_id.clone(), state);
+            }
+            if !run.state.is_terminal() && run.state != RunState::Cancelling {
+                for (call_id, state) in questions {
+                    if state.state == "pending" {
+                        if let Some(tool) = tools.get_mut(&call_id) {
+                            tool.state = "awaiting_user".into();
+                        }
+                    }
+                }
+            }
             run.tools = tools.into_values().collect();
             // delegate_task的异步返回仅为接受。子Run才是完成事实，不能让
             // ToolCallComplete(success=true)把尚在执行的同事变成成功证据。
@@ -928,6 +954,240 @@ impl Db {
         }
         Ok(run)
     }
+    /// 功能：从可信原Run和父子绑定确定问题展示会话及角色。
+    /// 参数：run_id为当前工具所属运行。
+    /// 返回：真实Office父会话及角色，不接受模型指定身份。
+    /// 错误：已删除、非Office或父子归属不一致。
+    /// 状态：只读，不创建会话。
+    /// 并发与取消：原Store单写序列内运行，不持资源锁。
+    /// 权限：主子工作根、父会话及删除意图均沿原绑定校验。
+    /// 关联：REQ-OP-013/023；DES-OP-008/012；CHG-2026-0007第9.16节。
+    fn question_owner(&self, run_id: &str) -> HostResult<(ClientScope, String)> {
+        let run = self.run_metadata(run_id)?;
+        let binding = self.binding(&run.session_id)?;
+        self.check_live_scope(&binding.scope)?;
+        if binding.scope.namespace == "office" {
+            return Ok((binding.scope, "lead".into()));
+        }
+        let delegation = self
+            .delegation_for_child(run_id)?
+            .ok_or_else(|| HostError::new("scope_denied", "问题没有真实Office所属关系"))?;
+        self.check_live_scope(&delegation.parent_scope)?;
+        let parent = self.run_metadata(&delegation.run_id)?;
+        let owner = self.binding(&parent.session_id)?;
+        if parent.state.is_terminal()
+            || parent.state == RunState::Cancelling
+            || owner.scope != delegation.parent_scope
+            || owner.root_id != binding.root_id
+            || delegation.child_session != run.session_id
+        {
+            return Err(HostError::new(
+                "cancelled",
+                "问题的父任务已停止或绑定已改变",
+            ));
+        }
+        Ok((delegation.parent_scope, delegation.role_id))
+    }
+    /// 功能：读取一个问题的最后控制事实并检查版本和不可变绑定。
+    /// 参数：id为Host生成的问题ID。
+    /// 返回：当前状态；不存在返回None。
+    /// 错误：SQL、JSON、版本或字段损坏，不能视为空闲或已回答。
+    /// 状态：只读原host_events，不读取答案正文。
+    /// 并发与取消：单写队列内调用；不会自动恢复展示或执行。
+    /// 权限：调用方必须已核对原Run作用域。
+    /// 关联：REQ-OP-013/016；DES-OP-008/009；CHG-2026-0007第7.1节。
+    pub(crate) fn question(&self, id: &str) -> HostResult<Option<crate::question::State>> {
+        let raw: Option<String> = self.conn.query_row("SELECT reference FROM host_events WHERE kind='question' AND json_extract(reference,'$.question_id')=?1 ORDER BY revision DESC LIMIT 1", [id], |r|r.get(0)).optional().map_err(HostError::storage)?;
+        raw.map(|raw| {
+            let state: crate::question::State =
+                serde_json::from_str(&raw).map_err(HostError::storage)?;
+            if state.version != 1
+                || state.question_id != id
+                || state.input_digest.len() != 64
+                || state.expires_at_ms < state.created_at_ms
+                || state.expires_at_ms - state.created_at_ms > 300000
+                || !matches!(
+                    state.state.as_str(),
+                    "pending"
+                        | "answered"
+                        | "declined"
+                        | "expired"
+                        | "cancelled"
+                        | "display_failed"
+                        | "interrupted"
+                )
+            {
+                return Err(HostError::new(
+                    "storage_unavailable",
+                    "问题控制事实版本或字段损坏",
+                ));
+            }
+            Ok(state)
+        })
+        .transpose()
+    }
+    /// 功能：在工具实际开始处创建固定期限问题，拒绝同call重复开问。
+    /// 参数：binding为最终原调用，expires为Host绝对期限，cancel为原调用取消。
+    /// 返回：持久化的pending控制事实。
+    /// 错误：无真实Office绑定、调用冲突、停止、期限或存储错误。
+    /// 状态：只写原工具开始及question控制事实，答案不进入控制库。
+    /// 并发与取消：单写CAS与删除/停止按同一队列排序；不持根锁。
+    /// 权限：从原Run派生父会话和角色，不提升任何工具许可。
+    /// 关联：REQ-OP-013/023；DES-OP-008/012；CHG-2026-0007第9.16节。
+    pub(crate) fn question_start(
+        &mut self,
+        binding: &openpaw_core::ToolCallBinding,
+        expires: i64,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> HostResult<crate::question::State> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let run = self.run_metadata(&binding.run_id)?;
+        if cancel.is_cancelled() || run.state != RunState::Running {
+            return Err(HostError::new("cancelled", "本轮已停止，不能创建问题"));
+        }
+        if binding.tool_name != "clarify" || expires <= now || expires > now + 300000 {
+            return Err(HostError::new("invalid_input", "问题工具或期限不合法"));
+        }
+        crate::question::validate(&binding.input)?;
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM host_events WHERE kind='question' AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.call_id')=?2)", params![binding.run_id,binding.call_id], |r|r.get(0)).map_err(HostError::storage)?;
+        if exists {
+            return Err(HostError::new(
+                "request_conflict",
+                "同一问题调用不能重复展示或执行",
+            ));
+        }
+        let (scope, role_id) = self.question_owner(&binding.run_id)?;
+        let state = crate::question::State {
+            version: 1,
+            question_id: uuid::Uuid::new_v4().simple().to_string(),
+            run_id: binding.run_id.clone(),
+            call_id: binding.call_id.clone(),
+            input_digest: crate::question::digest(&binding.input)?,
+            scope,
+            role_id,
+            created_at_ms: now,
+            expires_at_ms: expires,
+            state: "pending".into(),
+            display_id: None,
+            answer_digest: None,
+        };
+        self.bump(
+            "tool_started",
+            &serde_json::to_string(binding).map_err(HostError::storage)?,
+        )?;
+        self.save_question(&state)?;
+        Ok(state)
+    }
+    /// 功能：为同一问题登记当前唯一display，不重置问题或到期时间。
+    /// 参数：id/display为Host生成标识，cancel为原调用取消。
+    /// 返回：提交完成。
+    /// 错误：非pending、已停止/删除/超时或存储错误。
+    /// 状态：仅替换展示关联，旧display不能提交答案。
+    /// 并发与取消：单写CAS，HTTP重开前先释放旧连接。
+    /// 权限：每次重查原Run与父会话，display不是执行授权。
+    /// 关联：REQ-OP-013/016；DES-OP-008/009；CHG-2026-0007第9.16节。
+    pub(crate) fn question_display(
+        &mut self,
+        id: &str,
+        display: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> HostResult<()> {
+        let mut state = self
+            .question(id)?
+            .ok_or_else(|| HostError::new("not_found", "问题不存在"))?;
+        if state.state != "pending"
+            || cancel.is_cancelled()
+            || self.run_metadata(&state.run_id)?.state != RunState::Running
+        {
+            return Err(HostError::new("cancelled", "问题已结束或停止"));
+        }
+        if state.expires_at_ms - chrono::Utc::now().timestamp_millis() < 1000 {
+            return Err(HostError::new("decision_expired", "问题已到期"));
+        }
+        let (scope, role) = self.question_owner(&state.run_id)?;
+        if scope != state.scope || role != state.role_id {
+            return Err(HostError::new("scope_denied", "问题所属关系已改变"));
+        }
+        state.display_id = Some(display.into());
+        self.save_question(&state)
+    }
+    /// 功能：唯一收敛问题结果；停止、删除和到期优先于晚到回答。
+    /// 参数：id/display绑定当前展示，result为结果类别，answer_digest仅为原答案摘要，cancel同源。
+    /// 返回：实际终态；重复调用不重复接受答案。
+    /// 错误：未知结果、旧display、SQL或绑定损坏。
+    /// 状态：控制事实及工具结果元数据配对；完整文本由原AgentLoop记账。
+    /// 并发与取消：原Store单写CAS，无等待/事务跨用户交互。
+    /// 权限：答案不能消费或产生执行审批。
+    /// 关联：REQ-OP-013/016；DES-OP-008/009；CHG-2026-0007第9.16节。
+    pub(crate) fn question_finish(
+        &mut self,
+        id: &str,
+        display: Option<&str>,
+        result: &str,
+        answer_digest: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> HostResult<String> {
+        let mut state = self
+            .question(id)?
+            .ok_or_else(|| HostError::new("not_found", "问题不存在"))?;
+        if state.state != "pending" {
+            return Ok(state.state);
+        }
+        if !matches!(
+            result,
+            "answered" | "declined" | "expired" | "cancelled" | "display_failed"
+        ) {
+            return Err(HostError::new("invalid_input", "未知问题结果"));
+        }
+        if state.display_id.as_deref() != display {
+            return Err(HostError::new("request_conflict", "旧问题展示不能提交答案"));
+        }
+        let owner = self.question_owner(&state.run_id);
+        let run = self.run_metadata(&state.run_id)?;
+        let stopped = cancel.is_cancelled()
+            || run.state != RunState::Running
+            || owner.as_ref().is_err_and(|e| {
+                matches!(e.kind.as_str(), "cancelled" | "not_found" | "scope_denied")
+            });
+        if let Err(e) = &owner {
+            if !stopped {
+                return Err(e.clone());
+            }
+        }
+        state.state = if stopped {
+            "cancelled"
+        } else if state.expires_at_ms <= chrono::Utc::now().timestamp_millis() {
+            "expired"
+        } else {
+            result
+        }
+        .into();
+        if !stopped
+            && owner
+                .as_ref()
+                .is_ok_and(|(scope, role)| scope != &state.scope || role != &state.role_id)
+        {
+            return Err(HostError::new("scope_denied", "问题所属关系已改变"));
+        }
+        if matches!(state.state.as_str(), "answered" | "declined") {
+            if state.display_id.is_none() || answer_digest.as_ref().is_none_or(|s| s.len() != 64) {
+                return Err(HostError::new("invalid_input", "答案缺少真实展示或摘要"));
+            }
+            state.answer_digest = answer_digest;
+        }
+        self.save_question(&state)?;
+        let revision=self.bump("tool_result",&serde_json::json!({"run_id":state.run_id,"call_id":state.call_id,"success":matches!(state.state.as_str(),"answered"|"declined")}).to_string())?;
+        let _ = self.notices.send(HostNotice::Changed { revision });
+        Ok(state.state)
+    }
+    fn save_question(&mut self, state: &crate::question::State) -> HostResult<()> {
+        let revision = self.bump(
+            "question",
+            &serde_json::to_string(state).map_err(HostError::storage)?,
+        )?;
+        let _ = self.notices.send(HostNotice::Changed { revision });
+        Ok(())
+    }
     /// 功能：读取主Run最后持久化的持续任务控制记录。
     /// 参数：id为已授权调用方提供的稳定RunID。
     /// 返回：准确控制记录或尚未启动时None。
@@ -958,10 +1218,12 @@ impl Db {
     ) -> HostResult<Option<openpaw_core::ToolCallBinding>> {
         if run.state.is_terminal()
             || run.state == RunState::Cancelling
-            || run
-                .tools
-                .iter()
-                .any(|t| matches!(t.state.as_str(), "awaiting_approval" | "awaiting_resource"))
+            || run.tools.iter().any(|t| {
+                matches!(
+                    t.state.as_str(),
+                    "awaiting_approval" | "awaiting_resource" | "awaiting_user"
+                )
+            })
             || !run.tools.iter().any(|t| {
                 matches!(t.state.as_str(), "running" | "completed")
                     && !matches!(
@@ -1321,6 +1583,22 @@ impl Db {
         id: &str,
         history: &[openpaw_core::Message],
     ) -> HostResult<()> {
+        self.reconcile_history_with_display(id, history, None)
+    }
+    /// 功能：在同一原Store序列中比较历史及调用方可信展示别名。
+    /// 参数：id/history为原会话历史，display为服务端适配器纯转换函数。
+    /// 返回：原正文或同位置可信展示一致时成功。
+    /// 错误：转换、账本或历史冲突沿原错误返回。
+    /// 状态：只按原首次导入规则追加；别名不写入模型历史。
+    /// 并发与取消：转换与最终核对位于同一单写序列，不读取过期缓存。
+    /// 权限：函数由可信Host装配，浏览器不能提供或覆盖别名。
+    /// 关联：需求/设计：CHG-2026-0007 §12.169；REQ-OP-014；DES-OP-007。
+    pub(crate) fn reconcile_history_with_display(
+        &mut self,
+        id: &str,
+        history: &[openpaw_core::Message],
+        display: Option<fn(&Db, &RunView) -> HostResult<String>>,
+    ) -> HostResult<()> {
         use openpaw_core::{Message, Role};
         let same = |a: &Message, b: &Message| a.role == b.role && a.text() == b.text();
         let runs: Vec<_> = self
@@ -1382,7 +1660,6 @@ impl Db {
         }
         let mut complete_history = Vec::new();
         let mut display_aliases = std::collections::BTreeMap::new();
-        let office_history = self.binding(id)?.scope.namespace == "office";
         if let Some((offset, count, _, true)) = imported {
             for e in events.iter().skip(offset).take(count) {
                 if let SessionEvent::Message(m) = e {
@@ -1409,8 +1686,8 @@ impl Db {
                     let view = self.get_run(&r.run_id)?;
                     if !view.text.trim().is_empty() {
                         complete_history.push(m.clone());
-                        if office_history {
-                            let display = crate::office::chat_display(self, &view)?;
+                        if let Some(convert) = display {
+                            let display = convert(self, &view)?;
                             if display != view.text {
                                 display_aliases.insert(
                                     complete_history.len(),
@@ -1771,6 +2048,22 @@ impl Db {
                     ));
                 }
                 self.save_run(run, 0)?;
+            }
+        }
+        let question_ids: Vec<String> = {
+            let mut query=self.conn.prepare("SELECT DISTINCT json_extract(reference,'$.question_id') FROM host_events WHERE kind='question'").map_err(HostError::storage)?;
+            let rows = query
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(HostError::storage)?;
+            rows.collect::<Result<_, _>>().map_err(HostError::storage)?
+        };
+        for id in question_ids {
+            let mut state = self
+                .question(&id)?
+                .ok_or_else(|| HostError::new("storage_unavailable", "问题恢复事实丢失"))?;
+            if state.state == "pending" {
+                state.state = "interrupted".into();
+                self.save_question(&state)?;
             }
         }
         for mut a in self.approvals()? {
@@ -3195,7 +3488,7 @@ impl Db {
         }
         let dir = self.home.join("engine-host/artifacts");
         if dir.exists() {
-            crate::office::artifacts::private_dir(&dir)?;
+            crate::artifacts::private_dir(&dir)?;
         }
         self.conn.execute("INSERT INTO host_artifact_settings(key,value) VALUES('origin',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[origin]).map_err(HostError::storage)?;
         Ok(())
@@ -3215,7 +3508,7 @@ impl Db {
         mime: &str,
         bytes: &[u8],
     ) -> HostResult<Option<serde_json::Value>> {
-        use crate::office::artifacts as a;
+        use crate::artifacts as a;
         let run = self.get_run(&binding.run_id)?;
         let own = self.binding(&run.session_id)?;
         let (scope, parent) = if let Some(d) = self.delegation_for_child(&run.run_id)? {
@@ -3305,16 +3598,146 @@ impl Db {
         let rows = stmt
             .query_map([key], |r| r.get::<_, String>(0))
             .map_err(HostError::storage)?;
-        let data = rows
+        let mut data: Vec<serde_json::Value> = rows
             .map(|r| {
                 serde_json::from_str(&r.map_err(HostError::storage)?).map_err(HostError::storage)
             })
             .collect::<HostResult<Vec<_>>>()?;
+        // 单次读取该会话版本关联的最新检查，避免逐文件查询或跨会话继承结论。
+        let mut checks = self.conn.prepare("SELECT reference FROM host_events WHERE kind='delivery_checked' AND json_extract(reference,'$.version') IN (SELECT version FROM host_artifact_versions WHERE scope=?1) ORDER BY revision DESC").map_err(HostError::storage)?;
+        let records = checks
+            .query_map(
+                [serde_json::to_string(scope).map_err(HostError::storage)?],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(HostError::storage)?;
+        let mut seen = std::collections::HashSet::new();
+        for record in records {
+            let record: serde_json::Value =
+                serde_json::from_str(&record.map_err(HostError::storage)?)
+                    .map_err(HostError::storage)?;
+            let version = record["version"]
+                .as_str()
+                .ok_or_else(|| HostError::new("storage_unavailable", "核验版本记录损坏"))?;
+            if !seen.insert(version.to_owned()) {
+                continue;
+            }
+            if let Some(row) = data
+                .iter_mut()
+                .find(|row| row["version"] == version && row["hash"] == record["hash"])
+            {
+                row["check_summary"] = serde_json::json!(crate::delivery::summary(Some(&record)));
+                row["check_detail"] = serde_json::json!(format!("最近一次有限检查\nversion: {}\nSHA256: {}\n{}\n自动条件: {}\n模型意见: {}\n只覆盖所列条件；模型意见不是客观证明，历史检查保留在原账本。",version,record["hash"].as_str().unwrap_or(""),crate::delivery::summary(Some(&record)),record["deterministic_checks"],record["assessment"]));
+            }
+        }
         Ok((data, self.home.join("engine-host/artifacts")))
     }
-    /// 功能：验证确定版本的单资源能力并返回原件字节。
-    /// 参数：version/access为URL版本和单版本能力；delivery选择原件或交付JSON。
-    /// 返回：经过墓碑、能力和SHA256核对的有界字节及MIME。
+
+    /// 功能：在原Store内绑定真实版本读取与范围明确的核验事实。
+    /// 参数：binding为准确工具调用，value为最终输入。
+    /// 返回：当前授权目录、有界摘录或确切版本的有限检查结果。
+    /// 错误：跨作用域、墓碑、未知版本、伪造回执、非UTF8及超限拒绝。
+    /// 状态：复用host_events记read/check；不写业务文件、不修改执行终态。
+    /// 并发与取消：原Store串行，调用方先核取消；逐call幂等且每Run最多256条。
+    /// 权限：scope只从本Run原绑定及可信父子关系取得，不接受模型传scope。
+    /// 关联：CHG-2026-0007第12.160节；REQ-OP-014/022。
+    pub(crate) fn inspect_delivery(
+        &mut self,
+        binding: &openpaw_core::ToolCallBinding,
+        value: &serde_json::Value,
+    ) -> HostResult<serde_json::Value> {
+        use serde_json::json;
+        crate::delivery::validate(value)?;
+        let run = self.get_run(&binding.run_id)?;
+        let own = self.binding(&run.session_id)?;
+        let scope = self
+            .delegation_for_child(&run.run_id)?
+            .map_or(own.scope, |d| d.parent_scope);
+        if scope.namespace != "office"
+            || binding.tool_name != "inspect_delivery"
+            || binding.input != *value
+            || run.state.is_terminal()
+            || run.state == RunState::Cancelling
+        {
+            return Err(HostError::new(
+                "scope_denied",
+                "核验不属于当前活动Office运行",
+            ));
+        }
+        let (rows, dir) = self.artifacts(&scope)?;
+        if value["action"] == "list" {
+            let versions: Vec<_> = rows.iter().take(20).map(|row|json!({"version":row["version"],"hash":row["hash"],"path":row["path"],"bytes":row["bytes"],"run_id":row["run_id"],"check_summary":row["check_summary"]})).collect();
+            return Ok(
+                json!({"versions":versions,"total_versions":rows.len(),"returned":versions.len(),"note":"只列最近20个版本；未登记核验不等于内容失败。"}),
+            );
+        }
+        let row = rows
+            .iter()
+            .find(|row| row["version"] == value["version"])
+            .ok_or_else(|| HostError::new("scope_denied", "版本不属于当前会话或不存在"))?;
+        let prior: Option<String> = self.conn.query_row("SELECT reference FROM host_events WHERE kind IN ('delivery_inspected','delivery_checked') AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.call_id')=?2 ORDER BY revision DESC LIMIT 1",params![binding.run_id,binding.call_id],|r|r.get(0)).optional().map_err(HostError::storage)?;
+        if let Some(prior) = &prior {
+            let prior: serde_json::Value =
+                serde_json::from_str(prior).map_err(HostError::storage)?;
+            if prior["input_hash"] != crate::artifacts::sha256(value.to_string().as_bytes()) {
+                return Err(HostError::new("request_conflict", "同一核验调用不能改输入"));
+            }
+            // read不在事件复制正文，原件按hash重新读取，返回完全相同的范围。
+            if value["action"] == "check" {
+                return Ok(prior);
+            }
+        }
+        let bytes = crate::artifacts::read_blob(&dir, row)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            HostError::new(
+                "unsupported",
+                "文本核验不支持二进制原件，不能声称已检查图片内容",
+            )
+        })?;
+        let receipt: Option<String> = if value["action"] == "check" {
+            self.conn.query_row("SELECT reference FROM host_events WHERE kind='delivery_inspected' AND json_extract(reference,'$.run_id')=?1 AND json_extract(reference,'$.call_id')=?2 AND json_extract(reference,'$.version')=?3 AND json_extract(reference,'$.hash')=?4 ORDER BY revision DESC LIMIT 1",params![binding.run_id,value["inspected_call_id"].as_str().unwrap_or(""),row["version"].as_str(),row["hash"].as_str()],|r|r.get(0)).optional().map_err(HostError::storage)?
+        } else {
+            None
+        };
+        let receipt: Option<serde_json::Value> = receipt
+            .map(|v| serde_json::from_str(&v).map_err(HostError::storage))
+            .transpose()?;
+        let mut result = crate::delivery::evaluate(value, text, receipt.as_ref())?;
+        result["version"] = row["version"].clone();
+        result["hash"] = row["hash"].clone();
+        result["path"] = row["path"].clone();
+        result["run_id"] = json!(binding.run_id);
+        result["call_id"] = json!(binding.call_id);
+        result["inspected_call_id"] = value["inspected_call_id"].clone();
+        result["at"] = json!(chrono::Utc::now().to_rfc3339());
+        result["input_hash"] = json!(crate::artifacts::sha256(value.to_string().as_bytes()));
+        if value["action"] == "read" {
+            result["read_call_id"] = json!(binding.call_id);
+        }
+        let mut saved = result.clone();
+        saved.as_object_mut().unwrap().remove("text");
+        let count:u64=self.conn.query_row("SELECT COUNT(*) FROM host_events WHERE kind IN ('delivery_inspected','delivery_checked') AND json_extract(reference,'$.run_id')=?1",[&binding.run_id],|r|r.get(0)).map_err(HostError::storage)?;
+        if prior.is_none() && count >= 256 {
+            return Err(HostError::new(
+                "capacity_exceeded",
+                "本轮产物读取/核验记录已达256条",
+            ));
+        }
+        let kind = if value["action"] == "read" {
+            "delivery_inspected"
+        } else {
+            "delivery_checked"
+        };
+        let exists:u64=self.conn.query_row("SELECT COUNT(*) FROM host_events WHERE kind=?1 AND json_extract(reference,'$.run_id')=?2 AND json_extract(reference,'$.call_id')=?3",params![kind,binding.run_id,binding.call_id],|r|r.get(0)).map_err(HostError::storage)?;
+        if exists == 0 {
+            let revision = self.bump(kind, &saved.to_string())?;
+            let _ = self.notices.send(HostNotice::Changed { revision });
+        }
+        Ok(result)
+    }
+    /// 功能：验证确定版本的单资源能力并返回授权后的原版本事实。
+    /// 参数：version/access为原URL版本与能力；delivery控制是否读取同作用域关联版本。
+    /// 返回：已核对墓碑与能力的版本元数据、关联版本及固定blob目录；调用方在同一Store序列中读取或转换。
     /// 错误：存储、作用域或数据损坏明确拒绝。
     /// 状态：不改变原工具、Run或工作区文件。
     /// 并发与取消：原Store线程串行，不重放工具；删除墓碑优先核验。
@@ -3325,8 +3748,8 @@ impl Db {
         version: &str,
         access: &str,
         delivery: bool,
-    ) -> HostResult<(Vec<u8>, String)> {
-        use crate::office::artifacts as a;
+    ) -> HostResult<(serde_json::Value, Vec<serde_json::Value>, PathBuf)> {
+        use crate::artifacts as a;
         let raw: Option<String> = self
             .conn
             .query_row(
@@ -3347,23 +3770,12 @@ impl Db {
             return Err(denied());
         }
         let dir = self.home.join("engine-host/artifacts");
-        if delivery {
-            let (rows, _) = self.artifacts(&scope)?;
-            let result = a::delivery(&data, &rows, &dir)?;
-            let bytes = serde_json::to_vec(&result).map_err(HostError::storage)?;
-            if bytes.len() > 64000 {
-                return Err(HostError::new("capacity_exceeded", "历史交付JSON超过64KB"));
-            }
-            return Ok((bytes, "application/json".into()));
-        }
-        let bytes = a::read_blob(&dir, &data)?;
-        Ok((
-            bytes,
-            data["mime"]
-                .as_str()
-                .unwrap_or("application/octet-stream")
-                .to_owned(),
-        ))
+        let rows = if delivery {
+            self.artifacts(&scope)?.0
+        } else {
+            Vec::new()
+        };
+        Ok((data, rows, dir))
     }
 }
 
@@ -3466,6 +3878,72 @@ mod office_regressions {
             "精确可信路径不需要访问旧根"
         );
         assert!(migrated_relative_path(&verbatim.join(relative), &canonical).is_none());
+    }
+
+    #[tokio::test]
+    async fn d170_delivery_checks_bind_scope_version_receipt_and_preserve_run_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let cfg: HostConfig = serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(cfg).await.unwrap();
+        let mut sessions = Vec::new();
+        for name in ["first", "other"] {
+            sessions.push(
+                host.open_session(ClientScope {
+                    namespace: "office".into(),
+                    slot_id: "office-1".into(),
+                    conversation_id: name.into(),
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        host.inner.store.call(move |db| {
+            db.artifact_origin("http://127.0.0.1:12345")?;
+            for (i,b) in sessions.iter().enumerate() {
+                db.append(&b.session_id,SessionEvent::RunStarted{run_id:format!("run-{i}")})?;
+                db.save_run(RunView{run_id:format!("run-{i}"),session_id:b.session_id.clone(),state:RunState::Running,revision:0,text:String::new(),error:None,tools:vec![],text_truncated:false},0)?;
+            }
+            let call=|run:&str,id:&str,input:serde_json::Value|openpaw_core::ToolCallBinding{run_id:run.into(),call_id:id.into(),tool_name:"inspect_delivery".into(),input};
+            let writer=openpaw_core::ToolCallBinding{run_id:"run-0".into(),call_id:"write-1".into(),tool_name:"write_file".into(),input:json!({"path":"note.md","content":"# 甲乙\n金额100元"})};
+            let old=db.capture_artifact(&writer,"note.md","text/markdown","# 甲乙\n金额100元".as_bytes())?.unwrap();
+            let read=json!({"action":"read","version":old["version"]});
+            let denied=call("run-1","cross",read.clone());
+            assert_eq!(db.inspect_delivery(&denied,&read).unwrap_err().kind,"scope_denied");
+            let r=call("run-0","read-1",read.clone());let actual=db.inspect_delivery(&r,&read)?;
+            assert_eq!(actual["text"],"# 甲乙\n金额100元");assert!(actual["full_text"].as_bool().unwrap());
+            db.inspect_delivery(&r,&read)?;
+            let inspect_count:u64=db.conn.query_row("SELECT COUNT(*) FROM host_events WHERE kind='delivery_inspected'",[],|r|r.get(0)).unwrap();assert_eq!(inspect_count,1);
+            let check=json!({"action":"check","version":old["version"],"inspected_call_id":"missing","contains":["金额200元"]});
+            assert!(db.inspect_delivery(&call("run-0","bad",check.clone()),&check).is_err());
+            let mut check=check;check["inspected_call_id"]=json!("read-1");
+            let result=db.inspect_delivery(&call("run-0","check-1",check.clone()),&check)?;
+            assert_eq!(result["deterministic_failed"],1);
+            assert_eq!(db.inspect_delivery(&call("run-0","check-1",check.clone()),&check)?,result);
+            assert_eq!(db.get_run("run-0")?.state,RunState::Running,"验收失败不能篡改执行终态");
+            let mut changed=check.clone();changed["contains"]=json!(["金额100元"]);
+            assert_eq!(db.inspect_delivery(&call("run-0","check-1",changed.clone()),&changed).unwrap_err().kind,"request_conflict");
+            let mut writer=writer;writer.call_id="write-2".into();
+            let new=db.capture_artifact(&writer,"note.md","text/markdown","# 新版\n金额200元".as_bytes())?.unwrap();
+            let rows=db.artifacts(&sessions[0].scope)?.0;
+            assert!(rows[0]["check_summary"].is_null(),"新版不继承旧版核验");
+            assert!(rows[1]["check_summary"].as_str().unwrap().contains("1项未通过"));
+            let mut forged=check.clone();forged["version"]=new["version"].clone();
+            assert!(db.inspect_delivery(&call("run-0","wrong-version",forged.clone()),&forged).is_err());
+            let new_read=json!({"action":"read","version":new["version"]});
+            db.inspect_delivery(&call("run-0","read-2",new_read.clone()),&new_read)?;
+            forged["inspected_call_id"]=json!("read-2");
+            assert_eq!(db.inspect_delivery(&call("run-0","check-2",forged.clone()),&forged)?["deterministic_failed"],0);
+            assert!(db.artifacts(&sessions[0].scope)?.0[0]["check_summary"].as_str().unwrap().contains("其余未核验"));
+            let bytes=super::super::office::artifacts::delivery(&rows[1],&rows,&temp.path().join("home/engine-host/artifacts"))?;
+            assert!(bytes["result"]["note"].as_str().unwrap().contains("1项未通过"));
+            // 结束/取消后不能继续向当前Run登记新的核验。
+            let mut run=db.get_run("run-0")?;run.state=RunState::Cancelled;db.save_run(run,0)?;
+            assert_eq!(db.inspect_delivery(&call("run-0","late",read.clone()),&read).unwrap_err().kind,"scope_denied");
+            Ok(())
+        }).await.unwrap();
+        host.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3776,7 +4254,7 @@ mod office_regressions {
                 db.save_run(RunView {run_id:id.into(),session_id:binding.session_id.clone(),state:RunState::Running,revision:0,text:String::new(),tools:vec![],error:None,text_truncated:false},0)?;
             }
             for id in ["parent", "child"] {
-                for kind in ["agent_group", "agent_delegation", "agent_budget", "run_progress", "tool_waiting_resource", "tool_started", "tool_result", "continuous_task", "approval_policy", "artifact_published", "artifact_capture_failed"] {
+                for kind in ["agent_group", "agent_delegation", "agent_budget", "run_progress", "tool_waiting_resource", "tool_started", "tool_result", "continuous_task", "approval_policy", "artifact_published", "artifact_capture_failed", "delivery_inspected", "delivery_checked"] {
                     let before = db.revision()?;
                     db.bump(kind, &json!({"run_id":id,"call_id":format!("{id}-{kind}"),"tool_name":"read_file","input":{}}).to_string())?;
                     assert!(!db.office_projection_changed("office-1", before)?, "unrelated {id}/{kind} must not force historical replay");
@@ -4328,6 +4806,169 @@ mod office_regressions {
             Ok(())
         }).await.unwrap();
         assert!(host.open_session(scope).await.is_err());
+        host.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod question_cas_tests {
+    use super::*;
+    use crate::{Host, HostConfig};
+    use serde_json::json;
+    #[tokio::test]
+    async fn question_cas_rejects_old_display_late_answers_and_never_replays_on_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let cfg:HostConfig=serde_json::from_value(json!({"home":temp.path().join("home"),"roots":{"r":root},"slots":{"office-1":"r"},"provider":"echo"})).unwrap();
+        let host = Host::start(cfg).await.unwrap();
+        let binding = host
+            .open_session(ClientScope {
+                namespace: "office".into(),
+                slot_id: "office-1".into(),
+                conversation_id: "cas".into(),
+            })
+            .await
+            .unwrap();
+        host.inner
+            .store
+            .call(move |db| {
+                let session = &binding.session_id;
+                let offset = db.events(session)?.len();
+                db.append(
+                    session,
+                    SessionEvent::Message(openpaw_core::Message::user_text("真实输入")),
+                )?;
+                db.append(
+                    session,
+                    SessionEvent::RunStarted {
+                        run_id: "question-run".into(),
+                    },
+                )?;
+                db.save_run(
+                    RunView {
+                        run_id: "question-run".into(),
+                        session_id: session.clone(),
+                        state: RunState::Running,
+                        revision: 0,
+                        text: String::new(),
+                        tools: vec![],
+                        error: None,
+                        text_truncated: false,
+                    },
+                    offset,
+                )?;
+                let cancel = tokio_util::sync::CancellationToken::new();
+                for (index, expected) in ["answered", "cancelled", "expired", "interrupted"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let call = openpaw_core::ToolCallBinding {
+                        run_id: "question-run".into(),
+                        call_id: format!("q-{index}"),
+                        tool_name: "clarify".into(),
+                        input: json!({"question":"补充？"}),
+                    };
+                    db.append(
+                        session,
+                        SessionEvent::ToolCallStart {
+                            call_id: call.call_id.clone(),
+                            tool_name: "clarify".into(),
+                        },
+                    )?;
+                    let q = db.question_start(
+                        &call,
+                        chrono::Utc::now().timestamp_millis() + 300000,
+                        &cancel,
+                    )?;
+                    assert_eq!(
+                        db.question_start(&call, q.expires_at_ms, &cancel)
+                            .unwrap_err()
+                            .kind,
+                        "request_conflict"
+                    );
+                    db.question_display(&q.question_id, "old", &cancel)?;
+                    db.question_display(&q.question_id, "new", &cancel)?;
+                    assert_eq!(
+                        db.question(&q.question_id)?.unwrap().expires_at_ms,
+                        q.expires_at_ms,
+                        "刷新不能续期"
+                    );
+                    assert_eq!(
+                        db.question_finish(
+                            &q.question_id,
+                            Some("old"),
+                            "answered",
+                            Some("0".repeat(64)),
+                            &cancel
+                        )
+                        .unwrap_err()
+                        .kind,
+                        "request_conflict"
+                    );
+                    assert!(db
+                        .get_run("question-run")?
+                        .tools
+                        .iter()
+                        .any(|t| t.call_id == call.call_id && t.state == "awaiting_user"));
+                    let c = cancel.child_token();
+                    if expected == "cancelled" {
+                        c.cancel();
+                    }
+                    if expected == "expired" {
+                        let mut expired = db.question(&q.question_id)?.unwrap();
+                        expired.created_at_ms = chrono::Utc::now().timestamp_millis() - 10000;
+                        expired.expires_at_ms = chrono::Utc::now().timestamp_millis() - 1;
+                        db.save_question(&expired)?;
+                    }
+                    if expected == "interrupted" {
+                        db.recover()?;
+                        assert_eq!(db.question(&q.question_id)?.unwrap().state, "interrupted");
+                        assert_eq!(db.get_run("question-run")?.state, RunState::Interrupted);
+                        break;
+                    }
+                    assert_eq!(
+                        db.question_finish(
+                            &q.question_id,
+                            Some("new"),
+                            "answered",
+                            Some("0".repeat(64)),
+                            &c
+                        )?,
+                        expected
+                    );
+                    let before = db.revision()?;
+                    assert_eq!(
+                        db.question_finish(
+                            &q.question_id,
+                            Some("new"),
+                            "answered",
+                            Some("1".repeat(64)),
+                            &cancel
+                        )?,
+                        expected
+                    );
+                    assert_eq!(db.revision()?, before, "终态不可二次接受回答");
+                    assert!(!db
+                        .get_run("question-run")?
+                        .tools
+                        .iter()
+                        .any(|t| t.call_id == call.call_id && t.state == "awaiting_user"));
+                    let actual = db.question(&q.question_id)?.unwrap();
+                    assert_eq!(
+                        actual.answer_digest,
+                        if expected == "answered" {
+                            Some("0".repeat(64))
+                        } else {
+                            None
+                        }
+                    );
+                }
+                assert!(db.approvals()?.is_empty(), "问题回答不得变成执行授权");
+                Ok(())
+            })
+            .await
+            .unwrap();
         host.shutdown().await.unwrap();
     }
 }

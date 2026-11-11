@@ -3,6 +3,7 @@
 //! 依赖：原共享Host事实、Office能力与唯一Client。
 //! 禁止职责：不补播历史，不重复前向分配，不将forwarded当动画或业务完成。
 use super::client::Client;
+use super::RolePresentation;
 use crate::Host;
 use serde_json::json;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -221,8 +222,8 @@ async fn completion_returns(
                 .as_array()
                 .is_some_and(|v| v.iter().any(|c| c["id"] == "office.visit"))
                 || !actors.is_some_and(|v| {
-                    v.iter().any(|a| a["id"] == role.actor)
-                        && v.iter().any(|a| a["id"] == lead.actor)
+                    v.iter().any(|a| a["id"] == role.actor())
+                        && v.iter().any(|a| a["id"] == lead.actor())
                 })
             {
                 return Ok("dropped");
@@ -231,8 +232,8 @@ async fn completion_returns(
             let (_, receipt) = client.post(json!({"teamId":team,"conversationId":delegation.parent_scope.conversation_id,
                 "command":{"protocolVersion":"2.0","sceneId":team,"commandId":command,
                     "type":"activity.start","capability":"office.visit",
-                    "participants":[{"entityId":role.actor,"role":"visitor"},{"entityId":lead.actor,"role":"host"}],
-                    "params":{"stops":[{"hostId":lead.actor,"message":format!("{}：独立执行已结束，向分配人汇报结果，请核验。",super::dto::bounded(&delegation.title,80))}]},
+                    "participants":[{"entityId":role.actor(),"role":"visitor"},{"entityId":lead.actor(),"role":"host"}],
+                    "params":{"stops":[{"hostId":lead.actor(),"message":format!("已处理：{}。",super::dto::bounded(&delegation.title,48))}]},
                     "busyPolicy":"queue","expiresAt":chrono::DateTime::from_timestamp_millis(expiry).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)}})).await?;
             // 只记录实际送达页面；完整播放仍需浏览器runtime记录证明。
             Ok::<_, crate::HostError>(
@@ -273,24 +274,28 @@ mod tests {
     use crate::{ClientScope, HostConfig};
     #[test]
     fn scene_delivery_is_bounded_and_never_replays_offline_history() {
-        assert!(std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "office::scene::tests::scene_fixture_child",
-                "--nocapture"
-            ])
-            .env("OPENPAW_SCENE_CHILD", "1")
-            .env("PAWOFFICE_SCENE_TEST_KEY", "scene-fixture")
-            .status()
-            .unwrap()
-            .success());
+        crate::test_support::run_child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "office::scene::tests::scene_fixture_child",
+                    "--nocapture",
+                ])
+                .env("OPENPAW_SCENE_CHILD", "1")
+                .env("PAWOFFICE_SCENE_TEST_KEY", "scene-fixture"),
+            "office::scene::tests::scene_fixture_child",
+        );
     }
     #[test]
     fn scene_fixture_child() {
         if std::env::var("OPENPAW_SCENE_CHILD").as_deref() != Ok("1") {
             return;
         }
+        let proof =
+            crate::test_support::ChildProof::start("office::scene::tests::scene_fixture_child");
         tokio::runtime::Runtime::new().unwrap().block_on(scenario());
+
+        proof.complete();
     }
     async fn wait_terminal_receipt(home: &std::path::Path, run: &str, want: &str) -> String {
         use rusqlite::OptionalExtension;
@@ -464,17 +469,17 @@ mod tests {
     }
     #[test]
     fn completion_returns_follow_real_children_once_without_replay() {
-        assert!(std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "office::scene::tests::completion_return_fixture_child",
-                "--nocapture"
-            ])
-            .env("OPENPAW_COMPLETION_SCENE_CHILD", "1")
-            .env("PAWOFFICE_SCENE_TEST_KEY", "return-fixture")
-            .status()
-            .unwrap()
-            .success());
+        crate::test_support::run_child(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "office::scene::tests::completion_return_fixture_child",
+                    "--nocapture",
+                ])
+                .env("OPENPAW_COMPLETION_SCENE_CHILD", "1")
+                .env("PAWOFFICE_SCENE_TEST_KEY", "return-fixture"),
+            "office::scene::tests::completion_return_fixture_child",
+        );
     }
 
     #[test]
@@ -482,9 +487,14 @@ mod tests {
         if std::env::var("OPENPAW_COMPLETION_SCENE_CHILD").as_deref() != Ok("1") {
             return;
         }
+        let proof = crate::test_support::ChildProof::start(
+            "office::scene::tests::completion_return_fixture_child",
+        );
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(completion_scenario());
+
+        proof.complete();
     }
 
     async fn wait_return_receipt(home: &std::path::Path, child: &str, status: &str) {
@@ -589,7 +599,7 @@ mod tests {
                 return (
                     StatusCode::OK,
                     Json(
-                        json!({"code":200,"msg":"fixture","data":{"scene":{"protocolVersion":"2.0","actors":crate::agents::ROLES.iter().map(|r|json!({"id":r.actor})).collect::<Vec<_>>(),"capabilities":[{"id":"scene.say"},{"id":"office.visit"}]},"ui":{"whiteboardSchema":{}},"requests":{},"responses":{"success":{},"error":{}}}}),
+                        json!({"code":200,"msg":"fixture","data":{"scene":{"protocolVersion":"2.0","actors":crate::agents::ROLES.iter().map(|r|json!({"id":r.actor()})).collect::<Vec<_>>(),"capabilities":[{"id":"scene.say"},{"id":"office.visit"}]},"ui":{"whiteboardSchema":{}},"requests":{},"responses":{"success":{},"error":{}}}}),
                     ),
                 );
             }
@@ -599,15 +609,15 @@ mod tests {
             if command["capability"] == "office.visit" {
                 assert_eq!(
                     command["participants"][1]["entityId"],
-                    crate::agents::role("lead").unwrap().actor
+                    crate::agents::role("lead").unwrap().actor()
                 );
                 assert_eq!(command["participants"][0]["role"], "visitor");
                 assert_eq!(command["participants"][1]["role"], "host");
                 assert_eq!(command["busyPolicy"], "queue");
-                assert!(command["params"]["stops"][0]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("请核验"));
+                let message = command["params"]["stops"][0]["message"].as_str().unwrap();
+                assert!(message.starts_with("已处理：独立待办"), "{message}");
+                assert!(message.ends_with('。'));
+                assert!(!message.contains("分配人") && !message.contains("请核验"));
                 let expiry =
                     chrono::DateTime::parse_from_rfc3339(command["expiresAt"].as_str().unwrap())
                         .unwrap()
@@ -743,7 +753,7 @@ mod tests {
             assert_eq!(visits.len(), i + 1);
             assert_eq!(
                 visits[i]["command"]["participants"][0]["entityId"],
-                crate::agents::role(ROLES[i]).unwrap().actor
+                crate::agents::role(ROLES[i]).unwrap().actor()
             );
             drop(s);
             let child = ds[i].child_run.clone();

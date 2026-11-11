@@ -53,25 +53,14 @@ impl WebSearchAdapter for DuckDuckGoAdapter {
         };
         let url = format!("{}{}q={}", self.base_url, sep, urlencoding::encode(query));
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| SearchError::Http(e.to_string()))?;
+        let resp = self.client.get(&url).send().await.map_err(|e| {
+            SearchError::Http(crate::web::web_fetch::transport_diagnostic(
+                &e,
+                "search_request",
+            ))
+        })?;
 
-        let status = resp.status();
-        if status == reqwest::StatusCode::FORBIDDEN {
-            return Err(SearchError::BlockedByAntiBot);
-        }
-        if !status.is_success() {
-            return Err(SearchError::Http(format!("HTTP {status}")));
-        }
-
-        let html = resp
-            .text()
-            .await
-            .map_err(|e| SearchError::Http(e.to_string()))?;
+        let html = super::super::search_page(resp, query).await?;
 
         if is_ddg_anti_bot_page(&html) {
             return Err(SearchError::BlockedByAntiBot);

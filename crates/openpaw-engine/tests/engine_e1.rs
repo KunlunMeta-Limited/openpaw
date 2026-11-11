@@ -481,11 +481,13 @@ async fn stream_retry_recovers_from_overloaded() {
 }
 
 #[tokio::test]
-async fn d97_argument_recovery_is_bounded_and_never_replays_completed_tools() {
+async fn model_request_recovery_is_bounded_and_never_replays_completed_tools() {
     struct ArgumentsProvider {
         calls: AtomicUsize,
         partial: bool,
         always_invalid: bool,
+        failure: &'static str,
+        failure_seen: Option<Arc<tokio::sync::Notify>>,
     }
     #[async_trait::async_trait]
     impl LlmProvider for ArgumentsProvider {
@@ -526,9 +528,7 @@ async fn d97_argument_recovery_is_bounded_and_never_replays_completed_tools() {
                             text: "visible prefix".into(),
                         }));
                     }
-                    events.push(Err(Error::Provider(
-                        "invalid OpenAI streamed tool arguments: tool_index=0 json=Eof".into(),
-                    )));
+                    events.push(Err(Error::Provider(self.failure.into())));
                 } else {
                     events.push(Ok(StreamEvent::Final(Box::new(
                         openpaw_core::CompletionResponse {
@@ -541,7 +541,17 @@ async fn d97_argument_recovery_is_bounded_and_never_replays_completed_tools() {
                     ))));
                 }
             }
-            Ok(Box::pin(futures::stream::iter(events)))
+            use futures::StreamExt;
+            let failure_seen = self.failure_seen.clone();
+            Ok(Box::pin(futures::stream::iter(events).inspect(
+                move |event| {
+                    if event.is_err() {
+                        if let Some(notify) = &failure_seen {
+                            notify.notify_one();
+                        }
+                    }
+                },
+            )))
         }
         fn capabilities(&self) -> openpaw_core::Capabilities {
             Default::default()
@@ -553,15 +563,30 @@ async fn d97_argument_recovery_is_bounded_and_never_replays_completed_tools() {
             "arguments"
         }
     }
-    for (partial, always_invalid, succeeds, calls) in [
-        (false, false, true, 3),
-        (true, false, false, 2),
-        (false, true, false, 3),
+    let arguments = "invalid OpenAI streamed tool arguments: tool_index=0 json=Eof";
+    let early = "stream read: early-transient unexpected-eof";
+    for (failure, partial, always_invalid, succeeds, calls) in [
+        (arguments, false, false, true, 3),
+        (arguments, true, false, false, 2),
+        (arguments, false, true, false, 3),
+        (early, false, false, true, 3),
+        (early, true, false, false, 2),
+        (early, false, true, false, 3),
+        (
+            "stream read: content-or-unknown unexpected-eof",
+            false,
+            false,
+            false,
+            2,
+        ),
+        ("stream read: unclassified unknown", false, false, false, 2),
     ] {
         let provider = Arc::new(ArgumentsProvider {
             calls: AtomicUsize::new(0),
             partial,
             always_invalid,
+            failure,
+            failure_seen: None,
         });
         let engine = AgentLoop::new(provider.clone())
             .with_tool_host(echo_tool_host())
@@ -588,6 +613,38 @@ async fn d97_argument_recovery_is_bounded_and_never_replays_completed_tools() {
             assert_eq!(session.messages.last().unwrap().text(), "visible prefix");
         }
     }
+
+    let failure_seen = Arc::new(tokio::sync::Notify::new());
+    let provider = Arc::new(ArgumentsProvider {
+        calls: AtomicUsize::new(0),
+        partial: false,
+        always_invalid: false,
+        failure: early,
+        failure_seen: Some(failure_seen.clone()),
+    });
+    let cancel = CancellationToken::new();
+    let engine = AgentLoop::new(provider.clone())
+        .with_tool_host(echo_tool_host())
+        .with_cancel_token(cancel.clone());
+    let mut session = Session::new("cancel-retry", "arguments");
+    session
+        .messages
+        .push(Message::user_text("one effect then answer"));
+    let tools = [ToolSpec::new("echo_tool", "echo")];
+    let (cancelled, _) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(run_simple(&engine, &mut session, &tools), async {
+            failure_seen.notified().await;
+            cancel.cancel();
+        })
+    })
+    .await
+    .unwrap();
+    assert!(matches!(cancelled.0, Err(Error::Cancelled)));
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "取消退避后不得发出重试"
+    );
 }
 
 /// Provider whose stream lingers long enough to be cancelled mid-flight.
