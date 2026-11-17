@@ -1094,7 +1094,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openpaw-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1115,7 +1115,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-engine-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-goal-ledger"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "openpaw-core",
@@ -1191,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-llm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rmcp",
  "serde",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1235,7 +1235,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-plugins"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "futures",
@@ -1253,7 +1253,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-reflect-lite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-sandbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "openpaw-core",
  "rusqlite",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "openpaw-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -2794,7 +2794,7 @@ checksum = "1e9df38ee2d2c3c5948ea468a8406ff0db0b29ae1ffde1bcf20ef305bcc95c51"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "openpaw-store",
