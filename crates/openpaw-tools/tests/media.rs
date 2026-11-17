@@ -121,10 +121,12 @@ async fn image_body_wait_is_cancelled_and_never_commits_partial_output() {
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 999\r\nConnection: close\r\n\r\n{\"data\":").await.unwrap();
         ready.send(()).unwrap();
         // The client must release this actual connection on cancellation.
-        tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
-            .await
-            .unwrap()
-            .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut buffer))
+                .await
+                .unwrap()
+                .is_err()
+        )
     });
     let service = ImageService::new(
         ImageConfig {
