@@ -151,6 +151,24 @@ keyless signing, and GitHub Release attachment. The crates.io publish path
 is dry-run-validated in dependency order; the real publish awaits the
 registry token.
 
+### Workspace crates
+
+All ten crates are published on crates.io at version `0.1.1` and are
+released together under the GitHub tag `v0.1.1`.
+
+| Crate | Version | crates.io | GitHub tag |
+|-------|---------|-----------|------------|
+| `openpaw-core` | `0.1.1` | [openpaw-core](https://crates.io/crates/openpaw-core) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-engine` | `0.1.1` | [openpaw-engine](https://crates.io/crates/openpaw-engine) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-llm` | `0.1.1` | [openpaw-llm](https://crates.io/crates/openpaw-llm) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-mcp` | `0.1.1` | [openpaw-mcp](https://crates.io/crates/openpaw-mcp) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-memory` | `0.1.1` | [openpaw-memory](https://crates.io/crates/openpaw-memory) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-plugins` | `0.1.1` | [openpaw-plugins](https://crates.io/crates/openpaw-plugins) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-reflect-lite` | `0.1.1` | [openpaw-reflect-lite](https://crates.io/crates/openpaw-reflect-lite) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-sandbox` | `0.1.1` | [openpaw-sandbox](https://crates.io/crates/openpaw-sandbox) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-store` | `0.1.1` | [openpaw-store](https://crates.io/crates/openpaw-store) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+| `openpaw-tools` | `0.1.1` | [openpaw-tools](https://crates.io/crates/openpaw-tools) | [`v0.1.1`](https://github.com/KunlunMeta-Limited/openpaw/releases/tag/v0.1.1) |
+
 **Data layout.** Everything lives under `OPENPAW_HOME` (default
 `~/.openpaw`; create the skeleton with `openpaw init`):
 
